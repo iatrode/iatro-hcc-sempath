@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hcc-sempath"
+version = "0.1.0"
+description = "HCC-specific semantic pathology encoder"
+requires-python = ">=3.12"
+dependencies = [
+  "torch",
+  "torchvision",
+  "timm",
+  "PyYAML",
+  "numpy",
+  "Pillow",
+  "tqdm",
+  "imagecodecs",
+  "huggingface_hub",
+  "safetensors",
+  "openslide-python",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

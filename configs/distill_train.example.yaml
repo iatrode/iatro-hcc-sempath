@@ -1,0 +1,32 @@
+runtime:
+  device: cuda
+  seed: 13
+  output_dir: outputs/hcc_sempath_v1
+
+data:
+  manifest_path: data/manifests/tile_manifest.csv
+  tile_package_path:
+  teacher_cache_dir: data/teacher_cache/h_optimus_1
+  anchors_path: data/anchors/hcc_semantic_anchors.pt
+  image_size: 224
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  num_workers: 8
+
+model:
+  backbone_name: vit_small_patch14_dinov2.lvd142m
+  teacher_dim: 1536
+  pretrained: true
+
+loss:
+  relation_weight: 0.25
+  semantic_weight: 0.25
+  semantic_temperature: 1.0
+
+train:
+  batch_size: 256
+  epochs: 100
+  lr: 0.0001
+  weight_decay: 0.01
+  amp: true
+  topk: 10

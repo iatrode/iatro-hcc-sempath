@@ -1,0 +1,31 @@
+runtime:
+  device: cpu
+  seed: 13
+  output_dir: outputs/smoke
+
+data:
+  manifest_path: smoke_data/tile_manifest.csv
+  tile_package_path:
+  teacher_cache_dir: smoke_data/teacher_cache
+  anchors_path: smoke_data/anchors.pt
+  image_size: 224
+  num_workers: 0
+
+model:
+  backbone_name: vit_tiny_patch16_224
+  teacher_dim: 256
+  pretrained: false
+
+semantic:
+loss:
+  relation_weight: 0.25
+  semantic_weight: 0.25
+  semantic_temperature: 1.0
+
+train:
+  batch_size: 2
+  epochs: 2
+  lr: 0.0001
+  weight_decay: 0.01
+  amp: false
+  topk: 2
