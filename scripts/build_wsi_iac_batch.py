@@ -36,6 +36,28 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def _compression_stats(input_path: Path, package_path: Path) -> dict:
+    input_bytes = input_path.stat().st_size
+    package_bytes = package_path.stat().st_size
+    compression_ratio = round(input_bytes / package_bytes, 4) if package_bytes > 0 else 0.0
+    space_saving_pct = round((1.0 - package_bytes / input_bytes) * 100.0, 3) if input_bytes > 0 else 0.0
+    return {
+        "input_bytes": input_bytes,
+        "package_bytes": package_bytes,
+        "compression_ratio": compression_ratio,
+        "space_saving_pct": space_saving_pct,
+    }
+
+
+def _print_package_stats(status: str, slide_id: str, stats: dict) -> None:
+    tqdm.write(
+        f"wsi_package_{status} slide={slide_id} "
+        f"input_bytes={stats['input_bytes']} package_bytes={stats['package_bytes']} "
+        f"compression_ratio={stats['compression_ratio']:.4f}x "
+        f"space_saving_pct={stats['space_saving_pct']:.3f}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Batch package WSIs into per-slide IatroCache tile packages.")
     parser.add_argument("--input-root", required=True)
@@ -92,6 +114,8 @@ def main() -> None:
                 tile_count = int(metadata["num_records"])
             except Exception:
                 tile_count = -1
+            stats = _compression_stats(wsi_path, package_path)
+            _print_package_stats("skipped", slide_id, stats)
             manifest_rows.append(
                 {
                     "slide_id": slide_id,
@@ -101,6 +125,7 @@ def main() -> None:
                     "qc_path": "" if qc_path is None else str(qc_path),
                     "tile_count": tile_count,
                     "status": "skipped",
+                    **stats,
                 }
             )
             continue
@@ -142,13 +167,34 @@ def main() -> None:
                 "tile_size": args.tile_size,
                 "min_tissue_fraction": args.min_tissue_fraction,
                 "distance": args.distance,
-                "package_bytes": package_path.stat().st_size,
+                "input_bytes": result["input_bytes"],
+                "package_bytes": result["package_bytes"],
+                "compression_ratio": result["compression_ratio"],
+                "space_saving_pct": result["space_saving_pct"],
                 "header": metadata,
             }
             _write_json(done_path, payload)
             if fail_path.exists():
                 fail_path.unlink()
-            manifest_rows.append({k: payload[k] for k in ("slide_id", "patient_id", "wsi_path", "package_path", "qc_path", "tile_count", "status")})
+            _print_package_stats("ok", slide_id, result)
+            manifest_rows.append(
+                {
+                    k: payload[k]
+                    for k in (
+                        "slide_id",
+                        "patient_id",
+                        "wsi_path",
+                        "package_path",
+                        "qc_path",
+                        "tile_count",
+                        "status",
+                        "input_bytes",
+                        "package_bytes",
+                        "compression_ratio",
+                        "space_saving_pct",
+                    )
+                }
+            )
         except Exception as exc:
             failure = {
                 "status": "failed",
@@ -169,6 +215,10 @@ def main() -> None:
                     "qc_path": "" if qc_path is None else str(qc_path),
                     "tile_count": 0,
                     "status": "failed",
+                    "input_bytes": wsi_path.stat().st_size if wsi_path.exists() else 0,
+                    "package_bytes": 0,
+                    "compression_ratio": 0.0,
+                    "space_saving_pct": 0.0,
                 }
             )
 
@@ -188,11 +238,30 @@ def main() -> None:
 
     manifest_path = output_root / "packages.csv"
     with manifest_path.open("w", newline="", encoding="utf-8") as handle:
-        fieldnames = ["slide_id", "patient_id", "wsi_path", "package_path", "qc_path", "tile_count", "status"]
+        fieldnames = [
+            "slide_id",
+            "patient_id",
+            "wsi_path",
+            "package_path",
+            "qc_path",
+            "tile_count",
+            "status",
+            "input_bytes",
+            "package_bytes",
+            "compression_ratio",
+            "space_saving_pct",
+        ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(manifest_rows)
 
+    completed_rows = [row for row in manifest_rows if row["status"] in {"ok", "skipped"}]
+    total_input_bytes = sum(int(row["input_bytes"]) for row in completed_rows)
+    total_package_bytes = sum(int(row["package_bytes"]) for row in completed_rows)
+    overall_compression_ratio = round(total_input_bytes / total_package_bytes, 4) if total_package_bytes > 0 else 0.0
+    overall_space_saving_pct = (
+        round((1.0 - total_package_bytes / total_input_bytes) * 100.0, 3) if total_input_bytes > 0 else 0.0
+    )
     summary = {
         "input_root": str(input_root),
         "output_root": str(output_root),
@@ -200,12 +269,19 @@ def main() -> None:
         "ok": sum(1 for row in manifest_rows if row["status"] in {"ok", "skipped"}),
         "failed": sum(1 for row in manifest_rows if row["status"] == "failed"),
         "elapsed_sec": round(time.time() - started, 3),
+        "input_bytes": total_input_bytes,
+        "package_bytes": total_package_bytes,
+        "compression_ratio": overall_compression_ratio,
+        "space_saving_pct": overall_space_saving_pct,
         "manifest": str(manifest_path),
     }
     _write_json(output_root / "batch_summary.json", summary)
     print(
         "wsi_batch_done "
         f"total={summary['total']} ok={summary['ok']} failed={summary['failed']} "
+        f"input_bytes={summary['input_bytes']} package_bytes={summary['package_bytes']} "
+        f"compression_ratio={summary['compression_ratio']:.4f}x "
+        f"space_saving_pct={summary['space_saving_pct']:.3f} "
         f"manifest={manifest_path}"
     )
 

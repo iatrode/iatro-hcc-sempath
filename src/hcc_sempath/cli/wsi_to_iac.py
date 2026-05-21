@@ -14,6 +14,19 @@ def _default_workers() -> int:
     return max(1, min(8, os.cpu_count() or 1))
 
 
+def _compression_stats(input_path: Path, output_path: Path) -> dict:
+    input_bytes = input_path.stat().st_size
+    package_bytes = output_path.stat().st_size
+    compression_ratio = round(input_bytes / package_bytes, 4) if package_bytes > 0 else 0.0
+    space_saving_pct = round((1.0 - package_bytes / input_bytes) * 100.0, 3) if input_bytes > 0 else 0.0
+    return {
+        "input_bytes": input_bytes,
+        "package_bytes": package_bytes,
+        "compression_ratio": compression_ratio,
+        "space_saving_pct": space_saving_pct,
+    }
+
+
 def build_wsi_iac(
     *,
     wsi_path: str | Path,
@@ -84,6 +97,7 @@ def build_wsi_iac(
         "output_path": output_path,
         "work_dir": work_dir,
         "qc_path": None if qc_out is None else Path(qc_out),
+        **_compression_stats(wsi_path, output_path),
     }
 
 
@@ -142,7 +156,10 @@ def main() -> None:
     print(
         "wsi_package_ok "
         f"tiles={result['tile_count']} manifest={result['manifest_path']} output={result['output_path']} "
-        f"target_mpp={args.target_mpp} tile_size={args.tile_size}"
+        f"target_mpp={args.target_mpp} tile_size={args.tile_size} "
+        f"input_bytes={result['input_bytes']} package_bytes={result['package_bytes']} "
+        f"compression_ratio={result['compression_ratio']:.4f}x "
+        f"space_saving_pct={result['space_saving_pct']:.3f}"
     )
 
 
