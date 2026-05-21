@@ -261,6 +261,7 @@ def build_tile_package_from_records(
     overwrite: bool = False,
     stride_x: int | None = None,
     stride_y: int | None = None,
+    extra_header: dict | None = None,
 ) -> None:
     output_path = Path(output_path)
     if not records:
@@ -314,6 +315,8 @@ def build_tile_package_from_records(
         "max_slides_per_pack": 255,
         "created_by": "hcc-sempath",
     }
+    if extra_header:
+        header_json.update(extra_header)
     build_pack(output_path, header_json, slide_table, record_table, payloads, overwrite=overwrite)
 
 

@@ -105,7 +105,11 @@ conda run --no-capture-output -n hcc-sempath python scripts/build_wsi_iac_batch.
   --workers 8
 ```
 
-The batch manifest and summary include `input_bytes`, `package_bytes`, `compression_ratio`, and `space_saving_pct`.
+By default, batch output is flat: one `<slide_id>.iac` per input WSI plus
+`packages.csv`, `batch_progress.json`, and `batch_summary.json`. Per-slide QC
+contact sheets are only written when `--qc` is set. `packages.csv` is the batch
+manifest and includes `input_bytes`, `package_bytes`, `compression_ratio`, and
+`space_saving_pct`; per-slide tiling metadata is stored in the IAC header/table.
 
 Build a JXL tile package for remote teacher inference:
 

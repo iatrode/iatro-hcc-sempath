@@ -49,9 +49,19 @@ def _compression_stats(input_path: Path, package_path: Path) -> dict:
     }
 
 
+def _format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+        value /= 1024.0
+    return f"{size}B"
+
+
 def _print_package_stats(status: str, slide_id: str, stats: dict) -> None:
     tqdm.write(
         f"wsi_package_{status} slide={slide_id} "
+        f"input={_format_bytes(stats['input_bytes'])} package={_format_bytes(stats['package_bytes'])} "
         f"input_bytes={stats['input_bytes']} package_bytes={stats['package_bytes']} "
         f"compression_ratio={stats['compression_ratio']:.4f}x "
         f"space_saving_pct={stats['space_saving_pct']:.3f}"
@@ -74,7 +84,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="Debug limit; 0 means all slides.")
     parser.add_argument("--tcga-patient-id", action="store_true", help="Parse patient_id as TCGA-XX-YYYY from file names.")
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--no-qc", action="store_true")
+    parser.add_argument("--qc", action="store_true", help="Write per-slide QC contact sheets beside IAC packages.")
     parser.add_argument("--no-inner-progress", action="store_true")
     args = parser.parse_args()
 
@@ -101,13 +111,10 @@ def main() -> None:
     for wsi_path in tqdm(slides, desc="WSI", unit="slide"):
         slide_id = _safe_id(wsi_path.stem)
         patient_id = _tcga_patient_id_from_name(wsi_path) if args.tcga_patient_id else slide_id
-        slide_dir = output_root / slide_id
-        package_path = slide_dir / "tiles.iac"
-        qc_path = None if args.no_qc else slide_dir / "tile_package_qc.png"
-        done_path = slide_dir / "done.json"
-        fail_path = slide_dir / "failed.json"
+        package_path = output_root / f"{slide_id}.iac"
+        qc_path = output_root / f"{slide_id}.qc.png" if args.qc else None
 
-        if package_path.exists() and done_path.exists() and not args.overwrite:
+        if package_path.exists() and not args.overwrite:
             try:
                 metadata = read_package_metadata(package_path)
                 tile_count = int(metadata["num_records"])
@@ -124,6 +131,12 @@ def main() -> None:
                     "qc_path": "" if qc_path is None else str(qc_path),
                     "tile_count": tile_count,
                     "status": "skipped",
+                    "target_mpp": args.target_mpp,
+                    "tile_size": args.tile_size,
+                    "min_tissue_fraction": args.min_tissue_fraction,
+                    "distance": args.distance,
+                    "error_type": "",
+                    "error": "",
                     **stats,
                 }
             )
@@ -151,8 +164,7 @@ def main() -> None:
                 overwrite=args.overwrite,
                 show_progress=not args.no_inner_progress,
             )
-            metadata = read_package_metadata(package_path)
-            payload = {
+            row = {
                 "status": "ok",
                 "slide_id": slide_id,
                 "patient_id": patient_id,
@@ -168,30 +180,11 @@ def main() -> None:
                 "package_bytes": result["package_bytes"],
                 "compression_ratio": result["compression_ratio"],
                 "space_saving_pct": result["space_saving_pct"],
-                "header": metadata,
+                "error_type": "",
+                "error": "",
             }
-            _write_json(done_path, payload)
-            if fail_path.exists():
-                fail_path.unlink()
             _print_package_stats("ok", slide_id, result)
-            manifest_rows.append(
-                {
-                    k: payload[k]
-                    for k in (
-                        "slide_id",
-                        "patient_id",
-                        "wsi_path",
-                        "package_path",
-                        "qc_path",
-                        "tile_count",
-                        "status",
-                        "input_bytes",
-                        "package_bytes",
-                        "compression_ratio",
-                        "space_saving_pct",
-                    )
-                }
-            )
+            manifest_rows.append(row)
         except Exception as exc:
             failure = {
                 "status": "failed",
@@ -202,7 +195,6 @@ def main() -> None:
                 "error": str(exc),
             }
             failures.append(failure)
-            _write_json(fail_path, failure)
             manifest_rows.append(
                 {
                     "slide_id": slide_id,
@@ -212,10 +204,16 @@ def main() -> None:
                     "qc_path": "" if qc_path is None else str(qc_path),
                     "tile_count": 0,
                     "status": "failed",
+                    "target_mpp": args.target_mpp,
+                    "tile_size": args.tile_size,
+                    "min_tissue_fraction": args.min_tissue_fraction,
+                    "distance": args.distance,
                     "input_bytes": wsi_path.stat().st_size if wsi_path.exists() else 0,
                     "package_bytes": 0,
                     "compression_ratio": 0.0,
                     "space_saving_pct": 0.0,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
                 }
             )
 
@@ -243,10 +241,16 @@ def main() -> None:
             "qc_path",
             "tile_count",
             "status",
+            "target_mpp",
+            "tile_size",
+            "min_tissue_fraction",
+            "distance",
             "input_bytes",
             "package_bytes",
             "compression_ratio",
             "space_saving_pct",
+            "error_type",
+            "error",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -276,6 +280,7 @@ def main() -> None:
     print(
         "wsi_batch_done "
         f"total={summary['total']} ok={summary['ok']} failed={summary['failed']} "
+        f"input={_format_bytes(summary['input_bytes'])} package={_format_bytes(summary['package_bytes'])} "
         f"input_bytes={summary['input_bytes']} package_bytes={summary['package_bytes']} "
         f"compression_ratio={summary['compression_ratio']:.4f}x "
         f"space_saving_pct={summary['space_saving_pct']:.3f} "

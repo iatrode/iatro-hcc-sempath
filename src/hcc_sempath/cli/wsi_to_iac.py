@@ -32,6 +32,15 @@ def _compression_stats(input_path: Path, output_path: Path) -> dict:
     }
 
 
+def _format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+        value /= 1024.0
+    return f"{size}B"
+
+
 def _open_slide(wsi_path: Path):
     try:
         import openslide
@@ -178,6 +187,27 @@ def build_wsi_iac(
         overwrite=overwrite,
         stride_x=level0_stride_x,
         stride_y=level0_stride_y,
+        extra_header={
+            "source": {
+                "path": str(wsi_path),
+                "bytes": wsi_path.stat().st_size,
+                "width": width,
+                "height": height,
+                "native_mpp_x": native_mpp,
+                "native_mpp_y": native_mpp_y,
+            },
+            "tiling": {
+                "target_mpp": target_mpp,
+                "openslide_level": level,
+                "level_downsample": level_downsample,
+                "level_read_width": level_read_w,
+                "level_read_height": level_read_h,
+                "min_tissue_fraction": min_tissue_fraction,
+                "candidate_tiles": total_candidates,
+                "retained_tiles": len(records),
+                "max_tiles": max_tiles,
+            },
+        },
     )
 
     if qc_out:
@@ -241,6 +271,7 @@ def main() -> None:
         "wsi_package_ok "
         f"tiles={result['tile_count']} output={result['output_path']} "
         f"target_mpp={args.target_mpp} tile_size={args.tile_size} "
+        f"input={_format_bytes(result['input_bytes'])} package={_format_bytes(result['package_bytes'])} "
         f"input_bytes={result['input_bytes']} package_bytes={result['package_bytes']} "
         f"compression_ratio={result['compression_ratio']:.4f}x "
         f"space_saving_pct={result['space_saving_pct']:.3f}"
