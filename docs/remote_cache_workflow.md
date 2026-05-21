@@ -2,7 +2,8 @@
 
 ## Goal
 
-Build teacher features once on a high-performance machine, then train the student locally without repeatedly running the teacher.
+Build teacher features once on a high-performance machine, then train the
+student without repeatedly running the teacher.
 
 ## Inputs copied to the remote machine
 
@@ -14,12 +15,6 @@ Preferred transfer artifact:
 The package contains an IatroCache header, Arrow slide/record tables, and
 JXL-compressed `224 x 224` tiles. It is a pre-inference data package, not the
 teacher feature cache.
-
-Legacy transfer inputs are also supported:
-
-1. `tile_manifest.csv`
-2. Tile image directory referenced by the manifest
-3. Repository code
 
 ## Remote commands
 
@@ -40,16 +35,16 @@ PYTHONPATH=src python scripts/build_feature_package.py \
   --teacher-name h_optimus_1
 ```
 
-## Outputs copied back locally
+## Outputs copied back after teacher inference
 
 ```text
 data/packages/h_optimus_1_features.iac
 ```
 
-The local training code uses `teacher_features.iac` as the distillation target.
-Loose `.npy` feature files are remote build intermediates.
+Training uses `teacher_features.iac` as the distillation target. Loose `.npy`
+feature files are build intermediates.
 
-## Local verification before training
+## Verification before training
 
 ```bash
 PYTHONPATH=src python -m hcc_sempath.train --config configs/distill_train.example.yaml

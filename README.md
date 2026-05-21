@@ -1,6 +1,54 @@
 # HCC-SemPath
 
-HCC-specific semantic pathology encoder repository.
+HCC-SemPath is a hepatocellular carcinoma specific pathology representation
+repository. The project target is a reusable HCC semantic embedding space, not a
+single downstream diagnostic, prognosis, or report-generation model.
+
+HCC-SemPath 是面向肝细胞癌（HCC）专病病理表征的仓库。项目目标是构建可复用的
+HCC 语义 embedding 空间，而不是单一下游诊断、预后或报告生成模型。
+
+## Current Direction
+
+The main training design is a shared student encoder with HCC-centered
+embeddings. During training, teacher-specific projection heads align the student
+space to multiple pathology foundation teachers. At inference time, downstream
+users consume the student embedding itself; teacher heads are training-time
+adapters.
+
+当前设计采用共享学生编码器生成 HCC 专病 embedding。训练时通过多个 teacher 专属
+projection head 对接不同病理基座模型；推理和下游任务使用学生 embedding 本身，teacher
+head 只是训练阶段的适配层。
+
+HCC weak supervision is expected to further shape the embedding space around
+domain-specific morphology and tissue semantics, such as tumor architecture,
+cholangiocytic components, liver lobule context, necrosis, fibrosis, and immune
+microenvironment patterns.
+
+HCC 弱监督用于进一步把 embedding 空间塑造成专病语义空间，覆盖肿瘤结构、胆管样成分、
+肝小叶背景、坏死、纤维化和免疫微环境等 HCC 相关形态语义。
+
+## Repository Scope
+
+This repository contains:
+
+- data contracts and package readers/writers for offline tile and feature caches;
+- student model, loss, training, and evaluation scaffolding;
+- public-safe documentation of the HCC-SemPath model plan;
+- smoke-test utilities based on synthetic data.
+
+本仓库包含：
+
+- 离线 tile 与 feature cache 的数据合同和读写实现；
+- 学生模型、loss、训练和评估脚手架；
+- 面向公开发布的 HCC-SemPath 模型规划文档；
+- 基于合成数据的 smoke-test 工具。
+
+This repository should not contain private WSIs, production tile packages,
+teacher feature packages, checkpoints, patient-identifiable manifests, or local
+machine paths.
+
+本仓库不应包含私有 WSI、生产级 tile package、teacher feature package、checkpoint、
+可识别患者身份的 manifest 或本机路径。
 
 ## Environment
 
@@ -9,19 +57,30 @@ conda env create -f environment.yml
 conda activate hcc-sempath
 ```
 
-## Repository flow
+## Data Flow
 
 ```text
-slide/image
+WSI or raster image
   -> 224 px tiling
-  -> tile manifest
-  -> teacher feature cache
-  -> student training
-  -> evaluation
-  -> deployment benchmark
+  -> image-tile package
+  -> teacher feature package
+  -> multi-teacher student training
+  -> HCC semantic embedding
+  -> downstream evaluation
 ```
 
-## Contract smoke test
+IatroCache (`.iac`) is the current implementation-level data contract for tile
+and feature packages. It is an engineering format for this repository, not the
+scientific contribution itself.
+
+IatroCache（`.iac`）是当前 tile 与 feature package 的工程数据合同。它属于仓库实现层，
+不是论文或模型工作的科学贡献本身。
+
+## Smoke Test
+
+The contract smoke test uses synthetic data and validates package loading,
+anchor loading, training, checkpointing, evaluation output, and throughput
+benchmarking.
 
 ```bash
 cd hcc-sempath
@@ -29,19 +88,9 @@ conda activate hcc-sempath
 bash scripts/run_contract_smoke.sh
 ```
 
-The smoke test validates the full local contract:
+## Core Commands
 
-- tile manifest loading
-- teacher cache loading
-- anchor loading
-- training
-- checkpointing
-- evaluation output
-- throughput benchmark
-
-## Core commands
-
-Tile a rasterized slide/image:
+Tile a rasterized image:
 
 ```bash
 PYTHONPATH=src python -m hcc_sempath.tiling \
@@ -53,25 +102,7 @@ PYTHONPATH=src python -m hcc_sempath.tiling \
   --split train
 ```
 
-Tile a WSI:
-
-```bash
-PYTHONPATH=src python -m hcc_sempath.tiling \
-  --wsi slide.svs \
-  --output-dir data/tiles \
-  --manifest-out data/manifests/tile_manifest.csv \
-  --patient-id P001 \
-  --slide-id S001 \
-  --split train \
-  --target-mpp 0.5
-```
-
-For a fast real-WSI smoke test, add `--max-tiles 64`. For a clean rerun of the same
-`slide_id`, add `--overwrite-slide-dir`.
-
-Build an image-tile IatroCache package directly from an OpenSlide-readable WSI
-such as `.svs` or `.mrxs`. This path writes the IAC package directly and does
-not materialize per-tile PNGs or `tile_manifest.csv`:
+Package an OpenSlide-readable WSI directly into an image-tile package:
 
 ```bash
 hcc-sempath-wsi2iac \
@@ -84,15 +115,7 @@ hcc-sempath-wsi2iac \
   --qc-out data/packages/slide.tiles.qc.png
 ```
 
-Equivalent script form:
-
-```bash
-python scripts/build_wsi_package.py \
-  --wsi slide.svs \
-  --output data/packages/slide.tiles.iac
-```
-
-Batch-package a WSI directory with progress:
+Batch-package a WSI directory:
 
 ```bash
 conda run --no-capture-output -n hcc-sempath python scripts/build_wsi_iac_batch.py \
@@ -105,20 +128,6 @@ conda run --no-capture-output -n hcc-sempath python scripts/build_wsi_iac_batch.
   --workers 8
 ```
 
-By default, batch output is flat: one `<slide_id>.iac` per input WSI plus
-`packages.csv`, `batch_progress.json`, and `batch_summary.json`. Per-slide QC
-contact sheets are only written when `--qc` is set. `packages.csv` is the batch
-manifest and includes `input_bytes`, `package_bytes`, `compression_ratio`, and
-`space_saving_pct`; per-slide tiling metadata is stored in the IAC header/table.
-
-Build a JXL tile package for remote teacher inference:
-
-```bash
-PYTHONPATH=src python scripts/build_tile_package.py \
-  --manifest data/manifests/tile_manifest.csv \
-  --output data/packages/tiles.iac
-```
-
 Validate a package:
 
 ```bash
@@ -126,22 +135,7 @@ PYTHONPATH=src python scripts/validate_tile_package.py \
   --package data/packages/tiles.iac
 ```
 
-Download teacher assets:
-
-```bash
-python scripts/download_teacher.py
-```
-
-Cache teacher features:
-
-```bash
-PYTHONPATH=src python -m hcc_sempath.teachers \
-  --manifest data/manifests/tile_manifest.csv \
-  --output-dir data/teacher_cache/h_optimus_1 \
-  --model-name hf_hub:bioptimus/H-optimus-1
-```
-
-For remote/high-performance cache building:
+Build teacher features:
 
 ```bash
 PYTHONPATH=src python scripts/build_teacher_cache.py \
@@ -150,6 +144,16 @@ PYTHONPATH=src python scripts/build_teacher_cache.py \
   --model-name hf_hub:bioptimus/H-optimus-1 \
   --batch-size 256 \
   --device cuda
+```
+
+Convert teacher outputs into a feature package:
+
+```bash
+PYTHONPATH=src python scripts/build_feature_package.py \
+  --tile-package data/packages/tiles.iac \
+  --feature-dir data/teacher_cache/h_optimus_1 \
+  --output data/packages/h_optimus_1_features.iac \
+  --teacher-name h_optimus_1
 ```
 
 Build semantic anchors:
@@ -165,10 +169,6 @@ Train:
 ```bash
 PYTHONPATH=src python -m hcc_sempath.train --config configs/distill_train.example.yaml
 ```
-
-Training and evaluation use IatroCache packages as the data contract. Set
-`data.image_tile_package_path` and `data.teacher_feature_package_path` in the
-YAML config.
 
 Resume:
 
@@ -187,33 +187,10 @@ PYTHONPATH=src python -m hcc_sempath.evaluate \
   --split val
 ```
 
-## Data contracts
+## Documentation
 
-`tile_manifest.csv` must contain:
-
-```text
-tile_id,patient_id,slide_id,tile_path,x,y,split
-```
-
-`tiles.iac` is the image-tile IatroCache package and the training image contract.
-Format specification: `docs/IATROCACHE_FORMAT.md`.
-
-Training and evaluation read images from `data.image_tile_package_path` and use
-the package's record table as the tile index.
-
-`teacher_features.iac` is the teacher-output IatroCache package and the
-distillation target contract. Loose `.npy` teacher caches are intermediate build
-artifacts, not the primary training input.
-
-```text
-data.teacher_feature_package_path
-```
-
-Anchor payload must be a PyTorch tensor or a dict containing:
-
-```python
-{"anchors": Tensor[K, teacher_dim]}
-```
-
-Student-side image normalization is configured in YAML. Teacher-cache extraction uses
-the teacher model's own `timm` data configuration.
+- `docs/model_plan.md`: public bilingual model direction.
+- `docs/CURRENT_STATUS.md`: current engineering and training status.
+- `docs/TECHNICAL_FRAMEWORK.md`: public technical framework.
+- `docs/IATROCACHE_FORMAT.md`: implementation-level package format.
+- `docs/remote_cache_workflow.md`: teacher-cache workflow.
