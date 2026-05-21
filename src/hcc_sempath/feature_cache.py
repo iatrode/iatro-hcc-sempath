@@ -10,6 +10,18 @@ from .manifests import TileRecord, read_tile_manifest
 from .tile_package import read_package_manifest
 
 
+def _ensure_unique_tile_ids(records: list[TileRecord]) -> None:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for record in records:
+        if record.tile_id in seen:
+            duplicates.append(record.tile_id)
+        seen.add(record.tile_id)
+    if duplicates:
+        sample = ", ".join(duplicates[:3])
+        raise ValueError(f"duplicate tile_id values: count={len(duplicates)} sample={sample}")
+
+
 def _build_feature_table(records: list[TileRecord]) -> pa.Table:
     return pa.table(
         {
@@ -38,6 +50,7 @@ def build_teacher_feature_package(
     feature_dir = Path(feature_dir)
     if not records:
         raise ValueError("records are empty")
+    _ensure_unique_tile_ids(records)
     payloads = []
     feature_dim = None
     for record in records:
@@ -119,6 +132,16 @@ class FeatureCacheReader:
         if self._reader.header.get("payload_type") != "teacher_features":
             raise ValueError(f"not a teacher feature package: {self._reader.header.get('payload_type')}")
         tile_ids = self._reader.record_table.column("tile_id")
+        values = tile_ids.to_pylist()
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for tile_id in values:
+            if tile_id in seen:
+                duplicates.append(tile_id)
+            seen.add(tile_id)
+        if duplicates:
+            sample = ", ".join(duplicates[:3])
+            raise ValueError(f"duplicate tile_id values in feature package: count={len(duplicates)} sample={sample}")
         self._tile_index = {tile_ids[i].as_py(): i for i in range(len(tile_ids))}
 
     def read_feature(self, tile_id: str) -> np.ndarray:
