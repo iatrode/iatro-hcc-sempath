@@ -17,10 +17,14 @@ from .iatrocache import PackReader, build_pack, read_header, read_tables
 from .manifests import TileRecord
 
 
+def encode_jxl_array(arr: np.ndarray, lossless: bool, distance: float | None, effort: int | None) -> bytes:
+    return imagecodecs.jpegxl_encode(arr, lossless=lossless, distance=distance, effort=effort)
+
+
 def encode_jxl(image_path: Path, lossless: bool, distance: float | None, effort: int | None) -> bytes:
     with Image.open(image_path) as image:
         arr = np.asarray(image.convert("RGB"))
-    return imagecodecs.jpegxl_encode(arr, lossless=lossless, distance=distance, effort=effort)
+    return encode_jxl_array(arr, lossless=lossless, distance=distance, effort=effort)
 
 
 def decode_jxl(payload: bytes) -> Image.Image:
@@ -242,6 +246,75 @@ def build_tile_package(
         payloads,
         overwrite=overwrite,
     )
+
+
+def build_tile_package_from_records(
+    records: list[TileRecord],
+    payloads: list[bytes],
+    output_path: str | Path,
+    *,
+    tile_width: int,
+    tile_height: int,
+    lossless: bool = False,
+    distance: float | None = 1.0,
+    effort: int | None = 7,
+    overwrite: bool = False,
+    stride_x: int | None = None,
+    stride_y: int | None = None,
+) -> None:
+    output_path = Path(output_path)
+    if not records:
+        raise ValueError("records are empty")
+    if len(records) != len(payloads):
+        raise ValueError(f"record/payload count mismatch: {len(records)} != {len(payloads)}")
+
+    slide_table, slide_to_idx = _build_slide_table(records)
+    if len(slide_to_idx) > 255:
+        raise ValueError(f"too many slides: {len(slide_to_idx)} > 255")
+
+    stride_x = _infer_coordinate_stride(records, "x", tile_width) if stride_x is None else int(stride_x)
+    stride_y = _infer_coordinate_stride(records, "y", tile_height) if stride_y is None else int(stride_y)
+    if stride_x <= 0 or stride_y <= 0:
+        raise ValueError(f"stride must be positive, got ({stride_x}, {stride_y})")
+
+    offsets: list[int] = []
+    lengths: list[int] = []
+    crcs: list[int] = []
+    total = 0
+    for payload in payloads:
+        offsets.append(total)
+        lengths.append(len(payload))
+        crcs.append(0)
+        total += len(payload)
+    record_table = _build_record_table(records, slide_to_idx, stride_x, stride_y, offsets, lengths, crcs)
+
+    header_json = {
+        "payload_type": "image_tiles",
+        "codec": "jxl",
+        "codec_params": {
+            "mode": "lossless" if lossless else "lossy",
+            "lossless": lossless,
+            "distance": distance,
+            "effort": effort,
+            "tile_color_space": "RGB",
+            "input_dtype": "uint8",
+        },
+        "tile_width": int(tile_width),
+        "tile_height": int(tile_height),
+        "stride_x": stride_x,
+        "stride_y": stride_y,
+        "coordinate_mode": "tile_grid",
+        "origin": "top_left",
+        "slide_idx_dtype": "uint8",
+        "tile_xy_dtype": "uint16",
+        "offset_dtype": "uint64",
+        "length_dtype": "uint32",
+        "flags_dtype": "uint8",
+        "checksum": "crc32",
+        "max_slides_per_pack": 255,
+        "created_by": "hcc-sempath",
+    }
+    build_pack(output_path, header_json, slide_table, record_table, payloads, overwrite=overwrite)
 
 
 def read_package_metadata(package_path: str | Path) -> dict:

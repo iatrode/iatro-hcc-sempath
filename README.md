@@ -70,7 +70,8 @@ For a fast real-WSI smoke test, add `--max-tiles 64`. For a clean rerun of the s
 `slide_id`, add `--overwrite-slide-dir`.
 
 Build an image-tile IatroCache package directly from an OpenSlide-readable WSI
-such as `.svs` or `.mrxs`:
+such as `.svs` or `.mrxs`. This path writes the IAC package directly and does
+not materialize per-tile PNGs or `tile_manifest.csv`:
 
 ```bash
 hcc-sempath-wsi2iac \
