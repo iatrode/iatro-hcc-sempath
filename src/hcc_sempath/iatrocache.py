@@ -8,6 +8,7 @@ project-specific data model (TileRecord, manifest, etc.).
 from __future__ import annotations
 
 import json
+import os
 import struct
 import zlib
 from collections.abc import Iterator
@@ -41,6 +42,8 @@ def _replace_column(table: pa.Table, name: str, values: list[int], pa_type: pa.D
 def _read_arrow_table(f, offset: int, length: int) -> pa.Table:
     f.seek(offset)
     raw = f.read(length)
+    if len(raw) != length:
+        raise ValueError(f"short Arrow table read at offset={offset}: expected={length} got={len(raw)}")
     return pa.ipc.open_stream(pa.py_buffer(raw)).read_all()
 
 
@@ -65,7 +68,48 @@ def _read_fixed_header(f) -> dict:
     version = struct.unpack_from("<I", raw, 12)[0]
     if version != FORMAT_VERSION:
         raise ValueError(f"unsupported IatroCache version: {version}")
+    if header_len > HEADER_BYTES - 16:
+        raise ValueError(f"invalid IatroCache header length: {header_len}")
+    if len(raw) < 16 + header_len:
+        raise ValueError(f"truncated IatroCache header: expected={header_len} got={max(0, len(raw) - 16)}")
     return json.loads(raw[16:16 + header_len].decode("utf-8"))
+
+
+def _file_size(f) -> int:
+    return os.fstat(f.fileno()).st_size
+
+
+def _validate_segment(header: dict, name: str, file_size: int) -> None:
+    offset = int(header[f"{name}_offset"])
+    length = int(header[f"{name}_length"])
+    if offset < 0 or length < 0 or offset + length > file_size:
+        raise ValueError(
+            f"{name} segment outside file bounds: offset={offset} length={length} file_size={file_size}"
+        )
+
+
+def _validate_layout(header: dict, file_size: int) -> None:
+    header_bytes = int(header.get("header_bytes", HEADER_BYTES))
+    if header_bytes != HEADER_BYTES:
+        raise ValueError(f"unsupported header_bytes: {header_bytes}")
+    if int(header.get("slide_table_offset", -1)) != HEADER_BYTES:
+        raise ValueError(f"unexpected slide_table_offset: {header.get('slide_table_offset')}")
+    _validate_segment(header, "slide_table", file_size)
+    _validate_segment(header, "record_table", file_size)
+    expected_record_offset = int(header["slide_table_offset"]) + int(header["slide_table_length"])
+    if int(header["record_table_offset"]) != expected_record_offset:
+        raise ValueError(
+            f"unexpected record_table_offset: {header['record_table_offset']} expected={expected_record_offset}"
+        )
+    data_offset = int(header["data_offset"])
+    data_length = int(header["data_length"])
+    expected_data_offset = int(header["record_table_offset"]) + int(header["record_table_length"])
+    if data_offset != expected_data_offset:
+        raise ValueError(f"unexpected data_offset: {data_offset} expected={expected_data_offset}")
+    if data_offset < 0 or data_length < 0 or data_offset + data_length > file_size:
+        raise ValueError(
+            f"data segment outside file bounds: offset={data_offset} length={data_length} file_size={file_size}"
+        )
 
 
 # ---- public API: build -------------------------------------------------------
@@ -94,6 +138,8 @@ def build_pack(
     crcs: list[int] = []
     total = 0
     for p in payloads:
+        if len(p) > 0xFFFFFFFF:
+            raise ValueError(f"payload too large for uint32 length: {len(p)} bytes")
         offsets.append(total)
         lengths.append(len(p))
         crcs.append(zlib.crc32(p) & 0xFFFFFFFF)
@@ -146,37 +192,57 @@ def build_pack(
 def read_header(package_path: str | Path) -> dict:
     """Read the JSON header from an IatroCache pack."""
     with Path(package_path).open("rb") as f:
-        return _read_fixed_header(f)
+        header = _read_fixed_header(f)
+        _validate_layout(header, _file_size(f))
+        return header
 
 
 def read_tables(package_path: str | Path) -> tuple[dict, pa.Table, pa.Table]:
     """Return (header, slide_table, record_table)."""
     with Path(package_path).open("rb") as f:
         header = _read_fixed_header(f)
+        _validate_layout(header, _file_size(f))
         slides = _read_arrow_table(f, header["slide_table_offset"], header["slide_table_length"])
         records = _read_arrow_table(f, header["record_table_offset"], header["record_table_length"])
+    if int(header["num_slides"]) != len(slides):
+        raise ValueError(f"num_slides mismatch: header={header['num_slides']} table={len(slides)}")
+    if int(header["num_records"]) != len(records):
+        raise ValueError(f"num_records mismatch: header={header['num_records']} table={len(records)}")
     return header, slides, records
 
 
 def read_payload(package_path: str | Path, header: dict, offset: int, length: int) -> bytes:
     """Read a single payload record from the data segment."""
+    if offset < 0 or length < 0 or offset + length > int(header["data_length"]):
+        raise ValueError(f"payload span outside data segment: offset={offset} length={length}")
     with Path(package_path).open("rb") as f:
         f.seek(header["data_offset"] + offset)
-        return f.read(length)
+        payload = f.read(length)
+    if len(payload) != length:
+        raise ValueError(f"short payload read at offset={offset}: expected={length} got={len(payload)}")
+    return payload
 
 
 def iter_payloads(package_path: str | Path) -> Iterator[bytes]:
     """Yield all payloads in data-offset order."""
     with Path(package_path).open("rb") as f:
         header = _read_fixed_header(f)
+        _validate_layout(header, _file_size(f))
         record_table = _read_arrow_table(
             f, header["record_table_offset"], header["record_table_length"]
         )
         offsets = record_table.column("offset")
         lengths = record_table.column("length")
         for i in range(len(record_table)):
-            f.seek(header["data_offset"] + offsets[i].as_py())
-            yield f.read(lengths[i].as_py())
+            offset = offsets[i].as_py()
+            length = lengths[i].as_py()
+            if offset < 0 or length < 0 or offset + length > int(header["data_length"]):
+                raise ValueError(f"payload span outside data segment at row {i}: offset={offset} length={length}")
+            f.seek(header["data_offset"] + offset)
+            payload = f.read(length)
+            if len(payload) != length:
+                raise ValueError(f"short payload read at row {i}: expected={length} got={len(payload)}")
+            yield payload
 
 
 class PackReader:
@@ -194,12 +260,19 @@ class PackReader:
             return
         self._file = self.package_path.open("rb")
         self._header = _read_fixed_header(self._file)
+        _validate_layout(self._header, _file_size(self._file))
         self._slide_table = _read_arrow_table(
             self._file, self._header["slide_table_offset"], self._header["slide_table_length"]
         )
         self._record_table = _read_arrow_table(
             self._file, self._header["record_table_offset"], self._header["record_table_length"]
         )
+        if int(self._header["num_slides"]) != len(self._slide_table):
+            raise ValueError(f"num_slides mismatch: header={self._header['num_slides']} table={len(self._slide_table)}")
+        if int(self._header["num_records"]) != len(self._record_table):
+            raise ValueError(
+                f"num_records mismatch: header={self._header['num_records']} table={len(self._record_table)}"
+            )
 
     @property
     def header(self) -> dict:
@@ -226,8 +299,13 @@ class PackReader:
         assert self._record_table is not None
         offset = self._record_table.column("offset")[row].as_py()
         length = self._record_table.column("length")[row].as_py()
+        if offset < 0 or length < 0 or offset + length > int(self._header["data_length"]):
+            raise ValueError(f"payload span outside data segment at row {row}: offset={offset} length={length}")
         self._file.seek(self._header["data_offset"] + offset)
-        return self._file.read(length)
+        payload = self._file.read(length)
+        if len(payload) != length:
+            raise ValueError(f"short payload read at row {row}: expected={length} got={len(payload)}")
+        return payload
 
     def close(self) -> None:
         if self._file is not None:

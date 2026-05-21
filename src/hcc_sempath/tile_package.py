@@ -41,12 +41,29 @@ def _build_slide_table(records: list[TileRecord]) -> tuple[pa.Table, dict[str, i
         if r.slide_id not in slide_to_idx:
             slide_to_idx[r.slide_id] = len(seen)
             seen.append((r.slide_id, r.patient_id))
+        elif seen[slide_to_idx[r.slide_id]][1] != r.patient_id:
+            raise ValueError(
+                f"inconsistent patient_id for slide {r.slide_id}: "
+                f"{seen[slide_to_idx[r.slide_id]][1]} != {r.patient_id}"
+            )
     table = pa.table({
         "slide_idx": pa.array(np.arange(len(seen), dtype=np.uint8), type=pa.uint8()),
         "slide_id": [s[0] for s in seen],
         "patient_id": [s[1] for s in seen],
     })
     return table, slide_to_idx
+
+
+def _ensure_unique_tile_ids(records: list[TileRecord]) -> None:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for record in records:
+        if record.tile_id in seen:
+            duplicates.append(record.tile_id)
+        seen.add(record.tile_id)
+    if duplicates:
+        sample = ", ".join(duplicates[:3])
+        raise ValueError(f"duplicate tile_id values: count={len(duplicates)} sample={sample}")
 
 
 def _build_record_table(
@@ -109,6 +126,26 @@ def _slide_map(slide_table: pa.Table) -> dict[int, tuple[str, str]]:
     return result
 
 
+def _ensure_unique_column(table: pa.Table, column_name: str) -> None:
+    values = table.column(column_name).to_pylist()
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for value in values:
+        if value in seen:
+            duplicates.append(value)
+        seen.add(value)
+    if duplicates:
+        sample = ", ".join(str(value) for value in duplicates[:3])
+        raise ValueError(f"duplicate {column_name} values in package: count={len(duplicates)} sample={sample}")
+
+
+def _require_image_tile_header(header: dict) -> None:
+    if header.get("payload_type") != "image_tiles":
+        raise ValueError(f"not an image tile package: {header.get('payload_type')}")
+    if header.get("codec") != "jxl":
+        raise ValueError(f"unsupported image tile codec: {header.get('codec')}")
+
+
 def _to_tile_record(
     header: dict,
     record_table: pa.Table,
@@ -161,6 +198,7 @@ def build_tile_package(
     records = read_tile_manifest(manifest_path)
     if not records:
         raise ValueError("manifest is empty")
+    _ensure_unique_tile_ids(records)
 
     slide_table, slide_to_idx = _build_slide_table(records)
     if len(slide_to_idx) > 255:
@@ -268,6 +306,7 @@ def build_tile_package_from_records(
         raise ValueError("records are empty")
     if len(records) != len(payloads):
         raise ValueError(f"record/payload count mismatch: {len(records)} != {len(payloads)}")
+    _ensure_unique_tile_ids(records)
 
     slide_table, slide_to_idx = _build_slide_table(records)
     if len(slide_to_idx) > 255:
@@ -326,6 +365,8 @@ def read_package_metadata(package_path: str | Path) -> dict:
 
 def read_package_manifest(package_path: str | Path) -> list[TileRecord]:
     header, slide_table, record_table = read_tables(package_path)
+    _require_image_tile_header(header)
+    _ensure_unique_column(record_table, "tile_id")
     sm = _slide_map(slide_table)
     return [_to_tile_record(header, record_table, sm, i) for i in range(len(record_table))]
 
@@ -339,8 +380,10 @@ class TilePackageReader:
     def _ensure_index(self) -> None:
         if self._tile_index is not None:
             return
+        _require_image_tile_header(self._reader.header)
         self._slide_map = _slide_map(self._reader.slide_table)
         tile_ids = self._reader.record_table.column("tile_id")
+        _ensure_unique_column(self._reader.record_table, "tile_id")
         self._tile_index = {tile_ids[i].as_py(): i for i in range(len(tile_ids))}
 
     def read_image(self, tile_id: str) -> Image.Image:
@@ -349,7 +392,11 @@ class TilePackageReader:
         row = self._tile_index.get(tile_id)
         if row is None:
             raise FileNotFoundError(f"missing packaged tile: {tile_id}")
-        return decode_jxl(self._reader.read_payload(row))
+        image = decode_jxl(self._reader.read_payload(row))
+        expected_size = (int(self._reader.header["tile_width"]), int(self._reader.header["tile_height"]))
+        if image.size != expected_size:
+            raise ValueError(f"invalid tile size for {tile_id}: expected={expected_size} got={image.size}")
+        return image
 
     def close(self) -> None:
         self._reader.close()
@@ -370,11 +417,18 @@ class TilePackageReader:
 
 def iter_package_tiles(package_path: str | Path) -> Iterator[tuple[TileRecord, Image.Image]]:
     header, slide_table, record_table = read_tables(package_path)
+    _require_image_tile_header(header)
+    _ensure_unique_column(record_table, "tile_id")
     sm = _slide_map(slide_table)
     reader = PackReader(package_path)
     try:
         for i in range(len(record_table)):
             payload = reader.read_payload(i)
-            yield _to_tile_record(header, record_table, sm, i), decode_jxl(payload)
+            record = _to_tile_record(header, record_table, sm, i)
+            image = decode_jxl(payload)
+            expected_size = (int(header["tile_width"]), int(header["tile_height"]))
+            if image.size != expected_size:
+                raise ValueError(f"invalid tile size for {record.tile_id}: expected={expected_size} got={image.size}")
+            yield record, image
     finally:
         reader.close()
