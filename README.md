@@ -104,6 +104,8 @@ conda run --no-capture-output -n hcc-sempath python scripts/build_wsi_iac_batch.
   --workers 8
 ```
 
+The batch manifest and summary include `input_bytes`, `package_bytes`, `compression_ratio`, and `space_saving_pct`.
+
 Build a JXL tile package for remote teacher inference:
 
 ```bash
