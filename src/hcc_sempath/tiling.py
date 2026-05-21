@@ -6,6 +6,7 @@ import shutil
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 from .manifests import write_tile_manifest
 
@@ -86,6 +87,7 @@ def tile_wsi(
     native_mpp_y: float | None = None,
     max_tiles: int | None = None,
     overwrite_slide_dir: bool = False,
+    show_progress: bool = False,
 ) -> list[dict]:
     try:
         import openslide
@@ -115,34 +117,55 @@ def tile_wsi(
     level_read_w = max(1, round(level0_stride_x / level_downsample))
     level_read_h = max(1, round(level0_stride_y / level_downsample))
     width, height = slide.dimensions
+    x_count = max(0, ((width - level0_stride_x) // level0_stride_x) + 1)
+    y_count = max(0, ((height - level0_stride_y) // level0_stride_y) + 1)
+    total_candidates = x_count * y_count
+    progress = None
+    if show_progress:
+        print(
+            "tiling_start "
+            f"slide={slide_id} size={width}x{height} "
+            f"native_mpp=({native_mpp:.4f},{native_mpp_y:.4f}) target_mpp={target_mpp:.4f} "
+            f"level={level} level_downsample={level_downsample:.4f} "
+            f"stride0=({level0_stride_x},{level0_stride_y}) candidates={total_candidates}",
+            flush=True,
+        )
+        progress = tqdm(total=total_candidates, desc=f"Tiling {slide_id}", unit="tile")
     rows = []
     idx = 0
-    for y in range(0, height - level0_stride_y + 1, level0_stride_y):
-        for x in range(0, width - level0_stride_x + 1, level0_stride_x):
-            tile = slide.read_region((x, y), level, (level_read_w, level_read_h)).convert("RGB")
-            if tile.size != (tile_size, tile_size):
-                tile = tile.resize((tile_size, tile_size), Image.Resampling.BICUBIC)
-            if tissue_fraction(np.asarray(tile)) < min_tissue_fraction:
-                continue
-            tile_id = f"{slide_id}_{idx:07d}"
-            tile_path = slide_dir / f"{tile_id}.png"
-            tile.save(tile_path)
-            rows.append(
-                {
-                    "tile_id": tile_id,
-                    "patient_id": patient_id,
-                    "slide_id": slide_id,
-                    "tile_path": str(tile_path),
-                    "x": x,
-                    "y": y,
-                    "split": split,
-                }
-            )
-            idx += 1
-            if max_tiles is not None and idx >= max_tiles:
-                slide.close()
-                return rows
-    slide.close()
+    try:
+        for y in range(0, height - level0_stride_y + 1, level0_stride_y):
+            for x in range(0, width - level0_stride_x + 1, level0_stride_x):
+                if progress is not None:
+                    progress.update(1)
+                    progress.set_postfix(retained=idx, refresh=False)
+                tile = slide.read_region((x, y), level, (level_read_w, level_read_h)).convert("RGB")
+                if tile.size != (tile_size, tile_size):
+                    tile = tile.resize((tile_size, tile_size), Image.Resampling.BICUBIC)
+                if tissue_fraction(np.asarray(tile)) < min_tissue_fraction:
+                    continue
+                tile_id = f"{slide_id}_{idx:07d}"
+                tile_path = slide_dir / f"{tile_id}.png"
+                tile.save(tile_path)
+                rows.append(
+                    {
+                        "tile_id": tile_id,
+                        "patient_id": patient_id,
+                        "slide_id": slide_id,
+                        "tile_path": str(tile_path),
+                        "x": x,
+                        "y": y,
+                        "split": split,
+                    }
+                )
+                idx += 1
+                if max_tiles is not None and idx >= max_tiles:
+                    return rows
+    finally:
+        if progress is not None:
+            progress.close()
+            tqdm.write(f"tiling_done slide={slide_id} retained={idx} candidates_seen={progress.n}")
+        slide.close()
     return rows
 
 
@@ -187,6 +210,7 @@ def main() -> None:
         native_mpp_y=args.native_mpp_y,
         max_tiles=args.max_tiles,
         overwrite_slide_dir=args.overwrite_slide_dir,
+        show_progress=True,
     )
     write_tile_manifest(args.manifest_out, rows)
     print(f"wrote_tiles={len(rows)} manifest={args.manifest_out}")

@@ -65,6 +65,13 @@ def main() -> None:
         slides = slides[: args.limit]
     if not slides:
         raise FileNotFoundError(f"no WSI files found under {input_root}")
+    print(
+        "batch_start "
+        f"slides={len(slides)} input_root={input_root} output_root={output_root} "
+        f"target_mpp={args.target_mpp} tile_size={args.tile_size} "
+        f"min_tissue_fraction={args.min_tissue_fraction} distance={args.distance} workers={args.workers}",
+        flush=True,
+    )
 
     manifest_rows = []
     failures = []

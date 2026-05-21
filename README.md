@@ -94,7 +94,7 @@ python scripts/build_wsi_package.py \
 Batch-package a WSI directory with progress:
 
 ```bash
-python scripts/build_wsi_iac_batch.py \
+conda run --no-capture-output -n hcc-sempath python scripts/build_wsi_iac_batch.py \
   --input-root /path/to/wsi-root \
   --output-root /path/to/output-iac-root \
   --target-mpp 0.5 \

@@ -58,6 +58,7 @@ def build_wsi_iac(
         native_mpp_y=native_mpp_y,
         max_tiles=max_tiles,
         overwrite_slide_dir=overwrite,
+        show_progress=show_progress,
     )
     if not rows:
         raise ValueError(f"no tiles retained from {wsi_path}; lower --min-tissue-fraction or check the slide")
