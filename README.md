@@ -91,6 +91,19 @@ python scripts/build_wsi_package.py \
   --output data/packages/slide.tiles.iac
 ```
 
+Batch-package a WSI directory with progress:
+
+```bash
+python scripts/build_wsi_iac_batch.py \
+  --input-root /path/to/wsi-root \
+  --output-root /path/to/output-iac-root \
+  --target-mpp 0.5 \
+  --tile-size 224 \
+  --min-tissue-fraction 0.3 \
+  --distance 1.0 \
+  --workers 8
+```
+
 Build a JXL tile package for remote teacher inference:
 
 ```bash
