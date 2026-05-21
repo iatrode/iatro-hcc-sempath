@@ -1,20 +1,41 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
 import timm
 import torch
 from timm.data import create_transform, resolve_model_data_config
+from tqdm import tqdm
 from .manifests import read_tile_manifest
-from .tile_package import iter_package_tiles
+from .tile_package import iter_package_tiles, read_package_manifest
 
 
 class TimmTeacherEncoder(torch.nn.Module):
     def __init__(self, model_name: str, pretrained: bool = True) -> None:
         super().__init__()
-        self.model = timm.create_model(model_name, pretrained=pretrained, num_classes=0, global_pool="avg")
+        model_path = Path(model_name)
+        if model_path.is_dir():
+            config_path = model_path / "config.json"
+            if not config_path.exists():
+                raise FileNotFoundError(f"missing local teacher config: {config_path}")
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            architecture = config.get("architecture")
+            if not architecture:
+                raise ValueError(f"local teacher config missing architecture: {config_path}")
+            model_args = dict(config.get("model_args", {}))
+            model_args.setdefault("num_classes", 0)
+            self.model = timm.create_model(architecture, pretrained=False, **model_args)
+            weight_path = model_path / "pytorch_model.bin"
+            if pretrained:
+                if not weight_path.exists():
+                    raise FileNotFoundError(f"missing local teacher weights: {weight_path}")
+                state_dict = torch.load(weight_path, map_location="cpu", weights_only=False)
+                self.model.load_state_dict(state_dict, strict=False)
+        else:
+            self.model = timm.create_model(model_name, pretrained=pretrained, num_classes=0, global_pool="avg")
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
@@ -45,7 +66,7 @@ def cache_teacher_features(
     data_config["input_size"] = (3, image_size, image_size)
     transform = create_transform(**data_config, is_training=False)
     model = model.to(device).eval()
-    for start in range(0, len(missing_only), batch_size):
+    for start in tqdm(range(0, len(missing_only), batch_size), desc="teacher batches"):
         chunk = missing_only[start : start + batch_size]
         images = []
         for record in chunk:
@@ -72,20 +93,26 @@ def cache_teacher_features_from_package(
     data_config["input_size"] = (3, image_size, image_size)
     transform = create_transform(**data_config, is_training=False)
     model = model.to(device).eval()
+    total_records = len(read_package_manifest(package_path))
     tile_ids = []
     images = []
-    for record, image in iter_package_tiles(package_path):
-        if (cache_dir / f"{record.tile_id}.npy").exists():
-            continue
-        tile_ids.append(record.tile_id)
-        images.append(transform(image.convert("RGB")))
-        if len(images) >= batch_size:
-            batch = torch.stack(images).to(device)
-            features = model(batch).detach().cpu().numpy().astype(np.float32)
-            for tile_id, feature in zip(tile_ids, features):
-                np.save(cache_dir / f"{tile_id}.npy", feature)
-            tile_ids = []
-            images = []
+    progress = tqdm(total=total_records, desc="teacher tiles")
+    try:
+        for record, image in iter_package_tiles(package_path):
+            progress.update(1)
+            if (cache_dir / f"{record.tile_id}.npy").exists():
+                continue
+            tile_ids.append(record.tile_id)
+            images.append(transform(image.convert("RGB")))
+            if len(images) >= batch_size:
+                batch = torch.stack(images).to(device)
+                features = model(batch).detach().cpu().numpy().astype(np.float32)
+                for tile_id, feature in zip(tile_ids, features):
+                    np.save(cache_dir / f"{tile_id}.npy", feature)
+                tile_ids = []
+                images = []
+    finally:
+        progress.close()
     if images:
         batch = torch.stack(images).to(device)
         features = model(batch).detach().cpu().numpy().astype(np.float32)
@@ -94,7 +121,7 @@ def cache_teacher_features_from_package(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Cache teacher features from a tile manifest or HCCSPK package.")
+    parser = argparse.ArgumentParser(description="Cache teacher features from a tile manifest or IatroCache package.")
     parser.add_argument("--manifest", default="")
     parser.add_argument("--tile-package", default="")
     parser.add_argument("--output-dir", required=True)

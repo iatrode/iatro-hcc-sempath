@@ -10,7 +10,6 @@ from .anchors import load_anchors
 from .config import load_config
 from .datasets import DistillationTileDataset, collate_distillation, validate_teacher_cache
 from .engine import fit
-from .manifests import read_tile_manifest
 from .models import StudentEncoder
 from .tile_package import read_package_manifest
 from .utils import seed_everything
@@ -24,19 +23,26 @@ def main() -> None:
     cfg = load_config(args.config)
     seed_everything(int(cfg["runtime"]["seed"]))
     device = torch.device(cfg["runtime"]["device"])
-    tile_package_path = cfg["data"].get("tile_package_path")
-    records = read_package_manifest(tile_package_path) if tile_package_path else read_tile_manifest(cfg["data"]["manifest_path"])
+    image_tile_package_path = cfg["data"]["image_tile_package_path"]
+    teacher_feature_package_path = cfg["data"]["teacher_feature_package_path"]
+    records = read_package_manifest(image_tile_package_path)
     train_records = [record for record in records if record.split == "train"]
     val_records = [record for record in records if record.split == "val"]
     if not train_records or not val_records:
         raise ValueError("manifest must contain non-empty train and val splits")
-    validate_teacher_cache(records, cfg["data"]["teacher_cache_dir"], cfg["model"]["teacher_dim"])
+    validate_teacher_cache(
+        records,
+        None,
+        cfg["model"]["teacher_dim"],
+        teacher_cache_package_path=teacher_feature_package_path,
+    )
     dataset_kwargs = {
-        "teacher_cache_dir": cfg["data"]["teacher_cache_dir"],
+        "teacher_cache_dir": None,
         "image_size": cfg["data"]["image_size"],
         "mean": cfg["data"].get("mean"),
         "std": cfg["data"].get("std"),
-        "tile_package_path": tile_package_path,
+        "tile_package_path": image_tile_package_path,
+        "teacher_cache_package_path": teacher_feature_package_path,
     }
     train_ds = DistillationTileDataset(train_records, **dataset_kwargs)
     val_ds = DistillationTileDataset(val_records, **dataset_kwargs)

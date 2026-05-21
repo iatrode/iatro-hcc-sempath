@@ -4,9 +4,8 @@ runtime:
   output_dir: outputs/hcc_sempath_v1
 
 data:
-  manifest_path: data/manifests/tile_manifest.csv
-  tile_package_path:
-  teacher_cache_dir: data/teacher_cache/h_optimus_1
+  image_tile_package_path: data/packages/train_tiles.iac
+  teacher_feature_package_path: data/packages/h_optimus_1_features.iac
   anchors_path: data/anchors/hcc_semantic_anchors.pt
   image_size: 224
   mean: [0.485, 0.456, 0.406]

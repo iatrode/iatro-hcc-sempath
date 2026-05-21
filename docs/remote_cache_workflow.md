@@ -8,11 +8,12 @@ Build teacher features once on a high-performance machine, then train the studen
 
 Preferred transfer artifact:
 
-1. `tiles.hccspk`
+1. `tiles.iac`
 2. Repository code
 
-The package contains `metadata.json`, `manifest.csv`, and JXL-compressed `224 x 224`
-tiles. It is a pre-inference data package, not the teacher feature cache.
+The package contains an IatroCache header, Arrow slide/record tables, and
+JXL-compressed `224 x 224` tiles. It is a pre-inference data package, not the
+teacher feature cache.
 
 Legacy transfer inputs are also supported:
 
@@ -24,23 +25,29 @@ Legacy transfer inputs are also supported:
 
 ```bash
 conda env create -f environment.yml
-conda activate 2026-ct-wsi
+conda activate hcc-sempath
 python scripts/download_teacher.py
 PYTHONPATH=src python scripts/build_teacher_cache.py \
-  --tile-package data/packages/tiles.hccspk \
+  --tile-package data/packages/tiles.iac \
   --output-dir data/teacher_cache/h_optimus_1 \
   --model-name hf_hub:bioptimus/H-optimus-1 \
   --batch-size 256 \
   --device cuda
+PYTHONPATH=src python scripts/build_feature_package.py \
+  --tile-package data/packages/tiles.iac \
+  --feature-dir data/teacher_cache/h_optimus_1 \
+  --output data/packages/h_optimus_1_features.iac \
+  --teacher-name h_optimus_1
 ```
 
 ## Outputs copied back locally
 
 ```text
-data/teacher_cache/h_optimus_1/<tile_id>.npy
+data/packages/h_optimus_1_features.iac
 ```
 
-The local training code expects exactly one cached feature per `tile_id` in the tile manifest.
+The local training code uses `teacher_features.iac` as the distillation target.
+Loose `.npy` feature files are remote build intermediates.
 
 ## Local verification before training
 

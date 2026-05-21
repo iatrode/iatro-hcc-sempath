@@ -1,18 +1,26 @@
-name: 2026-ct-wsi
+name: hcc-sempath
+variables:
+  PYTHONNOUSERSITE: "1"
 channels:
   - conda-forge
 dependencies:
   - python=3.12
   - pip
-  - pytorch
-  - torchvision
-  - pyyaml
-  - numpy
-  - pillow
-  - tqdm
-  - imagecodecs
   - pip:
+      - --pre
+      - --extra-index-url=https://download.pytorch.org/whl/nightly/cpu
+      - torch
+      - torchvision
+      - -e .
+      - PyYAML
+      - numpy
+      - Pillow
+      - tqdm
+      - imagecodecs
+      - pytest
       - timm
       - huggingface_hub
       - safetensors
       - openslide-python
+      - openslide-bin
+      - pyarrow

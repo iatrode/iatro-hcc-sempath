@@ -6,7 +6,7 @@ HCC-specific semantic pathology encoder repository.
 
 ```bash
 conda env create -f environment.yml
-conda activate 2026-ct-wsi
+conda activate hcc-sempath
 ```
 
 ## Repository flow
@@ -25,7 +25,7 @@ slide/image
 
 ```bash
 cd hcc-sempath
-conda activate 2026-ct-wsi
+conda activate hcc-sempath
 bash scripts/run_contract_smoke.sh
 ```
 
@@ -69,19 +69,41 @@ PYTHONPATH=src python -m hcc_sempath.tiling \
 For a fast real-WSI smoke test, add `--max-tiles 64`. For a clean rerun of the same
 `slide_id`, add `--overwrite-slide-dir`.
 
+Build an image-tile IatroCache package directly from an OpenSlide-readable WSI
+such as `.svs` or `.mrxs`:
+
+```bash
+hcc-sempath-wsi2iac \
+  --wsi slide.svs \
+  --output data/packages/slide.tiles.iac \
+  --target-mpp 0.5 \
+  --tile-size 224 \
+  --distance 1.0 \
+  --workers 8 \
+  --qc-out data/packages/slide.tiles.qc.png
+```
+
+Equivalent script form:
+
+```bash
+python scripts/build_wsi_package.py \
+  --wsi slide.svs \
+  --output data/packages/slide.tiles.iac
+```
+
 Build a JXL tile package for remote teacher inference:
 
 ```bash
 PYTHONPATH=src python scripts/build_tile_package.py \
   --manifest data/manifests/tile_manifest.csv \
-  --output data/packages/tiles.hccspk
+  --output data/packages/tiles.iac
 ```
 
 Validate a package:
 
 ```bash
 PYTHONPATH=src python scripts/validate_tile_package.py \
-  --package data/packages/tiles.hccspk
+  --package data/packages/tiles.iac
 ```
 
 Download teacher assets:
@@ -103,7 +125,7 @@ For remote/high-performance cache building:
 
 ```bash
 PYTHONPATH=src python scripts/build_teacher_cache.py \
-  --tile-package data/packages/tiles.hccspk \
+  --tile-package data/packages/tiles.iac \
   --output-dir data/teacher_cache/h_optimus_1 \
   --model-name hf_hub:bioptimus/H-optimus-1 \
   --batch-size 256 \
@@ -124,9 +146,9 @@ Train:
 PYTHONPATH=src python -m hcc_sempath.train --config configs/distill_train.example.yaml
 ```
 
-To train directly from an HCCSPK package, set `data.tile_package_path` in the
-YAML config. The package manifest becomes the tile contract, while
-`teacher_cache_dir/<tile_id>.npy` remains the distillation target.
+Training and evaluation use IatroCache packages as the data contract. Set
+`data.image_tile_package_path` and `data.teacher_feature_package_path` in the
+YAML config.
 
 Resume:
 
@@ -153,22 +175,18 @@ PYTHONPATH=src python -m hcc_sempath.evaluate \
 tile_id,patient_id,slide_id,tile_path,x,y,split
 ```
 
-`tiles.hccspk` is a first-class data contract and can replace loose tile files
-during both remote teacher inference and local student training. It must contain:
+`tiles.iac` is the image-tile IatroCache package and the training image contract.
+Format specification: `docs/IATROCACHE_FORMAT.md`.
+
+Training and evaluation read images from `data.image_tile_package_path` and use
+the package's record table as the tile index.
+
+`teacher_features.iac` is the teacher-output IatroCache package and the
+distillation target contract. Loose `.npy` teacher caches are intermediate build
+artifacts, not the primary training input.
 
 ```text
-metadata.json
-manifest.csv
-tiles/<tile_id>.jxl
-```
-
-When `data.tile_package_path` is set, training and evaluation read images from
-the package and use package `manifest.csv` as the tile index.
-
-Teacher cache must contain one NumPy file per tile:
-
-```text
-<teacher_cache_dir>/<tile_id>.npy
+data.teacher_feature_package_path
 ```
 
 Anchor payload must be a PyTorch tensor or a dict containing:

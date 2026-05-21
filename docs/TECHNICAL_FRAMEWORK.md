@@ -31,7 +31,7 @@ Requirements:
 
 - Keep patient-level or slide-level split discipline.
 - Avoid tile-level leakage across train, validation, and test partitions.
-- Store all tiles through a reproducible manifest or HCCSPK package contract.
+- Store all tiles through a reproducible manifest or IatroCache package contract.
 - Record scanning, magnification, MPP, and tissue-filtering settings whenever available.
 
 ### TCGA-LIHC WSI cohort
@@ -56,13 +56,13 @@ Tasks:
 1. Tile WSIs at the selected magnification and tile size.
 2. Apply basic tissue filtering and artifact-aware quality control.
 3. Write a tile manifest containing tile ID, patient ID, slide ID, coordinates, split, and tile path.
-4. Optionally package tiles into HCCSPK for portable teacher inference and public benchmarking.
+4. Optionally package tiles into IatroCache for portable teacher inference and public benchmarking.
 5. Generate summary statistics: number of slides, patients, tiles, tissue-pass rate, and per-slide tile distribution.
 
 Expected outputs:
 
 - `data/manifests/*.csv`
-- `data/packages/*.hccspk`
+- `data/packages/*.iac`
 - tile QC summary tables
 
 ## Module 2: Teacher feature cache
