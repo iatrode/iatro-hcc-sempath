@@ -78,6 +78,9 @@ def main() -> None:
     parser.add_argument("--distance", type=float, default=1.0)
     parser.add_argument("--effort", type=int, default=7)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--white-threshold", type=int, default=220)
+    parser.add_argument("--prefilter-tissue-fraction", type=float, default=0.05)
+    parser.add_argument("--mask-max-pixels", type=int, default=12_000_000)
     parser.add_argument("--split", default="train")
     parser.add_argument("--max-tiles", type=int, default=None)
     parser.add_argument("--qc-max-tiles", type=int, default=36)
@@ -134,6 +137,7 @@ def main() -> None:
                     "target_mpp": args.target_mpp,
                     "tile_size": args.tile_size,
                     "min_tissue_fraction": args.min_tissue_fraction,
+                    "prefilter_tissue_fraction": args.prefilter_tissue_fraction,
                     "distance": args.distance,
                     "error_type": "",
                     "error": "",
@@ -159,6 +163,9 @@ def main() -> None:
                 distance=args.distance,
                 effort=args.effort,
                 workers=args.workers,
+                white_threshold=args.white_threshold,
+                prefilter_tissue_fraction=args.prefilter_tissue_fraction,
+                mask_max_pixels=args.mask_max_pixels,
                 qc_out=qc_path,
                 qc_max_tiles=args.qc_max_tiles,
                 overwrite=args.overwrite,
@@ -175,6 +182,7 @@ def main() -> None:
                 "target_mpp": args.target_mpp,
                 "tile_size": args.tile_size,
                 "min_tissue_fraction": args.min_tissue_fraction,
+                "prefilter_tissue_fraction": args.prefilter_tissue_fraction,
                 "distance": args.distance,
                 "input_bytes": result["input_bytes"],
                 "package_bytes": result["package_bytes"],
@@ -207,6 +215,7 @@ def main() -> None:
                     "target_mpp": args.target_mpp,
                     "tile_size": args.tile_size,
                     "min_tissue_fraction": args.min_tissue_fraction,
+                    "prefilter_tissue_fraction": args.prefilter_tissue_fraction,
                     "distance": args.distance,
                     "input_bytes": wsi_path.stat().st_size if wsi_path.exists() else 0,
                     "package_bytes": 0,
@@ -244,6 +253,7 @@ def main() -> None:
             "target_mpp",
             "tile_size",
             "min_tissue_fraction",
+            "prefilter_tissue_fraction",
             "distance",
             "input_bytes",
             "package_bytes",
