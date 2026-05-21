@@ -3,11 +3,16 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-from hcc_sempath.manifests import write_tile_manifest
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+
+from hcc_sempath.manifests import TileRecord
 from hcc_sempath.qc import render_tile_package_qc
-from hcc_sempath.tile_package import build_tile_package
-from hcc_sempath.tiling import tile_wsi
+from hcc_sempath.tile_package import build_tile_package_from_records, encode_jxl_array
+from hcc_sempath.tiling import tissue_fraction
 
 
 def _default_workers() -> int:
@@ -27,11 +32,25 @@ def _compression_stats(input_path: Path, output_path: Path) -> dict:
     }
 
 
+def _open_slide(wsi_path: Path):
+    try:
+        import openslide
+    except ImportError as exc:
+        raise RuntimeError("openslide-python is required for WSI packaging") from exc
+    return openslide, openslide.OpenSlide(str(wsi_path))
+
+
+def _flush_done(done, records: list[TileRecord], payloads: list[bytes]) -> None:
+    for future in done:
+        idx, record, payload = future.result()
+        records.append(record)
+        payloads.append(payload)
+
+
 def build_wsi_iac(
     *,
     wsi_path: str | Path,
     output_path: str | Path,
-    work_dir: str | Path | None = None,
     patient_id: str | None = None,
     slide_id: str | None = None,
     split: str = "train",
@@ -54,48 +73,119 @@ def build_wsi_iac(
     output_path = Path(output_path)
     slide_id = slide_id or wsi_path.stem
     patient_id = patient_id or slide_id
-    work_dir = Path(work_dir) if work_dir else output_path.parent / f"{output_path.stem}_work"
-    tiles_dir = work_dir / "tiles"
-    manifest_path = work_dir / "tile_manifest.csv"
 
-    rows = tile_wsi(
-        wsi_path=wsi_path,
-        output_dir=tiles_dir,
-        patient_id=patient_id,
-        slide_id=slide_id,
-        split=split,
-        tile_size=tile_size,
-        min_tissue_fraction=min_tissue_fraction,
-        target_mpp=target_mpp,
-        native_mpp=native_mpp,
-        native_mpp_y=native_mpp_y,
-        max_tiles=max_tiles,
-        overwrite_slide_dir=overwrite,
-        show_progress=show_progress,
-    )
-    if not rows:
+    openslide, slide = _open_slide(wsi_path)
+    if native_mpp is None:
+        mpp_value = slide.properties.get(openslide.PROPERTY_NAME_MPP_X)
+        if mpp_value is None:
+            slide.close()
+            raise ValueError("WSI is missing MPP metadata; pass --native-mpp explicitly")
+        native_mpp = float(mpp_value)
+    if native_mpp_y is None:
+        mpp_y_value = slide.properties.get(openslide.PROPERTY_NAME_MPP_Y)
+        native_mpp_y = float(mpp_y_value) if mpp_y_value is not None else native_mpp
+
+    downsample_needed = target_mpp / native_mpp
+    level = slide.get_best_level_for_downsample(downsample_needed)
+    level_downsample = float(slide.level_downsamples[level])
+    scale_x = native_mpp / target_mpp
+    scale_y = native_mpp_y / target_mpp
+    level0_stride_x = max(1, round(tile_size / scale_x))
+    level0_stride_y = max(1, round(tile_size / scale_y))
+    level_read_w = max(1, round(level0_stride_x / level_downsample))
+    level_read_h = max(1, round(level0_stride_y / level_downsample))
+    width, height = slide.dimensions
+    x_count = max(0, ((width - level0_stride_x) // level0_stride_x) + 1)
+    y_count = max(0, ((height - level0_stride_y) // level0_stride_y) + 1)
+    total_candidates = x_count * y_count
+
+    if show_progress:
+        print(
+            "wsi_direct_pack_start "
+            f"slide={slide_id} size={width}x{height} "
+            f"native_mpp=({native_mpp:.4f},{native_mpp_y:.4f}) target_mpp={target_mpp:.4f} "
+            f"level={level} level_downsample={level_downsample:.4f} "
+            f"stride0=({level0_stride_x},{level0_stride_y}) candidates={total_candidates}",
+            flush=True,
+        )
+    progress = tqdm(total=total_candidates, desc=f"Packing {slide_id}", unit="tile") if show_progress else None
+    records: list[TileRecord] = []
+    payloads: list[bytes] = []
+    pending = set()
+    idx = 0
+    workers = max(1, int(workers))
+
+    def encode_record(tile_idx: int, x: int, y: int, arr: np.ndarray):
+        tile_id = f"{slide_id}_{tile_idx:07d}"
+        record = TileRecord(
+            tile_id=tile_id,
+            patient_id=patient_id,
+            slide_id=slide_id,
+            tile_path=Path(f"tiles/{tile_id}.jxl"),
+            x=x,
+            y=y,
+            split=split,
+        )
+        payload = encode_jxl_array(arr, lossless=lossless, distance=None if lossless else distance, effort=effort)
+        return tile_idx, record, payload
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for y in range(0, height - level0_stride_y + 1, level0_stride_y):
+                for x in range(0, width - level0_stride_x + 1, level0_stride_x):
+                    tile = slide.read_region((x, y), level, (level_read_w, level_read_h)).convert("RGB")
+                    if tile.size != (tile_size, tile_size):
+                        tile = tile.resize((tile_size, tile_size), Image.Resampling.BICUBIC)
+                    arr = np.asarray(tile).copy()
+                    if progress is not None:
+                        progress.update(1)
+                        progress.set_postfix(retained=idx, refresh=False)
+                    if tissue_fraction(arr) < min_tissue_fraction:
+                        continue
+                    pending.add(executor.submit(encode_record, idx, x, y, arr))
+                    idx += 1
+                    if len(pending) >= workers * 4:
+                        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                        _flush_done(done, records, payloads)
+                    if max_tiles is not None and idx >= max_tiles:
+                        break
+                if max_tiles is not None and idx >= max_tiles:
+                    break
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                _flush_done(done, records, payloads)
+    finally:
+        if progress is not None:
+            progress.close()
+            tqdm.write(f"wsi_direct_pack_tiles_done slide={slide_id} retained={idx} candidates_seen={progress.n}")
+        slide.close()
+
+    ordered = sorted(zip(records, payloads), key=lambda item: item[0].tile_id)
+    records = [record for record, _ in ordered]
+    payloads = [payload for _, payload in ordered]
+    if not records:
         raise ValueError(f"no tiles retained from {wsi_path}; lower --min-tissue-fraction or check the slide")
-    write_tile_manifest(manifest_path, rows)
 
-    build_tile_package(
-        manifest_path=manifest_path,
+    build_tile_package_from_records(
+        records=records,
+        payloads=payloads,
         output_path=output_path,
+        tile_width=tile_size,
+        tile_height=tile_size,
         lossless=lossless,
         distance=None if lossless else distance,
         effort=effort,
-        workers=workers,
-        show_progress=show_progress,
         overwrite=overwrite,
+        stride_x=level0_stride_x,
+        stride_y=level0_stride_y,
     )
 
     if qc_out:
         render_tile_package_qc(output_path, qc_out, max_tiles=qc_max_tiles)
 
     return {
-        "tile_count": len(rows),
-        "manifest_path": manifest_path,
+        "tile_count": len(records),
         "output_path": output_path,
-        "work_dir": work_dir,
         "qc_path": None if qc_out is None else Path(qc_out),
         **_compression_stats(wsi_path, output_path),
     }
@@ -107,11 +197,6 @@ def main() -> None:
     )
     parser.add_argument("--wsi", required=True, help="Input WSI path, such as .svs or .mrxs.")
     parser.add_argument("--output", required=True, help="Output image-tile .iac path.")
-    parser.add_argument(
-        "--work-dir",
-        default=None,
-        help="Intermediate directory for PNG tiles and tile_manifest.csv. Defaults beside the output package.",
-    )
     parser.add_argument("--patient-id", default=None)
     parser.add_argument("--slide-id", default=None)
     parser.add_argument("--split", default="train")
@@ -134,7 +219,6 @@ def main() -> None:
     result = build_wsi_iac(
         wsi_path=args.wsi,
         output_path=args.output,
-        work_dir=args.work_dir,
         patient_id=args.patient_id,
         slide_id=args.slide_id,
         split=args.split,
@@ -155,7 +239,7 @@ def main() -> None:
     )
     print(
         "wsi_package_ok "
-        f"tiles={result['tile_count']} manifest={result['manifest_path']} output={result['output_path']} "
+        f"tiles={result['tile_count']} output={result['output_path']} "
         f"target_mpp={args.target_mpp} tile_size={args.tile_size} "
         f"input_bytes={result['input_bytes']} package_bytes={result['package_bytes']} "
         f"compression_ratio={result['compression_ratio']:.4f}x "

@@ -103,7 +103,6 @@ def main() -> None:
         patient_id = _tcga_patient_id_from_name(wsi_path) if args.tcga_patient_id else slide_id
         slide_dir = output_root / slide_id
         package_path = slide_dir / "tiles.iac"
-        work_dir = slide_dir / "work"
         qc_path = None if args.no_qc else slide_dir / "tile_package_qc.png"
         done_path = slide_dir / "done.json"
         fail_path = slide_dir / "failed.json"
@@ -134,7 +133,6 @@ def main() -> None:
             result = build_wsi_iac(
                 wsi_path=wsi_path,
                 output_path=package_path,
-                work_dir=work_dir,
                 patient_id=patient_id,
                 slide_id=slide_id,
                 split=args.split,
@@ -160,7 +158,6 @@ def main() -> None:
                 "patient_id": patient_id,
                 "wsi_path": str(wsi_path),
                 "package_path": str(package_path),
-                "work_dir": str(work_dir),
                 "qc_path": "" if qc_path is None else str(qc_path),
                 "tile_count": result["tile_count"],
                 "target_mpp": args.target_mpp,
