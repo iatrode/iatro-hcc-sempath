@@ -1,278 +1,167 @@
-# HCC-SemPath technical framework
+# HCC-SemPath Technical Framework / 技术框架
 
-This document records the current technical direction for HCC-SemPath. The project is positioned as an expert-anchor-guided compact pathology representation model, not as a task-specific clinical prediction model.
+This document describes the public technical framework for HCC-SemPath.
 
-## Core technical hypothesis
+本文档描述 HCC-SemPath 面向公开发布的技术框架。
 
-A small expert-initialized hepatobiliary morphology anchor bank can organize large-scale HCC pathology patches into a disease-aware semantic coordinate system, and this organization can be distilled into an open-weight compact encoder.
+## 1. Purpose / 目的
 
-The method should therefore be evaluated as a representation-learning and database-organization framework rather than as a conventional clinical endpoint model.
+HCC-SemPath aims to build a reusable HCC-specific pathology representation model.
+It is designed to produce compact embeddings for HCC histopathology rather than
+task-specific diagnostic, prognostic, or visual-question-answering outputs.
 
-## Design principles
+HCC-SemPath 旨在构建可复用的 HCC 专病病理表征模型。模型输出面向 HCC
+组织病理的轻量 embedding，而不是单一诊断、预后或视觉问答结果。
 
-1. Use H-optimus-1 as a high-quality general pathology teacher, not as the final scientific contribution.
-2. Use expert anchors as low-cost semantic control points that organize the large HCC patch database.
-3. Treat anchor labels as dominant morphology anchors rather than mutually exclusive histological classes.
-4. Keep private institutional WSIs as the main development resource, while using TCGA-LIHC as a public reproducibility benchmark.
-5. Release code, configs, trained compact weights when allowed, anchor schema, and public benchmark scripts to compensate for non-releasable institutional raw data.
+## 2. Core Hypothesis / 核心假设
 
-## Data roles
+General pathology foundation models contain useful morphology priors, but their
+embedding spaces are not optimized for HCC-specific histopathology semantics.
+A compact student model can integrate heterogeneous teacher priors and then be
+reshaped by HCC-specific weak supervision into a disease-oriented embedding space.
 
-### Institutional HCC WSI cohort
+通用病理基础模型包含有价值的形态学先验，但其 embedding space 并非为
+HCC 专病组织病理语义优化。轻量 student 可以整合异质 teacher 先验，并通过
+HCC 专病弱监督进一步重塑为 disease-oriented embedding space。
 
-Role:
+## 3. System Modules / 系统模块
 
-- Main training and development cohort.
-- Source for large-scale HCC patch database construction.
-- Source for expert-selected morphology anchor seeds.
-- Source for compact student distillation.
+### 3.1 WSI preprocessing and manifest contract / WSI 预处理与 manifest 约定
 
-Requirements:
+Inputs are tiled at a defined magnification, resolution, and tissue-filtering
+policy. Each retained tile is represented by a reproducible manifest row.
 
-- Keep patient-level or slide-level split discipline.
-- Avoid tile-level leakage across train, validation, and test partitions.
-- Store all tiles through a reproducible manifest or IatroCache package contract.
-- Record scanning, magnification, MPP, and tissue-filtering settings whenever available.
+输入 WSI 按固定倍率、分辨率和组织筛选策略切块。每个保留 tile 都由可复现的
+manifest 行表示。
 
-### TCGA-LIHC WSI cohort
+Minimum manifest fields:
 
-Role:
+最小 manifest 字段：
 
-- Public reproducibility benchmark.
-- Cross-cohort anchor-response stability test.
-- Public demonstration of released weights and scripts.
-- Public database for retrieval, anchor-response, and efficiency benchmarks.
+```text
+tile_id, patient_id, slide_id, tile_path, x, y, split
+```
 
-TCGA should not be framed primarily as a clinical validation cohort for OS, DFS, RFS, or Cox modeling in this technical paper.
+Public repositories should provide schemas and synthetic examples, not private
+institutional manifests.
 
-## Module 1: WSI tiling and data contract
+公开仓库应提供 schema 和 synthetic examples，而不是私有机构 manifest。
 
-Goal:
+### 3.2 Multi-teacher feature extraction / 多 teacher 特征提取
 
-Build a reproducible large-scale patch database from institutional and TCGA HCC WSIs.
+Multiple pathology foundation models may be used as teachers. Each teacher source
+must record model name, version, feature dimension, preprocessing, normalization
+convention, and extraction environment.
 
-Tasks:
+可使用多个病理基础模型作为 teacher。每个 teacher 来源都需要记录模型名称、版本、
+feature dimension、预处理、normalization convention 和特征提取环境。
 
-1. Tile WSIs at the selected magnification and tile size.
-2. Apply basic tissue filtering and artifact-aware quality control.
-3. Write a tile manifest containing tile ID, patient ID, slide ID, coordinates, split, and tile path.
-4. Optionally package tiles into IatroCache for portable teacher inference and public benchmarking.
-5. Generate summary statistics: number of slides, patients, tiles, tissue-pass rate, and per-slide tile distribution.
+Teacher features are training artifacts and should generally be stored outside git.
 
-Expected outputs:
+Teacher feature 属于训练 artifact，通常应存储在 git 之外。
 
-- `data/manifests/*.csv`
-- `data/packages/*.iac`
-- tile QC summary tables
+### 3.3 Shared HCC embedding with teacher-specific heads / 共享 HCC embedding 与 teacher-specific heads
 
-## Module 2: Teacher feature cache
+The student model learns a shared HCC embedding `z_hcc`. During training,
+teacher-specific heads align this shared embedding to each teacher feature space.
 
-Goal:
+Student 模型学习共享 HCC embedding `z_hcc`。训练阶段，teacher-specific heads
+将该共享 embedding 对齐到各 teacher feature space。
 
-Use H-optimus-1 to create a high-quality teacher feature space for all eligible tiles.
+```text
+tile image -> student encoder -> z_hcc
+                              -> head_teacher_a
+                              -> head_teacher_b
+                              -> head_teacher_c
+```
 
-Tasks:
+The teacher-alignment heads are not the primary released representation. The
+primary reusable output is `z_hcc`.
 
-1. Run teacher inference on institutional and TCGA tiles.
-2. Save one feature vector per tile using the manifest tile ID.
-3. Validate teacher feature dimensionality and completeness.
-4. Record teacher model name, version, preprocessing, batch size, and device.
+teacher-alignment heads 不是主要发布表征。主要可复用输出是 `z_hcc`。
 
-Expected outputs:
+### 3.4 HCC-specific weak supervision / HCC 专病弱监督
 
-- `data/teacher_cache/h_optimus_1/<tile_id>.npy`
-- teacher cache validation report
+HCC-specific weak supervision should reshape the embedding space beyond teacher
+imitation. Candidate signals include expert morphology anchors, weak region
+labels, structured pathology descriptions, curated retrieval sets, and slide- or
+region-level disease-domain labels.
 
-## Module 3: Expert-initialized morphology anchor bank
+HCC 专病弱监督应将 embedding space 从 teacher imitation 推向专病语义空间。候选信号
+包括专家形态锚点、弱区域标签、结构化病理描述、人工整理检索集合，以及切片级或
+区域级专病标签。
 
-Goal:
+## 4. Evaluation / 评估
 
-Construct a small, auditable anchor bank that represents dominant hepatobiliary morphology directions.
+Evaluation is divided into two groups.
 
-Anchor design:
+评估分为两组。
 
-- Anchors are semantic control points, not exhaustive class labels.
-- Anchors may overlap biologically and morphologically.
-- A tile assigned to one anchor means the anchor is the dominant visible morphology for prototype construction.
-- Initial anchor categories should be broad and stable at 20x / 224-pixel tile resolution.
+### 4.1 Teacher-alignment metrics / Teacher 对齐指标
 
-Candidate anchor groups:
-
-1. Tumor cell-rich area
-2. Hepatocyte-like / low-atypia tumor area
-3. High-atypia tumor area
-4. Necrosis
-5. Fibrous stroma / collagen-rich area
-6. Non-tumor liver parenchyma
-7. Sinusoid-rich / blood-rich area
-8. Portal tract / bile duct-like area
-
-Tasks:
-
-1. Select high-confidence seed tiles or small regions for each anchor.
-2. Encode seed tiles with the teacher model.
-3. Build one or more prototype vectors per anchor by averaging or clustering seed features.
-4. Store anchor metadata: name, definition, seed tile IDs, source slide IDs, number of seeds, feature extractor, and creation date.
-5. Save the anchor bank as a payload containing both tensors and metadata.
-
-Expected outputs:
-
-- `data/anchors/hcc_semantic_anchors.pt`
-- `data/anchors/anchor_schema.json`
-- representative anchor tile sheets for manual review
-
-## Module 4: Anchor-guided semantic database organization
-
-Goal:
-
-Use the anchor bank to organize the large HCC patch database into a semantic coordinate system.
-
-Tasks:
-
-1. Compute cosine similarity between every teacher feature and every anchor vector.
-2. Store each tile's anchor-response vector.
-3. Retrieve top-K patches for each anchor from institutional and TCGA cohorts.
-4. Generate anchor heatmaps on selected WSIs using patch coordinates.
-5. Generate anchor-response distribution summaries by cohort.
-
-Expected outputs:
-
-- tile-level anchor-response tables
-- top-K retrieval sheets per anchor
-- anchor heatmaps for representative WSIs
-- institutional vs TCGA anchor-response distribution summaries
-
-## Module 5: Compact student encoder training
-
-Goal:
-
-Train a compact encoder that inherits both the teacher morphology space and the anchor-organized semantic coordinate system.
-
-Training objectives:
-
-1. Feature distillation: preserve teacher morphology features.
-2. Relation distillation: preserve pairwise or neighborhood structure among tiles.
-3. Anchor-response distillation: preserve anchor response geometry and ranking.
-4. Optional prototype contrastive objective: strengthen dominant-anchor neighborhoods without treating anchors as strictly mutually exclusive classes.
-5. Optional momentum-constrained anchor adaptation: allow mild anchor adjustment while preventing semantic drift.
-
-Tasks:
-
-1. Train feature-only student baseline.
-2. Train feature + relation student baseline.
-3. Train anchor-response distillation model.
-4. Train full model with all selected objectives.
-5. Save checkpoints, resolved configs, training curves, and validation metrics.
-
-Expected outputs:
-
-- `outputs/hcc_sempath_v*/checkpoints/*.pt`
-- `outputs/hcc_sempath_v*/metrics.csv`
-- `outputs/hcc_sempath_v*/summary.json`
-
-## Module 6: Baselines and controls
-
-Goal:
-
-Show that the method is not merely teacher imitation, random projection, or unsupervised clustering.
-
-Required comparisons:
-
-1. H-optimus-1 raw feature retrieval.
-2. Random anchor bank.
-3. Unsupervised prototype bank from clustering.
-4. Student with feature-only distillation.
-5. Student with feature + relation distillation.
-6. Full expert-anchor-guided HCC-SemPath model.
-
-Optional comparisons:
-
-- Different student backbones.
-- Different anchor seed counts per category.
-- Fixed anchors vs trainable momentum-constrained anchors.
-- Institutional-only anchors vs mixed institutional/TCGA anchors.
-
-## Module 7: Technical validation metrics
-
-Goal:
-
-Validate database organization and compact-model inheritance without relying on clinical endpoint prediction.
-
-Primary metrics:
-
-1. Anchor retrieval precision@K: expert review of top-K patches retrieved by each anchor.
-2. Anchor enrichment fold: top-K anchor retrieval compared with random retrieval.
-3. Anchor-response rank correlation: student response ranking compared with teacher-anchor response ranking.
-4. Top-K overlap: overlap between teacher-anchor and student-anchor retrieval lists.
-5. Cross-cohort stability: consistency of anchor retrieval and response distributions between institutional data and TCGA.
-6. Efficiency: parameters, FLOPs if available, tiles per second, GPU memory, and end-to-end WSI processing time.
-
-Secondary metrics:
-
-- Feature cosine similarity between teacher and student.
-- Relation MSE between teacher and student embedding neighborhoods.
-- Anchor-response MSE or KL divergence.
-- Spatial coherence of anchor heatmaps.
-
-Clinical survival, recurrence, or Cox models are not primary validation targets for this technical paper.
-
-## Module 8: Public reproducibility package
-
-Goal:
-
-Make the technical contribution reviewable despite institutional raw WSI restrictions.
-
-Tasks:
-
-1. Release training and inference code.
-2. Release configs and environment files.
-3. Release compact model weights if permitted.
-4. Release anchor schema and, if permitted, anchor payload or derived anchor vectors.
-5. Release TCGA benchmark scripts.
-6. Provide a smoke-test dataset or synthetic contract test.
-7. Provide documentation for reproducing TCGA feature extraction, anchor response, retrieval, and benchmark tables.
-
-Expected outputs:
-
-- `MODEL_CARD.md`
-- `REPRODUCIBILITY.md`
-- `BENCHMARKS.md`
-- public TCGA benchmark scripts
-
-## Immediate implementation priorities
-
-Priority 1:
-
-- Finalize broad anchor categories.
-- Add anchor metadata schema.
-- Add scripts for anchor-response computation and top-K retrieval export.
-
-Priority 2:
-
-- Add random-anchor and unsupervised-prototype baselines.
-- Add anchor-response rank correlation and top-K overlap metrics.
-- Add TCGA public benchmark config.
-
-Priority 3:
-
-- Add feature-only, relation-only, and full anchor-guided ablation configs.
-- Add real WSI throughput benchmark.
-- Add model card and reproducibility guide.
-
-Priority 4:
-
-- Run full institutional training.
-- Run TCGA public benchmark.
-- Prepare expert blind review sheets for top-K anchor retrieval.
-
-## What this project should not become
-
-- It should not be framed as a clinical OS, DFS, RFS, or Cox prediction paper.
-- It should not claim that the compact student universally outperforms the teacher.
-- It should not treat broad morphology anchors as mutually exclusive diagnostic labels.
-- It should not rely only on feature cosine similarity to claim success.
-- It should not require public release of institutional raw WSIs to be technically reviewable.
-
-## Intended technical contribution
-
-HCC-SemPath aims to demonstrate that a small expert-defined hepatobiliary morphology anchor bank can organize large-scale HCC pathology data into a reusable semantic coordinate system, and that this organization can be distilled into a compact, open-weight pathology encoder suitable for public benchmarking and downstream technical reuse.
+- cosine similarity and normalized feature MSE;
+- cosine similarity 和 normalized feature MSE；
+- pairwise relation preservation;
+- pairwise relation preservation；
+- nearest-neighbor overlap;
+- nearest-neighbor overlap；
+- teacher-specific retrieval consistency.
+- teacher-specific retrieval consistency。
+
+These metrics verify distillation quality but do not by themselves prove HCC-specific
+representation value.
+
+这些指标验证蒸馏质量，但不能单独证明 HCC 专病表征价值。
+
+### 4.2 HCC representation metrics / HCC 表征指标
+
+- expert-reviewed morphology retrieval;
+- 专家审阅的形态检索；
+- HCC semantic anchor consistency;
+- HCC 语义锚点一致性；
+- morphology-group clustering or neighborhood purity;
+- 形态组聚类或邻域纯度；
+- cross-cohort stability;
+- 跨队列稳定性；
+- lightweight downstream adaptation;
+- 轻量下游适配；
+- parameter count, memory, throughput, and WSI-level processing time.
+- 参数量、显存、吞吐和 WSI 级处理时间。
+
+## 5. Required Baselines / 必要对照
+
+Public experiments should distinguish the proposed representation from simpler
+alternatives.
+
+公开实验应将本项目表征与更简单的替代方案区分开。
+
+Required baselines:
+
+必要基线：
+
+1. individual teacher embeddings;
+1. 单个 teacher embedding；
+2. single-teacher distillation;
+2. 单 teacher 蒸馏；
+3. multi-teacher distillation without HCC weak supervision;
+3. 无 HCC 弱监督的多 teacher 蒸馏；
+4. HCC weak supervision without teacher distillation;
+4. 无 teacher 蒸馏的 HCC 弱监督；
+5. full HCC-SemPath training.
+5. 完整 HCC-SemPath 训练。
+
+## 6. Public Reproducibility / 公开可复现
+
+The public repository should contain code, schemas, configuration templates,
+small synthetic fixtures, public-safe benchmark summaries, documentation, and
+model cards.
+
+公开仓库应包含代码、schema、配置模板、小型 synthetic fixtures、公开安全的
+benchmark summaries、文档和 model cards。
+
+The public repository should not contain raw WSIs, large feature artifacts,
+large checkpoints, patient-identifiable metadata, institutional file paths, or
+production-scale per-tile tables.
+
+公开仓库不应包含原始 WSI、大型 feature artifact、大型 checkpoint、可识别患者身份的
+元数据、机构内部路径或生产规模每 tile 表。

@@ -6,6 +6,7 @@ smoke_data/
 weights/
 data/
 real_smoke/
+results/
 results/**/*.iac
 results/**/*.png
 results/**/tile_manifest.csv
