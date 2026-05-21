@@ -9,7 +9,6 @@ from .anchors import load_anchors
 from .config import load_config
 from .datasets import DistillationTileDataset, collate_distillation, validate_teacher_cache
 from .engine import collect_embeddings
-from .manifests import read_tile_manifest
 from .metrics import evaluate_embeddings
 from .models import StudentEncoder
 from .tile_package import read_package_manifest
@@ -24,17 +23,24 @@ def main() -> None:
     args = parser.parse_args()
     cfg = load_config(args.config)
     device = torch.device(cfg["runtime"]["device"])
-    tile_package_path = cfg["data"].get("tile_package_path")
-    all_records = read_package_manifest(tile_package_path) if tile_package_path else read_tile_manifest(cfg["data"]["manifest_path"])
+    image_tile_package_path = cfg["data"]["image_tile_package_path"]
+    teacher_feature_package_path = cfg["data"]["teacher_feature_package_path"]
+    all_records = read_package_manifest(image_tile_package_path)
     records = [record for record in all_records if record.split == args.split]
-    validate_teacher_cache(records, cfg["data"]["teacher_cache_dir"], cfg["model"]["teacher_dim"])
+    validate_teacher_cache(
+        records,
+        None,
+        cfg["model"]["teacher_dim"],
+        teacher_cache_package_path=teacher_feature_package_path,
+    )
     dataset = DistillationTileDataset(
         records,
-        cfg["data"]["teacher_cache_dir"],
+        None,
         cfg["data"]["image_size"],
         mean=cfg["data"].get("mean"),
         std=cfg["data"].get("std"),
-        tile_package_path=tile_package_path,
+        tile_package_path=image_tile_package_path,
+        teacher_cache_package_path=teacher_feature_package_path,
     )
     loader = DataLoader(dataset, batch_size=cfg["train"]["batch_size"], shuffle=False, num_workers=cfg["data"]["num_workers"], collate_fn=collate_distillation)
     model = StudentEncoder(cfg["model"]["backbone_name"], cfg["model"]["teacher_dim"], cfg["model"]["pretrained"]).to(device)

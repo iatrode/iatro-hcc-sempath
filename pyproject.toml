@@ -19,7 +19,13 @@ dependencies = [
   "huggingface_hub",
   "safetensors",
   "openslide-python",
+  "openslide-bin",
+  "pyarrow",
+  "pytest",
 ]
+
+[project.scripts]
+hcc-sempath-wsi2iac = "hcc_sempath.cli.wsi_to_iac:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

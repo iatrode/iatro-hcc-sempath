@@ -8,6 +8,8 @@ from PIL import Image
 
 from hcc_sempath.manifests import write_tile_manifest
 from hcc_sempath.tiling import tile_raster_image
+from hcc_sempath.tile_package import build_tile_package
+from hcc_sempath.feature_cache import build_teacher_feature_package_from_manifest
 
 
 def main() -> None:
@@ -39,7 +41,16 @@ def main() -> None:
         )
     for row in rows:
         np.save(cache_dir / f"{row['tile_id']}.npy", rng.normal(size=(teacher_dim,)).astype(np.float32))
-    write_tile_manifest(root / "tile_manifest.csv", rows)
+    manifest_path = root / "tile_manifest.csv"
+    write_tile_manifest(manifest_path, rows)
+    build_tile_package(manifest_path, root / "tiles.iac", overwrite=True)
+    build_teacher_feature_package_from_manifest(
+        manifest_path,
+        cache_dir,
+        root / "teacher_features.iac",
+        teacher_name="smoke",
+        overwrite=True,
+    )
     torch.save({"anchors": torch.randn(7, teacher_dim)}, root / "anchors.pt")
     print("smoke_data_ok")
 

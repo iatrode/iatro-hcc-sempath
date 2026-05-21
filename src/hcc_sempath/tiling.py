@@ -26,6 +26,17 @@ def iter_image_tiles(image: Image.Image, tile_size: int, min_tissue_fraction: fl
                 yield x, y, tile
 
 
+def select_read_level(level_downsamples: tuple[float, ...] | list[float], native_mpp: float, target_mpp: float) -> int:
+    """Approximate OpenSlide's best level choice for target/native downsampling."""
+    downsample_needed = target_mpp / native_mpp
+    if downsample_needed <= 1:
+        return 0
+    return min(
+        range(len(level_downsamples)),
+        key=lambda idx: abs(float(level_downsamples[idx]) - downsample_needed),
+    )
+
+
 def tile_raster_image(
     image_path: str | Path,
     output_dir: str | Path,
@@ -72,6 +83,7 @@ def tile_wsi(
     min_tissue_fraction: float = 0.1,
     target_mpp: float = 0.5,
     native_mpp: float | None = None,
+    native_mpp_y: float | None = None,
     max_tiles: int | None = None,
     overwrite_slide_dir: bool = False,
 ) -> list[dict]:
@@ -90,14 +102,25 @@ def tile_wsi(
         if mpp_value is None:
             raise ValueError("WSI is missing MPP metadata; pass --native-mpp explicitly")
         native_mpp = float(mpp_value)
-    read_size = max(1, round(tile_size * target_mpp / native_mpp))
+    if native_mpp_y is None:
+        mpp_y_value = slide.properties.get(openslide.PROPERTY_NAME_MPP_Y)
+        native_mpp_y = float(mpp_y_value) if mpp_y_value is not None else native_mpp
+    downsample_needed = target_mpp / native_mpp
+    level = slide.get_best_level_for_downsample(downsample_needed)
+    level_downsample = float(slide.level_downsamples[level])
+    scale_x = native_mpp / target_mpp
+    scale_y = native_mpp_y / target_mpp
+    level0_stride_x = max(1, round(tile_size / scale_x))
+    level0_stride_y = max(1, round(tile_size / scale_y))
+    level_read_w = max(1, round(level0_stride_x / level_downsample))
+    level_read_h = max(1, round(level0_stride_y / level_downsample))
     width, height = slide.dimensions
     rows = []
     idx = 0
-    for y in range(0, height - read_size + 1, read_size):
-        for x in range(0, width - read_size + 1, read_size):
-            tile = slide.read_region((x, y), 0, (read_size, read_size)).convert("RGB")
-            if read_size != tile_size:
+    for y in range(0, height - level0_stride_y + 1, level0_stride_y):
+        for x in range(0, width - level0_stride_x + 1, level0_stride_x):
+            tile = slide.read_region((x, y), level, (level_read_w, level_read_h)).convert("RGB")
+            if tile.size != (tile_size, tile_size):
                 tile = tile.resize((tile_size, tile_size), Image.Resampling.BICUBIC)
             if tissue_fraction(np.asarray(tile)) < min_tissue_fraction:
                 continue
@@ -136,6 +159,7 @@ def main() -> None:
     parser.add_argument("--min-tissue-fraction", type=float, default=0.1)
     parser.add_argument("--target-mpp", type=float, default=0.5)
     parser.add_argument("--native-mpp", type=float, default=None)
+    parser.add_argument("--native-mpp-y", type=float, default=None)
     parser.add_argument("--max-tiles", type=int, default=None)
     parser.add_argument("--overwrite-slide-dir", action="store_true")
     args = parser.parse_args()
@@ -160,6 +184,7 @@ def main() -> None:
         min_tissue_fraction=args.min_tissue_fraction,
         target_mpp=args.target_mpp,
         native_mpp=args.native_mpp,
+        native_mpp_y=args.native_mpp_y,
         max_tiles=args.max_tiles,
         overwrite_slide_dir=args.overwrite_slide_dir,
     )

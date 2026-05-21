@@ -4,9 +4,8 @@ runtime:
   output_dir: outputs/smoke
 
 data:
-  manifest_path: smoke_data/tile_manifest.csv
-  tile_package_path:
-  teacher_cache_dir: smoke_data/teacher_cache
+  image_tile_package_path: smoke_data/tiles.iac
+  teacher_feature_package_path: smoke_data/teacher_features.iac
   anchors_path: smoke_data/anchors.pt
   image_size: 224
   num_workers: 0
