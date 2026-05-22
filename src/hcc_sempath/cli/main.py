@@ -8,6 +8,7 @@ from collections.abc import Sequence
 COMMANDS: dict[str, tuple[str, str]] = {
     "build-tile-cache": ("hcc_sempath.cli.tile_cache", "Build image-tile IAC packages from a WSI file or directory."),
     "validate-package": ("hcc_sempath.io.validate_package", "Validate an IatroCache tile package."),
+    "view-iac": ("hcc_sempath.cli.view_iac", "Open a local browser UI for inspecting an IAC package."),
     "build-teacher-cache": ("hcc_sempath.teacher.cache", "Run a teacher model and write <teacher-name>.features.iac directly."),
     "build-anchors": ("hcc_sempath.modeling.build_anchors", "Build semantic anchors from concept feature arrays."),
     "train": ("hcc_sempath.training.train", "Train the HCC-SemPath student model."),
