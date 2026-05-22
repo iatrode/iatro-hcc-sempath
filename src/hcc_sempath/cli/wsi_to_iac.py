@@ -71,11 +71,12 @@ def _choose_mask_level(slide, max_pixels: int = 12_000_000) -> int:
     return len(slide.level_dimensions) - 1
 
 
-def _build_tissue_mask(slide, mask_level: int, white_threshold: int) -> np.ndarray:
+def _build_tissue_mask(slide, mask_level: int, white_threshold: int, black_threshold: int) -> np.ndarray:
     width, height = slide.level_dimensions[mask_level]
     image = slide.read_region((0, 0), mask_level, (width, height)).convert("RGB")
     arr = np.asarray(image)
-    return arr.mean(axis=2) < white_threshold
+    gray = arr.mean(axis=2)
+    return (gray > black_threshold) & (gray < white_threshold)
 
 
 def _candidate_grid(width: int, height: int, stride_x: int, stride_y: int) -> tuple[np.ndarray, np.ndarray]:
@@ -135,6 +136,7 @@ def _read_encode_record(
     tile_size: int,
     min_tissue_fraction: float,
     white_threshold: int,
+    black_threshold: int,
     lossless: bool,
     distance: float,
     effort: int,
@@ -144,7 +146,7 @@ def _read_encode_record(
     if tile.size != (tile_size, tile_size):
         tile = tile.resize((tile_size, tile_size), Image.Resampling.BICUBIC)
     arr = np.asarray(tile).copy()
-    if tissue_fraction(arr, white_threshold=white_threshold) < min_tissue_fraction:
+    if tissue_fraction(arr, white_threshold=white_threshold, black_threshold=black_threshold) < min_tissue_fraction:
         return None
     tile_id = f"{slide_id}_{tile_idx:07d}"
     record = TileRecord(
@@ -178,6 +180,7 @@ def build_wsi_iac(
     effort: int = 7,
     workers: int = 1,
     white_threshold: int = 220,
+    black_threshold: int = 8,
     prefilter_tissue_fraction: float = 0.05,
     mask_max_pixels: int = 12_000_000,
     qc_out: str | Path | None = None,
@@ -217,7 +220,7 @@ def build_wsi_iac(
     candidate_x, candidate_y = _candidate_grid(width, height, level0_stride_x, level0_stride_y)
     mask_level = _choose_mask_level(slide, max_pixels=mask_max_pixels)
     mask_downsample = float(slide.level_downsamples[mask_level])
-    mask = _build_tissue_mask(slide, mask_level, white_threshold=white_threshold)
+    mask = _build_tissue_mask(slide, mask_level, white_threshold=white_threshold, black_threshold=black_threshold)
     selected_x, selected_y = _prefilter_candidates(
         mask=mask,
         candidate_x=candidate_x,
@@ -268,6 +271,7 @@ def build_wsi_iac(
                         tile_size=tile_size,
                         min_tissue_fraction=min_tissue_fraction,
                         white_threshold=white_threshold,
+                        black_threshold=black_threshold,
                         lossless=lossless,
                         distance=distance,
                         effort=effort,
@@ -344,6 +348,8 @@ def build_wsi_iac(
                 "level_read_width": level_read_w,
                 "level_read_height": level_read_h,
                 "min_tissue_fraction": min_tissue_fraction,
+                "black_threshold": black_threshold,
+                "white_threshold": white_threshold,
                 "prefilter_tissue_fraction": prefilter_tissue_fraction,
                 "mask_level": mask_level,
                 "mask_downsample": mask_downsample,

@@ -54,12 +54,13 @@ def _read_tile(slide, x: int, y: int, level: int, level_read_w: int, level_read_
     return np.asarray(tile).copy()
 
 
-def _build_mask(slide, mask_level: int, white_threshold: int) -> tuple[np.ndarray, float]:
+def _build_mask(slide, mask_level: int, white_threshold: int, black_threshold: int) -> tuple[np.ndarray, float]:
     width, height = slide.level_dimensions[mask_level]
     started = time.perf_counter()
     image = slide.read_region((0, 0), mask_level, (width, height)).convert("RGB")
     arr = np.asarray(image)
-    mask = arr.mean(axis=2) < white_threshold
+    gray = arr.mean(axis=2)
+    mask = (gray > black_threshold) & (gray < white_threshold)
     return mask, time.perf_counter() - started
 
 
@@ -130,6 +131,7 @@ def _confirm_tile(
     level_read_h: int,
     tile_size: int,
     white_threshold: int,
+    black_threshold: int,
     min_tissue_fraction: float,
     encode: bool,
     distance: float,
@@ -138,7 +140,7 @@ def _confirm_tile(
     slide = _get_thread_slide(wsi_path)
     x, y = item
     arr = _read_tile(slide, x, y, level, level_read_w, level_read_h, tile_size)
-    if tissue_fraction(arr, white_threshold=white_threshold) < min_tissue_fraction:
+    if tissue_fraction(arr, white_threshold=white_threshold, black_threshold=black_threshold) < min_tissue_fraction:
         return False, 0
     if not encode:
         return True, 0
@@ -156,6 +158,7 @@ def main() -> None:
     parser.add_argument("--distance", type=float, default=1.0)
     parser.add_argument("--effort", type=int, default=7)
     parser.add_argument("--white-threshold", type=int, default=220)
+    parser.add_argument("--black-threshold", type=int, default=8)
     parser.add_argument("--mask-max-pixels", type=int, default=12_000_000)
     parser.add_argument("--max-candidates", type=int, default=0, help="Debug cap; 0 means full slide.")
     parser.add_argument("--workers", type=int, default=1, help="Threaded benchmark workers for prefiltered high-res reads.")
@@ -202,6 +205,8 @@ def main() -> None:
             "target_mpp": args.target_mpp,
             "tile_size": args.tile_size,
             "min_tissue_fraction": args.min_tissue_fraction,
+            "black_threshold": args.black_threshold,
+            "white_threshold": args.white_threshold,
             "openslide_level": level,
             "level_downsample": level_downsample,
             "stride_x": stride_x,
@@ -219,13 +224,16 @@ def main() -> None:
             full_retained = 0
             for x, y in tqdm(candidates, desc="current_full_scan", unit="tile"):
                 arr = _read_tile(slide, x, y, level, level_read_w, level_read_h, args.tile_size)
-                if tissue_fraction(arr, white_threshold=args.white_threshold) >= args.min_tissue_fraction:
+                if (
+                    tissue_fraction(arr, white_threshold=args.white_threshold, black_threshold=args.black_threshold)
+                    >= args.min_tissue_fraction
+                ):
                     full_retained += 1
             rows.append(_row("current_full_scan_read_every_candidate", time.perf_counter() - started, total_candidates, total_candidates, total_candidates, full_retained))
 
         mask_level = _choose_mask_level(slide, args.mask_max_pixels)
         mask_downsample = float(slide.level_downsamples[mask_level])
-        mask, mask_build_sec = _build_mask(slide, mask_level, args.white_threshold)
+        mask, mask_build_sec = _build_mask(slide, mask_level, args.white_threshold, args.black_threshold)
         started = time.perf_counter()
         selected = [
             (x, y)
@@ -256,7 +264,10 @@ def main() -> None:
         encoded_bytes = 0
         for x, y in tqdm(selected, desc="prefiltered_highres_confirm", unit="tile"):
             arr = _read_tile(slide, x, y, level, level_read_w, level_read_h, args.tile_size)
-            if tissue_fraction(arr, white_threshold=args.white_threshold) < args.min_tissue_fraction:
+            if (
+                tissue_fraction(arr, white_threshold=args.white_threshold, black_threshold=args.black_threshold)
+                < args.min_tissue_fraction
+            ):
                 continue
             confirmed_retained += 1
             if args.encode:
@@ -280,6 +291,7 @@ def main() -> None:
                         level_read_h=level_read_h,
                         tile_size=args.tile_size,
                         white_threshold=args.white_threshold,
+                        black_threshold=args.black_threshold,
                         min_tissue_fraction=args.min_tissue_fraction,
                         encode=args.encode,
                         distance=args.distance,

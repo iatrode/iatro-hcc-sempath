@@ -112,6 +112,12 @@ def main() -> None:
     parser.add_argument("--effort", type=int, default=7)
     parser.add_argument("--workers", type=int, default=_default_workers())
     parser.add_argument("--white-threshold", type=int, default=220)
+    parser.add_argument(
+        "--black-threshold",
+        type=int,
+        default=8,
+        help="Pixels at or below this grayscale value are treated as empty black background.",
+    )
     parser.add_argument("--prefilter-tissue-fraction", type=float, default=0.05)
     parser.add_argument("--mask-max-pixels", type=int, default=12_000_000)
     parser.add_argument("--qc", action="store_true", help="Write per-slide QC contact sheets beside IAC packages.")
@@ -138,7 +144,9 @@ def main() -> None:
         "tile_cache_start "
         f"slides={len(slides)} input={input_path} output={output} "
         f"target_mpp={args.target_mpp} tile_size={args.tile_size} "
-        f"min_tissue_fraction={args.min_tissue_fraction} distance={args.distance} workers={args.workers}",
+        f"min_tissue_fraction={args.min_tissue_fraction} "
+        f"black_threshold={args.black_threshold} white_threshold={args.white_threshold} "
+        f"distance={args.distance} workers={args.workers}",
         flush=True,
     )
 
@@ -178,6 +186,8 @@ def main() -> None:
                     "target_mpp": args.target_mpp,
                     "tile_size": args.tile_size,
                     "min_tissue_fraction": args.min_tissue_fraction,
+                    "black_threshold": args.black_threshold,
+                    "white_threshold": args.white_threshold,
                     "prefilter_tissue_fraction": args.prefilter_tissue_fraction,
                     "distance": args.distance,
                     "input_bytes": stats["input_bytes"],
@@ -208,6 +218,7 @@ def main() -> None:
                 effort=args.effort,
                 workers=args.workers,
                 white_threshold=args.white_threshold,
+                black_threshold=args.black_threshold,
                 prefilter_tissue_fraction=args.prefilter_tissue_fraction,
                 mask_max_pixels=args.mask_max_pixels,
                 qc_out=qc_path,
@@ -228,6 +239,8 @@ def main() -> None:
                     "target_mpp": args.target_mpp,
                     "tile_size": args.tile_size,
                     "min_tissue_fraction": args.min_tissue_fraction,
+                    "black_threshold": args.black_threshold,
+                    "white_threshold": args.white_threshold,
                     "prefilter_tissue_fraction": args.prefilter_tissue_fraction,
                     "distance": args.distance,
                     "input_bytes": result["input_bytes"],
@@ -252,6 +265,8 @@ def main() -> None:
                     "target_mpp": args.target_mpp,
                     "tile_size": args.tile_size,
                     "min_tissue_fraction": args.min_tissue_fraction,
+                    "black_threshold": args.black_threshold,
+                    "white_threshold": args.white_threshold,
                     "prefilter_tissue_fraction": args.prefilter_tissue_fraction,
                     "distance": args.distance,
                     "input_bytes": wsi_path.stat().st_size if wsi_path.exists() else 0,
@@ -290,6 +305,8 @@ def main() -> None:
                 "target_mpp",
                 "tile_size",
                 "min_tissue_fraction",
+                "black_threshold",
+                "white_threshold",
                 "prefilter_tissue_fraction",
                 "distance",
                 "input_bytes",
