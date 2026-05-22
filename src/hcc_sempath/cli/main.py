@@ -6,9 +6,7 @@ from collections.abc import Sequence
 
 
 COMMANDS: dict[str, tuple[str, str]] = {
-    "tile-raster": ("hcc_sempath.io.tiling", "Tile a raster image or WSI into PNG tiles plus a manifest."),
-    "wsi2iac": ("hcc_sempath.cli.wsi_to_iac", "Package an OpenSlide-readable WSI directly into a tile IAC."),
-    "wsi-batch": ("hcc_sempath.cli.wsi_batch", "Batch-package a WSI directory into per-slide tile IAC files."),
+    "build-tile-cache": ("hcc_sempath.cli.tile_cache", "Build image-tile IAC packages from a WSI file or directory."),
     "validate-package": ("hcc_sempath.io.validate_package", "Validate an IatroCache tile package."),
     "build-teacher-cache": ("hcc_sempath.teacher.cache", "Run a teacher model and write <teacher-name>.features.iac directly."),
     "build-anchors": ("hcc_sempath.modeling.build_anchors", "Build semantic anchors from concept feature arrays."),
@@ -18,9 +16,6 @@ COMMANDS: dict[str, tuple[str, str]] = {
 }
 
 ALIASES = {
-    "tile": "tile-raster",
-    "package-wsi": "wsi2iac",
-    "batch-wsi": "wsi-batch",
     "teacher-cache": "build-teacher-cache",
     "eval": "evaluate",
 }

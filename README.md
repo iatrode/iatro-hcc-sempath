@@ -54,7 +54,7 @@ machine paths.
 
 ```text
 src/hcc_sempath/
-  io/        IatroCache, tile packages, feature packages, manifests, tiling, QC
+  io/        IatroCache, tile packages, feature packages, manifests, QC
   teacher/   teacher model loading and offline feature-cache construction
   modeling/  student models and semantic anchors
   training/  datasets, losses, metrics, engine, train/evaluate/benchmark CLIs
@@ -111,43 +111,35 @@ bash scripts/run_contract_smoke.sh
 
 ## Core Commands
 
-Tile a rasterized image:
+Build an image-tile cache from one WSI:
 
 ```bash
-hcc-sempath tile-raster \
-  --image slide.png \
-  --output-dir data/tiles \
-  --manifest-out data/manifests/tile_manifest.csv \
-  --patient-id P001 \
-  --slide-id S001 \
-  --split train
-```
-
-Package an OpenSlide-readable WSI directly into an image-tile package:
-
-```bash
-hcc-sempath wsi2iac \
-  --wsi slide.svs \
+hcc-sempath build-tile-cache \
+  --input slide.svs \
   --output data/packages/slide.tiles.iac \
   --target-mpp 0.5 \
   --tile-size 224 \
   --distance 1.0 \
   --workers 8 \
-  --qc-out data/packages/slide.tiles.qc.png
+  --qc
 ```
 
-Batch-package a WSI directory:
+Build image-tile caches from a WSI directory:
 
 ```bash
-hcc-sempath wsi-batch \
-  --input-root /path/to/wsi-root \
-  --output-root /path/to/output-iac-root \
+hcc-sempath build-tile-cache \
+  --input /path/to/wsi-root \
+  --output /path/to/output-iac-root \
   --target-mpp 0.5 \
   --tile-size 224 \
   --min-tissue-fraction 0.3 \
   --distance 1.0 \
   --workers 8
 ```
+
+`build-tile-cache` is the only public WSI ingestion command. It writes tile
+IAC directly; PNG tile directories and standalone CSV tile manifests are kept
+out of the training workflow.
 
 Validate a package:
 
