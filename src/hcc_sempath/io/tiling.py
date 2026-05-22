@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 import shutil
 
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-
-from .manifests import write_tile_manifest
-
 
 def tissue_fraction(rgb: np.ndarray, white_threshold: int = 220) -> float:
     gray = rgb.mean(axis=2)
@@ -167,54 +163,3 @@ def tile_wsi(
             tqdm.write(f"tiling_done slide={slide_id} retained={idx} candidates_seen={progress.n}")
         slide.close()
     return rows
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Tile a raster image or WSI into fixed-size patches.")
-    parser.add_argument("--image", default="")
-    parser.add_argument("--wsi", default="")
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--manifest-out", required=True)
-    parser.add_argument("--patient-id", required=True)
-    parser.add_argument("--slide-id", required=True)
-    parser.add_argument("--split", default="train")
-    parser.add_argument("--tile-size", type=int, default=224)
-    parser.add_argument("--min-tissue-fraction", type=float, default=0.1)
-    parser.add_argument("--target-mpp", type=float, default=0.5)
-    parser.add_argument("--native-mpp", type=float, default=None)
-    parser.add_argument("--native-mpp-y", type=float, default=None)
-    parser.add_argument("--max-tiles", type=int, default=None)
-    parser.add_argument("--overwrite-slide-dir", action="store_true")
-    args = parser.parse_args()
-    if bool(args.image) == bool(args.wsi):
-        raise ValueError("provide exactly one of --image or --wsi")
-    rows = tile_raster_image(
-        image_path=args.image,
-        output_dir=args.output_dir,
-        patient_id=args.patient_id,
-        slide_id=args.slide_id,
-        split=args.split,
-        tile_size=args.tile_size,
-        min_tissue_fraction=args.min_tissue_fraction,
-        overwrite_slide_dir=args.overwrite_slide_dir,
-    ) if args.image else tile_wsi(
-        wsi_path=args.wsi,
-        output_dir=args.output_dir,
-        patient_id=args.patient_id,
-        slide_id=args.slide_id,
-        split=args.split,
-        tile_size=args.tile_size,
-        min_tissue_fraction=args.min_tissue_fraction,
-        target_mpp=args.target_mpp,
-        native_mpp=args.native_mpp,
-        native_mpp_y=args.native_mpp_y,
-        max_tiles=args.max_tiles,
-        overwrite_slide_dir=args.overwrite_slide_dir,
-        show_progress=True,
-    )
-    write_tile_manifest(args.manifest_out, rows)
-    print(f"wrote_tiles={len(rows)} manifest={args.manifest_out}")
-
-
-if __name__ == "__main__":
-    main()

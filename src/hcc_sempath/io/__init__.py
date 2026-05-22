@@ -1,2 +1,1 @@
-"""IatroCache, tile, feature, manifest, tiling, and QC utilities."""
-
+"""IatroCache tile, feature, manifest, and QC utilities."""

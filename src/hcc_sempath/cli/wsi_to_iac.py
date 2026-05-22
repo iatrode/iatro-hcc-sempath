@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import os
 from pathlib import Path
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -366,70 +365,3 @@ def build_wsi_iac(
         "qc_path": None if qc_out is None else Path(qc_out),
         **_compression_stats(wsi_path, output_path),
     }
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Build an image-tile IatroCache package directly from an OpenSlide-readable WSI."
-    )
-    parser.add_argument("--wsi", required=True, help="Input WSI path, such as .svs or .mrxs.")
-    parser.add_argument("--output", required=True, help="Output image-tile .iac path.")
-    parser.add_argument("--patient-id", default=None)
-    parser.add_argument("--slide-id", default=None)
-    parser.add_argument("--split", default="train")
-    parser.add_argument("--target-mpp", type=float, default=0.5)
-    parser.add_argument("--native-mpp", type=float, default=None)
-    parser.add_argument("--native-mpp-y", type=float, default=None)
-    parser.add_argument("--tile-size", type=int, default=224)
-    parser.add_argument("--min-tissue-fraction", type=float, default=0.1)
-    parser.add_argument("--max-tiles", type=int, default=None)
-    parser.add_argument("--lossless", action="store_true")
-    parser.add_argument("--distance", type=float, default=1.0)
-    parser.add_argument("--effort", type=int, default=7)
-    parser.add_argument("--workers", type=int, default=_default_workers())
-    parser.add_argument("--white-threshold", type=int, default=220)
-    parser.add_argument("--prefilter-tissue-fraction", type=float, default=0.05)
-    parser.add_argument("--mask-max-pixels", type=int, default=12_000_000)
-    parser.add_argument("--qc-out", default=None, help="Optional QC contact sheet path.")
-    parser.add_argument("--qc-max-tiles", type=int, default=36)
-    parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--no-progress", action="store_true")
-    args = parser.parse_args()
-
-    result = build_wsi_iac(
-        wsi_path=args.wsi,
-        output_path=args.output,
-        patient_id=args.patient_id,
-        slide_id=args.slide_id,
-        split=args.split,
-        target_mpp=args.target_mpp,
-        native_mpp=args.native_mpp,
-        native_mpp_y=args.native_mpp_y,
-        tile_size=args.tile_size,
-        min_tissue_fraction=args.min_tissue_fraction,
-        max_tiles=args.max_tiles,
-        lossless=args.lossless,
-        distance=args.distance,
-        effort=args.effort,
-        workers=args.workers,
-        white_threshold=args.white_threshold,
-        prefilter_tissue_fraction=args.prefilter_tissue_fraction,
-        mask_max_pixels=args.mask_max_pixels,
-        qc_out=args.qc_out,
-        qc_max_tiles=args.qc_max_tiles,
-        overwrite=args.overwrite,
-        show_progress=not args.no_progress,
-    )
-    print(
-        "wsi_package_ok "
-        f"tiles={result['tile_count']} output={result['output_path']} "
-        f"target_mpp={args.target_mpp} tile_size={args.tile_size} "
-        f"input={_format_bytes(result['input_bytes'])} package={_format_bytes(result['package_bytes'])} "
-        f"input_bytes={result['input_bytes']} package_bytes={result['package_bytes']} "
-        f"compression_ratio={result['compression_ratio']:.4f}x "
-        f"space_saving_pct={result['space_saving_pct']:.3f}"
-    )
-
-
-if __name__ == "__main__":
-    main()
