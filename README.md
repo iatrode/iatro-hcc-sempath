@@ -139,7 +139,9 @@ hcc-sempath build-tile-cache \
 
 `build-tile-cache` is the only public WSI ingestion command. It writes tile
 IAC directly; PNG tile directories and standalone CSV tile manifests are kept
-out of the training workflow.
+out of the training workflow. Directory input scans only the specified
+directory's top-level WSI files because MRXS slides use a file plus companion
+data directory layout.
 
 Validate a package:
 

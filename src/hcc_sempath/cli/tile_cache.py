@@ -17,7 +17,7 @@ WSI_SUFFIXES = {".svs", ".mrxs", ".ndpi", ".scn", ".tif", ".tiff"}
 
 
 def _discover_wsi(root: Path) -> list[Path]:
-    return sorted(path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in WSI_SUFFIXES)
+    return sorted(path for path in root.iterdir() if path.is_file() and path.suffix.lower() in WSI_SUFFIXES)
 
 
 def _safe_id(value: str) -> str:
