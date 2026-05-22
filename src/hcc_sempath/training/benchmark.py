@@ -5,8 +5,9 @@ import time
 
 import torch
 
+from ..io.tile_package import read_package_metadata
 from .config import load_config
-from .models import StudentEncoder
+from ..modeling.models import StudentEncoder
 
 
 def main() -> None:
@@ -17,9 +18,12 @@ def main() -> None:
     args = parser.parse_args()
     cfg = load_config(args.config)
     device = torch.device(cfg["runtime"]["device"])
+    tile_metadata = read_package_metadata(cfg["data"]["image_tile_package_path"])
+    image_height = int(tile_metadata["tile_height"])
+    image_width = int(tile_metadata["tile_width"])
     model = StudentEncoder(cfg["model"]["backbone_name"], cfg["model"]["teacher_dim"], cfg["model"]["pretrained"]).to(device).eval()
     model.load_state_dict(torch.load(args.checkpoint, map_location=device)["model"])
-    batch = torch.randn(cfg["train"]["batch_size"], 3, cfg["data"]["image_size"], cfg["data"]["image_size"], device=device)
+    batch = torch.randn(cfg["train"]["batch_size"], 3, image_height, image_width, device=device)
     with torch.no_grad():
         for _ in range(3):
             model(batch)
@@ -37,4 +41,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

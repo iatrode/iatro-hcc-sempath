@@ -6,9 +6,9 @@ from pathlib import Path
 
 from PIL import Image
 
-from hcc_sempath.iatrocache import read_payload, read_tables
-from hcc_sempath.manifests import write_tile_manifest
-from hcc_sempath.tile_package import build_tile_package, read_package_manifest
+from hcc_sempath.io.iatrocache import read_payload, read_tables
+from hcc_sempath.io.manifests import write_tile_manifest
+from hcc_sempath.io.tile_package import build_tile_package, read_package_manifest
 
 
 def _write_manifest_with_tiles(root: Path, coords: tuple[tuple[int, int], ...]) -> tuple[Path, list[dict]]:

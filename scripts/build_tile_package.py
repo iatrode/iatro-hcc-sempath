@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from hcc_sempath.tile_package import build_tile_package
+from hcc_sempath.io.tile_package import build_tile_package
 
 
 def main() -> None:

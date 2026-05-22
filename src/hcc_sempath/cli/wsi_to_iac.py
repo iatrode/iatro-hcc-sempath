@@ -10,10 +10,10 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from hcc_sempath.manifests import TileRecord
-from hcc_sempath.qc import render_tile_package_qc
-from hcc_sempath.tile_package import build_tile_package_from_records, encode_jxl_array
-from hcc_sempath.tiling import tissue_fraction
+from hcc_sempath.io.manifests import TileRecord
+from hcc_sempath.io.qc import render_tile_package_qc
+from hcc_sempath.io.tile_package import build_tile_package_from_records, encode_jxl_array
+from hcc_sempath.io.tiling import tissue_fraction
 
 
 _thread_state = threading.local()

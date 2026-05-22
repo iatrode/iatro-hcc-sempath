@@ -5,13 +5,13 @@ import argparse
 import torch
 from torch.utils.data import DataLoader
 
-from .anchors import load_anchors
+from ..io.tile_package import read_package_manifest, read_package_metadata
+from ..modeling.anchors import load_anchors
+from ..modeling.models import StudentEncoder
 from .config import load_config
 from .datasets import DistillationTileDataset, collate_distillation, validate_teacher_cache
 from .engine import collect_embeddings
 from .metrics import evaluate_embeddings
-from .models import StudentEncoder
-from .tile_package import read_package_manifest
 from .utils import write_json
 
 
@@ -25,6 +25,8 @@ def main() -> None:
     device = torch.device(cfg["runtime"]["device"])
     image_tile_package_path = cfg["data"]["image_tile_package_path"]
     teacher_feature_package_path = cfg["data"]["teacher_feature_package_path"]
+    tile_metadata = read_package_metadata(image_tile_package_path)
+    image_size = (int(tile_metadata["tile_height"]), int(tile_metadata["tile_width"]))
     all_records = read_package_manifest(image_tile_package_path)
     records = [record for record in all_records if record.split == args.split]
     validate_teacher_cache(
@@ -36,7 +38,7 @@ def main() -> None:
     dataset = DistillationTileDataset(
         records,
         None,
-        cfg["data"]["image_size"],
+        image_size,
         mean=cfg["data"].get("mean"),
         std=cfg["data"].get("std"),
         tile_package_path=image_tile_package_path,

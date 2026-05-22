@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from hcc_sempath.qc import render_tile_package_qc
+from hcc_sempath.io.qc import render_tile_package_qc
 
 
 def main() -> None:

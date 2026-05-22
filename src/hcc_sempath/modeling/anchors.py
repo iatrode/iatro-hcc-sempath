@@ -14,4 +14,3 @@ def load_anchors(path: str | Path, expected_dim: int | None = None) -> torch.Ten
     if expected_dim is not None and anchors.shape[1] != expected_dim:
         raise ValueError(f"anchor dim mismatch: got {anchors.shape[1]}, expected {expected_dim}")
     return anchors
-

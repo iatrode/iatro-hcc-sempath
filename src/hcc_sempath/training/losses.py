@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .models import normalized_anchor_logits
+from ..modeling.models import normalized_anchor_logits
 
 
 def feature_distillation_loss(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
@@ -59,4 +59,3 @@ def total_distillation_loss(
         "relation": relation.detach(),
         "semantic": semantic.detach(),
     }
-

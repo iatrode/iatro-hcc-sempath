@@ -6,12 +6,12 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from .anchors import load_anchors
+from ..io.tile_package import read_package_manifest, read_package_metadata
+from ..modeling.anchors import load_anchors
+from ..modeling.models import StudentEncoder
 from .config import load_config
 from .datasets import DistillationTileDataset, collate_distillation, validate_teacher_cache
 from .engine import fit
-from .models import StudentEncoder
-from .tile_package import read_package_manifest
 from .utils import seed_everything
 
 
@@ -25,6 +25,8 @@ def main() -> None:
     device = torch.device(cfg["runtime"]["device"])
     image_tile_package_path = cfg["data"]["image_tile_package_path"]
     teacher_feature_package_path = cfg["data"]["teacher_feature_package_path"]
+    tile_metadata = read_package_metadata(image_tile_package_path)
+    image_size = (int(tile_metadata["tile_height"]), int(tile_metadata["tile_width"]))
     records = read_package_manifest(image_tile_package_path)
     train_records = [record for record in records if record.split == "train"]
     val_records = [record for record in records if record.split == "val"]
@@ -38,7 +40,7 @@ def main() -> None:
     )
     dataset_kwargs = {
         "teacher_cache_dir": None,
-        "image_size": cfg["data"]["image_size"],
+        "image_size": image_size,
         "mean": cfg["data"].get("mean"),
         "std": cfg["data"].get("std"),
         "tile_package_path": image_tile_package_path,
@@ -46,8 +48,18 @@ def main() -> None:
     }
     train_ds = DistillationTileDataset(train_records, **dataset_kwargs)
     val_ds = DistillationTileDataset(val_records, **dataset_kwargs)
-    train_loader = DataLoader(train_ds, batch_size=cfg["train"]["batch_size"], shuffle=True, num_workers=cfg["data"]["num_workers"], collate_fn=collate_distillation)
-    val_loader = DataLoader(val_ds, batch_size=cfg["train"]["batch_size"], shuffle=False, num_workers=cfg["data"]["num_workers"], collate_fn=collate_distillation)
+    num_workers = int(cfg["data"]["num_workers"])
+    loader_kwargs = {
+        "batch_size": cfg["train"]["batch_size"],
+        "num_workers": num_workers,
+        "collate_fn": collate_distillation,
+        "pin_memory": device.type == "cuda",
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = int(cfg["data"].get("prefetch_factor", 2))
+        loader_kwargs["persistent_workers"] = bool(cfg["data"].get("persistent_workers", True))
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
     anchors = load_anchors(cfg["data"]["anchors_path"], expected_dim=cfg["model"]["teacher_dim"]).to(device)
     model = StudentEncoder(cfg["model"]["backbone_name"], cfg["model"]["teacher_dim"], cfg["model"]["pretrained"]).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])

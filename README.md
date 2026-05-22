@@ -50,11 +50,32 @@ machine paths.
 本仓库不应包含私有 WSI、生产级 tile package、teacher feature package、checkpoint、
 可识别患者身份的 manifest 或本机路径。
 
+## Source Layout
+
+```text
+src/hcc_sempath/
+  io/        IatroCache, tile packages, feature packages, manifests, tiling, QC
+  teacher/   teacher model loading and offline feature-cache construction
+  modeling/  student models and semantic anchors
+  training/  datasets, losses, metrics, engine, train/evaluate/benchmark CLIs
+  cli/       installed command-line entry points
+```
+
 ## Environment
 
 ```bash
 conda env create -f environment.yml
 conda activate hcc-sempath
+python -m pip install --no-deps -e .
+hcc-sempath --help
+```
+
+For an existing environment:
+
+```bash
+conda env update -f environment.yml --prune
+conda activate hcc-sempath
+python -m pip install --no-deps -e .
 ```
 
 ## Data Flow
@@ -93,7 +114,7 @@ bash scripts/run_contract_smoke.sh
 Tile a rasterized image:
 
 ```bash
-PYTHONPATH=src python -m hcc_sempath.tiling \
+hcc-sempath tile-raster \
   --image slide.png \
   --output-dir data/tiles \
   --manifest-out data/manifests/tile_manifest.csv \
@@ -105,7 +126,7 @@ PYTHONPATH=src python -m hcc_sempath.tiling \
 Package an OpenSlide-readable WSI directly into an image-tile package:
 
 ```bash
-hcc-sempath-wsi2iac \
+hcc-sempath wsi2iac \
   --wsi slide.svs \
   --output data/packages/slide.tiles.iac \
   --target-mpp 0.5 \
@@ -118,7 +139,7 @@ hcc-sempath-wsi2iac \
 Batch-package a WSI directory:
 
 ```bash
-conda run --no-capture-output -n hcc-sempath python scripts/build_wsi_iac_batch.py \
+hcc-sempath wsi-batch \
   --input-root /path/to/wsi-root \
   --output-root /path/to/output-iac-root \
   --target-mpp 0.5 \
@@ -131,35 +152,35 @@ conda run --no-capture-output -n hcc-sempath python scripts/build_wsi_iac_batch.
 Validate a package:
 
 ```bash
-PYTHONPATH=src python scripts/validate_tile_package.py \
+hcc-sempath validate-package \
   --package data/packages/tiles.iac
 ```
 
 Build teacher features:
 
 ```bash
-PYTHONPATH=src python scripts/build_teacher_cache.py \
+hcc-sempath build-teacher-cache \
   --tile-package data/packages/tiles.iac \
-  --output-dir data/teacher_cache/h_optimus_1 \
-  --model-name hf_hub:bioptimus/H-optimus-1 \
+  --output data/packages/h_optimus_1.features.iac \
+  --model h_optimus_1 \
   --batch-size 256 \
+  --num-workers 8 \
+  --prefetch-factor 2 \
   --device cuda
 ```
 
-Convert teacher outputs into a feature package:
-
-```bash
-PYTHONPATH=src python scripts/build_feature_package.py \
-  --tile-package data/packages/tiles.iac \
-  --feature-dir data/teacher_cache/h_optimus_1 \
-  --output data/packages/h_optimus_1_features.iac \
-  --teacher-name h_optimus_1
-```
+Teacher output packages use the suffix pattern `<teacher-name>.features.iac`.
+The input image-tile package naming remains unchanged.
+Tile size is read from the input `.iac` header. Directory inputs are allowed;
+all discovered image-tile packages must have the same tile dimensions.
+The planned supported presets are `h_optimus_1` and `gigapath`. Local model directories
+and custom timm / `hf_hub:*` names remain available for controlled experiments,
+but the documented path should use the supported presets.
 
 Build semantic anchors:
 
 ```bash
-PYTHONPATH=src python -m hcc_sempath.build_anchors \
+hcc-sempath build-anchors \
   --concept-dir data/concept_features \
   --output data/anchors/hcc_semantic_anchors.pt
 ```
@@ -167,13 +188,13 @@ PYTHONPATH=src python -m hcc_sempath.build_anchors \
 Train:
 
 ```bash
-PYTHONPATH=src python -m hcc_sempath.train --config configs/distill_train.example.yaml
+hcc-sempath train --config configs/distill_train.example.yaml
 ```
 
 Resume:
 
 ```bash
-PYTHONPATH=src python -m hcc_sempath.train \
+hcc-sempath train \
   --config configs/distill_train.example.yaml \
   --resume outputs/hcc_sempath_v1/checkpoints/last.pt
 ```
@@ -181,7 +202,7 @@ PYTHONPATH=src python -m hcc_sempath.train \
 Evaluate:
 
 ```bash
-PYTHONPATH=src python -m hcc_sempath.evaluate \
+hcc-sempath evaluate \
   --config configs/distill_train.example.yaml \
   --checkpoint outputs/hcc_sempath_v1/checkpoints/best.pt \
   --split val

@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from .losses import relation_distillation_loss, semantic_distillation_loss
-from .models import normalized_anchor_logits
+from ..modeling.models import normalized_anchor_logits
 
 
 def feature_cosine(student: torch.Tensor, teacher: torch.Tensor) -> float:
@@ -38,4 +38,3 @@ def evaluate_embeddings(student: torch.Tensor, teacher: torch.Tensor, anchors: t
         "retrieval_overlap": retrieval_overlap(student, teacher, topk=topk),
         "anchor_response_corr": anchor_response_correlation(student, teacher, anchors),
     }
-

@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from hcc_sempath.tiling import tissue_fraction
+from hcc_sempath.io.tiling import tissue_fraction
 
 
 _thread_state = threading.local()

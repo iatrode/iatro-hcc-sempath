@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from hcc_sempath.tiling import select_read_level
+from hcc_sempath.io.tiling import select_read_level
 
 
 def test_select_read_level_matches_target_native_downsample() -> None:
