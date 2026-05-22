@@ -5,6 +5,7 @@ import csv
 import json
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from tqdm import tqdm
@@ -16,12 +17,21 @@ from hcc_sempath.io.tile_package import read_package_metadata
 WSI_SUFFIXES = {".svs", ".mrxs", ".ndpi", ".scn", ".tif", ".tiff"}
 
 
+@dataclass(frozen=True)
+class SlideJob:
+    wsi_path: Path
+    slide_id: str
+    patient_id: str
+    package_path: Path
+    qc_path: Path | None
+
+
 def _discover_wsi(root: Path) -> list[Path]:
     return sorted(path for path in root.iterdir() if path.is_file() and path.suffix.lower() in WSI_SUFFIXES)
 
 
 def _safe_id(value: str) -> str:
-    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+    value = re.sub(r"[^\w.-]+", "_", value, flags=re.UNICODE)
     return value.strip("._") or "slide"
 
 
@@ -35,6 +45,22 @@ def _tcga_patient_id_from_name(path: Path) -> str:
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _write_batch_progress(output: Path, input_path: Path, rows: list[dict], failures: list[dict], total: int, started: float) -> None:
+    if total <= 1:
+        return
+    _write_json(
+        output / "batch_progress.json",
+        {
+            "input": str(input_path),
+            "output": str(output),
+            "processed": len(rows),
+            "total": total,
+            "failures": len(failures),
+            "elapsed_sec": round(time.time() - started, 3),
+        },
+    )
 
 
 def _compression_stats(input_path: Path, package_path: Path) -> dict:
@@ -88,6 +114,57 @@ def _resolve_slides(input_path: Path) -> list[Path]:
     raise FileNotFoundError(f"input path does not exist: {input_path}")
 
 
+def _ensure_unique_jobs(jobs: list[SlideJob]) -> None:
+    collisions: dict[Path, list[Path]] = {}
+    for job in jobs:
+        collisions.setdefault(job.package_path, []).append(job.wsi_path)
+    duplicates = {path: sources for path, sources in collisions.items() if len(sources) > 1}
+    if not duplicates:
+        return
+    details = []
+    for path, sources in list(duplicates.items())[:5]:
+        details.append(f"{path} <- {', '.join(str(source) for source in sources[:4])}")
+    raise ValueError(
+        "multiple input WSI files resolve to the same output IAC path; "
+        "rename inputs or adjust slide-id normalization. " + " | ".join(details)
+    )
+
+
+def _plan_slide_jobs(
+    slides: list[Path],
+    output: Path,
+    *,
+    patient_id: str | None,
+    slide_id: str | None,
+    tcga_patient_id: bool,
+    qc: bool,
+) -> list[SlideJob]:
+    total = len(slides)
+    jobs = []
+    for wsi_path in slides:
+        single = total == 1
+        resolved_slide_id = _safe_id(slide_id) if single and slide_id else _safe_id(wsi_path.stem)
+        resolved_patient_id = (
+            patient_id
+            if single and patient_id
+            else _tcga_patient_id_from_name(wsi_path)
+            if tcga_patient_id
+            else resolved_slide_id
+        )
+        package_path = _package_path_for_slide(output, resolved_slide_id, total)
+        jobs.append(
+            SlideJob(
+                wsi_path=wsi_path,
+                slide_id=resolved_slide_id,
+                patient_id=resolved_patient_id,
+                package_path=package_path,
+                qc_path=_qc_path_for_slide(output, resolved_slide_id, package_path, qc, total),
+            )
+        )
+    _ensure_unique_jobs(jobs)
+    return jobs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Build image-tile IatroCache packages directly from a WSI file or WSI directory."
@@ -139,10 +216,18 @@ def main() -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
     else:
         output.mkdir(parents=True, exist_ok=True)
+    jobs = _plan_slide_jobs(
+        slides,
+        output,
+        patient_id=args.patient_id,
+        slide_id=args.slide_id,
+        tcga_patient_id=args.tcga_patient_id,
+        qc=args.qc,
+    )
 
     print(
         "tile_cache_start "
-        f"slides={len(slides)} input={input_path} output={output} "
+        f"slides={len(jobs)} input={input_path} output={output} "
         f"target_mpp={args.target_mpp} tile_size={args.tile_size} "
         f"min_tissue_fraction={args.min_tissue_fraction} "
         f"black_threshold={args.black_threshold} white_threshold={args.white_threshold} "
@@ -153,34 +238,24 @@ def main() -> None:
     rows = []
     failures = []
     started = time.time()
-    for wsi_path in tqdm(slides, desc="WSI", unit="slide", disable=args.no_progress):
-        single = len(slides) == 1
-        slide_id = _safe_id(args.slide_id) if single and args.slide_id else _safe_id(wsi_path.stem)
-        patient_id = (
-            args.patient_id
-            if single and args.patient_id
-            else _tcga_patient_id_from_name(wsi_path)
-            if args.tcga_patient_id
-            else slide_id
-        )
-        package_path = _package_path_for_slide(output, slide_id, len(slides))
-        qc_path = _qc_path_for_slide(output, slide_id, package_path, args.qc, len(slides))
+    for job in tqdm(jobs, desc="WSI", unit="slide", disable=args.no_progress):
+        wsi_path = job.wsi_path
 
-        if package_path.exists() and not args.overwrite:
+        if job.package_path.exists() and not args.overwrite:
             try:
-                metadata = read_package_metadata(package_path)
+                metadata = read_package_metadata(job.package_path)
                 tile_count = int(metadata["num_records"])
             except Exception:
                 tile_count = -1
-            stats = _compression_stats(wsi_path, package_path)
-            _print_package_stats("skipped", slide_id, stats)
+            stats = _compression_stats(wsi_path, job.package_path)
+            _print_package_stats("skipped", job.slide_id, stats)
             rows.append(
                 {
-                    "slide_id": slide_id,
-                    "patient_id": patient_id,
+                    "slide_id": job.slide_id,
+                    "patient_id": job.patient_id,
                     "wsi_path": str(wsi_path),
-                    "package_path": str(package_path),
-                    "qc_path": "" if qc_path is None else str(qc_path),
+                    "package_path": str(job.package_path),
+                    "qc_path": "" if job.qc_path is None else str(job.qc_path),
                     "tile_count": tile_count,
                     "status": "skipped",
                     "target_mpp": args.target_mpp,
@@ -198,14 +273,15 @@ def main() -> None:
                     "error": "",
                 }
             )
+            _write_batch_progress(output, input_path, rows, failures, len(jobs), started)
             continue
 
         try:
             result = build_wsi_iac(
                 wsi_path=wsi_path,
-                output_path=package_path,
-                patient_id=patient_id,
-                slide_id=slide_id,
+                output_path=job.package_path,
+                patient_id=job.patient_id,
+                slide_id=job.slide_id,
                 split=args.split,
                 target_mpp=args.target_mpp,
                 native_mpp=args.native_mpp,
@@ -221,20 +297,20 @@ def main() -> None:
                 black_threshold=args.black_threshold,
                 prefilter_tissue_fraction=args.prefilter_tissue_fraction,
                 mask_max_pixels=args.mask_max_pixels,
-                qc_out=qc_path,
+                qc_out=job.qc_path,
                 qc_max_tiles=args.qc_max_tiles,
                 overwrite=args.overwrite,
                 show_progress=not args.no_progress,
             )
-            _print_package_stats("ok", slide_id, result)
+            _print_package_stats("ok", job.slide_id, result)
             rows.append(
                 {
                     "status": "ok",
-                    "slide_id": slide_id,
-                    "patient_id": patient_id,
+                    "slide_id": job.slide_id,
+                    "patient_id": job.patient_id,
                     "wsi_path": str(wsi_path),
-                    "package_path": str(package_path),
-                    "qc_path": "" if qc_path is None else str(qc_path),
+                    "package_path": str(job.package_path),
+                    "qc_path": "" if job.qc_path is None else str(job.qc_path),
                     "tile_count": result["tile_count"],
                     "target_mpp": args.target_mpp,
                     "tile_size": args.tile_size,
@@ -252,14 +328,14 @@ def main() -> None:
                 }
             )
         except Exception as exc:
-            failures.append({"slide_id": slide_id, "wsi_path": str(wsi_path), "error": str(exc)})
+            failures.append({"slide_id": job.slide_id, "wsi_path": str(wsi_path), "error": str(exc)})
             rows.append(
                 {
-                    "slide_id": slide_id,
-                    "patient_id": patient_id,
+                    "slide_id": job.slide_id,
+                    "patient_id": job.patient_id,
                     "wsi_path": str(wsi_path),
-                    "package_path": str(package_path),
-                    "qc_path": "" if qc_path is None else str(qc_path),
+                    "package_path": str(job.package_path),
+                    "qc_path": "" if job.qc_path is None else str(job.qc_path),
                     "tile_count": 0,
                     "status": "failed",
                     "target_mpp": args.target_mpp,
@@ -278,20 +354,9 @@ def main() -> None:
                 }
             )
 
-        if len(slides) > 1:
-            _write_json(
-                output / "batch_progress.json",
-                {
-                    "input": str(input_path),
-                    "output": str(output),
-                    "processed": len(rows),
-                    "total": len(slides),
-                    "failures": len(failures),
-                    "elapsed_sec": round(time.time() - started, 3),
-                },
-            )
+        _write_batch_progress(output, input_path, rows, failures, len(jobs), started)
 
-    if len(slides) > 1:
+    if len(jobs) > 1:
         manifest_path = output / "packages.csv"
         with manifest_path.open("w", newline="", encoding="utf-8") as handle:
             fieldnames = [
@@ -325,7 +390,7 @@ def main() -> None:
         summary = {
             "input": str(input_path),
             "output": str(output),
-            "total": len(slides),
+            "total": len(jobs),
             "ok": sum(1 for row in rows if row["status"] in {"ok", "skipped"}),
             "failed": sum(1 for row in rows if row["status"] == "failed"),
             "elapsed_sec": round(time.time() - started, 3),
