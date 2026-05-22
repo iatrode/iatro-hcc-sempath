@@ -152,6 +152,18 @@ hcc-sempath validate-package \
   --package data/packages/tiles.iac
 ```
 
+Inspect an IAC package in a local browser:
+
+```bash
+hcc-sempath view-iac \
+  --package data/packages/tiles.iac
+```
+
+Image-tile packages show a spatial coordinate map and a clickable 5x5 tile
+window centered on the clicked coordinate.
+Teacher feature packages show a coordinate heatmap without decoding feature
+payloads.
+
 Build teacher features:
 
 ```bash
