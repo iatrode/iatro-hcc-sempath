@@ -1,8 +1,10 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
 
+from hcc_sempath.cli import tile_cache
 from hcc_sempath.cli.tile_cache import _discover_wsi, _plan_slide_jobs, _safe_id, _write_batch_progress
 
 
@@ -46,3 +48,32 @@ def test_write_batch_progress_counts_skipped_rows() -> None:
         payload = (output / "batch_progress.json").read_text(encoding="utf-8")
         assert '"processed": 2' in payload
         assert '"total": 3' in payload
+
+
+def test_batch_progress_is_updated_for_skipped_packages(monkeypatch, tmp_path: Path) -> None:
+    input_root = tmp_path / "slides"
+    output_root = tmp_path / "packages"
+    input_root.mkdir()
+    output_root.mkdir()
+    for stem in ("a", "b"):
+        (input_root / f"{stem}.svs").write_text("slide", encoding="utf-8")
+        (output_root / f"{stem}.tiles.iac").write_text("existing", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "hcc-sempath build-tile-cache",
+            "--input",
+            str(input_root),
+            "--output",
+            str(output_root),
+            "--no-progress",
+        ],
+    )
+    tile_cache.main()
+
+    progress = json.loads((output_root / "batch_progress.json").read_text(encoding="utf-8"))
+    summary = json.loads((output_root / "batch_summary.json").read_text(encoding="utf-8"))
+    assert progress["processed"] == 2
+    assert progress["total"] == 2
+    assert summary["ok"] == 2
