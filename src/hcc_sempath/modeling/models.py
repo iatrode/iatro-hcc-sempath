@@ -61,4 +61,3 @@ def normalized_anchor_logits(features: torch.Tensor, anchors: torch.Tensor) -> t
     features = F.normalize(features, dim=-1)
     anchors = F.normalize(anchors, dim=-1)
     return features @ anchors.transpose(0, 1)
-

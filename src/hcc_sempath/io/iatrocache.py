@@ -11,7 +11,7 @@ import json
 import os
 import struct
 import zlib
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -185,6 +185,81 @@ def build_pack(
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
+
+
+def build_pack_streaming(
+    output_path: str | Path,
+    header_json: dict,
+    slide_table: pa.Table,
+    record_table: pa.Table,
+    payloads: Iterable[bytes],
+    *,
+    overwrite: bool = False,
+) -> None:
+    """Assemble an IatroCache pack while streaming payload bytes through disk."""
+    output_path = Path(output_path)
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"pack already exists: {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    offsets: list[int] = []
+    lengths: list[int] = []
+    crcs: list[int] = []
+    total = 0
+    with NamedTemporaryFile(dir=output_path.parent, delete=False) as data_tmp:
+        data_tmp_path = Path(data_tmp.name)
+        for payload in payloads:
+            if len(payload) > 0xFFFFFFFF:
+                raise ValueError(f"payload too large for uint32 length: {len(payload)} bytes")
+            offsets.append(total)
+            lengths.append(len(payload))
+            crcs.append(zlib.crc32(payload) & 0xFFFFFFFF)
+            data_tmp.write(payload)
+            total += len(payload)
+    try:
+        if len(offsets) != len(record_table):
+            raise ValueError(f"payload count mismatch: payloads={len(offsets)} records={len(record_table)}")
+        record_table = _replace_column(record_table, "offset", offsets, pa.uint64())
+        record_table = _replace_column(record_table, "length", lengths, pa.uint32())
+        record_table = _replace_column(record_table, "crc32", crcs, pa.uint32())
+
+        slide_bytes = _arrow_to_bytes(slide_table)
+        record_bytes = _arrow_to_bytes(record_table)
+        data_offset = HEADER_BYTES + len(slide_bytes) + len(record_bytes)
+        full_header = {
+            **header_json,
+            "format": "IatroCache",
+            "version": FORMAT_VERSION,
+            "header_bytes": HEADER_BYTES,
+            "slide_table_offset": HEADER_BYTES,
+            "slide_table_length": len(slide_bytes),
+            "record_table_offset": HEADER_BYTES + len(slide_bytes),
+            "record_table_length": len(record_bytes),
+            "data_offset": data_offset,
+            "data_length": total,
+            "num_slides": len(slide_table),
+            "num_records": len(record_table),
+        }
+        fixed = _build_fixed_header(
+            json.dumps(full_header, indent=2, sort_keys=True).encode("utf-8")
+        )
+
+        with NamedTemporaryFile(dir=output_path.parent, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            with tmp_path.open("wb") as out, data_tmp_path.open("rb") as data_in:
+                out.write(fixed)
+                out.write(slide_bytes)
+                out.write(record_bytes)
+                while chunk := data_in.read(1024 * 1024 * 16):
+                    out.write(chunk)
+            tmp_path.replace(output_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+    finally:
+        if data_tmp_path.exists():
+            data_tmp_path.unlink()
 
 
 # ---- public API: read --------------------------------------------------------

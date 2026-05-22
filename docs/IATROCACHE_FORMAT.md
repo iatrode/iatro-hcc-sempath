@@ -41,9 +41,13 @@ Example files:
 ```text
 train_tiles_000.iac
 tcga_tiles_000.iac
-teacher_features_000.iac
+gigapath.features.iac
 anchor_scores_000.iac
 ```
+
+Teacher model output packages should use `<teacher-name>.features.iac`. This is
+a repository naming convention for output semantics; the file extension remains
+`.iac`.
 
 ## Top-level layout
 

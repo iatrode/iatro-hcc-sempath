@@ -21,33 +21,67 @@ teacher feature cache.
 ```bash
 conda env create -f environment.yml
 conda activate hcc-sempath
+python -m pip install --no-deps -e .
 python scripts/download_teacher.py
-PYTHONPATH=src python scripts/build_teacher_cache.py \
+hcc-sempath build-teacher-cache \
   --tile-package data/packages/tiles.iac \
-  --output-dir data/teacher_cache/h_optimus_1 \
-  --model-name hf_hub:bioptimus/H-optimus-1 \
+  --output data/packages/h_optimus_1.features.iac \
+  --model h_optimus_1 \
   --batch-size 256 \
+  --num-workers 8 \
+  --prefetch-factor 2 \
   --device cuda
-PYTHONPATH=src python scripts/build_feature_package.py \
-  --tile-package data/packages/tiles.iac \
-  --feature-dir data/teacher_cache/h_optimus_1 \
-  --output data/packages/h_optimus_1_features.iac \
-  --teacher-name h_optimus_1
+```
+
+`--num-workers` controls parallel IatroCache tile reads and JXL decode during
+teacher inference. `--prefetch-factor` controls the number of prefetched batches
+per worker. Keep `--batch-size` as the GPU-memory knob and tune workers only
+when GPU utilization is low.
+
+`--tile-package` may point to one image-tile `.iac` file or a directory of
+image-tile `.iac` files. Tile size is read from each input package header. A
+directory input fails if discovered packages have inconsistent tile dimensions.
+The planned supported presets are `h_optimus_1` and `gigapath`. Local model directories
+and custom timm / `hf_hub:*` names remain available for controlled experiments,
+but the documented path should use the supported presets.
+
+## Output naming
+
+Input package naming is already fixed by the image-tile workflow. Teacher model
+outputs should use:
+
+```text
+<teacher-name>.features.iac
+```
+
+Examples:
+
+```text
+gigapath.features.iac
+h_optimus_1.features.iac
 ```
 
 ## Outputs copied back after teacher inference
 
 ```text
-data/packages/h_optimus_1_features.iac
+data/packages/h_optimus_1.features.iac
 ```
 
-Training uses `teacher_features.iac` as the distillation target. Loose `.npy`
-feature files are build intermediates.
+Training uses the `*.features.iac` package as the distillation target. Teacher
+feature construction writes IatroCache directly and does not create loose `.npy`
+intermediates.
 
 ## Verification before training
 
 ```bash
-PYTHONPATH=src python -m hcc_sempath.train --config configs/distill_train.example.yaml
+hcc-sempath train --config configs/distill_train.example.yaml
 ```
 
 If a cache file is missing or has the wrong dimensionality, training fails during startup before the first batch is launched.
+
+## Open-source hygiene
+
+The public repository should contain code, schemas, documentation, examples,
+and synthetic smoke-test artifacts only. Do not commit production WSIs,
+production tile packages, teacher feature packages, checkpoints, patient-level
+manifests, access tokens, or machine-local paths.

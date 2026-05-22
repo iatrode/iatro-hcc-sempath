@@ -25,6 +25,7 @@ dependencies = [
 ]
 
 [project.scripts]
+hcc-sempath = "hcc_sempath.cli.main:main"
 hcc-sempath-wsi2iac = "hcc_sempath.cli.wsi_to_iac:main"
 
 [tool.setuptools.packages.find]

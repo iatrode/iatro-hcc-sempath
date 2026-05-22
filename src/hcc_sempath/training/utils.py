@@ -38,4 +38,3 @@ def append_csv(path: str | Path, row: dict) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow(row)
-

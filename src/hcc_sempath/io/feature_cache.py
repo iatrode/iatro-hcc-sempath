@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections.abc import Iterable
 
 import numpy as np
 import pyarrow as pa
 
-from .iatrocache import PackReader, build_pack, read_tables
-from .manifests import TileRecord, read_tile_manifest
+from .iatrocache import PackReader, build_pack_streaming, read_tables
+from .manifests import TileRecord
 from .tile_package import read_package_manifest
 
 
@@ -41,29 +42,54 @@ def _build_feature_table(records: list[TileRecord]) -> pa.Table:
 
 def build_teacher_feature_package(
     records: list[TileRecord],
-    feature_dir: str | Path,
+    features: Iterable[np.ndarray],
     output_path: str | Path,
     teacher_name: str = "",
     dtype: str = "float32",
+    feature_dim: int | None = None,
     overwrite: bool = False,
 ) -> None:
-    feature_dir = Path(feature_dir)
     if not records:
         raise ValueError("records are empty")
     _ensure_unique_tile_ids(records)
-    payloads = []
-    feature_dim = None
-    for record in records:
-        feature_path = feature_dir / f"{record.tile_id}.npy"
-        if not feature_path.exists():
-            raise FileNotFoundError(f"missing teacher feature: {feature_path}")
-        feature = np.load(feature_path).astype(dtype, copy=False)
-        if feature.ndim != 1:
-            raise ValueError(f"teacher feature must be 1D: {feature_path}")
-        feature_dim = feature.shape[0] if feature_dim is None else feature_dim
-        if feature.shape[0] != feature_dim:
-            raise ValueError(f"inconsistent feature dim: {feature_path} got {feature.shape[0]} expected {feature_dim}")
-        payloads.append(feature.tobytes(order="C"))
+
+    def payloads() -> Iterable[bytes]:
+        nonlocal feature_dim
+        count = 0
+        for feature in features:
+            feature = np.asarray(feature).astype(dtype, copy=False)
+            if feature.ndim != 1:
+                raise ValueError(f"teacher feature must be 1D, got {feature.shape}")
+            feature_dim = feature.shape[0] if feature_dim is None else feature_dim
+            if feature.shape[0] != feature_dim:
+                raise ValueError(f"inconsistent feature dim: got {feature.shape[0]} expected {feature_dim}")
+            count += 1
+            yield feature.tobytes(order="C")
+        if count != len(records):
+            raise ValueError(f"feature count mismatch: features={count} records={len(records)}")
+
+    class _FeaturePayloads:
+        def __iter__(self):
+            return iter(payloads())
+
+    first_feature = None
+    if feature_dim is None:
+        rest_features = iter(features)
+        try:
+            first_feature = np.asarray(next(rest_features)).astype(dtype, copy=False)
+        except StopIteration as exc:
+            raise ValueError("features are empty") from exc
+        if first_feature.ndim != 1:
+            raise ValueError(f"teacher feature must be 1D, got {first_feature.shape}")
+        feature_dim = first_feature.shape[0]
+
+        def features_with_first() -> Iterable[np.ndarray]:
+            assert first_feature is not None
+            yield first_feature
+            yield from rest_features
+
+        features = features_with_first()
+
     table = _build_feature_table(records)
     header = {
         "payload_type": "teacher_features",
@@ -74,20 +100,27 @@ def build_teacher_feature_package(
         "checksum": "crc32",
         "created_by": "hcc-sempath",
     }
-    build_pack(output_path, header, pa.table({}), table, payloads, overwrite=overwrite)
+    build_pack_streaming(output_path, header, pa.table({}), table, _FeaturePayloads(), overwrite=overwrite)
 
 
-def build_teacher_feature_package_from_manifest(
-    manifest_path: str | Path,
-    feature_dir: str | Path,
+def build_teacher_feature_package_from_feature_map(
+    records: list[TileRecord],
+    feature_by_tile_id: dict[str, np.ndarray],
     output_path: str | Path,
     teacher_name: str = "",
     dtype: str = "float32",
     overwrite: bool = False,
 ) -> None:
+    def features() -> Iterable[np.ndarray]:
+        for record in records:
+            try:
+                yield feature_by_tile_id[record.tile_id]
+            except KeyError as exc:
+                raise FileNotFoundError(f"missing teacher feature: {record.tile_id}") from exc
+
     build_teacher_feature_package(
-        read_tile_manifest(manifest_path),
-        feature_dir,
+        records,
+        features(),
         output_path,
         teacher_name=teacher_name,
         dtype=dtype,
@@ -97,18 +130,20 @@ def build_teacher_feature_package_from_manifest(
 
 def build_teacher_feature_package_from_tile_package(
     tile_package_path: str | Path,
-    feature_dir: str | Path,
+    features: Iterable[np.ndarray],
     output_path: str | Path,
     teacher_name: str = "",
     dtype: str = "float32",
+    feature_dim: int | None = None,
     overwrite: bool = False,
 ) -> None:
     build_teacher_feature_package(
         read_package_manifest(tile_package_path),
-        feature_dir,
+        features,
         output_path,
         teacher_name=teacher_name,
         dtype=dtype,
+        feature_dim=feature_dim,
         overwrite=overwrite,
     )
 
