@@ -7,9 +7,9 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-def tissue_fraction(rgb: np.ndarray, white_threshold: int = 220) -> float:
+def tissue_fraction(rgb: np.ndarray, white_threshold: int = 220, black_threshold: int = 8) -> float:
     gray = rgb.mean(axis=2)
-    return float((gray < white_threshold).mean())
+    return float(((gray > black_threshold) & (gray < white_threshold)).mean())
 
 
 def iter_image_tiles(image: Image.Image, tile_size: int, min_tissue_fraction: float):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from hcc_sempath.io.tiling import select_read_level
+import numpy as np
+
+from hcc_sempath.io.tiling import select_read_level, tissue_fraction
 
 
 def test_select_read_level_matches_target_native_downsample() -> None:
@@ -12,3 +14,13 @@ def test_select_read_level_matches_target_native_downsample() -> None:
 
 def test_select_read_level_falls_back_to_level_zero_when_target_is_finer() -> None:
     assert select_read_level([1.0, 2.0, 4.0], native_mpp=0.5, target_mpp=0.25) == 0
+
+
+def test_tissue_fraction_excludes_black_and_white_background() -> None:
+    tile = np.zeros((2, 2, 3), dtype=np.uint8)
+    tile[0, 0] = [0, 0, 0]
+    tile[0, 1] = [255, 255, 255]
+    tile[1, 0] = [120, 80, 110]
+    tile[1, 1] = [30, 30, 30]
+
+    assert tissue_fraction(tile, white_threshold=220, black_threshold=8) == 0.5

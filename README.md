@@ -141,7 +141,9 @@ hcc-sempath build-tile-cache \
 IAC directly; PNG tile directories and standalone CSV tile manifests are kept
 out of the training workflow. Directory input scans only the specified
 directory's top-level WSI files because MRXS slides use a file plus companion
-data directory layout.
+data directory layout. Tissue filtering excludes both white background and
+near-black empty regions (`--black-threshold`, default `8`) so MRXS skipped
+regions do not become retained tiles.
 
 Validate a package:
 
