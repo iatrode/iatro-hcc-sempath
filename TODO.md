@@ -6,6 +6,9 @@ git repository.
 
 ## Open-source readiness
 
+- Keep `README.md`, `docs/PROJECT_DIRECTION.md`, `docs/model_plan.md`, and
+  `docs/TECHNICAL_FRAMEWORK.md` aligned around the lightweight vertical HCC
+  representation objective.
 - Add `docs/RELATED_WORK.md` with public citations and model-boundary notes.
 - Add `docs/HCC_SEMANTIC_SPACE.md` describing reusable HCC morphology semantics.
 - Add schema files for tile manifests, teacher manifests, and HCC semantic anchors.

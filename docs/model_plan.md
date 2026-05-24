@@ -6,13 +6,13 @@ This document describes the current model design for HCC-SemPath. It is written 
 
 ## 1. Objective / 目标
 
-HCC-SemPath aims to learn a compact, reusable, HCC-specific pathology embedding model. The model is not designed as a single-task diagnostic classifier. Its primary output is a shared representation space for hepatocellular carcinoma histopathology.
+HCC-SemPath aims to learn a lightweight vertical pathology representation model for hepatocellular carcinoma. The model is not designed as a general-purpose pathology foundation model or a single-task diagnostic classifier. Its primary output is a compact shared embedding space for HCC histopathology.
 
-HCC-SemPath 旨在学习一个轻量、可复用、面向 HCC 专病的病理 embedding 模型。模型不是单任务诊断分类器，其主要输出是面向肝细胞癌组织病理的共享表征空间。
+HCC-SemPath 旨在学习一个面向肝细胞癌的轻量级垂直病理表征模型。模型不是通用病理基础模型，也不是单任务诊断分类器；其主要输出是面向 HCC 组织病理的紧凑共享 embedding space。
 
-The intended representation should support morphology retrieval, semantic organization, weakly supervised learning, downstream adaptation, and efficient large-scale WSI processing.
+The intended representation should support morphology retrieval, semantic organization, weakly supervised learning, downstream adaptation, and efficient large-scale WSI processing with a compact deployable model.
 
-该表征应支持形态检索、语义组织、弱监督学习、下游适配，以及大规模 WSI 的高效处理。
+该表征应通过紧凑、可部署的模型支持形态检索、语义组织、弱监督学习、下游适配，以及大规模 WSI 的高效处理。
 
 ## 2. Representation Strategy / 表征策略
 

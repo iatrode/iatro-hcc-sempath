@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hcc-sempath"
 version = "0.1.0"
-description = "HCC-specific semantic pathology encoder"
+description = "Lightweight vertical pathology representation model for HCC"
 requires-python = ">=3.12"
 dependencies = [
   "torch",
@@ -21,6 +21,10 @@ dependencies = [
   "openslide-python",
   "openslide-bin",
   "pyarrow",
+]
+
+[project.optional-dependencies]
+dev = [
   "pytest",
 ]
 

@@ -6,13 +6,13 @@ This document summarizes the current public-facing technical direction of HCC-Se
 
 ## 1. Project Positioning / 项目定位
 
-HCC-SemPath is being developed as a hepatocellular carcinoma (HCC)-specific pathology representation model. The primary output is a reusable embedding space for HCC histopathology, not a single diagnostic, prognostic, captioning, or visual question answering model.
+HCC-SemPath is being developed as a lightweight vertical pathology representation model for hepatocellular carcinoma (HCC). The primary output is a compact reusable embedding space for HCC histopathology, not a general-purpose pathology foundation model and not a single diagnostic, prognostic, captioning, or visual question answering model.
 
-HCC-SemPath 的目标是构建面向肝细胞癌（HCC）的专病病理表征模型。模型的主要输出是可复用的 HCC 组织病理 embedding space，而不是单一诊断、预后、图像描述或视觉问答模型。
+HCC-SemPath 的目标是构建面向肝细胞癌（HCC）的轻量级垂直病理表征模型。模型的主要输出是紧凑、可复用的 HCC 组织病理 embedding space，而不是通用病理基础模型，也不是单一诊断、预后、图像描述或视觉问答模型。
 
-The project is positioned as a representation-facing foundation model effort: it aims to define and learn an HCC-oriented semantic space that can support retrieval, clustering, weakly supervised learning, downstream adaptation, and computational pathology workflows.
+The project is positioned as a lightweight vertical representation effort: it aims to define and learn an HCC-oriented semantic space that can support retrieval, clustering, weakly supervised learning, downstream adaptation, and computational pathology workflows with a compact student model.
 
-本项目定位为表征基座模型工作：目标是定义并学习一个 HCC 专病语义空间，用于支持检索、聚类、弱监督学习、下游适配和计算病理工作流。
+本项目定位为轻量级垂直表征工作：目标是通过紧凑 student 定义并学习一个 HCC 专病语义空间，用于支持检索、聚类、弱监督学习、下游适配和计算病理工作流。
 
 ## 2. Technical Direction / 技术路线
 
@@ -59,9 +59,9 @@ HCC-SemPath should not be presented as the first multi-teacher distillation meth
 
 HCC-SemPath 不应被表述为首个多教师蒸馏方法、首个病理基础模型压缩方法，或一个常规 HCC 诊断模型。
 
-The intended contribution is a disease-specific representation framework:
+The intended contribution is a lightweight disease-specific representation framework:
 
-预期贡献是一个专病表征框架：
+预期贡献是一个轻量级专病表征框架：
 
 - heterogeneous pathology foundation teachers are used as morphology priors;
 - 异质病理基础模型 teacher 被用作形态学先验；
