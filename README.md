@@ -1,11 +1,12 @@
 # HCC-SemPath
 
-HCC-SemPath is a hepatocellular carcinoma specific pathology representation
-repository. The project target is a reusable HCC semantic embedding space, not a
-single downstream diagnostic, prognosis, or report-generation model.
+HCC-SemPath is a lightweight vertical pathology representation repository for
+hepatocellular carcinoma. The project target is a reusable HCC semantic
+embedding space, not a general-purpose pathology foundation model and not a
+single downstream diagnostic, prognostic, or report-generation model.
 
-HCC-SemPath 是面向肝细胞癌（HCC）专病病理表征的仓库。项目目标是构建可复用的
-HCC 语义 embedding 空间，而不是单一下游诊断、预后或报告生成模型。
+HCC-SemPath 是面向肝细胞癌（HCC）的轻量级垂直病理表征仓库。项目目标是构建可复用的
+HCC 语义 embedding 空间，而不是通用病理基础模型，也不是单一下游诊断、预后或报告生成模型。
 
 ## Current Direction
 
@@ -27,12 +28,18 @@ microenvironment patterns.
 HCC 弱监督用于进一步把 embedding 空间塑造成专病语义空间，覆盖肿瘤结构、胆管样成分、
 肝小叶背景、坏死、纤维化和免疫微环境等 HCC 相关形态语义。
 
+The guiding public research direction is maintained in
+[`docs/PROJECT_DIRECTION.md`](docs/PROJECT_DIRECTION.md).
+
+公开研究方向以 [`docs/PROJECT_DIRECTION.md`](docs/PROJECT_DIRECTION.md) 为准。
+
 ## Repository Scope
 
 This repository contains:
 
 - data contracts and package readers/writers for offline tile and feature caches;
 - student model, loss, training, and evaluation scaffolding;
+- public project direction for a lightweight vertical HCC representation model;
 - public-safe documentation of the HCC-SemPath model plan;
 - smoke-test utilities based on synthetic data.
 
@@ -40,6 +47,7 @@ This repository contains:
 
 - 离线 tile 与 feature cache 的数据合同和读写实现；
 - 学生模型、loss、训练和评估脚手架；
+- 轻量级 HCC 垂直表征模型的公开项目方向；
 - 面向公开发布的 HCC-SemPath 模型规划文档；
 - 基于合成数据的 smoke-test 工具。
 

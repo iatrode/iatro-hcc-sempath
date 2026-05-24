@@ -6,12 +6,14 @@ This document describes the public technical framework for HCC-SemPath.
 
 ## 1. Purpose / 目的
 
-HCC-SemPath aims to build a reusable HCC-specific pathology representation model.
-It is designed to produce compact embeddings for HCC histopathology rather than
-task-specific diagnostic, prognostic, or visual-question-answering outputs.
+HCC-SemPath aims to build a lightweight vertical pathology representation model
+for hepatocellular carcinoma. It is designed to produce compact reusable
+embeddings for HCC histopathology rather than a general-purpose pathology
+foundation model or task-specific diagnostic, prognostic, or
+visual-question-answering outputs.
 
-HCC-SemPath 旨在构建可复用的 HCC 专病病理表征模型。模型输出面向 HCC
-组织病理的轻量 embedding，而不是单一诊断、预后或视觉问答结果。
+HCC-SemPath 旨在构建面向肝细胞癌的轻量级垂直病理表征模型。模型输出面向 HCC
+组织病理的紧凑可复用 embedding，而不是通用病理基础模型，也不是单一诊断、预后或视觉问答结果。
 
 ## 2. Core Hypothesis / 核心假设
 
