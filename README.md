@@ -105,6 +105,15 @@ scientific contribution itself.
 IatroCache（`.iac`）是当前 tile 与 feature package 的工程数据合同。它属于仓库实现层，
 不是论文或模型工作的科学贡献本身。
 
+## Training Data Baseline
+
+The current local image-tile IAC baseline contains 928 effective tile packages
+and 13,964,919 tiles. This count is the reference scale for subsequent
+multi-teacher distillation training.
+
+当前本地 image-tile IAC 基准包含 928 个有效 tile package，共 13,964,919 个 tile。
+该规模作为后续多 teacher 蒸馏训练的基准。
+
 ## Smoke Test
 
 The contract smoke test uses synthetic data and validates package loading,
