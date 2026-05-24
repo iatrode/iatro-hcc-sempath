@@ -7,6 +7,51 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
+
+MPP_X_PROPERTY = "openslide.mpp-x"
+MPP_Y_PROPERTY = "openslide.mpp-y"
+OBJECTIVE_POWER_PROPERTY = "openslide.objective-power"
+APERIO_APP_MAG_PROPERTY = "aperio.AppMag"
+
+
+def _float_property(properties, key: str) -> float | None:
+    value = properties.get(key)
+    if value is None:
+        return None
+    try:
+        return float(str(value).strip())
+    except ValueError:
+        return None
+
+
+def native_mpp_from_properties(properties) -> tuple[float | None, float | None]:
+    mpp_x = _float_property(properties, MPP_X_PROPERTY)
+    mpp_y = _float_property(properties, MPP_Y_PROPERTY)
+    return mpp_x, mpp_y if mpp_y is not None else mpp_x
+
+
+def objective_power_from_properties(properties) -> float | None:
+    objective_power = _float_property(properties, OBJECTIVE_POWER_PROPERTY)
+    if objective_power is not None:
+        return objective_power
+    return _float_property(properties, APERIO_APP_MAG_PROPERTY)
+
+
+def infer_native_mpp_from_properties(properties) -> tuple[float | None, float | None, str | None]:
+    mpp_x, mpp_y = native_mpp_from_properties(properties)
+    if mpp_x is not None:
+        return mpp_x, mpp_y, "metadata"
+
+    objective_power = objective_power_from_properties(properties)
+    if objective_power is None:
+        return None, None, None
+    if objective_power not in {10.0, 20.0, 40.0, 80.0}:
+        return None, None, None
+
+    inferred_mpp = 10.0 / objective_power
+    return inferred_mpp, inferred_mpp, "objective_power"
+
+
 def tissue_fraction(rgb: np.ndarray, white_threshold: int = 220, black_threshold: int = 8) -> float:
     gray = rgb.mean(axis=2)
     return float(((gray > black_threshold) & (gray < white_threshold)).mean())
@@ -96,13 +141,11 @@ def tile_wsi(
     slide_dir.mkdir(parents=True, exist_ok=True)
     slide = openslide.OpenSlide(str(wsi_path))
     if native_mpp is None:
-        mpp_value = slide.properties.get(openslide.PROPERTY_NAME_MPP_X)
-        if mpp_value is None:
-            raise ValueError("WSI is missing MPP metadata; pass --native-mpp explicitly")
-        native_mpp = float(mpp_value)
+        native_mpp, inferred_native_mpp_y, _ = infer_native_mpp_from_properties(slide.properties)
+        if native_mpp is None:
+            raise ValueError("WSI is missing MPP metadata or a supported objective power; pass --native-mpp explicitly")
     if native_mpp_y is None:
-        mpp_y_value = slide.properties.get(openslide.PROPERTY_NAME_MPP_Y)
-        native_mpp_y = float(mpp_y_value) if mpp_y_value is not None else native_mpp
+        native_mpp_y = inferred_native_mpp_y if "inferred_native_mpp_y" in locals() else native_mpp
     downsample_needed = target_mpp / native_mpp
     level = slide.get_best_level_for_downsample(downsample_needed)
     level_downsample = float(slide.level_downsamples[level])
