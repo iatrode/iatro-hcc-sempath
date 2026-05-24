@@ -30,11 +30,36 @@ def anchor_response_correlation(student: torch.Tensor, teacher: torch.Tensor, an
     return float(matrix[0, 1].cpu())
 
 
-def evaluate_embeddings(student: torch.Tensor, teacher: torch.Tensor, anchors: torch.Tensor, topk: int) -> dict[str, float]:
-    return {
+def evaluate_embeddings(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    anchors: torch.Tensor | None,
+    topk: int,
+) -> dict[str, float]:
+    metrics = {
         "feature_cosine": feature_cosine(student, teacher),
         "relation_mse": float(relation_distillation_loss(student, teacher).cpu()),
-        "semantic_kl": float(semantic_distillation_loss(student, teacher, anchors).cpu()),
         "retrieval_overlap": retrieval_overlap(student, teacher, topk=topk),
-        "anchor_response_corr": anchor_response_correlation(student, teacher, anchors),
     }
+    if anchors is not None:
+        metrics["semantic_kl"] = float(semantic_distillation_loss(student, teacher, anchors).cpu())
+        metrics["anchor_response_corr"] = anchor_response_correlation(student, teacher, anchors)
+    return metrics
+
+
+def evaluate_teacher_outputs(
+    student_by_teacher: dict[str, torch.Tensor],
+    teacher_by_name: dict[str, torch.Tensor],
+    anchors_by_teacher: dict[str, torch.Tensor] | None,
+    topk: int,
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for name in sorted(student_by_teacher):
+        teacher_metrics = evaluate_embeddings(
+            student_by_teacher[name],
+            teacher_by_name[name],
+            anchors_by_teacher.get(name) if anchors_by_teacher else None,
+            topk,
+        )
+        metrics.update({f"{name}_{key}": value for key, value in teacher_metrics.items()})
+    return metrics

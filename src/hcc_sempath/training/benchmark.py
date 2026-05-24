@@ -6,8 +6,17 @@ import time
 import torch
 
 from ..io.tile_package import read_package_metadata
-from .config import load_config
-from ..modeling.models import StudentEncoder
+from .config import (
+    embedding_dim,
+    image_tile_package_paths,
+    load_config,
+    manifest_data_paths,
+    teacher_dims,
+    teacher_feature_package_paths,
+    teacher_names,
+)
+from ..modeling.models import HCCSemPathModel
+from .manifest import load_training_manifest
 
 
 def main() -> None:
@@ -18,10 +27,26 @@ def main() -> None:
     args = parser.parse_args()
     cfg = load_config(args.config)
     device = torch.device(cfg["runtime"]["device"])
-    tile_metadata = read_package_metadata(cfg["data"]["image_tile_package_path"])
+    if cfg["data"].get("train_manifest_path"):
+        manifest = load_training_manifest(cfg["data"]["train_manifest_path"])
+        tile_packages, _ = manifest_data_paths(cfg, manifest, "train")
+        names = teacher_names(cfg)
+    else:
+        tile_packages = image_tile_package_paths(cfg)
+        names = None
+    tile_metadata = read_package_metadata(tile_packages[0])
     image_height = int(tile_metadata["tile_height"])
     image_width = int(tile_metadata["tile_width"])
-    model = StudentEncoder(cfg["model"]["backbone_name"], cfg["model"]["teacher_dim"], cfg["model"]["pretrained"]).to(device).eval()
+    if names is None:
+        teacher_packages = teacher_feature_package_paths(cfg)
+        names = list(teacher_packages)
+    dims = teacher_dims(cfg, names)
+    model = HCCSemPathModel(
+        cfg["model"]["backbone_name"],
+        embedding_dim(cfg),
+        dims,
+        cfg["model"]["pretrained"],
+    ).to(device).eval()
     model.load_state_dict(torch.load(args.checkpoint, map_location=device)["model"])
     batch = torch.randn(cfg["train"]["batch_size"], 3, image_height, image_width, device=device)
     with torch.no_grad():

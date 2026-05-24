@@ -11,6 +11,7 @@ COMMANDS: dict[str, tuple[str, str]] = {
     "view-iac": ("hcc_sempath.cli.view_iac", "Open a local browser UI for inspecting an IAC package."),
     "build-teacher-cache": ("hcc_sempath.teacher.cache", "Run a teacher model and write <teacher-name>.features.iac directly."),
     "build-anchors": ("hcc_sempath.modeling.build_anchors", "Build semantic anchors from concept feature arrays."),
+    "build-train-manifest": ("hcc_sempath.training.manifest", "Build a training manifest from per-WSI IAC packages."),
     "train": ("hcc_sempath.training.train", "Train the HCC-SemPath student model."),
     "evaluate": ("hcc_sempath.training.evaluate", "Evaluate a trained checkpoint."),
     "benchmark": ("hcc_sempath.training.benchmark", "Benchmark student encoder throughput."),

@@ -150,20 +150,35 @@ A V100 32GB GPU should be able to train the current student model, but throughpu
 
 V100 32GB 应能训练当前 student 模型，但实际吞吐高度依赖混合精度、batch size、存储带宽、tile 解码速度和验证策略。
 
+Implemented training-system foundations:
+
+已实现的训练系统基础：
+
+- shared HCC embedding with teacher-specific projection heads;
+- 共享 HCC embedding 与 teacher-specific projection heads；
+- multi-teacher distillation losses and teacher-specific metrics;
+- 多 teacher 蒸馏损失与 teacher-specific 指标；
+- CUDA mixed precision training with autocast and gradient scaling;
+- CUDA 混合精度训练，包括 autocast 与 gradient scaling；
+- per-WSI multi-package dataset loading without changing the production image-tile IAC format;
+- 在不改变生产 image-tile IAC 格式的前提下支持 per-WSI multi-package dataset；
+- training manifest construction for development sources plus a public source with held-out external validation;
+- 支持 development source 与 public source held-out external validation 的 training manifest 构建；
+- convention-based teacher feature package resolution from manifest WSI stems.
+- 基于 manifest WSI stem 与命名约定解析 teacher feature package。
+
 Important engineering requirements before full-scale training:
 
 正式全量训练前的重要工程要求：
 
-- implement mixed precision training when using CUDA GPUs;
-- 在 CUDA GPU 上实现混合精度训练；
-- support multi-package datasets and per-slide package organization;
-- 支持 multi-package dataset 和 per-slide package 组织；
 - support multiple teacher feature sources;
 - 支持多个 teacher feature 来源；
-- use WSI-level splits to avoid tile-level leakage;
-- 使用 WSI-level split，避免 tile-level leakage；
-- use fixed or sampled validation subsets for frequent validation.
-- 高频验证时使用固定或抽样 validation subset。
+- add feature-cache-aware sampling for current whole-matrix teacher feature packages;
+- 为当前 whole-matrix teacher feature package 增加 feature-cache-aware sampling；
+- use fixed or sampled validation subsets for frequent validation;
+- 高频验证时使用固定或抽样 validation subset；
+- benchmark teacher-feature storage alternatives on real extracted features before changing the feature package layout.
+- 在修改 feature package layout 前，基于真实提取特征评估不同 teacher-feature 存储方案。
 
 ## 7. Repository Data Policy / 仓库数据策略
 
@@ -219,15 +234,15 @@ Near-term development should focus on:
 
 近期开发重点：
 
-1. multi-teacher training with teacher-specific heads;
-1. 支持 teacher-specific heads 的多教师训练；
-2. multi-package dataset support;
-2. 支持 multi-package dataset；
-3. explicit separation between shared HCC embedding and teacher-alignment heads;
-3. 显式区分共享 HCC embedding 和 teacher-alignment heads；
-4. minimal HCC-specific weak supervision objectives;
-4. 建立最小可执行的 HCC 专病弱监督目标；
-5. representation evaluation protocols beyond teacher imitation;
-5. 建立超越 teacher imitation 的表征评估协议；
+1. document the training manifest schema and cohort-building workflow;
+1. 记录 training manifest schema 与 cohort 构建流程；
+2. add feature-cache-aware training sampling for whole-matrix feature packages;
+2. 为 whole-matrix feature package 增加 feature-cache-aware training sampling；
+3. minimal HCC-specific weak supervision objectives;
+3. 建立最小可执行的 HCC 专病弱监督目标；
+4. representation evaluation protocols beyond teacher imitation;
+4. 建立超越 teacher imitation 的表征评估协议；
+5. benchmark teacher-feature storage alternatives after real feature extraction;
+5. 在真实 feature 提取后评估 teacher-feature 存储方案；
 6. bilingual open-source documentation for public release.
 6. 为未来公开发布准备中英双语文档。

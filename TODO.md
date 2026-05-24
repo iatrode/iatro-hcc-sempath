@@ -16,12 +16,15 @@ git repository.
 
 ## Training system
 
-- Implement CUDA mixed precision training with autocast and gradient scaling.
-- Add multi-teacher training with teacher-specific heads and a shared `z_hcc`
-  embedding.
-- Add multi-package dataset loading for per-slide or sharded tile packages.
-- Add WSI-level split management to prevent tile-level leakage.
+- Add training-manifest documentation and schema examples for per-WSI IAC
+  training cohorts.
 - Add sampled validation subsets for large-scale training.
+- Add WSI-window or feature-cache-aware sampling for current whole-matrix
+  teacher feature packages.
+- Add benchmark scripts for teacher-feature storage tradeoffs before changing
+  the feature package layout.
+- Add minimal HCC-specific weak-supervision objectives on the shared `z_hcc`
+  embedding.
 
 ## Evaluation
 

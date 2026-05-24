@@ -139,12 +139,16 @@ Data organization should support:
 
 数据组织需要支持：
 
+- a generated training manifest that lists per-WSI IAC stems and train/val/exval cohort membership;
+- 生成式 training manifest，用于记录 per-WSI IAC stem 及 train/val/exval 队列归属；
 - WSI-level or patient-level splits;
 - WSI 级或患者级拆分；
 - multiple teacher feature sources per tile;
 - 每个 tile 对应多个 teacher feature 来源；
-- multi-package or per-slide package reading;
-- multi-package 或 per-slide package 读取；
+- convention-based teacher feature package resolution from WSI stems and configured teachers;
+- 基于 WSI stem 与配置的 teacher 通过命名约定解析 teacher feature package；
+- multi-package or per-slide package reading without changing the image-tile IAC format;
+- 在不改变 image-tile IAC 格式的前提下进行 multi-package 或 per-slide package 读取；
 - reproducible tile coordinates and preprocessing metadata;
 - 可复现的 tile 坐标和预处理元数据；
 - separation of public schemas from private institutional data.
@@ -225,6 +229,10 @@ Before full-scale training, the implementation should support:
 - multi-package dataset loading；
 - WSI-level split management;
 - WSI-level split 管理；
+- manifest-based public held-out external validation;
+- 基于 manifest 的 public held-out external validation；
+- feature-cache-aware training sampling for current whole-matrix feature packages;
+- 面向当前 whole-matrix feature package 的 feature-cache-aware training sampling；
 - sampled validation subsets;
 - 抽样 validation subset；
 - teacher metadata recording, including model name, version, preprocessing, feature dimension, and normalization convention.
