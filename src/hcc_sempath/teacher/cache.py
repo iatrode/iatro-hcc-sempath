@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import timm
 import torch
+from safetensors.torch import load_file as load_safetensors_file
 from timm.data import create_transform, resolve_model_data_config
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -16,7 +17,7 @@ from ..io.manifests import TileRecord
 from ..io.tile_package import TilePackageReader, read_package_manifest, read_package_metadata
 
 
-TEACHER_MODEL_PRESETS: dict[str, dict[str, str]] = {
+TEACHER_MODEL_PRESETS: dict[str, dict] = {
     "h_optimus_1": {
         "model_name": "hf_hub:bioptimus/H-optimus-1",
         "teacher_name": "h_optimus_1",
@@ -26,6 +27,36 @@ TEACHER_MODEL_PRESETS: dict[str, dict[str, str]] = {
         "model_name": "hf_hub:prov-gigapath/prov-gigapath",
         "teacher_name": "gigapath",
         "description": "Planned supported Prov-GigaPath teacher.",
+    },
+    "uni2_h": {
+        "model_name": "hf-hub:MahmoodLab/UNI2-h",
+        "teacher_name": "uni2_h",
+        "description": "Supported UNI2-h teacher.",
+        "model_kwargs": {
+            "img_size": 224,
+            "patch_size": 14,
+            "depth": 24,
+            "num_heads": 24,
+            "init_values": 1e-5,
+            "embed_dim": 1536,
+            "mlp_ratio": 2.66667 * 2,
+            "num_classes": 0,
+            "no_embed_class": True,
+            "mlp_layer": timm.layers.SwiGLUPacked,
+            "act_layer": torch.nn.SiLU,
+            "reg_tokens": 8,
+            "dynamic_img_size": True,
+        },
+    },
+    "virchow2": {
+        "model_name": "hf-hub:paige-ai/Virchow2",
+        "teacher_name": "virchow2",
+        "description": "Supported Virchow2 teacher using class-token plus mean patch-token features.",
+        "feature_mode": "virchow2",
+        "model_kwargs": {
+            "mlp_layer": timm.layers.SwiGLUPacked,
+            "act_layer": torch.nn.SiLU,
+        },
     },
 }
 
@@ -51,36 +82,121 @@ def _resolve_model_name(model_name: str) -> str:
     return preset["model_name"] if preset else model_name
 
 
+def _resolve_model_spec(model_name: str) -> dict:
+    preset = TEACHER_MODEL_PRESETS.get(model_name)
+    if preset:
+        return {
+            "model_name": preset["model_name"],
+            "model_kwargs": dict(preset.get("model_kwargs", {})),
+            "feature_mode": preset.get("feature_mode", "default"),
+        }
+    model_path = Path(model_name)
+    local_preset = TEACHER_MODEL_PRESETS.get(model_path.name)
+    if model_path.is_dir() and local_preset:
+        return {
+            "model_name": model_name,
+            "model_kwargs": dict(local_preset.get("model_kwargs", {})),
+            "feature_mode": local_preset.get("feature_mode", "default"),
+        }
+    return {
+        "model_name": model_name,
+        "model_kwargs": {},
+        "feature_mode": "default",
+    }
+
+
+def _pool_virchow2_features(output: torch.Tensor) -> torch.Tensor:
+    if output.ndim != 3 or output.shape[1] < 6:
+        raise ValueError(f"expected Virchow2 token output with shape [batch, tokens, dim], got {tuple(output.shape)}")
+    class_token = output[:, 0]
+    patch_tokens = output[:, 5:]
+    return torch.cat([class_token, patch_tokens.mean(1)], dim=-1)
+
+
+def _decode_model_args(model_args: dict) -> dict:
+    decoded = dict(model_args)
+    named_objects = {
+        "timm.layers.SwiGLUPacked": timm.layers.SwiGLUPacked,
+        "torch.nn.SiLU": torch.nn.SiLU,
+    }
+    for key, value in list(decoded.items()):
+        if isinstance(value, str) and value in named_objects:
+            decoded[key] = named_objects[value]
+    return decoded
+
+
+def _local_config_path(model_path: Path) -> Path:
+    local_config_path = model_path / "hcc_sempath_model.json"
+    if local_config_path.exists():
+        return local_config_path
+    return model_path / "config.json"
+
+
+def _local_weight_path(model_path: Path, config: dict) -> Path:
+    configured = config.get("weight_path")
+    candidates = [configured] if configured else []
+    candidates.extend(["pytorch_model.bin", "model.safetensors"])
+    candidates.extend(path.name for path in sorted(model_path.glob("*.safetensors")))
+    for candidate in candidates:
+        if not candidate:
+            continue
+        weight_path = model_path / candidate
+        if weight_path.exists():
+            return weight_path
+    raise FileNotFoundError(f"missing local teacher weights under {model_path}")
+
+
+def _load_state_dict(weight_path: Path) -> dict:
+    if weight_path.suffix == ".safetensors":
+        return load_safetensors_file(str(weight_path), device="cpu")
+    return torch.load(weight_path, map_location="cpu", weights_only=False)
+
+
 class TimmTeacherEncoder(torch.nn.Module):
-    def __init__(self, model_name: str, pretrained: bool = True) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        pretrained: bool = True,
+        model_kwargs: dict | None = None,
+        feature_mode: str = "default",
+    ) -> None:
         super().__init__()
+        self.feature_mode = feature_mode
+        model_kwargs = dict(model_kwargs or {})
         model_path = Path(model_name)
         if model_path.is_dir():
-            config_path = model_path / "config.json"
+            config_path = _local_config_path(model_path)
             if not config_path.exists():
                 raise FileNotFoundError(f"missing local teacher config: {config_path}")
             config = json.loads(config_path.read_text(encoding="utf-8"))
             architecture = config.get("architecture")
             if not architecture:
                 raise ValueError(f"local teacher config missing architecture: {config_path}")
-            model_args = dict(config.get("model_args", {}))
+            model_args = _decode_model_args(config.get("model_args", {}))
+            model_args.update(model_kwargs)
             model_args.setdefault("num_classes", 0)
             self.model = timm.create_model(architecture, pretrained=False, **model_args)
-            weight_path = model_path / "pytorch_model.bin"
             if pretrained:
-                if not weight_path.exists():
-                    raise FileNotFoundError(f"missing local teacher weights: {weight_path}")
-                state_dict = torch.load(weight_path, map_location="cpu", weights_only=False)
+                weight_path = _local_weight_path(model_path, config)
+                state_dict = _load_state_dict(weight_path)
                 self.model.load_state_dict(state_dict, strict=False)
+            self.feature_mode = config.get("feature_mode", self.feature_mode)
         else:
-            self.model = timm.create_model(model_name, pretrained=pretrained, num_classes=0, global_pool="avg")
+            if not model_kwargs:
+                model_kwargs = {"num_classes": 0, "global_pool": "avg"}
+            self.model = timm.create_model(model_name, pretrained=pretrained, **model_kwargs)
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
 
     @torch.no_grad()
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        return self.model(images)
+        output = self.model(images)
+        if self.feature_mode == "virchow2":
+            return _pool_virchow2_features(output)
+        if isinstance(output, tuple):
+            output = output[0]
+        return output
 
 
 class PackageTeacherTileDataset(Dataset):
@@ -325,9 +441,14 @@ def main() -> None:
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     teacher_name = _teacher_name(args.model, args.output_teacher_name)
-    model_name = _resolve_model_name(args.model)
+    model_spec = _resolve_model_spec(args.model)
     package_paths = _discover_tile_packages(args.tile_package)
-    model = TimmTeacherEncoder(model_name, pretrained=args.pretrained)
+    model = TimmTeacherEncoder(
+        model_spec["model_name"],
+        pretrained=args.pretrained,
+        model_kwargs=model_spec["model_kwargs"],
+        feature_mode=model_spec["feature_mode"],
+    )
     cache_teacher_features_from_packages(
         model=model,
         package_paths=package_paths,
