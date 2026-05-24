@@ -6,12 +6,13 @@ git repository.
 
 ## Open-source readiness
 
-- Keep `README.md`, `docs/PROJECT_DIRECTION.md`, `docs/model_plan.md`, and
-  `docs/TECHNICAL_FRAMEWORK.md` aligned around the lightweight vertical HCC
-  representation objective.
+- Keep `README.md`, `docs/PROJECT_DIRECTION.md`, `docs/model_plan.md`,
+  `docs/TECHNICAL_FRAMEWORK.md`, and `docs/SEMANTIC_PROTOTYPE_PLAN.md` aligned
+  around the lightweight vertical HCC representation objective.
 - Add `docs/RELATED_WORK.md` with public citations and model-boundary notes.
 - Add `docs/HCC_SEMANTIC_SPACE.md` describing reusable HCC morphology semantics.
-- Add schema files for tile manifests, teacher manifests, and HCC semantic anchors.
+- Add schema files for tile manifests, teacher manifests, semantic prototype
+  metadata, and public-safe evaluation summaries.
 - Add model-card and reproducibility templates before public release.
 
 ## Training system
@@ -22,12 +23,17 @@ git repository.
 - Add multi-package dataset loading for per-slide or sharded tile packages.
 - Add WSI-level split management to prevent tile-level leakage.
 - Add sampled validation subsets for large-scale training.
+- Implement semantic prototype initialization from curated concept embeddings.
+- Add bounded prototype updates, prototype diagnostics, and prototype capacity
+  scaling experiments.
 
 ## Evaluation
 
 - Separate teacher-imitation metrics from HCC-specific representation metrics.
-- Add ablations for single-teacher, multi-teacher, weak-supervision-only, and
-  full multi-teacher plus HCC weak-supervision training.
+- Add morphology retrieval, clustering, cross-center stability, and prototype
+  utilization diagnostics.
+- Add ablations for individual teachers, single-teacher students, multi-teacher
+  students without prototypes, fixed prototypes, and bounded momentum prototypes.
 - Add public benchmark summaries that do not contain raw WSI paths, patient-level
   identifiers, or private artifact paths.
 
