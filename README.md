@@ -181,9 +181,16 @@ Teacher output packages use the suffix pattern `<teacher-name>.features.iac`.
 The input image-tile package naming remains unchanged.
 Tile size is read from the input `.iac` header. Directory inputs are allowed;
 all discovered image-tile packages must have the same tile dimensions.
-The planned supported presets are `h_optimus_1` and `gigapath`. Local model directories
-and custom timm / `hf_hub:*` names remain available for controlled experiments,
-but the documented path should use the supported presets.
+The planned supported presets are `h_optimus_1`, `gigapath`, `uni2_h`, and
+`virchow2`. Local model directories and custom timm / `hf_hub:*` names remain
+available for controlled experiments, but the documented path should use the
+supported presets.
+
+`uni2_h` and `virchow2` are gated Hugging Face models. Request access with an
+institutional account, accept the model terms, and run `hf auth login` in the
+feature-cache environment before building caches. Local snapshots can also be
+loaded directly with `--model weights/teachers/uni2_h` or
+`--model weights/teachers/virchow2`; the `weights/` tree is git-ignored.
 
 Build semantic anchors:
 
