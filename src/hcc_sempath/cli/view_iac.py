@@ -103,23 +103,23 @@ class IacViewerData:
         return records
 
     def _load_feature_records(self) -> list[IacRecord]:
+        labels = _slide_labels(self.slide_table)
         records = []
         for row in range(len(self.record_table)):
-            slide_id = str(_table_value(self.record_table, "slide_id", row, "slide"))
-            x = int(_table_value(self.record_table, "tile_x", row, 0))
-            y = int(_table_value(self.record_table, "tile_y", row, 0))
-            patient_id = str(_table_value(self.record_table, "patient_id", row, ""))
+            slide_idx = int(_table_value(self.record_table, "slide_idx", row, 0))
+            grid_x = int(_table_value(self.record_table, "tile_x", row, 0))
+            grid_y = int(_table_value(self.record_table, "tile_y", row, 0))
             records.append(
                 IacRecord(
                     row=row,
-                    slide_key=slide_id,
-                    slide_label=f"{slide_id} ({patient_id})" if patient_id and patient_id != slide_id else slide_id,
+                    slide_key=str(slide_idx),
+                    slide_label=labels.get(slide_idx, f"slide_{slide_idx}"),
                     tile_id=str(_table_value(self.record_table, "tile_id", row, f"tile_{row}")),
-                    grid_x=x,
-                    grid_y=y,
-                    display_x=x,
-                    display_y=y,
-                    split=str(_table_value(self.record_table, "split", row, "")),
+                    grid_x=grid_x,
+                    grid_y=grid_y,
+                    display_x=grid_x * self.stride_x,
+                    display_y=grid_y * self.stride_y,
+                    split="",
                 )
             )
         return records

@@ -9,6 +9,7 @@ from PIL import Image
 from hcc_sempath.io.iatrocache import read_payload, read_tables
 from hcc_sempath.io.manifests import write_tile_manifest
 from hcc_sempath.io.tile_package import build_tile_package, read_package_manifest
+from hcc_sempath.io.validate_package import _validate_common, _validate_image_tiles, _validate_record_payload_spans
 
 
 def _write_manifest_with_tiles(root: Path, coords: tuple[tuple[int, int], ...]) -> tuple[Path, list[dict]]:
@@ -60,6 +61,12 @@ def test_package_defaults_to_tile_size_stride_and_writes_crc() -> None:
 
         restored = read_package_manifest(package_path)
         assert [(r.tile_id, r.x, r.y) for r in restored] == [(r["tile_id"], r["x"], r["y"]) for r in rows]
+
+        _validate_common(header, _, record_table)
+        crc_checked = _validate_record_payload_spans(str(package_path), header, record_table, max_crc=0)
+        decoded = _validate_image_tiles(str(package_path), header, record_table, max_decode=8)
+        assert crc_checked == 4
+        assert decoded == 4
 
 
 def test_package_accepts_explicit_non_tile_stride() -> None:

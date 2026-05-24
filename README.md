@@ -62,7 +62,7 @@ machine paths.
 
 ```text
 src/hcc_sempath/
-  io/        IatroCache, tile packages, feature packages, manifests, QC
+  io/        offline cache readers/writers, manifests, QC
   teacher/   teacher model loading and offline feature-cache construction
   modeling/  student models and semantic anchors
   training/  datasets, losses, metrics, engine, train/evaluate/benchmark CLIs
@@ -98,12 +98,15 @@ WSI or raster image
   -> downstream evaluation
 ```
 
-IatroCache (`.iac`) is the current implementation-level data contract for tile
-and feature packages. It is an engineering format for this repository, not the
-scientific contribution itself.
+IatroCache (`.iac`) is the repository-internal engineering cache contract used
+for offline tile caches and teacher feature caches. It is an implementation
+detail for training data preparation, not the scientific contribution and not a
+general-purpose pathology format. The compact format note lives in
+[`docs/IATROCACHE_FORMAT.md`](docs/IATROCACHE_FORMAT.md).
 
-IatroCache（`.iac`）是当前 tile 与 feature package 的工程数据合同。它属于仓库实现层，
-不是论文或模型工作的科学贡献本身。
+IatroCache（`.iac`）是本仓库内部用于离线 tile cache 与 teacher feature cache 的工程合同，
+属于训练数据准备实现细节，不是论文或模型工作的科学贡献，也不是通用病理格式。
+格式说明见 [`docs/IATROCACHE_FORMAT.md`](docs/IATROCACHE_FORMAT.md)。
 
 ## Training Data Baseline
 
@@ -154,13 +157,14 @@ hcc-sempath build-tile-cache \
   --workers 8
 ```
 
-`build-tile-cache` is the only public WSI ingestion command. It writes tile
-IAC directly; PNG tile directories and standalone CSV tile manifests are kept
-out of the training workflow. Directory input scans only the specified
-directory's top-level WSI files because MRXS slides use a file plus companion
-data directory layout. Tissue filtering excludes both white background and
-near-black empty regions (`--black-threshold`, default `8`) so MRXS skipped
-regions do not become retained tiles.
+`build-tile-cache` is the WSI ingestion command used to prepare image-tile
+caches for training. It writes the internal cache package directly; PNG tile
+directories and standalone CSV tile manifests are kept out of the training
+workflow. Directory input scans only the specified directory's top-level WSI
+files because MRXS slides use a file plus companion data directory layout.
+Tissue filtering excludes both white background and near-black empty regions
+(`--black-threshold`, default `8`) so MRXS skipped regions do not become
+retained tiles.
 
 Validate a package:
 
@@ -169,7 +173,7 @@ hcc-sempath validate-package \
   --package data/packages/tiles.iac
 ```
 
-Inspect an IAC package in a local browser:
+Inspect an internal cache package in a local browser:
 
 ```bash
 hcc-sempath view-iac \
@@ -188,6 +192,8 @@ hcc-sempath build-teacher-cache \
   --tile-package data/packages/tiles.iac \
   --output data/packages/h_optimus_1.features.iac \
   --model h_optimus_1 \
+  --feature-compression zstd \
+  --feature-compression-level 6 \
   --batch-size 256 \
   --num-workers 8 \
   --prefetch-factor 2 \
@@ -196,8 +202,10 @@ hcc-sempath build-teacher-cache \
 
 Teacher output packages use the suffix pattern `<teacher-name>.features.iac`.
 The input image-tile package naming remains unchanged.
-Tile size is read from the input `.iac` header. Directory inputs are allowed;
-all discovered image-tile packages must have the same tile dimensions.
+Tile size is read from the input `.iac` header. Feature payloads are stored as
+a package-level losslessly compressed matrix, with tile order defined by the
+record table. Directory inputs are allowed; all discovered image-tile packages
+must have the same tile dimensions.
 The planned supported presets are `h_optimus_1`, `gigapath`, `uni2_h`, and
 `virchow2`. Local model directories and custom timm / `hf_hub:*` names remain
 available for controlled experiments, but the documented path should use the
@@ -245,5 +253,5 @@ hcc-sempath evaluate \
 - `docs/model_plan.md`: public bilingual model direction.
 - `docs/CURRENT_STATUS.md`: current engineering and training status.
 - `docs/TECHNICAL_FRAMEWORK.md`: public technical framework.
-- `docs/IATROCACHE_FORMAT.md`: implementation-level package format.
+- `docs/IATROCACHE_FORMAT.md`: internal cache contract used by data preparation.
 - `docs/remote_cache_workflow.md`: teacher-cache workflow.

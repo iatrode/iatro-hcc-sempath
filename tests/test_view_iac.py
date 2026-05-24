@@ -74,9 +74,9 @@ def test_iac_viewer_reads_feature_cache_as_heatmap() -> None:
         data = IacViewerData(path)
         try:
             assert data.summary()["payload_type"] == "teacher_features"
-            map_payload = data.map_payload("s1")
+            map_payload = data.map_payload("0")
             assert map_payload["count"] == 9
-            nearest = data.nearest("s1", 16.2, 16.1)["record"]
+            nearest = data.nearest("0", 16.2, 16.1)["record"]
             assert nearest["x"] == 16
             assert nearest["y"] == 16
         finally:

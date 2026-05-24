@@ -262,6 +262,56 @@ def build_pack_streaming(
             data_tmp_path.unlink()
 
 
+def build_pack_data_segment(
+    output_path: str | Path,
+    header_json: dict,
+    slide_table: pa.Table,
+    record_table: pa.Table,
+    data: bytes,
+    *,
+    overwrite: bool = False,
+) -> None:
+    """Assemble an IatroCache pack with one caller-managed data segment."""
+    output_path = Path(output_path)
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"pack already exists: {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    slide_bytes = _arrow_to_bytes(slide_table)
+    record_bytes = _arrow_to_bytes(record_table)
+    data_offset = HEADER_BYTES + len(slide_bytes) + len(record_bytes)
+    full_header = {
+        **header_json,
+        "format": "IatroCache",
+        "version": FORMAT_VERSION,
+        "header_bytes": HEADER_BYTES,
+        "slide_table_offset": HEADER_BYTES,
+        "slide_table_length": len(slide_bytes),
+        "record_table_offset": HEADER_BYTES + len(slide_bytes),
+        "record_table_length": len(record_bytes),
+        "data_offset": data_offset,
+        "data_length": len(data),
+        "num_slides": len(slide_table),
+        "num_records": len(record_table),
+    }
+    fixed = _build_fixed_header(
+        json.dumps(full_header, indent=2, sort_keys=True).encode("utf-8")
+    )
+
+    with NamedTemporaryFile(dir=output_path.parent, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        with tmp_path.open("wb") as f:
+            f.write(fixed)
+            f.write(slide_bytes)
+            f.write(record_bytes)
+            f.write(data)
+        tmp_path.replace(output_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
 # ---- public API: read --------------------------------------------------------
 
 def read_header(package_path: str | Path) -> dict:
