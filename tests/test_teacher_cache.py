@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
 import torch
 
+from hcc_sempath.io.feature_cache import build_teacher_feature_package_from_tile_package
+from hcc_sempath.io.manifests import write_tile_manifest
+from hcc_sempath.io.tile_package import build_tile_package
 from hcc_sempath.teacher.cache import _local_weight_path, _pool_virchow2_features, _resolve_model_spec, _teacher_name
+from hcc_sempath.teacher.cache import _discover_tile_packages, cache_teacher_features_from_packages
 
 
 def test_supported_teacher_presets_resolve_expected_names() -> None:
@@ -44,3 +53,105 @@ def test_local_weight_path_accepts_safetensors(tmp_path) -> None:
     weight_path.write_bytes(b"stub")
 
     assert _local_weight_path(model_dir, {}) == weight_path
+
+
+def _write_tile_package(tmp_path: Path, stem: str = "slide_a") -> Path:
+    from PIL import Image
+
+    tile_dir = tmp_path / f"{stem}_tiles"
+    tile_dir.mkdir()
+    tile_path = tile_dir / f"{stem}_0000000.png"
+    Image.new("RGB", (16, 16), (100, 40, 20)).save(tile_path)
+    manifest_path = tmp_path / f"{stem}.csv"
+    package_path = tmp_path / f"{stem}.tiles.iac"
+    write_tile_manifest(
+        manifest_path,
+        [
+            {
+                "tile_id": f"{stem}_0000000",
+                "patient_id": f"p_{stem}",
+                "slide_id": stem,
+                "tile_path": str(tile_path),
+                "x": 0,
+                "y": 0,
+                "split": "train",
+            }
+        ],
+    )
+    build_tile_package(manifest_path, package_path)
+    return package_path
+
+
+def test_teacher_cache_batch_skips_existing_valid_output_and_writes_progress(tmp_path: Path) -> None:
+    tile_package = _write_tile_package(tmp_path)
+    output_dir = tmp_path / "features"
+    output_dir.mkdir()
+    feature_package = output_dir / "slide_a.toy.features.iac"
+    build_teacher_feature_package_from_tile_package(
+        tile_package,
+        [np.arange(4, dtype=np.float32)],
+        feature_package,
+        teacher_name="toy",
+    )
+
+    cache_teacher_features_from_packages(
+        model=torch.nn.Identity(),
+        package_paths=[tile_package],
+        output=output_dir,
+        batch_size=1,
+        device="cpu",
+        teacher_name="toy",
+        num_workers=0,
+    )
+
+    progress = (output_dir / "teacher_cache_progress.csv").read_text(encoding="utf-8")
+    summary = json.loads((output_dir / "teacher_cache_progress.json").read_text(encoding="utf-8"))
+    assert "skipped" in progress
+    assert summary["ok"] == 1
+    assert summary["failed"] == 0
+
+
+def test_teacher_cache_batch_records_invalid_existing_output_with_continue(tmp_path: Path) -> None:
+    tile_package = _write_tile_package(tmp_path)
+    output_dir = tmp_path / "features"
+    output_dir.mkdir()
+    (output_dir / "slide_a.toy.features.iac").write_text("not a package", encoding="utf-8")
+
+    cache_teacher_features_from_packages(
+        model=torch.nn.Identity(),
+        package_paths=[tile_package],
+        output=output_dir,
+        batch_size=1,
+        device="cpu",
+        teacher_name="toy",
+        num_workers=0,
+        continue_on_error=True,
+    )
+
+    progress = (output_dir / "teacher_cache_progress.csv").read_text(encoding="utf-8")
+    summary = json.loads((output_dir / "teacher_cache_progress.json").read_text(encoding="utf-8"))
+    assert "failed" in progress
+    assert summary["ok"] == 0
+    assert summary["failed"] == 1
+
+
+def test_discover_tile_packages_rejects_invalid_iac_in_input_directory(tmp_path: Path) -> None:
+    _write_tile_package(tmp_path)
+    (tmp_path / "broken.iac").write_text("not an iac package", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid \\.iac package"):
+        _discover_tile_packages(tmp_path)
+
+
+def test_discover_tile_packages_rejects_non_tile_file_input(tmp_path: Path) -> None:
+    tile_package = _write_tile_package(tmp_path)
+    feature_package = tmp_path / "slide_a.toy.features.iac"
+    build_teacher_feature_package_from_tile_package(
+        tile_package,
+        [np.arange(4, dtype=np.float32)],
+        feature_package,
+        teacher_name="toy",
+    )
+
+    with pytest.raises(ValueError, match="not an image tile"):
+        _discover_tile_packages(feature_package)

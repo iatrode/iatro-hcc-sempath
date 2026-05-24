@@ -170,8 +170,21 @@ Validate a package:
 
 ```bash
 hcc-sempath validate-package \
-  --package data/packages/tiles.iac
+  --input data/packages/tiles.iac
 ```
+
+Validate all tile and teacher-feature IAC packages under a directory:
+
+```bash
+hcc-sempath validate-package \
+  --input data/packages \
+  --max-decode 8 \
+  --max-crc 0
+```
+
+Directory validation recursively scans `*.iac` files, shows a package progress
+bar, validates both image-tile packages and teacher-feature packages, and prints
+a final ok/failed summary.
 
 Inspect an internal cache package in a local browser:
 
@@ -189,14 +202,15 @@ Build teacher features:
 
 ```bash
 hcc-sempath build-teacher-cache \
-  --tile-package data/packages/tiles.iac \
-  --output data/packages/h_optimus_1.features.iac \
+  --tile-package data/packages \
+  --output data/features/h_optimus_1 \
   --model h_optimus_1 \
   --feature-compression zstd \
   --feature-compression-level 6 \
   --batch-size 256 \
   --num-workers 8 \
   --prefetch-factor 2 \
+  --continue-on-error \
   --device cuda
 ```
 
@@ -206,6 +220,11 @@ Tile size is read from the input `.iac` header. Feature payloads are stored as
 a package-level losslessly compressed matrix, with tile order defined by the
 record table. Directory inputs are allowed; all discovered image-tile packages
 must have the same tile dimensions.
+For directory inputs, existing valid outputs are skipped unless `--overwrite`
+is passed. Each generated or skipped package is validated and recorded in
+`teacher_cache_progress.csv` plus a JSON summary under the output directory.
+Use `--continue-on-error` for large remote batches so one failed package is
+recorded without stopping the whole teacher-cache run.
 The planned supported presets are `h_optimus_1`, `gigapath`, `uni2_h`, and
 `virchow2`. Local model directories and custom timm / `hf_hub:*` names remain
 available for controlled experiments, but the documented path should use the

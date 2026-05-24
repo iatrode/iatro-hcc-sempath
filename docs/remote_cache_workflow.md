@@ -24,12 +24,13 @@ conda activate hcc-sempath
 python -m pip install --no-deps -e .
 python scripts/download_teacher.py
 hcc-sempath build-teacher-cache \
-  --tile-package data/packages/tiles.iac \
-  --output data/packages/h_optimus_1.features.iac \
+  --tile-package data/packages \
+  --output data/features/h_optimus_1 \
   --model h_optimus_1 \
   --batch-size 256 \
   --num-workers 8 \
   --prefetch-factor 2 \
+  --continue-on-error \
   --device cuda
 ```
 
@@ -41,6 +42,10 @@ when GPU utilization is low.
 `--tile-package` may point to one image-tile `.iac` file or a directory of
 image-tile `.iac` files. Tile size is read from each input package header. A
 directory input fails if discovered packages have inconsistent tile dimensions.
+For directory inputs, existing valid outputs are skipped unless `--overwrite`
+is passed. Each generated or skipped output is validated immediately and written
+to `teacher_cache_progress.csv`; a JSON summary with total, processed, ok, and
+failed counts is written beside it.
 The planned supported presets are `h_optimus_1` and `gigapath`. Local model directories
 and custom timm / `hf_hub:*` names remain available for controlled experiments,
 but the documented path should use the supported presets.
@@ -57,14 +62,16 @@ outputs should use:
 Examples:
 
 ```text
-gigapath.features.iac
-h_optimus_1.features.iac
+slide_a.gigapath.features.iac
+slide_a.h_optimus_1.features.iac
 ```
 
 ## Outputs copied back after teacher inference
 
 ```text
-data/packages/h_optimus_1.features.iac
+data/features/h_optimus_1/*.h_optimus_1.features.iac
+data/features/h_optimus_1/teacher_cache_progress.csv
+data/features/h_optimus_1/teacher_cache_progress.json
 ```
 
 Training uses the `*.features.iac` package as the distillation target. Teacher
