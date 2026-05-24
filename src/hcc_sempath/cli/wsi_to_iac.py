@@ -12,7 +12,7 @@ from tqdm import tqdm
 from hcc_sempath.io.manifests import TileRecord
 from hcc_sempath.io.qc import render_tile_package_qc
 from hcc_sempath.io.tile_package import build_tile_package_from_records, encode_jxl_array
-from hcc_sempath.io.tiling import tissue_fraction
+from hcc_sempath.io.tiling import infer_native_mpp_from_properties, tissue_fraction
 
 
 _thread_state = threading.local()
@@ -194,15 +194,14 @@ def build_wsi_iac(
     patient_id = patient_id or slide_id
 
     openslide, slide = _open_slide(wsi_path)
+    native_mpp_source = "argument"
     if native_mpp is None:
-        mpp_value = slide.properties.get(openslide.PROPERTY_NAME_MPP_X)
-        if mpp_value is None:
+        native_mpp, inferred_native_mpp_y, native_mpp_source = infer_native_mpp_from_properties(slide.properties)
+        if native_mpp is None:
             slide.close()
-            raise ValueError("WSI is missing MPP metadata; pass --native-mpp explicitly")
-        native_mpp = float(mpp_value)
+            raise ValueError("WSI is missing MPP metadata or a supported objective power; pass --native-mpp explicitly")
     if native_mpp_y is None:
-        mpp_y_value = slide.properties.get(openslide.PROPERTY_NAME_MPP_Y)
-        native_mpp_y = float(mpp_y_value) if mpp_y_value is not None else native_mpp
+        native_mpp_y = inferred_native_mpp_y if "inferred_native_mpp_y" in locals() else native_mpp
 
     downsample_needed = target_mpp / native_mpp
     level = slide.get_best_level_for_downsample(downsample_needed)
@@ -340,6 +339,7 @@ def build_wsi_iac(
                 "height": height,
                 "native_mpp_x": native_mpp,
                 "native_mpp_y": native_mpp_y,
+                "native_mpp_source": native_mpp_source,
             },
             "tiling": {
                 "target_mpp": target_mpp,
