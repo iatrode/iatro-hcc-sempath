@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import zlib
 
 import numpy as np
+from tqdm import tqdm
 
 from .iatrocache import read_payload, read_tables
 from .feature_cache import _decompress_feature_matrix
@@ -134,32 +136,95 @@ def _validate_teacher_features(package_path: str, header: dict, record_table, ma
     return len(record_table) if max_payload == 0 else min(max_payload, len(record_table))
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Validate an IatroCache package.")
-    parser.add_argument("--package", required=True)
-    parser.add_argument("--max-decode", type=int, default=8)
-    parser.add_argument("--max-crc", type=int, default=0, help="Maximum records to CRC-check; 0 checks all records.")
-    args = parser.parse_args()
-    metadata = read_package_metadata(args.package)
-    header, slide_table, record_table = read_tables(args.package)
+def _discover_packages(path: str | Path) -> list[Path]:
+    root = Path(path)
+    if root.is_file():
+        return [root]
+    if root.is_dir():
+        packages = sorted(candidate for candidate in root.rglob("*.iac") if candidate.is_file())
+        if not packages:
+            raise FileNotFoundError(f"no .iac packages found under {root}")
+        return packages
+    raise FileNotFoundError(f"package path does not exist: {root}")
+
+
+def validate_package(package_path: str | Path, max_decode: int = 8, max_crc: int = 0) -> dict:
+    metadata = read_package_metadata(package_path)
+    header, slide_table, record_table = read_tables(package_path)
     _validate_common(header, slide_table, record_table)
     payload_type = metadata.get("payload_type")
     if payload_type == "image_tiles":
-        crc_limit = _validate_record_payload_spans(args.package, header, record_table, args.max_crc)
-        decoded = _validate_image_tiles(args.package, header, record_table, args.max_decode)
-        print(
-            f"package_valid type=image_tiles records={metadata['num_records']} "
-            f"codec={metadata['codec']} decoded={decoded} crc_checked={crc_limit}"
+        crc_limit = _validate_record_payload_spans(str(package_path), header, record_table, max_crc)
+        decoded = _validate_image_tiles(str(package_path), header, record_table, max_decode)
+        return {
+            "type": "image_tiles",
+            "records": int(metadata["num_records"]),
+            "codec": metadata["codec"],
+            "decoded": decoded,
+            "crc_checked": crc_limit,
+        }
+    if payload_type == "teacher_features":
+        checked = _validate_teacher_features(str(package_path), header, record_table, max_decode)
+        return {
+            "type": "teacher_features",
+            "records": int(metadata["num_records"]),
+            "teacher": metadata["teacher"],
+            "dim": metadata["feature_dim"],
+            "dtype": metadata["dtype"],
+            "compression": metadata["compression"],
+            "rows_checked": checked,
+        }
+    raise ValueError(f"unsupported payload_type: {payload_type}")
+
+
+def _format_valid_message(result: dict) -> str:
+    if result["type"] == "image_tiles":
+        return (
+            f"package_valid type=image_tiles records={result['records']} "
+            f"codec={result['codec']} decoded={result['decoded']} crc_checked={result['crc_checked']}"
         )
-    elif payload_type == "teacher_features":
-        checked = _validate_teacher_features(args.package, header, record_table, args.max_decode)
-        print(
-            f"package_valid type=teacher_features records={metadata['num_records']} "
-            f"teacher={metadata['teacher']} dim={metadata['feature_dim']} "
-            f"dtype={metadata['dtype']} compression={metadata['compression']} rows_checked={checked}"
-        )
-    else:
-        raise ValueError(f"unsupported payload_type: {payload_type}")
+    return (
+        f"package_valid type=teacher_features records={result['records']} "
+        f"teacher={result['teacher']} dim={result['dim']} "
+        f"dtype={result['dtype']} compression={result['compression']} rows_checked={result['rows_checked']}"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Validate one IatroCache package or a directory of .iac packages.")
+    parser.add_argument("--input", required=True, help="Input .iac package file or directory scanned recursively for .iac packages.")
+    parser.add_argument(
+        "--max-decode",
+        type=int,
+        default=8,
+        help="Maximum image-tile payloads to JXL-decode per image_tiles package; 0 decodes all tiles.",
+    )
+    parser.add_argument("--max-crc", type=int, default=0, help="Maximum image-tile records to CRC-check; 0 checks all records.")
+    parser.add_argument("--fail-fast", action="store_true", help="Stop directory validation on the first failed package.")
+    args = parser.parse_args()
+    packages = _discover_packages(args.input)
+    if len(packages) == 1:
+        result = validate_package(packages[0], max_decode=args.max_decode, max_crc=args.max_crc)
+        print(_format_valid_message(result))
+        return
+
+    ok = 0
+    failures: list[tuple[Path, str]] = []
+    for package_path in tqdm(packages, desc="validating packages", unit="pkg"):
+        try:
+            result = validate_package(package_path, max_decode=args.max_decode, max_crc=args.max_crc)
+            ok += 1
+            tqdm.write(f"package_valid path={package_path} " + _format_valid_message(result))
+        except Exception as exc:
+            failures.append((package_path, str(exc)))
+            tqdm.write(f"package_invalid path={package_path} error={exc}")
+            if args.fail_fast:
+                break
+
+    print(f"validation_summary total={len(packages)} ok={ok} failed={len(failures)}")
+    if failures:
+        sample = "; ".join(f"{path}: {error}" for path, error in failures[:5])
+        raise SystemExit(f"validation_failed count={len(failures)} sample={sample}")
 
 
 if __name__ == "__main__":

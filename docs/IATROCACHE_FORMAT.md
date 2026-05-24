@@ -218,8 +218,8 @@ matrix byte length / shape. They do not attempt image decoding for
 Validate either package type:
 
 ```bash
-hcc-sempath validate-package --package data/packages/tiles.iac
-hcc-sempath validate-package --package data/packages/h_optimus_1.features.iac
+hcc-sempath validate-package --input data/packages/tiles.iac
+hcc-sempath validate-package --input data/packages/h_optimus_1.features.iac
 ```
 
 Typical success output:

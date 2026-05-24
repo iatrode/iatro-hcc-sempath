@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
+import time
 from pathlib import Path
 
 import numpy as np
@@ -13,8 +15,10 @@ from timm.data import create_transform, resolve_model_data_config
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from ..io.feature_cache import build_teacher_feature_package, build_teacher_feature_package_from_tile_package
+from ..io.iatrocache import read_tables
 from ..io.manifests import TileRecord
 from ..io.tile_package import TilePackageReader, read_package_manifest, read_package_metadata
+from ..io.validate_package import _validate_common, _validate_teacher_features
 
 
 TEACHER_MODEL_PRESETS: dict[str, dict] = {
@@ -260,16 +264,24 @@ def _teacher_name(model: str, output_teacher_name: str) -> str:
 def _discover_tile_packages(path: str | Path) -> list[Path]:
     root = Path(path)
     if root.is_file():
+        metadata = read_package_metadata(root)
+        if metadata.get("payload_type") != "image_tiles":
+            raise ValueError(f"not an image tile .iac package: {root}")
         return [root]
     if root.is_dir():
         packages = []
+        invalid = []
         for candidate in sorted(root.rglob("*.iac")):
             try:
                 metadata = read_package_metadata(candidate)
-            except Exception:
+            except Exception as exc:
+                invalid.append(f"{candidate}: {exc}")
                 continue
             if metadata.get("payload_type") == "image_tiles":
                 packages.append(candidate)
+        if invalid:
+            sample = "; ".join(invalid[:5])
+            raise ValueError(f"invalid .iac package(s) under {root}: count={len(invalid)} sample={sample}")
         if packages:
             return packages
         raise FileNotFoundError(f"no image tile .iac packages found under {root}")
@@ -301,6 +313,58 @@ def _default_output_path(package_path: Path, output_dir: Path, teacher_name: str
     if stem.endswith(".tiles"):
         stem = stem[:-len(".tiles")]
     return output_dir / f"{stem}.{teacher_name}.features.iac"
+
+
+def _validate_feature_output(package_path: str | Path, expected_teacher: str = "") -> dict:
+    path = Path(package_path)
+    header, slide_table, record_table = read_tables(path)
+    _validate_common(header, slide_table, record_table)
+    _validate_teacher_features(str(path), header, record_table, max_payload=0)
+    if expected_teacher and header.get("teacher") != expected_teacher:
+        raise ValueError(f"teacher mismatch: got={header.get('teacher')} expected={expected_teacher}")
+    return {
+        "records": int(header["num_records"]),
+        "teacher": str(header["teacher"]),
+        "feature_dim": int(header["feature_dim"]),
+        "package_bytes": path.stat().st_size,
+    }
+
+
+def _progress_path(output_path: Path, progress_manifest: str | Path | None) -> Path:
+    if progress_manifest is not None:
+        return Path(progress_manifest)
+    if output_path.suffix == ".iac":
+        return output_path.with_suffix(".teacher_cache_progress.csv")
+    return output_path / "teacher_cache_progress.csv"
+
+
+def _write_progress(progress_path: Path, rows: list[dict], total: int, started: float) -> None:
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "tile_package",
+        "output",
+        "status",
+        "teacher",
+        "records",
+        "feature_dim",
+        "package_bytes",
+        "elapsed_sec",
+        "error",
+    ]
+    with progress_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
+    summary = {
+        "total": total,
+        "processed": len(rows),
+        "ok": sum(1 for row in rows if row.get("status") in {"ok", "skipped"}),
+        "failed": sum(1 for row in rows if row.get("status") == "failed"),
+        "elapsed_sec": round(time.time() - started, 3),
+        "progress_manifest": str(progress_path),
+    }
+    progress_path.with_suffix(".json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
 
 
 @torch.no_grad()
@@ -416,6 +480,8 @@ def cache_teacher_features_from_packages(
     compression: str = "zstd",
     compression_level: int | None = 6,
     overwrite: bool = False,
+    progress_manifest: str | Path | None = None,
+    continue_on_error: bool = False,
 ) -> None:
     tile_size = _validate_common_tile_size(package_paths)
     output_path = Path(output)
@@ -425,23 +491,58 @@ def cache_teacher_features_from_packages(
     if not output_is_file:
         output_path.mkdir(parents=True, exist_ok=True)
 
+    started = time.time()
+    rows: list[dict] = []
+    progress_path = _progress_path(output_path, progress_manifest)
     for package_path in package_paths:
         package_output = output_path if output_is_file else _default_output_path(package_path, output_path, teacher_name)
-        cache_teacher_features_from_package(
-            model=model,
-            package_path=package_path,
-            output_path=package_output,
-            tile_size=tile_size,
-            batch_size=batch_size,
-            device=device,
-            teacher_name=teacher_name,
-            num_workers=num_workers,
-            prefetch_factor=prefetch_factor,
-            compression=compression,
-            compression_level=compression_level,
-            overwrite=overwrite,
-        )
-        print(f"feature_package_ok tile_package={package_path} output={package_output}")
+        row = {
+            "tile_package": str(package_path),
+            "output": str(package_output),
+            "teacher": teacher_name,
+        }
+        item_started = time.time()
+        try:
+            if package_output.exists() and not overwrite:
+                metadata = _validate_feature_output(package_output, expected_teacher=teacher_name)
+                row.update(metadata)
+                row["status"] = "skipped"
+                row["elapsed_sec"] = round(time.time() - item_started, 3)
+                rows.append(row)
+                _write_progress(progress_path, rows, len(package_paths), started)
+                print(f"feature_package_skipped existing_valid tile_package={package_path} output={package_output}")
+                continue
+            cache_teacher_features_from_package(
+                model=model,
+                package_path=package_path,
+                output_path=package_output,
+                tile_size=tile_size,
+                batch_size=batch_size,
+                device=device,
+                teacher_name=teacher_name,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor,
+                compression=compression,
+                compression_level=compression_level,
+                overwrite=overwrite,
+            )
+            metadata = _validate_feature_output(package_output, expected_teacher=teacher_name)
+            row.update(metadata)
+            row["status"] = "ok"
+            row["elapsed_sec"] = round(time.time() - item_started, 3)
+            rows.append(row)
+            _write_progress(progress_path, rows, len(package_paths), started)
+            print(f"feature_package_ok tile_package={package_path} output={package_output}")
+        except Exception as exc:
+            row["status"] = "failed"
+            row["elapsed_sec"] = round(time.time() - item_started, 3)
+            row["error"] = str(exc)
+            rows.append(row)
+            _write_progress(progress_path, rows, len(package_paths), started)
+            if not continue_on_error:
+                raise
+            print(f"feature_package_failed tile_package={package_path} output={package_output} error={exc}")
+    print(f"teacher_cache_progress manifest={progress_path} summary={progress_path.with_suffix('.json')}")
 
 
 def main() -> None:
@@ -472,6 +573,16 @@ def main() -> None:
     parser.add_argument("--feature-compression-level", type=int, default=6)
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--progress-manifest",
+        default=None,
+        help="CSV progress manifest path. Defaults to teacher_cache_progress.csv under the output directory.",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue directory batch processing after a package fails and record the failure in the progress manifest.",
+    )
     args = parser.parse_args()
     teacher_name = _teacher_name(args.model, args.output_teacher_name)
     model_spec = _resolve_model_spec(args.model)
@@ -494,6 +605,8 @@ def main() -> None:
         compression=args.feature_compression,
         compression_level=args.feature_compression_level,
         overwrite=args.overwrite,
+        progress_manifest=args.progress_manifest,
+        continue_on_error=args.continue_on_error,
     )
 
 
