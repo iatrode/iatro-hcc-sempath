@@ -12,7 +12,7 @@ from safetensors.torch import load_file as load_safetensors_file
 from timm.data import create_transform, resolve_model_data_config
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from ..io.feature_cache import build_teacher_feature_package
+from ..io.feature_cache import build_teacher_feature_package, build_teacher_feature_package_from_tile_package
 from ..io.manifests import TileRecord
 from ..io.tile_package import TilePackageReader, read_package_manifest, read_package_metadata
 
@@ -315,6 +315,8 @@ def cache_teacher_features_from_records(
     teacher_name: str,
     num_workers: int = 8,
     prefetch_factor: int = 2,
+    compression: str = "zstd",
+    compression_level: int | None = 6,
     overwrite: bool = False,
 ) -> None:
     model = model.to(device).eval()
@@ -342,6 +344,8 @@ def cache_teacher_features_from_records(
         output_path,
         teacher_name=teacher_name,
         dtype="float32",
+        compression=compression,
+        compression_level=compression_level,
         overwrite=overwrite,
     )
 
@@ -357,6 +361,8 @@ def cache_teacher_features_from_package(
     teacher_name: str,
     num_workers: int = 8,
     prefetch_factor: int = 2,
+    compression: str = "zstd",
+    compression_level: int | None = 6,
     overwrite: bool = False,
 ) -> None:
     if tile_size is None:
@@ -367,17 +373,33 @@ def cache_teacher_features_from_package(
     transform = create_transform(**data_config, is_training=False)
     records = read_package_manifest(package_path)
     dataset = PackageTeacherTileDataset(package_path, records, transform)
-    cache_teacher_features_from_records(
-        model=model,
-        records=records,
-        dataset=dataset,
-        output_path=output_path,
-        tile_size=tile_size,
+    model = model.to(device).eval()
+    loader = DataLoader(
+        dataset,
         batch_size=batch_size,
-        device=device,
+        shuffle=False,
+        **_loader_kwargs(
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            pin_memory=device.startswith("cuda"),
+        ),
+    )
+
+    def features():
+        for batch in tqdm(loader, total=len(loader), desc="teacher batches"):
+            images = batch["image"].to(device, non_blocking=device.startswith("cuda"))
+            batch_features = model(images).detach().cpu().numpy().astype(np.float32)
+            for feature in batch_features:
+                yield feature
+
+    build_teacher_feature_package_from_tile_package(
+        package_path,
+        features(),
+        output_path,
         teacher_name=teacher_name,
-        num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
+        dtype="float32",
+        compression=compression,
+        compression_level=compression_level,
         overwrite=overwrite,
     )
 
@@ -391,6 +413,8 @@ def cache_teacher_features_from_packages(
     teacher_name: str,
     num_workers: int = 8,
     prefetch_factor: int = 2,
+    compression: str = "zstd",
+    compression_level: int | None = 6,
     overwrite: bool = False,
 ) -> None:
     tile_size = _validate_common_tile_size(package_paths)
@@ -413,6 +437,8 @@ def cache_teacher_features_from_packages(
             teacher_name=teacher_name,
             num_workers=num_workers,
             prefetch_factor=prefetch_factor,
+            compression=compression,
+            compression_level=compression_level,
             overwrite=overwrite,
         )
         print(f"feature_package_ok tile_package={package_path} output={package_output}")
@@ -437,6 +463,13 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers for --tile-package reads.")
     parser.add_argument("--prefetch-factor", type=int, default=2, help="Batches prefetched per worker for --tile-package reads.")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--feature-compression",
+        choices=("zstd", "zlib", "lzma", "none"),
+        default="zstd",
+        help="Lossless compression for the package-level feature matrix.",
+    )
+    parser.add_argument("--feature-compression-level", type=int, default=6)
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -458,6 +491,8 @@ def main() -> None:
         teacher_name=teacher_name,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
+        compression=args.feature_compression,
+        compression_level=args.feature_compression_level,
         overwrite=args.overwrite,
     )
 
