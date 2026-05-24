@@ -1,18 +1,45 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
 
-from ..io.tile_package import read_package_manifest, read_package_metadata
+from ..io.tile_package import read_package_metadata
 from ..modeling.anchors import load_anchors
-from ..modeling.models import StudentEncoder
-from .config import load_config
-from .datasets import DistillationTileDataset, collate_distillation, validate_teacher_cache
+from ..modeling.models import HCCSemPathModel
+from .config import (
+    embedding_dim,
+    image_tile_package_paths,
+    load_config,
+    manifest_data_paths,
+    teacher_dims,
+    teacher_feature_package_paths,
+    teacher_names,
+)
+from .datasets import (
+    DistillationTileDataset,
+    apply_split_overrides,
+    collate_distillation,
+    read_packaged_tile_records,
+    validate_teacher_cache,
+)
 from .engine import fit
+from .manifest import load_training_manifest
 from .utils import seed_everything
+
+
+def _load_anchor_map(cfg: dict, dims: dict[str, int], device: torch.device) -> dict[str, torch.Tensor] | None:
+    semantic_weight = float(cfg["loss"].get("semantic_weight", 0.0))
+    if semantic_weight == 0:
+        return None
+    anchor_paths = cfg["data"].get("anchors_paths")
+    if isinstance(anchor_paths, dict):
+        return {name: load_anchors(anchor_paths[name], expected_dim=dim).to(device) for name, dim in dims.items()}
+    anchor_path = cfg["data"].get("anchors_path")
+    if anchor_path is None:
+        raise ValueError("data.anchors_path or data.anchors_paths is required when semantic_weight > 0")
+    return {name: load_anchors(anchor_path, expected_dim=dim).to(device) for name, dim in dims.items()}
 
 
 def main() -> None:
@@ -23,31 +50,71 @@ def main() -> None:
     cfg = load_config(args.config)
     seed_everything(int(cfg["runtime"]["seed"]))
     device = torch.device(cfg["runtime"]["device"])
-    image_tile_package_path = cfg["data"]["image_tile_package_path"]
-    teacher_feature_package_path = cfg["data"]["teacher_feature_package_path"]
-    tile_metadata = read_package_metadata(image_tile_package_path)
+    manifest_path = cfg["data"].get("train_manifest_path")
+    if manifest_path:
+        manifest = load_training_manifest(manifest_path)
+        train_tile_packages, train_teacher_packages = manifest_data_paths(cfg, manifest, "train")
+        val_tile_packages, val_teacher_packages = manifest_data_paths(cfg, manifest, "val")
+        names = teacher_names(cfg)
+    else:
+        tile_packages = image_tile_package_paths(cfg)
+        teacher_packages = teacher_feature_package_paths(cfg)
+        train_tile_packages = tile_packages
+        val_tile_packages = tile_packages
+        train_teacher_packages = teacher_packages
+        val_teacher_packages = teacher_packages
+        names = list(teacher_packages)
+    dims = teacher_dims(cfg, names)
+    all_tile_packages = sorted(set(train_tile_packages + val_tile_packages))
+    tile_metadata = read_package_metadata(all_tile_packages[0])
     image_size = (int(tile_metadata["tile_height"]), int(tile_metadata["tile_width"]))
-    records = read_package_manifest(image_tile_package_path)
-    train_records = [record for record in records if record.split == "train"]
-    val_records = [record for record in records if record.split == "val"]
+    for package_path in all_tile_packages[1:]:
+        metadata = read_package_metadata(package_path)
+        candidate_size = (int(metadata["tile_height"]), int(metadata["tile_width"]))
+        if candidate_size != image_size:
+            raise ValueError(f"tile package size mismatch: {package_path} has {candidate_size}, expected {image_size}")
+    if manifest_path:
+        train_records = read_packaged_tile_records(train_tile_packages)
+        val_records = read_packaged_tile_records(val_tile_packages)
+    else:
+        records = read_packaged_tile_records(train_tile_packages)
+        records = apply_split_overrides(
+            records,
+            cfg["data"].get("split_manifest_path"),
+            cfg["data"].get("split_key", "slide_id"),
+        )
+        train_records = [item for item in records if item.record.split == "train"]
+        val_records = [item for item in records if item.record.split == "val"]
     if not train_records or not val_records:
         raise ValueError("manifest must contain non-empty train and val splits")
     validate_teacher_cache(
-        records,
+        train_records,
         None,
-        cfg["model"]["teacher_dim"],
-        teacher_cache_package_path=teacher_feature_package_path,
+        dims,
+        teacher_cache_package_paths=train_teacher_packages,
     )
-    dataset_kwargs = {
+    validate_teacher_cache(
+        val_records,
+        None,
+        dims,
+        teacher_cache_package_paths=val_teacher_packages,
+    )
+    common_dataset_kwargs = {
         "teacher_cache_dir": None,
         "image_size": image_size,
         "mean": cfg["data"].get("mean"),
         "std": cfg["data"].get("std"),
-        "tile_package_path": image_tile_package_path,
-        "teacher_cache_package_path": teacher_feature_package_path,
     }
-    train_ds = DistillationTileDataset(train_records, **dataset_kwargs)
-    val_ds = DistillationTileDataset(val_records, **dataset_kwargs)
+    train_ds = DistillationTileDataset(
+        train_records,
+        **common_dataset_kwargs,
+        teacher_cache_package_paths=train_teacher_packages,
+    )
+    val_ds = DistillationTileDataset(
+        val_records,
+        **common_dataset_kwargs,
+        teacher_cache_package_paths=val_teacher_packages,
+    )
     num_workers = int(cfg["data"]["num_workers"])
     loader_kwargs = {
         "batch_size": cfg["train"]["batch_size"],
@@ -60,8 +127,13 @@ def main() -> None:
         loader_kwargs["persistent_workers"] = bool(cfg["data"].get("persistent_workers", True))
     train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
-    anchors = load_anchors(cfg["data"]["anchors_path"], expected_dim=cfg["model"]["teacher_dim"]).to(device)
-    model = StudentEncoder(cfg["model"]["backbone_name"], cfg["model"]["teacher_dim"], cfg["model"]["pretrained"]).to(device)
+    anchors = _load_anchor_map(cfg, dims, device)
+    model = HCCSemPathModel(
+        backbone_name=cfg["model"]["backbone_name"],
+        embedding_dim=embedding_dim(cfg),
+        teacher_dims=dims,
+        pretrained=cfg["model"]["pretrained"],
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
     if args.resume:
         payload = torch.load(args.resume, map_location=device)

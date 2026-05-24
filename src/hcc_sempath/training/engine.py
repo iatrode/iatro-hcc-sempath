@@ -1,36 +1,50 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import torch
-from torch.utils.data import DataLoader
 
-from .losses import total_distillation_loss
-from .metrics import evaluate_embeddings
+from .losses import multi_teacher_distillation_loss
+from .metrics import evaluate_teacher_outputs
 from .utils import append_csv, ensure_dir, write_json
 
 
-def run_epoch(model, loader, anchors, optimizer, device, cfg, train: bool) -> dict[str, float]:
+def _move_teachers(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
+    return {name: value.to(device) for name, value in batch["teacher_features"].items()}
+
+
+def _amp_enabled(device: torch.device, cfg: dict, train: bool) -> bool:
+    return bool(train and cfg["train"].get("amp", False) and device.type == "cuda")
+
+
+def run_epoch(model, loader, anchors, optimizer, device, cfg, train: bool, scaler=None) -> dict[str, float]:
     model.train(train)
     totals = {"loss": 0.0, "feature": 0.0, "relation": 0.0, "semantic": 0.0}
     n_batches = 0
+    teacher_weights = cfg["loss"].get("teacher_weights")
     for batch in loader:
         images = batch["images"].to(device)
-        teacher = batch["teacher_features"].to(device)
+        teachers = _move_teachers(batch, device)
         with torch.set_grad_enabled(train):
-            student = model(images)
-            loss, parts = total_distillation_loss(
-                student=student,
-                teacher=teacher,
-                anchors=anchors,
-                relation_weight=float(cfg["loss"]["relation_weight"]),
-                semantic_weight=float(cfg["loss"]["semantic_weight"]),
-                semantic_temperature=float(cfg["loss"]["semantic_temperature"]),
-            )
+            with torch.autocast(device_type=device.type, enabled=_amp_enabled(device, cfg, train)):
+                outputs = model(images)
+                student_by_teacher = outputs["teacher_outputs"]
+                loss, parts = multi_teacher_distillation_loss(
+                    student_by_teacher=student_by_teacher,
+                    teacher_by_name=teachers,
+                    anchors_by_teacher=anchors,
+                    relation_weight=float(cfg["loss"]["relation_weight"]),
+                    semantic_weight=float(cfg["loss"]["semantic_weight"]),
+                    semantic_temperature=float(cfg["loss"]["semantic_temperature"]),
+                    teacher_weights=teacher_weights,
+                )
             if train:
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                if scaler is not None and scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
         totals["loss"] += float(loss.detach().cpu())
         for key in ("feature", "relation", "semantic"):
             totals[key] += float(parts[key].cpu())
@@ -39,15 +53,28 @@ def run_epoch(model, loader, anchors, optimizer, device, cfg, train: bool) -> di
 
 
 @torch.no_grad()
-def collect_embeddings(model, loader, device) -> tuple[torch.Tensor, torch.Tensor]:
+def collect_embeddings(
+    model,
+    loader,
+    device,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     model.eval()
-    students = []
-    teachers = []
+    embeddings = []
+    students_by_teacher: dict[str, list[torch.Tensor]] = {}
+    teachers_by_name: dict[str, list[torch.Tensor]] = {}
     for batch in loader:
         images = batch["images"].to(device)
-        students.append(model(images).cpu())
-        teachers.append(batch["teacher_features"].cpu())
-    return torch.cat(students), torch.cat(teachers)
+        outputs = model(images)
+        embeddings.append(outputs["embedding"].cpu())
+        for name, tensor in outputs["teacher_outputs"].items():
+            students_by_teacher.setdefault(name, []).append(tensor.cpu())
+        for name, tensor in batch["teacher_features"].items():
+            teachers_by_name.setdefault(name, []).append(tensor.cpu())
+    return (
+        torch.cat(embeddings),
+        {name: torch.cat(values) for name, values in students_by_teacher.items()},
+        {name: torch.cat(values) for name, values in teachers_by_name.items()},
+    )
 
 
 def fit(model, train_loader, val_loader, anchors, optimizer, device, cfg) -> dict:
@@ -56,22 +83,29 @@ def fit(model, train_loader, val_loader, anchors, optimizer, device, cfg) -> dic
     write_json(output_dir / "resolved_config.json", cfg)
     best_loss = float("inf")
     best_metrics = {}
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(cfg["train"].get("amp", False) and device.type == "cuda"))
     for epoch in range(1, int(cfg["train"]["epochs"]) + 1):
-        train_metrics = run_epoch(model, train_loader, anchors, optimizer, device, cfg, train=True)
+        train_metrics = run_epoch(model, train_loader, anchors, optimizer, device, cfg, train=True, scaler=scaler)
         val_metrics = run_epoch(model, val_loader, anchors, optimizer, device, cfg, train=False)
-        student, teacher = collect_embeddings(model, val_loader, device)
-        embedding_metrics = evaluate_embeddings(student, teacher, anchors.cpu(), int(cfg["train"]["topk"]))
+        _, student_by_teacher, teacher_by_name = collect_embeddings(model, val_loader, device)
+        cpu_anchors = {name: tensor.cpu() for name, tensor in anchors.items()} if anchors else None
+        embedding_metrics = evaluate_teacher_outputs(
+            student_by_teacher,
+            teacher_by_name,
+            cpu_anchors,
+            int(cfg["train"]["topk"]),
+        )
         row = {"epoch": epoch, **{f"train_{k}": v for k, v in train_metrics.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}, **embedding_metrics}
         append_csv(output_dir / "metrics.csv", row)
         torch.save(
-            {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "config": cfg},
+            {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(), "epoch": epoch, "config": cfg},
             checkpoints / "last.pt",
         )
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
             best_metrics = row
             torch.save(
-                {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "config": cfg},
+                {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(), "epoch": epoch, "config": cfg},
                 checkpoints / "best.pt",
             )
     write_json(output_dir / "summary.json", best_metrics)
