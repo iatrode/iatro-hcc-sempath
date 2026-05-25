@@ -8,7 +8,6 @@ import numpy as np
 from tqdm import tqdm
 
 from .iatrocache import read_payload, read_tables
-from .feature_cache import _decompress_feature_matrix
 from .tile_package import decode_jxl, read_package_metadata
 
 
@@ -99,8 +98,6 @@ def _validate_teacher_features(package_path: str, header: dict, record_table, ma
     teacher = header.get("teacher")
     if not isinstance(teacher, str) or not teacher:
         raise ValueError("teacher_features header requires non-empty teacher")
-    if header.get("feature_layout") != "matrix":
-        raise ValueError(f"unsupported teacher feature layout: {header.get('feature_layout')}")
     feature_dim = int(header.get("feature_dim", 0))
     if feature_dim <= 0:
         raise ValueError(f"invalid feature_dim: {header.get('feature_dim')}")
@@ -108,31 +105,22 @@ def _validate_teacher_features(package_path: str, header: dict, record_table, ma
         dtype = np.dtype(header["dtype"])
     except Exception as exc:
         raise ValueError(f"invalid feature dtype: {header.get('dtype')}") from exc
-    compression = str(header.get("compression", "none")).lower()
-    matrix_offset = int(header.get("matrix_offset", 0))
-    matrix_length = int(header["matrix_length"])
-    if matrix_offset < 0 or matrix_length < 0 or matrix_offset + matrix_length > int(header["data_length"]):
-        raise ValueError(f"feature matrix span outside data segment: offset={matrix_offset} length={matrix_length}")
-    payload = read_payload(package_path, header, matrix_offset, matrix_length)
-    expected_crc = int(header["matrix_crc32"])
-    actual_crc = zlib.crc32(payload) & 0xFFFFFFFF
-    if actual_crc != expected_crc:
-        raise ValueError(f"feature matrix crc32 mismatch: expected={expected_crc} actual={actual_crc}")
-    raw = _decompress_feature_matrix(payload, compression)
-    expected_length = len(record_table) * feature_dim * dtype.itemsize
-    if len(raw) != expected_length:
-        raise ValueError(f"invalid feature matrix byte length: expected={expected_length} got={len(raw)}")
-    if int(header.get("matrix_uncompressed_length", expected_length)) != expected_length:
-        raise ValueError(
-            f"matrix_uncompressed_length mismatch: header={header.get('matrix_uncompressed_length')} "
-            f"expected={expected_length}"
-        )
-    matrix = np.frombuffer(raw, dtype=dtype)
-    if matrix.shape != (len(record_table) * feature_dim,):
-        raise ValueError(f"invalid feature matrix flat shape: {matrix.shape}")
-    matrix.reshape((len(record_table), feature_dim))
-    if header.get("matrix_shape") != [len(record_table), feature_dim]:
-        raise ValueError(f"matrix_shape mismatch: header={header.get('matrix_shape')} expected={[len(record_table), feature_dim]}")
+    record_bytes = int(header.get("feature_record_bytes", 0))
+    expected_record_bytes = feature_dim * dtype.itemsize
+    if record_bytes != expected_record_bytes:
+        raise ValueError(f"invalid feature_record_bytes: expected={expected_record_bytes} got={record_bytes}")
+    expected_length = len(record_table) * record_bytes
+    if int(header["data_length"]) != expected_length:
+        raise ValueError(f"invalid feature data length: expected={expected_length} got={header['data_length']}")
+    if max_payload == 0:
+        rows = range(len(record_table))
+    else:
+        rows = range(min(max_payload, len(record_table)))
+    for row in rows:
+        payload = read_payload(package_path, header, row * record_bytes, record_bytes)
+        feature = np.frombuffer(payload, dtype=dtype)
+        if feature.shape != (feature_dim,):
+            raise ValueError(f"invalid feature shape at row {row}: {feature.shape}")
     return len(record_table) if max_payload == 0 else min(max_payload, len(record_table))
 
 
@@ -171,7 +159,6 @@ def validate_package(package_path: str | Path, max_decode: int = 8, max_crc: int
             "teacher": metadata["teacher"],
             "dim": metadata["feature_dim"],
             "dtype": metadata["dtype"],
-            "compression": metadata["compression"],
             "rows_checked": checked,
         }
     raise ValueError(f"unsupported payload_type: {payload_type}")
@@ -186,7 +173,7 @@ def _format_valid_message(result: dict) -> str:
     return (
         f"package_valid type=teacher_features records={result['records']} "
         f"teacher={result['teacher']} dim={result['dim']} "
-        f"dtype={result['dtype']} compression={result['compression']} rows_checked={result['rows_checked']}"
+        f"dtype={result['dtype']} rows_checked={result['rows_checked']}"
     )
 
 

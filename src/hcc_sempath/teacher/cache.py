@@ -481,8 +481,6 @@ def cache_teacher_features_from_records(
     teacher_name: str,
     num_workers: int = 8,
     prefetch_factor: int = 2,
-    compression: str = "zstd",
-    compression_level: int | None = 6,
     overwrite: bool = False,
     precision: str = "fp32",
     feature_dtype: str = "float32",
@@ -514,8 +512,6 @@ def cache_teacher_features_from_records(
         output_path,
         teacher_name=teacher_name,
         dtype=feature_dtype,
-        compression=compression,
-        compression_level=compression_level,
         overwrite=overwrite,
     )
 
@@ -531,8 +527,6 @@ def cache_teacher_features_from_package(
     teacher_name: str,
     num_workers: int = 8,
     prefetch_factor: int = 2,
-    compression: str = "zstd",
-    compression_level: int | None = 6,
     overwrite: bool = False,
     precision: str = "fp32",
     feature_dtype: str = "float32",
@@ -573,8 +567,6 @@ def cache_teacher_features_from_package(
         output_path,
         teacher_name=teacher_name,
         dtype=feature_dtype,
-        compression=compression,
-        compression_level=compression_level,
         overwrite=overwrite,
     )
 
@@ -586,8 +578,6 @@ def cache_teacher_features_from_prepared_package(
     output_path: str | Path,
     device: str,
     teacher_name: str,
-    compression: str = "zstd",
-    compression_level: int | None = 6,
     overwrite: bool = False,
     precision: str = "fp32",
     feature_dtype: str = "float32",
@@ -613,8 +603,6 @@ def cache_teacher_features_from_prepared_package(
         tile_height=prepared.tile_height,
         stride_x=prepared.stride_x,
         stride_y=prepared.stride_y,
-        compression=compression,
-        compression_level=compression_level,
         overwrite=overwrite,
     )
 
@@ -628,8 +616,6 @@ def cache_teacher_features_from_packages(
     teacher_name: str,
     num_workers: int = 8,
     prefetch_factor: int = 2,
-    compression: str = "zstd",
-    compression_level: int | None = 6,
     overwrite: bool = False,
     progress_manifest: str | Path | None = None,
     continue_on_error: bool = False,
@@ -670,8 +656,6 @@ def cache_teacher_features_from_packages(
         "resolved_feature_dtype": resolved_feature_dtype,
         "compile": compile_model,
         "compile_mode": compile_mode if compile_model else "",
-        "feature_compression": compression,
-        "feature_compression_level": compression_level,
         "overwrite": overwrite,
         "validate_output": validate_output,
         "prefetch_packages": prefetch_packages,
@@ -771,8 +755,6 @@ def cache_teacher_features_from_packages(
                     output_path=package_output,
                     device=device,
                     teacher_name=teacher_name,
-                    compression=compression,
-                    compression_level=compression_level,
                     overwrite=overwrite,
                     precision=precision,
                     feature_dtype=resolved_feature_dtype,
@@ -850,13 +832,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="reduce-overhead",
         help="torch.compile mode used with --compile.",
     )
-    parser.add_argument(
-        "--feature-compression",
-        choices=("zstd", "zlib", "lzma", "none"),
-        default="zstd",
-        help="Lossless compression for the package-level feature matrix.",
-    )
-    parser.add_argument("--feature-compression-level", type=int, default=6)
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
@@ -872,7 +847,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--validate-output",
         action="store_true",
-        help="Fully validate generated or skipped feature IAC packages by decompressing the feature matrix.",
+        help="Fully validate generated or skipped feature IAC packages by checking fixed-length feature records.",
     )
     parser.add_argument(
         "--prefetch-packages",
@@ -922,8 +897,6 @@ def main() -> None:
         teacher_name=teacher_name,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
-        compression=args.feature_compression,
-        compression_level=args.feature_compression_level,
         overwrite=args.overwrite,
         progress_manifest=args.progress_manifest,
         continue_on_error=args.continue_on_error,

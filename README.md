@@ -205,8 +205,6 @@ hcc-sempath build-teacher-cache \
   --input data/packages \
   --output data/features/h_optimus_1 \
   --teacher h_optimus_1 \
-  --feature-compression zstd \
-  --feature-compression-level 6 \
   --batch-size 512 \
   --precision bf16 \
   --feature-dtype auto \

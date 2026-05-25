@@ -432,6 +432,18 @@ class PackReader:
             raise ValueError(f"short payload read at row {row}: expected={length} got={len(payload)}")
         return payload
 
+    def read_data_span(self, offset: int, length: int) -> bytes:
+        self._ensure_loaded()
+        assert self._file is not None
+        assert self._header is not None
+        if offset < 0 or length < 0 or offset + length > int(self._header["data_length"]):
+            raise ValueError(f"data span outside data segment: offset={offset} length={length}")
+        self._file.seek(self._header["data_offset"] + offset)
+        payload = self._file.read(length)
+        if len(payload) != length:
+            raise ValueError(f"short data span read: expected={length} got={len(payload)}")
+        return payload
+
     def close(self) -> None:
         if self._file is not None:
             self._file.close()
