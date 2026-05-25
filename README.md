@@ -224,10 +224,15 @@ a package-level losslessly compressed matrix, with tile order defined by the
 record table. Directory inputs are allowed; all discovered image-tile packages
 must have the same tile dimensions.
 For directory inputs, existing valid outputs are skipped unless `--overwrite`
-is passed. Each generated or skipped package is validated and recorded in
+is passed. Each generated or skipped package is header-checked and recorded in
 `teacher_cache_progress.csv` plus a JSON summary under the output directory.
 Use `--continue-on-error` for large remote batches so one failed package is
 recorded without stopping the whole teacher-cache run.
+Use `--validate-output` only when a full output IAC matrix validation is needed;
+it decompresses each feature matrix and is intentionally off by default for
+large directory runs.
+Directory runs prefetch the next input package while the current package is
+running teacher inference; use `--no-prefetch-packages` only for debugging.
 The planned supported presets are `h_optimus_1`, `gigapath`, `uni2_h`, and
 `virchow2`. Local model directories and custom timm / `hf_hub:*` names remain
 available for controlled experiments, but the documented path should use the
