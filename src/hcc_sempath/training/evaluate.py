@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..io.tile_package import read_package_metadata
-from ..modeling.prototypes import load_prototypes
+from ..modeling.prototypes import PrototypeRegistry, load_prototype_registry
 from ..modeling.models import HCCSemPathModel
 from .config import (
     embedding_dim,
@@ -30,16 +30,16 @@ from .metrics import evaluate_teacher_outputs
 from .utils import write_json
 
 
-def _load_prototype_map(cfg: dict, dims: dict[str, int]) -> dict[str, torch.Tensor] | None:
+def _load_prototype_map(cfg: dict, dims: dict[str, int]) -> dict[str, PrototypeRegistry] | None:
     if float(cfg["loss"].get("semantic_weight", 0.0)) == 0:
         return None
     prototype_paths = cfg["data"].get("prototype_paths")
     if isinstance(prototype_paths, dict):
-        return {name: load_prototypes(prototype_paths[name], expected_dim=dim) for name, dim in dims.items()}
+        return {name: load_prototype_registry(prototype_paths[name], expected_dim=dim) for name, dim in dims.items()}
     prototype_path = cfg["data"].get("prototype_path")
     if prototype_path is None:
         return None
-    return {name: load_prototypes(prototype_path, expected_dim=dim) for name, dim in dims.items()}
+    return {name: load_prototype_registry(prototype_path, expected_dim=dim) for name, dim in dims.items()}
 
 
 def main() -> None:

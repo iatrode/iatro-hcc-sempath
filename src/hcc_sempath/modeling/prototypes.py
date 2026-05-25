@@ -37,6 +37,14 @@ class PrototypeRegistry:
     def attribute_indices(self) -> list[int]:
         return [idx for idx, level in enumerate(self.levels) if level == 2]
 
+    @property
+    def primary_prototypes(self) -> torch.Tensor:
+        return self.prototypes[self.primary_indices]
+
+    @property
+    def attribute_prototypes(self) -> torch.Tensor:
+        return self.prototypes[self.attribute_indices]
+
     def to(self, device: torch.device | str) -> "PrototypeRegistry":
         return PrototypeRegistry(
             prototypes=self.prototypes.to(device),
@@ -100,8 +108,8 @@ def _validate_registry(registry: PrototypeRegistry, expected_dim: int | None = N
         raise ValueError(
             f"prototype thresholds must have shape=({registry.count},), got {tuple(registry.thresholds.shape)}"
         )
-    if not registry.primary_indices:
-        raise ValueError("prototype package must contain at least one level-1 primary prototype")
+    if len(registry.primary_indices) < 2:
+        raise ValueError("prototype package must contain at least two level-1 primary prototypes")
 
 
 def load_prototype_registry(path: str | Path, expected_dim: int | None = None) -> PrototypeRegistry:

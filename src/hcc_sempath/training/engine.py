@@ -17,7 +17,7 @@ def _amp_enabled(device: torch.device, cfg: dict, train: bool) -> bool:
 
 def run_epoch(model, loader, prototypes, optimizer, device, cfg, train: bool, scaler=None) -> dict[str, float]:
     model.train(train)
-    totals = {"loss": 0.0, "feature": 0.0, "relation": 0.0, "semantic": 0.0}
+    totals = {"loss": 0.0, "feature": 0.0, "relation": 0.0, "semantic": 0.0, "reliability": 0.0}
     n_batches = 0
     teacher_weights = cfg["loss"].get("teacher_weights")
     for batch in loader:
@@ -35,6 +35,8 @@ def run_epoch(model, loader, prototypes, optimizer, device, cfg, train: bool, sc
                     semantic_weight=float(cfg["loss"]["semantic_weight"]),
                     semantic_temperature=float(cfg["loss"]["semantic_temperature"]),
                     teacher_weights=teacher_weights,
+                    prototype_filter_weight=float(cfg["loss"].get("prototype_filter_weight", 0.0)),
+                    prototype_filter_alpha_min=float(cfg["loss"].get("prototype_filter_alpha_min", 0.25)),
                 )
             if train:
                 optimizer.zero_grad(set_to_none=True)
@@ -46,7 +48,7 @@ def run_epoch(model, loader, prototypes, optimizer, device, cfg, train: bool, sc
                     loss.backward()
                     optimizer.step()
         totals["loss"] += float(loss.detach().cpu())
-        for key in ("feature", "relation", "semantic"):
+        for key in ("feature", "relation", "semantic", "reliability"):
             totals[key] += float(parts[key].cpu())
         n_batches += 1
     return {key: value / max(1, n_batches) for key, value in totals.items()}
@@ -88,7 +90,7 @@ def fit(model, train_loader, val_loader, prototypes, optimizer, device, cfg) -> 
         train_metrics = run_epoch(model, train_loader, prototypes, optimizer, device, cfg, train=True, scaler=scaler)
         val_metrics = run_epoch(model, val_loader, prototypes, optimizer, device, cfg, train=False)
         _, student_by_teacher, teacher_by_name = collect_embeddings(model, val_loader, device)
-        cpu_prototypes = {name: tensor.cpu() for name, tensor in prototypes.items()} if prototypes else None
+        cpu_prototypes = {name: registry.to("cpu") for name, registry in prototypes.items()} if prototypes else None
         embedding_metrics = evaluate_teacher_outputs(
             student_by_teacher,
             teacher_by_name,

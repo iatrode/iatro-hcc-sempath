@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 import yaml
 
+from hcc_sempath.modeling.build_prototypes import main as build_prototypes_main
 from hcc_sempath.modeling.prototypes import load_prototype_registry, load_prototypes
 
 
@@ -14,12 +16,12 @@ def test_load_prototype_registry_from_package(tmp_path: Path) -> None:
     torch.save(
         {
             "version": 1,
-            "prototypes": torch.randn(2, 4),
-            "names": ["primary_tumor", "lymphocyte_rich"],
-            "groups": ["primary_state", "microenvironment"],
-            "levels": [1, 2],
-            "exclusive": [True, False],
-            "thresholds": torch.tensor([0.6, 0.4]),
+            "prototypes": torch.randn(3, 4),
+            "names": ["primary_tumor", "primary_non_tumor", "lymphocyte_rich"],
+            "groups": ["primary_state", "primary_state", "microenvironment"],
+            "levels": [1, 1, 2],
+            "exclusive": [True, True, False],
+            "thresholds": torch.tensor([0.6, 0.5, 0.4]),
             "source": {"curation": "synthetic"},
         },
         package_path,
@@ -27,17 +29,17 @@ def test_load_prototype_registry_from_package(tmp_path: Path) -> None:
 
     registry = load_prototype_registry(package_path, expected_dim=4)
 
-    assert registry.count == 2
+    assert registry.count == 3
     assert registry.dim == 4
-    assert registry.names == ["primary_tumor", "lymphocyte_rich"]
-    assert registry.groups == ["primary_state", "microenvironment"]
-    assert registry.levels == [1, 2]
-    assert registry.exclusive == [True, False]
-    assert registry.primary_indices == [0]
-    assert registry.attribute_indices == [1]
+    assert registry.names == ["primary_tumor", "primary_non_tumor", "lymphocyte_rich"]
+    assert registry.groups == ["primary_state", "primary_state", "microenvironment"]
+    assert registry.levels == [1, 1, 2]
+    assert registry.exclusive == [True, True, False]
+    assert registry.primary_indices == [0, 1]
+    assert registry.attribute_indices == [2]
     assert registry.thresholds is not None
     assert registry.source == {"curation": "synthetic", "path": str(package_path)}
-    assert load_prototypes(package_path, expected_dim=4).shape == (2, 4)
+    assert load_prototypes(package_path, expected_dim=4).shape == (3, 4)
 
 
 def test_load_prototype_registry_from_directory_manifest(tmp_path: Path) -> None:
@@ -67,7 +69,7 @@ def test_load_prototype_registry_from_directory_manifest(tmp_path: Path) -> None
 def test_load_prototype_registry_requires_names(tmp_path: Path) -> None:
     package_path = tmp_path / "missing_names.pt"
     torch.save(
-        {"prototypes": torch.zeros(2, 3), "levels": [1, 2], "exclusive": [True, False]},
+        {"prototypes": torch.zeros(3, 3), "levels": [1, 1, 2], "exclusive": [True, True, False]},
         package_path,
     )
 
@@ -79,10 +81,10 @@ def test_load_prototype_registry_rejects_duplicate_names(tmp_path: Path) -> None
     package_path = tmp_path / "bad.pt"
     torch.save(
         {
-            "prototypes": torch.zeros(2, 3),
-            "names": ["dup", "dup"],
-            "levels": [1, 2],
-            "exclusive": [True, False],
+            "prototypes": torch.zeros(3, 3),
+            "names": ["dup", "dup", "attr"],
+            "levels": [1, 1, 2],
+            "exclusive": [True, True, False],
         },
         package_path,
     )
@@ -95,11 +97,11 @@ def test_load_prototype_registry_rejects_threshold_shape_mismatch(tmp_path: Path
     package_path = tmp_path / "bad_thresholds.pt"
     torch.save(
         {
-            "prototypes": torch.zeros(2, 3),
-            "names": ["a", "b"],
-            "levels": [1, 2],
-            "exclusive": [True, False],
-            "thresholds": torch.zeros(3),
+            "prototypes": torch.zeros(3, 3),
+            "names": ["a", "b", "c"],
+            "levels": [1, 1, 2],
+            "exclusive": [True, True, False],
+            "thresholds": torch.zeros(2),
         },
         package_path,
     )
@@ -154,3 +156,35 @@ def test_load_prototype_registry_requires_primary_level(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="level-1"):
         load_prototype_registry(package_path)
+
+
+def test_build_prototypes_writes_two_level_package(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    primary_dir = tmp_path / "primary"
+    attribute_dir = tmp_path / "attributes"
+    for concept_dir in [
+        primary_dir / "primary_tumor",
+        primary_dir / "primary_non_tumor",
+        attribute_dir / "lymphocyte_rich",
+    ]:
+        concept_dir.mkdir(parents=True)
+        np.save(concept_dir / "example.npy", np.ones((4,), dtype=np.float32))
+    output = tmp_path / "prototypes.pt"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "hcc-sempath build-prototypes",
+            "--primary-dir",
+            str(primary_dir),
+            "--attribute-dir",
+            str(attribute_dir),
+            "--output",
+            str(output),
+        ],
+    )
+
+    build_prototypes_main()
+    registry = load_prototype_registry(output, expected_dim=4)
+
+    assert registry.names == ["primary_non_tumor", "primary_tumor", "lymphocyte_rich"]
+    assert registry.levels == [1, 1, 2]
+    assert registry.exclusive == [True, True, False]
