@@ -24,9 +24,9 @@ conda activate hcc-sempath
 python -m pip install --no-deps -e .
 python scripts/download_teacher.py
 hcc-sempath build-teacher-cache \
-  --tile-package data/packages \
+  --input data/packages \
   --output data/features/h_optimus_1 \
-  --model h_optimus_1 \
+  --teacher h_optimus_1 \
   --batch-size 256 \
   --num-workers 8 \
   --prefetch-factor 2 \
@@ -39,16 +39,16 @@ teacher inference. `--prefetch-factor` controls the number of prefetched batches
 per worker. Keep `--batch-size` as the GPU-memory knob and tune workers only
 when GPU utilization is low.
 
-`--tile-package` may point to one image-tile `.iac` file or a directory of
+`--input` may point to one image-tile `.iac` file or a directory of
 image-tile `.iac` files. Tile size is read from each input package header. A
 directory input fails if discovered packages have inconsistent tile dimensions.
 For directory inputs, existing valid outputs are skipped unless `--overwrite`
 is passed. Each generated or skipped output is validated immediately and written
 to `teacher_cache_progress.csv`; a JSON summary with total, processed, ok, and
 failed counts is written beside it.
-The planned supported presets are `h_optimus_1` and `gigapath`. Local model directories
-and custom timm / `hf_hub:*` names remain available for controlled experiments,
-but the documented path should use the supported presets.
+The planned supported presets are `h_optimus_1`, `gigapath`, `uni2_h`, and
+`virchow2`. `--teacher` also accepts local model directories and custom timm /
+`hf_hub:*` names for controlled experiments.
 
 ## Output naming
 

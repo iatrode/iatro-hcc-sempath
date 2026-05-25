@@ -67,7 +67,7 @@ TEACHER_MODEL_PRESETS: dict[str, dict] = {
 
 def _preset_help() -> str:
     lines = [
-        "Planned supported presets for --model:",
+        "Planned supported presets for --teacher:",
     ]
     for name, item in TEACHER_MODEL_PRESETS.items():
         lines.append(
@@ -285,7 +285,7 @@ def _discover_tile_packages(path: str | Path) -> list[Path]:
         if packages:
             return packages
         raise FileNotFoundError(f"no image tile .iac packages found under {root}")
-    raise FileNotFoundError(f"tile package path does not exist: {root}")
+    raise FileNotFoundError(f"input path does not exist: {root}")
 
 
 def _tile_size(package_path: str | Path) -> tuple[int, int]:
@@ -487,7 +487,7 @@ def cache_teacher_features_from_packages(
     output_path = Path(output)
     output_is_file = output_path.suffix == ".iac"
     if len(package_paths) > 1 and output_is_file:
-        raise ValueError("--output must be a directory when --tile-package points to multiple packages")
+        raise ValueError("--output must be a directory when --input resolves to multiple packages")
     if not output_is_file:
         output_path.mkdir(parents=True, exist_ok=True)
 
@@ -496,6 +496,7 @@ def cache_teacher_features_from_packages(
     progress_path = _progress_path(output_path, progress_manifest)
     for package_path in package_paths:
         package_output = output_path if output_is_file else _default_output_path(package_path, output_path, teacher_name)
+        print(f"feature_package_start tile_package={package_path} output={package_output} teacher={teacher_name}", flush=True)
         row = {
             "tile_package": str(package_path),
             "output": str(package_output),
@@ -510,7 +511,7 @@ def cache_teacher_features_from_packages(
                 row["elapsed_sec"] = round(time.time() - item_started, 3)
                 rows.append(row)
                 _write_progress(progress_path, rows, len(package_paths), started)
-                print(f"feature_package_skipped existing_valid tile_package={package_path} output={package_output}")
+                print(f"feature_package_skipped existing_valid tile_package={package_path} output={package_output}", flush=True)
                 continue
             cache_teacher_features_from_package(
                 model=model,
@@ -532,7 +533,7 @@ def cache_teacher_features_from_packages(
             row["elapsed_sec"] = round(time.time() - item_started, 3)
             rows.append(row)
             _write_progress(progress_path, rows, len(package_paths), started)
-            print(f"feature_package_ok tile_package={package_path} output={package_output}")
+            print(f"feature_package_ok tile_package={package_path} output={package_output}", flush=True)
         except Exception as exc:
             row["status"] = "failed"
             row["elapsed_sec"] = round(time.time() - item_started, 3)
@@ -541,28 +542,35 @@ def cache_teacher_features_from_packages(
             _write_progress(progress_path, rows, len(package_paths), started)
             if not continue_on_error:
                 raise
-            print(f"feature_package_failed tile_package={package_path} output={package_output} error={exc}")
-    print(f"teacher_cache_progress manifest={progress_path} summary={progress_path.with_suffix('.json')}")
+            print(f"feature_package_failed tile_package={package_path} output={package_output} error={exc}", flush=True)
+    print(f"teacher_cache_progress manifest={progress_path} summary={progress_path.with_suffix('.json')}", flush=True)
 
 
-def main() -> None:
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        usage="%(prog)s --input INPUT --output OUTPUT --teacher TEACHER [options]",
         description="Run a teacher model and write a teacher feature IatroCache package.",
         epilog=_preset_help(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--tile-package", required=True, help="Input image-tile .iac file or directory of image-tile .iac packages.")
+    parser.add_argument("--input", help="Input image-tile .iac file or directory recursively scanned for image-tile .iac packages.")
+    parser.add_argument("--tile-package", dest="input", help=argparse.SUPPRESS)
     parser.add_argument("--output", required=True, help="Output .features.iac file, or output directory for multiple input packages.")
     parser.add_argument(
-        "--model",
-        default="h_optimus_1",
+        "--teacher",
         help="Teacher preset, timm model name, hf_hub:* model name, or local model directory.",
     )
-    parser.add_argument("--model-name", dest="model", help=argparse.SUPPRESS)
-    parser.add_argument("--output-teacher-name", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--model", dest="teacher", help=argparse.SUPPRESS)
+    parser.add_argument("--model-name", dest="teacher", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--teacher-name",
+        default="",
+        help="Teacher name recorded in output metadata and filenames. Defaults to the preset teacher name.",
+    )
+    parser.add_argument("--output-teacher-name", dest="teacher_name", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers for --tile-package reads.")
-    parser.add_argument("--prefetch-factor", type=int, default=2, help="Batches prefetched per worker for --tile-package reads.")
+    parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers for --input reads.")
+    parser.add_argument("--prefetch-factor", type=int, default=2, help="Batches prefetched per worker for --input reads.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--feature-compression",
@@ -583,16 +591,38 @@ def main() -> None:
         action="store_true",
         help="Continue directory batch processing after a package fails and record the failure in the progress manifest.",
     )
+    return parser
+
+
+def main() -> None:
+    parser = _build_arg_parser()
     args = parser.parse_args()
-    teacher_name = _teacher_name(args.model, args.output_teacher_name)
-    model_spec = _resolve_model_spec(args.model)
-    package_paths = _discover_tile_packages(args.tile_package)
+    if not args.input:
+        parser.error("--input is required")
+    if not args.teacher:
+        parser.error("--teacher is required, for example --teacher h_optimus_1")
+    teacher_name = _teacher_name(args.teacher, args.teacher_name)
+    print(
+        f"teacher_cache_start input={args.input} output={args.output} teacher={args.teacher} "
+        f"teacher_name={teacher_name} device={args.device}",
+        flush=True,
+    )
+    print(f"teacher_cache_scanning_input path={args.input}", flush=True)
+    package_paths = _discover_tile_packages(args.input)
+    print(f"teacher_cache_input_discovered packages={len(package_paths)}", flush=True)
+    model_spec = _resolve_model_spec(args.teacher)
+    print(
+        f"teacher_model_loading teacher={args.teacher} model_name={model_spec['model_name']} "
+        f"pretrained={args.pretrained}",
+        flush=True,
+    )
     model = TimmTeacherEncoder(
         model_spec["model_name"],
         pretrained=args.pretrained,
         model_kwargs=model_spec["model_kwargs"],
         feature_mode=model_spec["feature_mode"],
     )
+    print(f"teacher_model_loaded teacher={args.teacher} feature_mode={model_spec['feature_mode']}", flush=True)
     cache_teacher_features_from_packages(
         model=model,
         package_paths=package_paths,

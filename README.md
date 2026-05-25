@@ -202,9 +202,9 @@ Build teacher features:
 
 ```bash
 hcc-sempath build-teacher-cache \
-  --tile-package data/packages \
+  --input data/packages \
   --output data/features/h_optimus_1 \
-  --model h_optimus_1 \
+  --teacher h_optimus_1 \
   --feature-compression zstd \
   --feature-compression-level 6 \
   --batch-size 256 \
@@ -233,8 +233,8 @@ supported presets.
 `uni2_h` and `virchow2` are gated Hugging Face models. Request access with an
 institutional account, accept the model terms, and run `hf auth login` in the
 feature-cache environment before building caches. Local snapshots can also be
-loaded directly with `--model weights/teachers/uni2_h` or
-`--model weights/teachers/virchow2`; the `weights/` tree is git-ignored.
+loaded directly with `--teacher weights/teachers/uni2_h` or
+`--teacher weights/teachers/virchow2`; the `weights/` tree is git-ignored.
 
 Build semantic anchors:
 
