@@ -4,10 +4,12 @@ import argparse
 import csv
 import io
 import json
+import logging
 import random
 import socket
 import tempfile
 import webbrowser
+from time import perf_counter
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +21,8 @@ from PIL import Image, ImageDraw
 from hcc_sempath.cli.view_iac import IacRecord, IacViewerData
 from hcc_sempath.io.iatrocache import read_header
 
+
+LOG = logging.getLogger("hcc_sempath.annotate_prototypes")
 
 L1_PROTOTYPES = [
     "HCC-trabecular",
@@ -61,6 +65,7 @@ def _find_free_port(host: str, preferred: int) -> int:
 
 def discover_iac_packages(input_path: str | Path) -> list[AnnotationPackage]:
     root = Path(input_path).resolve()
+    LOG.info("discover_iac_start input=%s", root)
     paths = [root] if root.is_file() and root.suffix == ".iac" else sorted(root.rglob("*.iac"))
     packages = []
     for path in paths:
@@ -68,6 +73,7 @@ def discover_iac_packages(input_path: str | Path) -> list[AnnotationPackage]:
         if header.get("payload_type") != "image_tiles":
             if root.is_file():
                 raise ValueError(f"annotation requires image-tile IAC package: {path}")
+            LOG.info("discover_iac_skip path=%s payload_type=%s", path, header.get("payload_type"))
             continue
         total = int(header.get("num_records", 0))
         rel = path.name if root.is_file() else str(path.relative_to(root))
@@ -76,8 +82,10 @@ def discover_iac_packages(input_path: str | Path) -> list[AnnotationPackage]:
             parent = path.parent.relative_to(root)
             dataset = "" if str(parent) == "." else parent.parts[0]
         packages.append(AnnotationPackage(path=path, rel_path=rel, dataset=dataset, total=total))
+        LOG.info("discover_iac_add rel_path=%s dataset=%s records=%d", rel, dataset or "-", total)
     if not packages:
         raise FileNotFoundError(f"no image-tile .iac packages found under: {root}")
+    LOG.info("discover_iac_done input=%s packages=%d", root, len(packages))
     return packages
 
 
@@ -94,6 +102,9 @@ class AnnotationState:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
             self.input_path = str(Path(payload.get("input_path", self.input_path)).resolve())
             self.annotations = dict(payload.get("annotations", {}))
+            LOG.info("state_load path=%s annotations=%d input=%s", self.state_path, len(self.annotations), self.input_path)
+        else:
+            LOG.info("state_new path=%s input=%s", self.state_path, self.input_path)
 
     @property
     def csv_path(self) -> Path:
@@ -134,6 +145,17 @@ class AnnotationState:
         }
         self.annotations[_annotation_key(package, record)] = payload
         self.flush()
+        LOG.info(
+            "annotation_save iac=%s row=%d tile_id=%s x=%d y=%d l1=%s l2=%s total_annotations=%d",
+            package.rel_path,
+            record.row,
+            record.tile_id,
+            record.display_x,
+            record.display_y,
+            l1,
+            ",".join(l2) if l2 else "-",
+            len(self.annotations),
+        )
 
     def flush(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,6 +171,7 @@ class AnnotationState:
             tmp_path = Path(handle.name)
         tmp_path.replace(self.state_path)
         self._write_csv()
+        LOG.info("state_flush json=%s csv=%s annotations=%d", self.state_path, self.csv_path, len(self.annotations))
 
     def _write_csv(self) -> None:
         with self.csv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -175,11 +198,25 @@ class AnnotationData:
 
     def viewer(self, index: int) -> IacViewerData:
         if index not in self._viewers:
+            package = self.packages[index]
+            start = perf_counter()
+            LOG.info("iac_open_start index=%d rel_path=%s path=%s", index, package.rel_path, package.path)
             viewer = IacViewerData(self.packages[index].path)
             if viewer.payload_type != "image_tiles":
                 viewer.close()
                 raise ValueError(f"annotation requires image-tile IAC package: {self.packages[index].path}")
             self._viewers[index] = viewer
+            LOG.info(
+                "iac_open_done index=%d rel_path=%s records=%d tile=%dx%d stride=%dx%d elapsed=%.3fs",
+                index,
+                package.rel_path,
+                len(viewer.records),
+                int(viewer.header.get("tile_width", 0)),
+                int(viewer.header.get("tile_height", 0)),
+                viewer.stride_x,
+                viewer.stride_y,
+                perf_counter() - start,
+            )
         return self._viewers[index]
 
     def package_json(self) -> list[dict]:
@@ -197,6 +234,7 @@ class AnnotationData:
                     "remaining": counts["remaining"],
                 }
             )
+        LOG.info("api_packages count=%d", len(items))
         return items
 
     def progress(self, index: int) -> dict:
@@ -209,6 +247,13 @@ class AnnotationData:
             l1_counts[item["l1"]] = l1_counts.get(item["l1"], 0) + 1
             for label in item["l2"]:
                 l2_counts[label] = l2_counts.get(label, 0) + 1
+        LOG.info(
+            "progress_read iac=%s annotated=%d total=%d remaining=%d",
+            package.rel_path,
+            counts["annotated"],
+            counts["total"],
+            counts["remaining"],
+        )
         return {"package": counts, "l1": l1_counts, "l2": l2_counts}
 
     def random_record(self, index: int) -> dict:
@@ -216,12 +261,19 @@ class AnnotationData:
         viewer = self.viewer(index)
         remaining = [record for record in viewer.records if not self.state.is_annotated(package, record)]
         if not remaining:
+            LOG.info("random_tile_empty iac=%s", package.rel_path)
             return {"record": None}
-        return {"record": viewer._record_json(random.choice(remaining))}
+        record = random.choice(remaining)
+        LOG.info("random_tile iac=%s row=%d tile_id=%s remaining=%d", package.rel_path, record.row, record.tile_id, len(remaining))
+        return {"record": viewer._record_json(record)}
 
     def select_nearest(self, index: int, x: float, y: float) -> dict:
         viewer = self.viewer(index)
-        return viewer.nearest("__all__", x, y)
+        result = viewer.nearest("__all__", x, y)
+        record = result.get("record")
+        if record:
+            LOG.info("nearest_tile iac=%s x=%.1f y=%.1f row=%s tile_id=%s", self.packages[index].rel_path, x, y, record.get("row"), record.get("tile_id"))
+        return result
 
     def annotated_rows(self, index: int) -> set[int]:
         package = self.packages[index]
@@ -231,36 +283,54 @@ class AnnotationData:
     def thumbnail_png(self, index: int, max_size: int = 900) -> bytes:
         package = self.packages[index]
         viewer = self.viewer(index)
+        start = perf_counter()
         records = viewer.records
         bounds = viewer._bounds(records)
         min_x, max_x, min_y, max_y = bounds
-        width_span = max(1, max_x - min_x + viewer.stride_x)
-        height_span = max(1, max_y - min_y + viewer.stride_y)
+        tile_w = max(1, int(viewer.header.get("tile_width", viewer.stride_x)))
+        tile_h = max(1, int(viewer.header.get("tile_height", viewer.stride_y)))
+        width_span = max(1, max_x - min_x + tile_w)
+        height_span = max(1, max_y - min_y + tile_h)
         scale = min(max_size / width_span, max_size / height_span)
         canvas_w = max(1, int(width_span * scale))
         canvas_h = max(1, int(height_span * scale))
         canvas = Image.new("RGB", (canvas_w, canvas_h), "white")
-        annotated = self.annotated_rows(index)
-        tile_px = max(2, int(max(viewer.stride_x, viewer.stride_y) * scale))
-        step = max(1, len(records) // 2500)
-        for record in records[::step]:
+        annotated = self.state.annotations_for_package(package)
+        tile_px_w = max(1, int(tile_w * scale))
+        tile_px_h = max(1, int(tile_h * scale))
+        sampled_records = records
+        max_tiles = 2500
+        if len(records) > max_tiles:
+            sampled_records = random.Random(0).sample(records, max_tiles)
+        for record in sampled_records:
             x = int((record.display_x - min_x) * scale)
             y = int((record.display_y - min_y) * scale)
             try:
                 tile = Image.open(io.BytesIO(viewer.read_tile_png(record.row))).convert("RGB")
-                tile.thumbnail((tile_px, tile_px))
+                tile = tile.resize((tile_px_w, tile_px_h), Image.Resampling.LANCZOS)
                 canvas.paste(tile, (x, y))
             except Exception:
+                LOG.exception("thumbnail_tile_decode_failed iac=%s row=%d", package.rel_path, record.row)
                 pass
         draw = ImageDraw.Draw(canvas, "RGBA")
-        for record in records:
-            if record.row not in annotated:
-                continue
-            x = int((record.display_x - min_x) * scale)
-            y = int((record.display_y - min_y) * scale)
-            draw.rectangle([x, y, x + tile_px, y + tile_px], outline=(0, 140, 80, 220), width=2)
+        for item in annotated:
+            x = int((int(item["x"]) - min_x) * scale)
+            y = int((int(item["y"]) - min_y) * scale)
+            draw.rectangle([x, y, x + tile_px_w, y + tile_px_h], outline=(0, 140, 80, 220), width=2)
         buffer = io.BytesIO()
         canvas.save(buffer, format="PNG")
+        LOG.info(
+            "thumbnail_render iac=%s records=%d sampled=%d annotated=%d canvas=%dx%d tile_px=%dx%d elapsed=%.3fs",
+            package.rel_path,
+            len(records),
+            len(sampled_records),
+            len(annotated),
+            canvas_w,
+            canvas_h,
+            tile_px_w,
+            tile_px_h,
+            perf_counter() - start,
+        )
         return buffer.getvalue()
 
 
@@ -324,6 +394,7 @@ def make_handler(data: AnnotationData):
             qs = parse_qs(parsed.query)
             try:
                 if parsed.path == "/":
+                    LOG.info("ui_open path=/")
                     html = HTML.replace("%L1_JSON%", json.dumps(L1_PROTOTYPES)).replace("%L2_JSON%", json.dumps(L2_PROTOTYPES))
                     body = html.encode("utf-8")
                     self.send_response(HTTPStatus.OK)
@@ -347,8 +418,10 @@ def make_handler(data: AnnotationData):
                     rx = float(qs.get("rx", ["0"])[0])
                     ry = float(qs.get("ry", ["0"])[0])
                     bounds = viewer._bounds(viewer.records)
-                    x = bounds[0] + rx * max(1, bounds[1] - bounds[0] + viewer.stride_x)
-                    y = bounds[2] + ry * max(1, bounds[3] - bounds[2] + viewer.stride_y)
+                    tile_w = max(1, int(viewer.header.get("tile_width", viewer.stride_x)))
+                    tile_h = max(1, int(viewer.header.get("tile_height", viewer.stride_y)))
+                    x = bounds[0] + rx * max(1, bounds[1] - bounds[0] + tile_w)
+                    y = bounds[2] + ry * max(1, bounds[3] - bounds[2] + tile_h)
                     _json_response(self, data.select_nearest(index, x, y))
                     return
                 if parsed.path == "/api/thumbnail":
@@ -361,6 +434,8 @@ def make_handler(data: AnnotationData):
                     return
                 if parsed.path == "/api/tile":
                     row = int(qs["row"][0])
+                    package = data.packages[index]
+                    LOG.info("tile_read iac=%s row=%d", package.rel_path, row)
                     body = data.viewer(index).read_tile_png(row)
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "image/png")
@@ -370,6 +445,7 @@ def make_handler(data: AnnotationData):
                     return
                 self.send_error(HTTPStatus.NOT_FOUND)
             except Exception as exc:
+                LOG.exception("api_get_failed path=%s query=%s", parsed.path, parsed.query)
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
 
         def do_POST(self):  # noqa: N802
@@ -384,15 +460,18 @@ def make_handler(data: AnnotationData):
                 row = int(payload["row"])
                 viewer = data.viewer(index)
                 record = viewer._by_row[row]
+                LOG.info("annotation_request iac=%s row=%d l1=%s l2=%s", data.packages[index].rel_path, row, payload.get("l1"), payload.get("l2", []))
                 data.state.save_annotation(data.packages[index], record, str(payload["l1"]), list(payload.get("l2", [])))
                 _json_response(self, {"ok": True})
             except Exception as exc:
+                LOG.exception("api_post_failed path=%s", parsed.path)
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
 
     return Handler
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Open a browser UI for L1/L2 prototype tile annotation.")
     parser.add_argument("--input", required=True, help="IAC file or directory containing image-tile IAC packages.")
     parser.add_argument("--state", required=True, help="JSON annotation state file; CSV is exported next to it.")
@@ -404,8 +483,10 @@ def main() -> None:
     port = _find_free_port(args.host, args.port)
     server = ThreadingHTTPServer((args.host, port), make_handler(data))
     url = f"http://{args.host}:{port}/"
-    print(f"annotation_ui url={url} packages={len(data.packages)} state={args.state} csv={data.state.csv_path}")
+    LOG.info("server_start url=%s packages=%d state=%s csv=%s", url, len(data.packages), args.state, data.state.csv_path)
+    print(f"annotation_ui url={url} packages={len(data.packages)} state={args.state} csv={data.state.csv_path}", flush=True)
     if not args.no_open:
+        LOG.info("browser_open url=%s", url)
         webbrowser.open(url)
     try:
         server.serve_forever()
