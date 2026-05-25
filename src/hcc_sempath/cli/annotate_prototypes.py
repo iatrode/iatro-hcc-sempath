@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 from PIL import Image, ImageDraw
 
 from hcc_sempath.cli.view_iac import IacRecord, IacViewerData
+from hcc_sempath.io.iatrocache import read_header
 
 
 L1_PROTOTYPES = [
@@ -47,6 +48,7 @@ class AnnotationPackage:
     path: Path
     rel_path: str
     dataset: str
+    total: int
 
 
 def _find_free_port(host: str, preferred: int) -> int:
@@ -62,14 +64,20 @@ def discover_iac_packages(input_path: str | Path) -> list[AnnotationPackage]:
     paths = [root] if root.is_file() and root.suffix == ".iac" else sorted(root.rglob("*.iac"))
     packages = []
     for path in paths:
+        header = read_header(path)
+        if header.get("payload_type") != "image_tiles":
+            if root.is_file():
+                raise ValueError(f"annotation requires image-tile IAC package: {path}")
+            continue
+        total = int(header.get("num_records", 0))
         rel = path.name if root.is_file() else str(path.relative_to(root))
         dataset = ""
         if not root.is_file():
             parent = path.parent.relative_to(root)
             dataset = "" if str(parent) == "." else parent.parts[0]
-        packages.append(AnnotationPackage(path=path, rel_path=rel, dataset=dataset))
+        packages.append(AnnotationPackage(path=path, rel_path=rel, dataset=dataset, total=total))
     if not packages:
-        raise FileNotFoundError(f"no .iac packages found under: {root}")
+        raise FileNotFoundError(f"no image-tile .iac packages found under: {root}")
     return packages
 
 
@@ -101,6 +109,10 @@ class AnnotationState:
     def annotations_for_package(self, package: AnnotationPackage) -> list[dict]:
         prefix = f"{package.rel_path}::"
         return [value for key, value in self.annotations.items() if key.startswith(prefix)]
+
+    def lightweight_counts_for_package(self, package: AnnotationPackage) -> dict:
+        annotated = len(self.annotations_for_package(package))
+        return {"annotated": annotated, "total": package.total, "remaining": max(0, package.total - annotated)}
 
     def save_annotation(self, package: AnnotationPackage, record: IacRecord, l1: str, l2: list[str]) -> None:
         if l1 not in L1_PROTOTYPES:
@@ -173,8 +185,7 @@ class AnnotationData:
     def package_json(self) -> list[dict]:
         items = []
         for idx, package in enumerate(self.packages):
-            viewer = self.viewer(idx)
-            counts = self.state.counts_for_package(package, viewer.records)
+            counts = self.state.lightweight_counts_for_package(package)
             items.append(
                 {
                     "index": idx,
