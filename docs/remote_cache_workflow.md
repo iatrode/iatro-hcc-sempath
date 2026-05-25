@@ -27,7 +27,9 @@ hcc-sempath build-teacher-cache \
   --input data/packages \
   --output data/features/h_optimus_1 \
   --teacher h_optimus_1 \
-  --batch-size 256 \
+  --batch-size 1024 \
+  --precision fp16 \
+  --compile \
   --num-workers 8 \
   --prefetch-factor 2 \
   --continue-on-error \
@@ -38,6 +40,10 @@ hcc-sempath build-teacher-cache \
 teacher inference. `--prefetch-factor` controls the number of prefetched batches
 per worker. Keep `--batch-size` as the GPU-memory knob and tune workers only
 when GPU utilization is low.
+`--precision fp16` or `--precision bf16` enables CUDA autocast for teacher
+inference and writes the resulting feature matrix back as float32. `--compile`
+uses `torch.compile`; its first generated package includes compilation warm-up
+cost, so judge throughput after the first batches have completed.
 
 `--input` may point to one image-tile `.iac` file or a directory of
 image-tile `.iac` files. Tile size is read from each input package header. A

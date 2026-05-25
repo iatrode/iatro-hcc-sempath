@@ -24,11 +24,28 @@ from hcc_sempath.teacher.cache import (
 def test_teacher_cache_cli_uses_input_and_teacher_names() -> None:
     parser = _build_arg_parser()
 
-    args = parser.parse_args(["--input", "tiles", "--output", "features", "--teacher", "virchow2"])
+    args = parser.parse_args(
+        [
+            "--input",
+            "tiles",
+            "--output",
+            "features",
+            "--teacher",
+            "virchow2",
+            "--precision",
+            "fp16",
+            "--compile",
+            "--compile-mode",
+            "default",
+        ]
+    )
 
     assert args.input == "tiles"
     assert args.output == "features"
     assert args.teacher == "virchow2"
+    assert args.precision == "fp16"
+    assert args.compile_model is True
+    assert args.compile_mode == "default"
     assert "--teacher TEACHER" in parser.format_usage()
 
 
