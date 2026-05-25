@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import csv
 import json
 import re
@@ -247,6 +248,27 @@ def _loader_kwargs(num_workers: int, prefetch_factor: int, pin_memory: bool) -> 
     return kwargs
 
 
+def _resolve_precision(precision: str, device: str) -> str:
+    if precision != "auto":
+        return precision
+    if not device.startswith("cuda"):
+        return "fp32"
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return "bf16"
+    return "fp16"
+
+
+def _autocast_context(device: str, precision: str):
+    precision = _resolve_precision(precision, device)
+    if not device.startswith("cuda") or precision == "fp32":
+        return nullcontext()
+    dtype_by_precision = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }
+    return torch.autocast(device_type="cuda", dtype=dtype_by_precision[precision])
+
+
 def _safe_name(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
     return value.strip("._") or "teacher"
@@ -367,7 +389,7 @@ def _write_progress(progress_path: Path, rows: list[dict], total: int, started: 
     progress_path.with_suffix(".json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def cache_teacher_features_from_records(
     model: torch.nn.Module,
     records: list[TileRecord],
@@ -382,6 +404,7 @@ def cache_teacher_features_from_records(
     compression: str = "zstd",
     compression_level: int | None = 6,
     overwrite: bool = False,
+    precision: str = "fp32",
 ) -> None:
     model = model.to(device).eval()
     loader = DataLoader(
@@ -398,7 +421,8 @@ def cache_teacher_features_from_records(
     def features():
         for batch in tqdm(loader, total=len(loader), desc="teacher batches"):
             images = batch["image"].to(device, non_blocking=device.startswith("cuda"))
-            batch_features = model(images).detach().cpu().numpy().astype(np.float32)
+            with _autocast_context(device, precision):
+                batch_features = model(images).detach().cpu().numpy().astype(np.float32)
             for feature in batch_features:
                 yield feature
 
@@ -414,7 +438,7 @@ def cache_teacher_features_from_records(
     )
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def cache_teacher_features_from_package(
     model: torch.nn.Module,
     package_path: str | Path,
@@ -428,11 +452,13 @@ def cache_teacher_features_from_package(
     compression: str = "zstd",
     compression_level: int | None = 6,
     overwrite: bool = False,
+    precision: str = "fp32",
+    data_config: dict | None = None,
 ) -> None:
     if tile_size is None:
         tile_size = _tile_size(package_path)
     tile_width, tile_height = tile_size
-    data_config = resolve_model_data_config(model.model)
+    data_config = dict(data_config) if data_config is not None else resolve_model_data_config(model.model)
     data_config["input_size"] = (3, tile_height, tile_width)
     transform = create_transform(**data_config, is_training=False)
     records = read_package_manifest(package_path)
@@ -452,7 +478,8 @@ def cache_teacher_features_from_package(
     def features():
         for batch in tqdm(loader, total=len(loader), desc="teacher batches"):
             images = batch["image"].to(device, non_blocking=device.startswith("cuda"))
-            batch_features = model(images).detach().cpu().numpy().astype(np.float32)
+            with _autocast_context(device, precision):
+                batch_features = model(images).detach().cpu().numpy().astype(np.float32)
             for feature in batch_features:
                 yield feature
 
@@ -482,6 +509,9 @@ def cache_teacher_features_from_packages(
     overwrite: bool = False,
     progress_manifest: str | Path | None = None,
     continue_on_error: bool = False,
+    precision: str = "fp32",
+    compile_model: bool = False,
+    compile_mode: str = "reduce-overhead",
 ) -> None:
     tile_size = _validate_common_tile_size(package_paths)
     output_path = Path(output)
@@ -494,6 +524,40 @@ def cache_teacher_features_from_packages(
     started = time.time()
     rows: list[dict] = []
     progress_path = _progress_path(output_path, progress_manifest)
+    data_config = resolve_model_data_config(model.model) if hasattr(model, "model") else None
+    runtime_model: torch.nn.Module | None = None
+    resolved_precision = _resolve_precision(precision, device)
+    runtime_config = {
+        "packages": len(package_paths),
+        "output": str(output_path),
+        "output_is_file": output_is_file,
+        "tile_size": list(tile_size),
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "prefetch_factor": prefetch_factor,
+        "device": device,
+        "precision": precision,
+        "resolved_precision": resolved_precision,
+        "compile": compile_model,
+        "compile_mode": compile_mode if compile_model else "",
+        "feature_compression": compression,
+        "feature_compression_level": compression_level,
+        "overwrite": overwrite,
+        "continue_on_error": continue_on_error,
+        "progress_manifest": str(progress_path),
+    }
+    print(f"teacher_cache_config {json.dumps(runtime_config, sort_keys=True)}", flush=True)
+
+    def get_runtime_model() -> torch.nn.Module:
+        nonlocal runtime_model
+        if runtime_model is None:
+            runtime_model = model.to(device).eval()
+            if compile_model:
+                print(f"teacher_model_compiling mode={compile_mode}", flush=True)
+                runtime_model = torch.compile(runtime_model, mode=compile_mode)
+                print("teacher_model_compiled", flush=True)
+        return runtime_model
+
     for package_path in package_paths:
         package_output = output_path if output_is_file else _default_output_path(package_path, output_path, teacher_name)
         print(f"feature_package_start tile_package={package_path} output={package_output} teacher={teacher_name}", flush=True)
@@ -514,7 +578,7 @@ def cache_teacher_features_from_packages(
                 print(f"feature_package_skipped existing_valid tile_package={package_path} output={package_output}", flush=True)
                 continue
             cache_teacher_features_from_package(
-                model=model,
+                model=get_runtime_model(),
                 package_path=package_path,
                 output_path=package_output,
                 tile_size=tile_size,
@@ -526,6 +590,8 @@ def cache_teacher_features_from_packages(
                 compression=compression,
                 compression_level=compression_level,
                 overwrite=overwrite,
+                precision=precision,
+                data_config=data_config,
             )
             metadata = _validate_feature_output(package_output, expected_teacher=teacher_name)
             row.update(metadata)
@@ -573,6 +639,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch-factor", type=int, default=2, help="Batches prefetched per worker for --input reads.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--precision",
+        choices=("fp32", "fp16", "bf16", "auto"),
+        default="fp32",
+        help="Teacher inference precision. fp32 preserves the previous behavior; fp16/bf16/auto use CUDA autocast.",
+    )
+    parser.add_argument(
+        "--compile",
+        dest="compile_model",
+        action="store_true",
+        help="Compile the teacher with torch.compile before generating features.",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="reduce-overhead",
+        help="torch.compile mode used with --compile.",
+    )
+    parser.add_argument(
         "--feature-compression",
         choices=("zstd", "zlib", "lzma", "none"),
         default="zstd",
@@ -604,7 +688,7 @@ def main() -> None:
     teacher_name = _teacher_name(args.teacher, args.teacher_name)
     print(
         f"teacher_cache_start input={args.input} output={args.output} teacher={args.teacher} "
-        f"teacher_name={teacher_name} device={args.device}",
+        f"teacher_name={teacher_name} device={args.device} precision={args.precision} compile={args.compile_model}",
         flush=True,
     )
     print(f"teacher_cache_scanning_input path={args.input}", flush=True)
@@ -637,6 +721,9 @@ def main() -> None:
         overwrite=args.overwrite,
         progress_manifest=args.progress_manifest,
         continue_on_error=args.continue_on_error,
+        precision=args.precision,
+        compile_model=args.compile_model,
+        compile_mode=args.compile_mode,
     )
 
 
