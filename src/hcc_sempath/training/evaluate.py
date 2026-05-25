@@ -31,7 +31,7 @@ from .utils import write_json
 
 
 def _load_prototype_map(cfg: dict, dims: dict[str, int]) -> dict[str, PrototypeRegistry] | None:
-    if float(cfg["loss"].get("semantic_weight", 0.0)) == 0:
+    if float(cfg["loss"].get("semantic_weight", 0.0)) == 0 and float(cfg["loss"].get("prototype_filter_weight", 0.0)) == 0:
         return None
     prototype_paths = cfg["data"].get("prototype_paths")
     if isinstance(prototype_paths, dict):
@@ -100,7 +100,12 @@ def main() -> None:
     ).to(device)
     payload = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(payload["model"])
-    _, student_by_teacher, teacher_by_name = collect_embeddings(model, loader, device)
+    _, student_by_teacher, teacher_by_name = collect_embeddings(
+        model,
+        loader,
+        device,
+        max_batches=cfg["train"].get("max_eval_batches", cfg["train"].get("max_val_batches")),
+    )
     prototypes = _load_prototype_map(cfg, dims)
     metrics = evaluate_teacher_outputs(student_by_teacher, teacher_by_name, prototypes, int(cfg["train"]["topk"]))
     write_json(f"{cfg['runtime']['output_dir']}/eval_{args.split}.json", metrics)

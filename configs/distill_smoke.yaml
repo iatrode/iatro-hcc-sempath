@@ -18,8 +18,10 @@ semantic:
 loss:
   relation_weight: 0.25
   semantic_weight: 0.25
+  semantic_warmup_epochs: 2
   semantic_temperature: 1.0
   prototype_filter_weight: 0.5
+  prototype_filter_warmup_epochs: 2
   prototype_filter_alpha_min: 0.25
 
 train:
@@ -29,3 +31,5 @@ train:
   weight_decay: 0.01
   amp: false
   topk: 2
+  max_val_batches: 1
+  max_eval_batches: 1

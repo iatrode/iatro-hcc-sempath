@@ -228,6 +228,13 @@ This can be implemented either as explicit staged training or as a single traini
 
 该策略既可以实现为显式分阶段训练，也可以实现为单次训练中的 scheduled loss weights。无论采用哪种工程实现，科学表述均应保持克制：目标是组织 HCC 相关形态，而不是声称 prototypes 构成穷尽或确定性的病理类别。
 
+At multi-million tile scale, validation and embedding metrics should use fixed
+or bounded sampled subsets during training. Full validation should be reserved
+for selected checkpoints, because collecting all validation embeddings every
+epoch is not memory- or time-efficient.
+
+在百万级 tile 训练规模下，训练过程中的 validation 与 embedding metric 应使用固定或有上限的抽样子集。全量 validation 应保留给关键 checkpoint，因为每个 epoch 收集全部 validation embedding 在内存和时间上都不合适。
+
 ## 4. Student Backbone / Student 主干
 
 The current compact student candidate is a ViT-S/14 style encoder.

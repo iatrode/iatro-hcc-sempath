@@ -30,8 +30,10 @@ loss:
     gigapath: 1.0
   relation_weight: 0.25
   semantic_weight: 0.25
+  semantic_warmup_epochs: 1
   semantic_temperature: 1.0
   prototype_filter_weight: 0.5
+  prototype_filter_warmup_epochs: 1
   prototype_filter_alpha_min: 0.25
 
 train:
@@ -41,3 +43,5 @@ train:
   weight_decay: 0.01
   amp: true
   topk: 10
+  max_val_batches: 512
+  max_eval_batches: 128
