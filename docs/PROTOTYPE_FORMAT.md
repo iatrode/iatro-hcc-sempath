@@ -16,6 +16,8 @@ A prototype package is a `.pt` or `.pth` file loaded with `torch.load`.
     "prototypes": Tensor[num_prototypes, dim],
     "names": list[str],
     "groups": list[str | None],          # optional
+    "levels": list[int],
+    "exclusive": list[bool],
     "thresholds": Tensor[num_prototypes], # optional
     "counts": list[int],                 # optional
     "source": dict,                      # optional public-safe metadata
@@ -26,8 +28,13 @@ Required fields:
 
 - `version`: currently `1`.
 - `prototypes`: 2D float tensor.
-- `names`: unique prototype names. If omitted, names are generated as
-  `prototype_000`, `prototype_001`, ...
+- `names`: unique prototype names.
+- `levels`: prototype semantic level. Level `1` is the primary mutually
+  exclusive state, such as tumor versus non-tumor / background tissue. Level `2`
+  is a non-exclusive attribute, such as lymphocyte-rich, fibrotic stroma,
+  necrosis, vascular context, or background liver change.
+- `exclusive`: per-prototype exclusivity flag. Level-1 prototypes must be
+  `True`; level-2 prototypes must be `False`.
 
 Optional fields:
 
@@ -63,10 +70,13 @@ take precedence for tensor fields.
 
 ## Training Use
 
-Prototype responses are multi-label affinities. A tile can match multiple
-prototypes at once, so prototype supervision should use multi-label regression,
-BCE-style losses, or positive-unlabeled objectives rather than single-class
-softmax classification.
+Prototype supervision is two-level:
+
+- Level 1 is mutually exclusive. It should use softmax-style competition or
+  cross-entropy over primary states.
+- Level 2 is non-exclusive. A tile can match multiple level-2 prototypes at
+  once, so it should use multi-label regression, BCE-style losses, or
+  positive-unlabeled objectives.
 
 Prototype response should also support teacher filtering: teacher signals that
 conflict with HCC prototype responses can be down-weighted with bounded soft
