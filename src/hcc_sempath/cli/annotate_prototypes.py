@@ -280,7 +280,7 @@ class AnnotationData:
         viewer = self.viewer(index)
         return {record.row for record in viewer.records if self.state.is_annotated(package, record)}
 
-    def thumbnail_png(self, index: int, max_size: int = 900) -> bytes:
+    def thumbnail_png(self, index: int, max_size: int = 1200) -> bytes:
         package = self.packages[index]
         viewer = self.viewer(index)
         start = perf_counter()
@@ -296,10 +296,10 @@ class AnnotationData:
         canvas_h = max(1, int(height_span * scale))
         canvas = Image.new("RGB", (canvas_w, canvas_h), "white")
         annotated = self.state.annotations_for_package(package)
-        tile_px_w = max(1, int(tile_w * scale))
-        tile_px_h = max(1, int(tile_h * scale))
+        tile_px_w = max(3, int(tile_w * scale))
+        tile_px_h = max(3, int(tile_h * scale))
         sampled_records = records
-        max_tiles = 2500
+        max_tiles = 6000
         if len(records) > max_tiles:
             sampled_records = random.Random(0).sample(records, max_tiles)
         for record in sampled_records:
@@ -320,11 +320,15 @@ class AnnotationData:
         buffer = io.BytesIO()
         canvas.save(buffer, format="PNG")
         LOG.info(
-            "thumbnail_render iac=%s records=%d sampled=%d annotated=%d canvas=%dx%d tile_px=%dx%d elapsed=%.3fs",
+            "thumbnail_render iac=%s mode=spatial records=%d sampled=%d annotated=%d bounds=(%d,%d,%d,%d) canvas=%dx%d tile_px=%dx%d elapsed=%.3fs",
             package.rel_path,
             len(records),
             len(sampled_records),
             len(annotated),
+            min_x,
+            max_x,
+            min_y,
+            max_y,
             canvas_w,
             canvas_h,
             tile_px_w,
@@ -344,17 +348,21 @@ HTML = r"""<!doctype html>
 body{margin:0;font:14px system-ui,-apple-system,Segoe UI,sans-serif;color:#202124;background:#f6f7f8}
 .layout{display:grid;grid-template-columns:300px 1fr 320px;height:100vh}
 aside,.right{overflow:auto;background:#fff;border-right:1px solid #d8dadd;padding:12px}.right{border-left:1px solid #d8dadd;border-right:0}
-main{overflow:auto;padding:12px}.pkg{padding:8px;border:1px solid #d8dadd;margin-bottom:6px;cursor:pointer;background:#fff}.pkg.active{border-color:#1a73e8;background:#eaf2ff}
-.muted{color:#6b7280;font-size:12px}.thumb{max-width:100%;border:1px solid #c7cbd1;background:white;cursor:crosshair}
+main{overflow:auto;padding:12px}.pkg{position:relative;padding:8px;border:1px solid #d8dadd;margin-bottom:6px;cursor:pointer;background:#fff;overflow:hidden}.pkg.active{border-color:#1a73e8;background:#eaf2ff}
+.pkg>*{position:relative;z-index:1}.pkg::before{content:"";position:absolute;inset:0 auto 0 0;width:var(--pct,0%);background:#dff3eb;z-index:0}
+.muted{color:#6b7280;font-size:12px}.thumbWrap{min-height:220px;border:1px solid #c7cbd1;background:white;display:flex;align-items:flex-start;justify-content:center}
+.thumb{display:block;max-width:100%;background:white;cursor:crosshair}.loading{padding:18px;color:#6b7280;font-size:12px}
 .tile{width:224px;height:224px;object-fit:contain;border:1px solid #c7cbd1;background:#fff}.chips{display:grid;grid-template-columns:1fr;gap:6px;margin:8px 0 16px}
 button.chip{text-align:left;border:1px solid #c7cbd1;background:#fff;padding:8px;cursor:pointer}button.chip.selected{background:#1a73e8;color:white;border-color:#1a73e8}
 .actions button{padding:8px 10px;margin-right:6px}.bar{height:8px;background:#e5e7eb;margin:6px 0 10px}.bar>div{height:8px;background:#18865b}
+.stat{position:relative;border:1px solid #d8dadd;background:#fff;padding:7px 8px;margin:5px 0;overflow:hidden}.stat::before{content:"";position:absolute;inset:0 auto 0 0;width:var(--pct,0%);background:#eaf2ff;z-index:0}.stat>*{position:relative;z-index:1}
+.stat .row{display:flex;justify-content:space-between;gap:8px}.stat .count{font-variant-numeric:tabular-nums;color:#374151}
 pre{white-space:pre-wrap;font-size:12px;background:#f1f3f4;padding:8px}
 </style>
 </head>
 <body><div class="layout"><aside><h3>IAC packages</h3><div id="packageSummary" class="muted"></div><div id="packages"></div></aside>
 <main><h3 id="title">Prototype annotation</h3><div class="muted" id="recordMeta"></div>
-<p><img id="tile" class="tile"></p><p><img id="thumb" class="thumb"></p></main>
+<p><img id="tile" class="tile"></p><h3>Location overview</h3><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb"></div></main>
 <section class="right"><h3>Progress</h3><div id="progress"></div><h3>L1 primary</h3><div id="l1" class="chips"></div>
 <h3>L2 attributes</h3><div id="l2" class="chips"></div><div class="actions"><button onclick="save()">Save + next</button><button onclick="nextRandom()">Skip / random</button></div><pre id="status"></pre></section>
 </div>
@@ -363,12 +371,15 @@ let packages=[], pkg=0, current=null, l1="", l2=new Set();
 async function api(path, opts){const r=await fetch(path, opts); if(!r.ok) throw new Error(await r.text()); return r.headers.get('content-type')?.includes('json')?r.json():r.blob();}
 function prototypeButton(name, selected, onClick){const b=document.createElement('button'); b.className='chip'+(selected?' selected':''); b.textContent=name; b.onclick=onClick; return b;}
 function renderLabels(){const a=document.getElementById('l1'); a.innerHTML=''; L1.forEach(x=>a.appendChild(prototypeButton(x,l1===x,()=>{l1=x;renderLabels()}))); const b=document.getElementById('l2'); b.innerHTML=''; L2.forEach(x=>b.appendChild(prototypeButton(x,l2.has(x),()=>{l2.has(x)?l2.delete(x):l2.add(x);renderLabels()})));}
-async function loadPackages(){packages=await api('/api/packages'); document.getElementById('packageSummary').textContent=`${packages.length} IAC package${packages.length===1?'':'s'}`; const box=document.getElementById('packages'); box.innerHTML=''; packages.forEach(p=>{const d=document.createElement('div'); d.className='pkg'+(p.index===pkg?' active':''); d.innerHTML=`<b>${p.name}</b><div class=muted>${p.dataset||'no dataset'} · ${p.annotated}/${p.total}</div>`; d.onclick=()=>{pkg=p.index; refreshPackage();}; box.appendChild(d)});}
-async function refreshPackage(){await loadPackages(); document.getElementById('thumb').src='/api/thumbnail?package='+pkg+'&t='+Date.now(); await progress(); await nextRandom();}
-async function progress(){const p=await api('/api/progress?package='+pkg); const pct=p.package.total?Math.round(p.package.annotated/p.package.total*100):0; document.getElementById('progress').innerHTML=`<div>${p.package.annotated}/${p.package.total} (${pct}%)</div><div class=bar><div style="width:${pct}%"></div></div><b>L1</b><pre>${JSON.stringify(p.l1,null,2)}</pre><b>L2</b><pre>${JSON.stringify(p.l2,null,2)}</pre>`;}
+function statRow(name,count,maxCount){const pct=maxCount?Math.round(count/maxCount*100):0; return `<div class=stat style="--pct:${pct}%"><div class=row><span>${name}</span><span class=count>${count}</span></div></div>`;}
+function statBlock(title, counts){const values=Object.values(counts); const maxCount=Math.max(1,...values); return `<b>${title}</b>`+Object.entries(counts).map(([name,count])=>statRow(name,count,maxCount)).join('');}
+function setThumbnailSrc(){const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); loading.style.display='block'; img.style.display='none'; img.onload=()=>{loading.style.display='none'; img.style.display='block';}; img.onerror=()=>{loading.textContent='Overview failed to load.';}; img.src='/api/thumbnail?package='+pkg+'&t='+Date.now();}
+async function loadPackages(){packages=await api('/api/packages'); document.getElementById('packageSummary').textContent=`${packages.length} IAC package${packages.length===1?'':'s'}`; const box=document.getElementById('packages'); box.innerHTML=''; packages.forEach(p=>{const pct=p.total?Math.round(p.annotated/p.total*100):0; const d=document.createElement('div'); d.className='pkg'+(p.index===pkg?' active':''); d.style.setProperty('--pct',pct+'%'); d.innerHTML=`<b>${p.name}</b><div class=muted>${p.dataset||'no dataset'} · ${p.annotated}/${p.total} · ${pct}%</div>`; d.onclick=()=>{pkg=p.index; refreshPackage();}; box.appendChild(d)});}
+async function refreshPackage(){await loadPackages(); setThumbnailSrc(); await progress(); await nextRandom();}
+async function progress(){const p=await api('/api/progress?package='+pkg); const pct=p.package.total?Math.round(p.package.annotated/p.package.total*100):0; document.getElementById('progress').innerHTML=`<div>${p.package.annotated}/${p.package.total} (${pct}%)</div><div class=bar><div style="width:${pct}%"></div></div>${statBlock('L1',p.l1)}${statBlock('L2',p.l2)}`;}
 async function showRecord(rec){current=rec; l1=""; l2=new Set(); renderLabels(); if(!rec){document.getElementById('recordMeta').textContent='All tiles in this IAC are annotated.'; document.getElementById('tile').removeAttribute('src'); return;} document.getElementById('recordMeta').textContent=`${packages[pkg].rel_path} · ${rec.tile_id} · x=${rec.x} y=${rec.y} row=${rec.row}`; document.getElementById('tile').src=`/api/tile?package=${pkg}&row=${rec.row}`;}
 async function nextRandom(){const r=await api('/api/random?package='+pkg); await showRecord(r.record);}
-async function save(){if(!current){await nextRandom(); return;} if(!l1){document.getElementById('status').textContent='Select one L1 primary prototype first.'; return;} await api('/api/annotation',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({package:pkg,row:current.row,l1,l2:[...l2]})}); document.getElementById('status').textContent='Saved.'; document.getElementById('thumb').src='/api/thumbnail?package='+pkg+'&t='+Date.now(); await progress(); await loadPackages(); await nextRandom();}
+async function save(){if(!current){await nextRandom(); return;} if(!l1){document.getElementById('status').textContent='Select one L1 primary prototype first.'; return;} await api('/api/annotation',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({package:pkg,row:current.row,l1,l2:[...l2]})}); document.getElementById('status').textContent='Saved.'; setThumbnailSrc(); await progress(); await loadPackages(); await nextRandom();}
 document.getElementById('thumb').onclick=async ev=>{const img=ev.target, r=img.getBoundingClientRect(); const x=(ev.clientX-r.left)/r.width, y=(ev.clientY-r.top)/r.height; const rec=await api(`/api/nearest?package=${pkg}&rx=${x}&ry=${y}`); await showRecord(rec.record);}
 const L1=%L1_JSON%; const L2=%L2_JSON%; renderLabels(); refreshPackage().catch(e=>document.getElementById('status').textContent=e);
 </script></body></html>

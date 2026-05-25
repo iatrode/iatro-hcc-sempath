@@ -49,6 +49,12 @@ def _slide_labels(slide_table) -> dict[int, str]:
     return labels
 
 
+def _display_coordinate(header: dict, value: int, stride: int) -> int:
+    if header.get("coordinate_mode") == "tile_grid":
+        return value * stride
+    return value
+
+
 class IacViewerData:
     def __init__(self, package_path: str | Path) -> None:
         self.package_path = Path(package_path)
@@ -87,6 +93,8 @@ class IacViewerData:
             slide_idx = int(_table_value(self.record_table, "slide_idx", row, 0))
             grid_x = int(_table_value(self.record_table, "tile_x", row, 0))
             grid_y = int(_table_value(self.record_table, "tile_y", row, 0))
+            display_x = _display_coordinate(self.header, grid_x, self.stride_x)
+            display_y = _display_coordinate(self.header, grid_y, self.stride_y)
             records.append(
                 IacRecord(
                     row=row,
@@ -95,8 +103,8 @@ class IacViewerData:
                     tile_id=str(_table_value(self.record_table, "tile_id", row, f"tile_{row}")),
                     grid_x=grid_x,
                     grid_y=grid_y,
-                    display_x=grid_x * self.stride_x,
-                    display_y=grid_y * self.stride_y,
+                    display_x=display_x,
+                    display_y=display_y,
                     split=str(_table_value(self.record_table, "split", row, "")),
                 )
             )
@@ -109,6 +117,8 @@ class IacViewerData:
             slide_idx = int(_table_value(self.record_table, "slide_idx", row, 0))
             grid_x = int(_table_value(self.record_table, "tile_x", row, 0))
             grid_y = int(_table_value(self.record_table, "tile_y", row, 0))
+            display_x = _display_coordinate(self.header, grid_x, self.stride_x)
+            display_y = _display_coordinate(self.header, grid_y, self.stride_y)
             records.append(
                 IacRecord(
                     row=row,
@@ -117,8 +127,8 @@ class IacViewerData:
                     tile_id=str(_table_value(self.record_table, "tile_id", row, f"tile_{row}")),
                     grid_x=grid_x,
                     grid_y=grid_y,
-                    display_x=grid_x * self.stride_x,
-                    display_y=grid_y * self.stride_y,
+                    display_x=display_x,
+                    display_y=display_y,
                     split="",
                 )
             )
