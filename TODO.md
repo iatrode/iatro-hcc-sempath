@@ -17,8 +17,7 @@ git repository.
 
 ## Training system
 
-- Add training-manifest documentation and schema examples for per-WSI IAC
-  training cohorts.
+- Extend training-manifest checks with optional fixed validation subset export.
 - Add sampled validation subsets for large-scale training.
 - Add WSI-window or feature-cache-aware sampling for current whole-matrix
   teacher feature packages.

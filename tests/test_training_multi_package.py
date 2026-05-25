@@ -18,6 +18,7 @@ from hcc_sempath.training.datasets import (
     validate_teacher_cache,
 )
 from hcc_sempath.training.manifest import build_training_manifest
+from hcc_sempath.training.manifest import validate_manifest_artifacts
 
 
 def _write_package(root: Path, slide_id: str, value: int) -> tuple[Path, Path]:
@@ -109,6 +110,9 @@ def test_build_training_manifest_splits_public_heldout_by_count(tmp_path: Path) 
     assert len(public_train) == 3
     assert public_train.isdisjoint(public_exval)
     assert set(manifest["splits"]["train"]["internal"]).isdisjoint(manifest["splits"]["val"]["internal"])
+    assert manifest["summary"]["datasets"]["internal"]["package_count"] == 4
+    assert manifest["summary"]["datasets"]["tcga"]["package_count"] == 5
+    assert manifest["summary"]["splits"]["exval"]["tcga_heldout"]["package_count"] == 2
 
 
 def test_manifest_data_paths_resolve_teacher_features_by_convention(tmp_path: Path) -> None:
@@ -134,3 +138,30 @@ def test_manifest_data_paths_resolve_teacher_features_by_convention(tmp_path: Pa
 
     assert tile_packages == [str(tile_path)]
     assert feature_packages == {"toy": [str(expected_feature_path)]}
+
+
+def test_validate_manifest_artifacts_checks_teacher_feature_packages(tmp_path: Path) -> None:
+    tile_root = tmp_path / "tiles"
+    feature_root = tmp_path / "features"
+    tile_root.mkdir()
+    (feature_root / "toy").mkdir(parents=True)
+    tile_path, feature_path = _write_package(tile_root, "slide_a", 10)
+    expected_feature_path = feature_root / "toy" / "slide_a.toy.features.iac"
+    feature_path.replace(expected_feature_path)
+    manifest = {
+        "version": 1,
+        "tile_suffix": ".tiles.iac",
+        "datasets": {"internal": {"role": "development", "tile_root": str(tile_root)}},
+        "splits": {"train": {"internal": ["slide_a"]}, "val": {}, "exval": {}},
+    }
+
+    result = validate_manifest_artifacts(
+        manifest=manifest,
+        splits=["train"],
+        teachers=["toy"],
+        feature_root=feature_root,
+    )
+
+    assert result["missing_tile_packages"] == []
+    assert result["missing_feature_packages"] == []
+    assert tile_path.exists()

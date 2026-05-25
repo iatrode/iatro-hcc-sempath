@@ -258,6 +258,24 @@ hcc-sempath build-prototypes \
 Prototype packages are runtime data with metadata, not hard-coded model classes.
 See `docs/PROTOTYPE_FORMAT.md` for the public package contract.
 
+Build a training manifest:
+
+```bash
+hcc-sempath build-train-manifest \
+  --dev-source internal=/data/hcc_tiles/internal \
+  --public-source tcga=/data/hcc_tiles/tcga \
+  --public-exval-n 50 \
+  --val-frac 0.15 \
+  --split-key patient_id \
+  --teacher h_optimus_1 \
+  --teacher gigapath \
+  --feature-root /data/hcc_features \
+  --check-artifacts \
+  --output data/manifests/hcc_train.yaml
+```
+
+See `docs/TRAINING_MANIFEST.md` for the cohort manifest contract.
+
 Train:
 
 ```bash

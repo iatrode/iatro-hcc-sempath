@@ -17,7 +17,7 @@ data:
   persistent_workers: true
 
 model:
-  backbone_name: vit_small_patch14_dinov2.lvd142m
+  backbone_name: vit_small_patch14_reg4_dinov2.lvd142m
   embedding_dim: 1536
   teacher_dims:
     h_optimus_1: 1536
