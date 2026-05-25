@@ -11,6 +11,7 @@ from hcc_sempath.cli.annotate_prototypes import (
     L2_PROTOTYPES,
     discover_iac_packages,
 )
+from hcc_sempath.io.feature_cache import build_teacher_feature_package
 from hcc_sempath.io.manifests import TileRecord
 from hcc_sempath.io.tile_package import build_tile_package_from_records, encode_jxl_array
 
@@ -65,6 +66,24 @@ def test_discover_iac_packages_supports_direct_file_and_dataset_dirs(tmp_path: P
     by_name = {package.rel_path: package for package in packages}
     assert by_name["direct.iac"].dataset == ""
     assert by_name["cohort_a/nested.iac"].dataset == "cohort_a"
+    assert by_name["cohort_a/nested.iac"].total == 4
+
+
+def test_discover_iac_packages_skips_teacher_feature_packages(tmp_path: Path) -> None:
+    image_path = tmp_path / "tiles.iac"
+    feature_path = tmp_path / "teacher.features.iac"
+    records = _records()
+    _write_iac(image_path)
+    build_teacher_feature_package(
+        records,
+        [np.arange(4, dtype=np.float32) for _ in records],
+        feature_path,
+        teacher_name="smoke",
+        overwrite=True,
+    )
+
+    packages = discover_iac_packages(tmp_path)
+    assert [package.rel_path for package in packages] == ["tiles.iac"]
 
 
 def test_annotation_state_writes_resume_json_and_csv(tmp_path: Path) -> None:
