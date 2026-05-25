@@ -31,14 +31,17 @@ from .utils import seed_everything
 
 def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -> dict[str, PrototypeRegistry] | None:
     semantic_weight = float(cfg["loss"].get("semantic_weight", 0.0))
-    if semantic_weight == 0:
+    prototype_filter_weight = float(cfg["loss"].get("prototype_filter_weight", 0.0))
+    if semantic_weight == 0 and prototype_filter_weight == 0:
         return None
     prototype_paths = cfg["data"].get("prototype_paths")
     if isinstance(prototype_paths, dict):
         return {name: load_prototype_registry(prototype_paths[name], expected_dim=dim).to(device) for name, dim in dims.items()}
     prototype_path = cfg["data"].get("prototype_path")
     if prototype_path is None:
-        raise ValueError("data.prototype_path or data.prototype_paths is required when semantic_weight > 0")
+        raise ValueError(
+            "data.prototype_path or data.prototype_paths is required when semantic_weight or prototype_filter_weight > 0"
+        )
     return {name: load_prototype_registry(prototype_path, expected_dim=dim).to(device) for name, dim in dims.items()}
 
 

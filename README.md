@@ -264,6 +264,11 @@ Train:
 hcc-sempath train --config configs/distill_train.example.yaml
 ```
 
+For large cohorts, validation and embedding metrics should be sampled with
+`train.max_val_batches` and `train.max_eval_batches`; prototype semantic and
+filtering weights can be warmed up with `loss.semantic_warmup_epochs` and
+`loss.prototype_filter_warmup_epochs`.
+
 Resume:
 
 ```bash

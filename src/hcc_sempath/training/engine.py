@@ -15,12 +15,52 @@ def _amp_enabled(device: torch.device, cfg: dict, train: bool) -> bool:
     return bool(train and cfg["train"].get("amp", False) and device.type == "cuda")
 
 
-def run_epoch(model, loader, prototypes, optimizer, device, cfg, train: bool, scaler=None) -> dict[str, float]:
+def _linear_warmup(base_value: float, epoch: int, warmup_epochs: int) -> float:
+    if warmup_epochs <= 0:
+        return base_value
+    return base_value * min(1.0, max(0.0, epoch / warmup_epochs))
+
+
+def scheduled_loss_config(cfg: dict, epoch: int) -> dict[str, float | dict]:
+    loss_cfg = cfg["loss"]
+    return {
+        "teacher_weights": loss_cfg.get("teacher_weights"),
+        "relation_weight": float(loss_cfg["relation_weight"]),
+        "semantic_weight": _linear_warmup(
+            float(loss_cfg.get("semantic_weight", 0.0)),
+            epoch,
+            int(loss_cfg.get("semantic_warmup_epochs", 0)),
+        ),
+        "semantic_temperature": float(loss_cfg["semantic_temperature"]),
+        "prototype_filter_weight": _linear_warmup(
+            float(loss_cfg.get("prototype_filter_weight", 0.0)),
+            epoch,
+            int(loss_cfg.get("prototype_filter_warmup_epochs", 0)),
+        ),
+        "prototype_filter_alpha_min": float(loss_cfg.get("prototype_filter_alpha_min", 0.25)),
+    }
+
+
+def run_epoch(
+    model,
+    loader,
+    prototypes,
+    optimizer,
+    device,
+    cfg,
+    train: bool,
+    scaler=None,
+    loss_cfg: dict | None = None,
+    max_batches: int | None = None,
+) -> dict[str, float]:
     model.train(train)
     totals = {"loss": 0.0, "feature": 0.0, "relation": 0.0, "semantic": 0.0, "reliability": 0.0}
     n_batches = 0
-    teacher_weights = cfg["loss"].get("teacher_weights")
+    loss_cfg = loss_cfg or scheduled_loss_config(cfg, epoch=1)
+    teacher_weights = loss_cfg.get("teacher_weights")
     for batch in loader:
+        if max_batches is not None and n_batches >= max_batches:
+            break
         images = batch["images"].to(device)
         teachers = _move_teachers(batch, device)
         with torch.set_grad_enabled(train):
@@ -31,12 +71,12 @@ def run_epoch(model, loader, prototypes, optimizer, device, cfg, train: bool, sc
                     student_by_teacher=student_by_teacher,
                     teacher_by_name=teachers,
                     prototypes_by_teacher=prototypes,
-                    relation_weight=float(cfg["loss"]["relation_weight"]),
-                    semantic_weight=float(cfg["loss"]["semantic_weight"]),
-                    semantic_temperature=float(cfg["loss"]["semantic_temperature"]),
+                    relation_weight=float(loss_cfg["relation_weight"]),
+                    semantic_weight=float(loss_cfg["semantic_weight"]),
+                    semantic_temperature=float(loss_cfg["semantic_temperature"]),
                     teacher_weights=teacher_weights,
-                    prototype_filter_weight=float(cfg["loss"].get("prototype_filter_weight", 0.0)),
-                    prototype_filter_alpha_min=float(cfg["loss"].get("prototype_filter_alpha_min", 0.25)),
+                    prototype_filter_weight=float(loss_cfg["prototype_filter_weight"]),
+                    prototype_filter_alpha_min=float(loss_cfg["prototype_filter_alpha_min"]),
                 )
             if train:
                 optimizer.zero_grad(set_to_none=True)
@@ -59,12 +99,15 @@ def collect_embeddings(
     model,
     loader,
     device,
+    max_batches: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     model.eval()
     embeddings = []
     students_by_teacher: dict[str, list[torch.Tensor]] = {}
     teachers_by_name: dict[str, list[torch.Tensor]] = {}
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
         images = batch["images"].to(device)
         outputs = model(images)
         embeddings.append(outputs["embedding"].cpu())
@@ -87,9 +130,36 @@ def fit(model, train_loader, val_loader, prototypes, optimizer, device, cfg) -> 
     best_metrics = {}
     scaler = torch.amp.GradScaler("cuda", enabled=bool(cfg["train"].get("amp", False) and device.type == "cuda"))
     for epoch in range(1, int(cfg["train"]["epochs"]) + 1):
-        train_metrics = run_epoch(model, train_loader, prototypes, optimizer, device, cfg, train=True, scaler=scaler)
-        val_metrics = run_epoch(model, val_loader, prototypes, optimizer, device, cfg, train=False)
-        _, student_by_teacher, teacher_by_name = collect_embeddings(model, val_loader, device)
+        loss_cfg = scheduled_loss_config(cfg, epoch)
+        train_metrics = run_epoch(
+            model,
+            train_loader,
+            prototypes,
+            optimizer,
+            device,
+            cfg,
+            train=True,
+            scaler=scaler,
+            loss_cfg=loss_cfg,
+            max_batches=cfg["train"].get("max_train_batches"),
+        )
+        val_metrics = run_epoch(
+            model,
+            val_loader,
+            prototypes,
+            optimizer,
+            device,
+            cfg,
+            train=False,
+            loss_cfg=loss_cfg,
+            max_batches=cfg["train"].get("max_val_batches"),
+        )
+        _, student_by_teacher, teacher_by_name = collect_embeddings(
+            model,
+            val_loader,
+            device,
+            max_batches=cfg["train"].get("max_eval_batches", cfg["train"].get("max_val_batches")),
+        )
         cpu_prototypes = {name: registry.to("cpu") for name, registry in prototypes.items()} if prototypes else None
         embedding_metrics = evaluate_teacher_outputs(
             student_by_teacher,
@@ -97,7 +167,14 @@ def fit(model, train_loader, val_loader, prototypes, optimizer, device, cfg) -> 
             cpu_prototypes,
             int(cfg["train"]["topk"]),
         )
-        row = {"epoch": epoch, **{f"train_{k}": v for k, v in train_metrics.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}, **embedding_metrics}
+        row = {
+            "epoch": epoch,
+            "scheduled_semantic_weight": float(loss_cfg["semantic_weight"]),
+            "scheduled_prototype_filter_weight": float(loss_cfg["prototype_filter_weight"]),
+            **{f"train_{k}": v for k, v in train_metrics.items()},
+            **{f"val_{k}": v for k, v in val_metrics.items()},
+            **embedding_metrics,
+        }
         append_csv(output_dir / "metrics.csv", row)
         torch.save(
             {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(), "epoch": epoch, "config": cfg},
