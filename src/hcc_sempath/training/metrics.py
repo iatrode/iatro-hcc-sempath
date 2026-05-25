@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from .losses import relation_distillation_loss, semantic_distillation_loss
 from ..modeling.models import normalized_prototype_logits
+from ..modeling.prototypes import PrototypeRegistry
 
 
 def feature_cosine(student: torch.Tensor, teacher: torch.Tensor) -> float:
@@ -23,9 +24,9 @@ def retrieval_overlap(student: torch.Tensor, teacher: torch.Tensor, topk: int) -
     return float(sum(overlap) / max(1, len(overlap)))
 
 
-def prototype_response_correlation(student: torch.Tensor, teacher: torch.Tensor, prototypes: torch.Tensor) -> float:
-    student_logits = normalized_prototype_logits(student, prototypes).flatten()
-    teacher_logits = normalized_prototype_logits(teacher, prototypes).flatten()
+def prototype_response_correlation(student: torch.Tensor, teacher: torch.Tensor, prototypes: PrototypeRegistry) -> float:
+    student_logits = normalized_prototype_logits(student, prototypes.prototypes).flatten()
+    teacher_logits = normalized_prototype_logits(teacher, prototypes.prototypes).flatten()
     matrix = torch.corrcoef(torch.stack([student_logits, teacher_logits]))
     return float(matrix[0, 1].cpu())
 
@@ -33,7 +34,7 @@ def prototype_response_correlation(student: torch.Tensor, teacher: torch.Tensor,
 def evaluate_embeddings(
     student: torch.Tensor,
     teacher: torch.Tensor,
-    prototypes: torch.Tensor | None,
+    prototypes: PrototypeRegistry | None,
     topk: int,
 ) -> dict[str, float]:
     metrics = {
@@ -42,7 +43,7 @@ def evaluate_embeddings(
         "retrieval_overlap": retrieval_overlap(student, teacher, topk=topk),
     }
     if prototypes is not None:
-        metrics["semantic_kl"] = float(semantic_distillation_loss(student, teacher, prototypes).cpu())
+        metrics["prototype_semantic_loss"] = float(semantic_distillation_loss(student, teacher, prototypes).cpu())
         metrics["prototype_response_corr"] = prototype_response_correlation(student, teacher, prototypes)
     return metrics
 
@@ -50,7 +51,7 @@ def evaluate_embeddings(
 def evaluate_teacher_outputs(
     student_by_teacher: dict[str, torch.Tensor],
     teacher_by_name: dict[str, torch.Tensor],
-    prototypes_by_teacher: dict[str, torch.Tensor] | None,
+    prototypes_by_teacher: dict[str, PrototypeRegistry] | None,
     topk: int,
 ) -> dict[str, float]:
     metrics: dict[str, float] = {}

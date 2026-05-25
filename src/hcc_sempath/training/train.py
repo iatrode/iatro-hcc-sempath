@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..io.tile_package import read_package_metadata
-from ..modeling.prototypes import load_prototypes
+from ..modeling.prototypes import PrototypeRegistry, load_prototype_registry
 from ..modeling.models import HCCSemPathModel
 from .config import (
     embedding_dim,
@@ -29,17 +29,17 @@ from .manifest import load_training_manifest
 from .utils import seed_everything
 
 
-def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -> dict[str, torch.Tensor] | None:
+def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -> dict[str, PrototypeRegistry] | None:
     semantic_weight = float(cfg["loss"].get("semantic_weight", 0.0))
     if semantic_weight == 0:
         return None
     prototype_paths = cfg["data"].get("prototype_paths")
     if isinstance(prototype_paths, dict):
-        return {name: load_prototypes(prototype_paths[name], expected_dim=dim).to(device) for name, dim in dims.items()}
+        return {name: load_prototype_registry(prototype_paths[name], expected_dim=dim).to(device) for name, dim in dims.items()}
     prototype_path = cfg["data"].get("prototype_path")
     if prototype_path is None:
         raise ValueError("data.prototype_path or data.prototype_paths is required when semantic_weight > 0")
-    return {name: load_prototypes(prototype_path, expected_dim=dim).to(device) for name, dim in dims.items()}
+    return {name: load_prototype_registry(prototype_path, expected_dim=dim).to(device) for name, dim in dims.items()}
 
 
 def main() -> None:

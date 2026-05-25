@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from hcc_sempath.modeling.models import HCCSemPathModel
+from hcc_sempath.modeling.prototypes import PrototypeRegistry
 from hcc_sempath.training.losses import multi_teacher_distillation_loss
 
 
@@ -30,8 +31,20 @@ def test_multi_teacher_distillation_loss_aggregates_named_heads() -> None:
         "teacher_b": torch.randn(4, 7),
     }
     prototypes_by_teacher = {
-        "teacher_a": torch.randn(3, 5),
-        "teacher_b": torch.randn(3, 7),
+        "teacher_a": PrototypeRegistry(
+            prototypes=torch.randn(4, 5),
+            names=["primary_tumor", "primary_non_tumor", "lymphocyte_rich", "fibrotic_stroma"],
+            groups=["primary_state", "primary_state", "immune", "stroma"],
+            levels=[1, 1, 2, 2],
+            exclusive=[True, True, False, False],
+        ),
+        "teacher_b": PrototypeRegistry(
+            prototypes=torch.randn(4, 7),
+            names=["primary_tumor", "primary_non_tumor", "lymphocyte_rich", "fibrotic_stroma"],
+            groups=["primary_state", "primary_state", "immune", "stroma"],
+            levels=[1, 1, 2, 2],
+            exclusive=[True, True, False, False],
+        ),
     }
 
     loss, parts = multi_teacher_distillation_loss(
@@ -41,10 +54,13 @@ def test_multi_teacher_distillation_loss_aggregates_named_heads() -> None:
         relation_weight=0.25,
         semantic_weight=0.25,
         semantic_temperature=1.0,
+        prototype_filter_weight=1.0,
+        prototype_filter_alpha_min=0.2,
     )
 
     assert loss.ndim == 0
-    assert set(parts) == {"feature", "relation", "semantic"}
+    assert set(parts) == {"feature", "relation", "semantic", "reliability"}
+    assert 0.2 <= float(parts["reliability"]) <= 1.0
     loss.backward()
     assert student_by_teacher["teacher_a"].grad is not None
     assert student_by_teacher["teacher_b"].grad is not None

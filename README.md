@@ -250,8 +250,8 @@ Build semantic prototypes:
 
 ```bash
 hcc-sempath build-prototypes \
-  --concept-dir data/concept_features \
-  --level 2 \
+  --primary-dir data/prototype_concepts/primary \
+  --attribute-dir data/prototype_concepts/attributes \
   --output data/prototypes/hcc_semantic_prototypes.pt
 ```
 
