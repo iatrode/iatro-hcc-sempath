@@ -139,7 +139,7 @@ def test_annotation_state_writes_resume_json_and_csv(tmp_path: Path) -> None:
     assert "necrotic;inflammatory-rich" in csv_text
 
 
-def test_random_record_skips_annotated_tiles_and_thumbnail_is_png(tmp_path: Path) -> None:
+def test_random_record_skips_annotated_tiles_and_overview_is_jpg(tmp_path: Path) -> None:
     iac_path = tmp_path / "tiles.iac"
     state_path = tmp_path / "annotations.json"
     _write_iac(iac_path)
@@ -152,20 +152,21 @@ def test_random_record_skips_annotated_tiles_and_thumbnail_is_png(tmp_path: Path
 
         seen_rows = {data.random_record(0)["record"]["row"] for _ in range(30)}
         assert first.row not in seen_rows
-        assert data.thumbnail_png(0).startswith(b"\x89PNG")
+        assert data.thumbnail_jpg(0).startswith(b"\xff\xd8")
+        assert data.overview_cache_path(package).exists()
     finally:
         data.close()
 
 
-def test_thumbnail_uses_stride_footprint_for_spatial_layout(tmp_path: Path) -> None:
+def test_overview_uses_fixed_cell_grid_for_spatial_layout(tmp_path: Path) -> None:
     iac_path = tmp_path / "tiles.iac"
     state_path = tmp_path / "annotations.json"
     _write_iac_with_stride(iac_path, stride=64)
 
     data = AnnotationData(iac_path, state_path)
     try:
-        image = Image.open(io.BytesIO(data.thumbnail_png(0, max_size=128))).convert("RGB")
-        assert image.size == (128, 128)
-        assert image.getpixel((60, 60)) != (255, 255, 255)
+        image = Image.open(io.BytesIO(data.thumbnail_jpg(0))).convert("RGB")
+        assert image.size == (8, 8)
+        assert image.getpixel((2, 2)) != (255, 255, 255)
     finally:
         data.close()
