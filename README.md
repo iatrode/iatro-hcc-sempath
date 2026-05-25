@@ -254,6 +254,9 @@ hcc-sempath build-prototypes \
   --output data/prototypes/hcc_semantic_prototypes.pt
 ```
 
+Prototype packages are runtime data with metadata, not hard-coded model classes.
+See `docs/PROTOTYPE_FORMAT.md` for the public package contract.
+
 Train:
 
 ```bash

@@ -194,6 +194,8 @@ Recommended to include in git:
 - 项目定位和设计文档；
 - training and evaluation configuration templates;
 - 训练和评估配置模板；
+- prototype package format documentation;
+- prototype package 格式文档；
 - manifest schemas;
 - manifest schema；
 - teacher metadata schemas;
