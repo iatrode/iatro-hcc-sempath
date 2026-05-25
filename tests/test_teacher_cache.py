@@ -10,8 +10,35 @@ import torch
 from hcc_sempath.io.feature_cache import build_teacher_feature_package_from_tile_package
 from hcc_sempath.io.manifests import write_tile_manifest
 from hcc_sempath.io.tile_package import build_tile_package
-from hcc_sempath.teacher.cache import _local_weight_path, _pool_virchow2_features, _resolve_model_spec, _teacher_name
-from hcc_sempath.teacher.cache import _discover_tile_packages, cache_teacher_features_from_packages
+from hcc_sempath.teacher.cache import (
+    _build_arg_parser,
+    _discover_tile_packages,
+    _local_weight_path,
+    _pool_virchow2_features,
+    _resolve_model_spec,
+    _teacher_name,
+    cache_teacher_features_from_packages,
+)
+
+
+def test_teacher_cache_cli_uses_input_and_teacher_names() -> None:
+    parser = _build_arg_parser()
+
+    args = parser.parse_args(["--input", "tiles", "--output", "features", "--teacher", "virchow2"])
+
+    assert args.input == "tiles"
+    assert args.output == "features"
+    assert args.teacher == "virchow2"
+    assert "--teacher TEACHER" in parser.format_usage()
+
+
+def test_teacher_cache_cli_keeps_legacy_aliases_hidden_but_parseable() -> None:
+    parser = _build_arg_parser()
+
+    args = parser.parse_args(["--tile-package", "tiles", "--output", "features", "--model", "uni2_h"])
+
+    assert args.input == "tiles"
+    assert args.teacher == "uni2_h"
 
 
 def test_supported_teacher_presets_resolve_expected_names() -> None:
