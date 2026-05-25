@@ -198,6 +198,20 @@ window centered on the clicked coordinate.
 Teacher feature packages show a coordinate heatmap without decoding feature
 payloads.
 
+Annotate L1/L2 semantic prototypes from image-tile packages:
+
+```bash
+hcc-sempath annotate-prototypes \
+  --input data/packages \
+  --state annotations/hcc_prototype_review.json
+```
+
+The annotation UI recursively discovers image-tile `.iac` packages. It supports
+both direct package directories and `dataset_name/*.iac` layouts, shows package
+progress, renders a downsampled tile thumbnail for spatial navigation, and saves
+resume state as JSON with a CSV export next to it. See
+[`docs/PROTOTYPE_ANNOTATION.md`](docs/PROTOTYPE_ANNOTATION.md).
+
 Build teacher features:
 
 ```bash
