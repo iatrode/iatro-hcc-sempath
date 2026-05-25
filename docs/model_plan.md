@@ -37,20 +37,24 @@ The teacher-specific heads are alignment modules used during training. The reusa
 
 teacher-specific heads 是训练阶段的对齐模块。可复用的模型输出是 `z_hcc`。
 
-## 3. Training Stages / 训练阶段
+A practical distinction from a simple downstream head on top of an existing teacher is that HCC-SemPath aims to modify the shared representation geometry itself. A downstream head can read a fixed teacher space, while the student representation can combine teacher consensus, reduce over-dependence on any single teacher, and be further organized by HCC-specific weak supervision.
 
-### 3.1 Stage 1: multi-teacher morphology distillation / 阶段一：多教师形态蒸馏
+与直接在现有 teacher feature 后接下游 head 相比，HCC-SemPath 的目标是调整共享表征空间本身。下游 head 只能读取固定 teacher space，而 student representation 可以整合 teacher 共识、降低对单一 teacher 的依赖，并通过 HCC 专病弱监督进一步组织表征几何。
 
-The first stage injects generic pathology morphology priors into the student encoder.
+## 3. Training Strategy / 训练策略
 
-第一阶段将通用病理形态先验注入 student encoder。
+### 3.1 Multi-teacher morphology distillation / 多教师形态蒸馏
+
+The first component injects general pathology morphology priors into the student encoder.
+
+第一部分将通用病理形态先验注入 student encoder。
 
 Candidate objectives:
 
 候选目标函数：
 
 ```text
-L_stage1 =
+L_distill =
   sum_t w_t * L_feature_t
   + lambda_rel * L_relation
   + lambda_rank * L_neighborhood
@@ -67,11 +71,34 @@ Where:
 - `L_neighborhood` preserves nearest-neighbor or ranking structure from teacher spaces when available.
 - `L_neighborhood` 在可用时保留 teacher space 中的近邻或排序结构。
 
-### 3.2 Stage 2: HCC-specific weak supervision / 阶段二：HCC 专病弱监督
+### 3.2 Consensus-disagreement guided selective distillation / 基于共识与分歧的选择性蒸馏
 
-The second stage reshapes the shared embedding space using HCC-specific weak supervision.
+Multi-teacher supervision should not treat all tiles as equally reliable distillation targets. When multiple teachers produce similar neighborhood or similarity structures for a tile, their agreement can be treated as a relatively stable morphology prior. When teachers disagree, the tile may reflect teacher-specific bias, difficult morphology, context sensitivity, or HCC-relevant patterns that are not consistently represented by a single generic teacher.
 
-第二阶段使用 HCC 专病弱监督重塑共享 embedding space。
+多 teacher 监督不应把所有 tile 都视为同等可靠的蒸馏目标。当多个 teacher 对某个 tile 给出相似的近邻或相似性结构时，这种共识可作为相对稳定的形态先验。当 teacher 之间存在明显分歧时，该 tile 可能反映 teacher-specific bias、复杂形态、上下文敏感性，或单一通用 teacher 未能稳定表达的 HCC 相关模式。
+
+The planned strategy is to use teacher agreement as a soft reliability signal rather than a hard label:
+
+计划中的策略是将 teacher agreement 作为软可靠性信号，而不是硬标签：
+
+```text
+high teacher agreement      -> stronger morphology distillation
+low teacher agreement       -> weaker hard imitation and stronger HCC semantic shaping
+```
+
+This design is intended to avoid simple averaging across heterogeneous teachers. It also provides a reason to train a shared student representation instead of only attaching an HCC head to a fixed teacher embedding.
+
+该设计旨在避免对异质 teacher 进行简单平均，同时也解释了为何需要训练共享 student representation，而不仅是在固定 teacher embedding 后接 HCC head。
+
+Potential agreement signals include pairwise teacher similarity consistency, teacher-neighborhood overlap, teacher-rank consistency, or normalized disagreement scores computed within sampled batches or cached feature subsets. These scores should be used as weighting signals and diagnostics, not as direct biological labels.
+
+潜在 agreement signal 包括 teacher 之间的相似性结构一致性、teacher-neighborhood overlap、teacher-rank consistency，或基于 sampled batch / cached feature subset 计算的 normalized disagreement score。这些分数应作为 loss weighting 和诊断指标，而不是直接生物学标签。
+
+### 3.3 HCC-specific weak supervision on `z_hcc` / 作用于 `z_hcc` 的 HCC 专病弱监督
+
+HCC-specific weak supervision should reshape the shared embedding space beyond teacher imitation. In the selective-distillation setting, this component should be activated gradually rather than applied as a strong constraint from the first training step.
+
+HCC 专病弱监督应将共享 embedding space 从 teacher imitation 推向专病语义空间。在选择性蒸馏设定下，该部分应渐进启用，而不是从训练第一步开始施加强约束。
 
 Potential supervision sources:
 
@@ -79,6 +106,8 @@ Potential supervision sources:
 
 - expert-defined morphology anchors;
 - 专家定义的形态锚点；
+- semantic prototypes initialized from curated concept embeddings or reviewed examples;
+- 基于 curated concept embeddings 或人工审阅样本初始化的语义原型；
 - weak region labels;
 - 弱区域标签；
 - slide-level or region-level pathology descriptors;
@@ -90,9 +119,23 @@ Potential supervision sources:
 - other disease-domain signals that do not require dense pixel-level annotation.
 - 其他不需要密集像素级标注的专病信号。
 
-The role of this stage is not to imitate a generic teacher more closely. It is to organize HCC-relevant morphology into a representation geometry that is useful for HCC computational pathology.
+The HCC semantic loss should act on the shared `z_hcc` representation whenever possible, because `z_hcc` is the reusable model output. Teacher-specific heads may still be used for teacher alignment, but they should not be the only location where HCC semantic constraints are applied.
 
-该阶段的作用不是更接近地模仿通用 teacher，而是把 HCC 相关形态组织成对 HCC 计算病理有用的表征几何。
+HCC semantic loss 应尽可能直接作用于共享 `z_hcc`，因为 `z_hcc` 是可复用模型输出。teacher-specific heads 仍可用于 teacher alignment，但不应成为 HCC 语义约束的唯一作用位置。
+
+A practical schedule is:
+
+一个可行训练调度为：
+
+```text
+early training:    teacher distillation dominates; HCC prototype loss is zero or small
+middle training:   HCC semantic/prototype loss is gradually warmed up
+later training:    high-disagreement tiles receive less hard imitation and more HCC shaping
+```
+
+This can be implemented either as explicit staged training or as a single training run with scheduled loss weights. In both cases, the scientific interpretation should remain conservative: the objective is to organize HCC-relevant morphology, not to claim that prototypes are exhaustive or definitive pathology categories.
+
+该策略既可以实现为显式分阶段训练，也可以实现为单次训练中的 scheduled loss weights。无论采用哪种工程实现，科学表述均应保持克制：目标是组织 HCC 相关形态，而不是声称 prototypes 构成穷尽或确定性的病理类别。
 
 ## 4. Student Backbone / Student 主干
 
@@ -151,6 +194,8 @@ Data organization should support:
 - 在不改变 image-tile IAC 格式的前提下进行 multi-package 或 per-slide package 读取；
 - reproducible tile coordinates and preprocessing metadata;
 - 可复现的 tile 坐标和预处理元数据；
+- optional cached teacher-agreement or disagreement summaries for efficient selective distillation;
+- 可选缓存 teacher agreement / disagreement summary，用于高效选择性蒸馏；
 - separation of public schemas from private institutional data.
 - 公开 schema 与私有机构数据分离。
 
@@ -174,25 +219,29 @@ Evaluation should distinguish teacher imitation from HCC-specific representation
 - pairwise relation preservation；
 - nearest-neighbor overlap;
 - nearest-neighbor overlap；
-- teacher-specific retrieval consistency.
-- teacher-specific retrieval consistency。
+- teacher-specific retrieval consistency;
+- teacher-specific retrieval consistency；
+- teacher agreement and disagreement diagnostics.
+- teacher agreement / disagreement 诊断指标。
 
-These metrics verify successful distillation, but they do not by themselves prove HCC-specific representation value.
+These metrics verify successful distillation and characterize teacher consistency, but they do not by themselves prove HCC-specific representation value.
 
-这些指标用于验证蒸馏是否成功，但不能单独证明 HCC 专病表征价值。
+这些指标用于验证蒸馏是否成功，并刻画 teacher consistency，但不能单独证明 HCC 专病表征价值。
 
 ### 6.2 HCC representation metrics / HCC 表征指标
 
 - expert-reviewed morphology retrieval;
 - 专家审阅的形态检索；
-- HCC semantic anchor response consistency;
-- HCC 语义锚点响应一致性；
+- HCC semantic anchor or prototype response consistency;
+- HCC 语义锚点或原型响应一致性；
 - clustering or neighborhood purity for HCC-relevant morphology groups;
 - HCC 相关形态组的聚类或邻域纯度；
 - cross-cohort stability;
 - 跨队列稳定性；
 - downstream adaptation with lightweight heads or weakly supervised modules;
 - 使用轻量 head 或弱监督模块进行下游适配；
+- stratified analysis across low- and high-disagreement tile groups;
+- 按低分歧与高分歧 tile group 分层分析；
 - efficiency in parameter count, memory, throughput, and WSI-level processing time.
 - 参数量、显存、吞吐和 WSI 级处理时间方面的效率。
 
@@ -208,12 +257,16 @@ Required comparisons:
 2. 单 teacher student 蒸馏；
 3. multi-teacher distillation without HCC weak supervision;
 3. 无 HCC 弱监督的多 teacher 蒸馏；
-4. HCC weak supervision without multi-teacher distillation;
-4. 无多 teacher 蒸馏的 HCC 弱监督；
-5. full HCC-SemPath model;
-5. 完整 HCC-SemPath 模型；
-6. alternative student backbone or projection-head capacities when feasible.
-6. 条件允许时比较不同 student backbone 或 projection-head capacity。
+4. multi-teacher distillation without selective weighting;
+4. 无选择性权重的多 teacher 蒸馏；
+5. HCC weak supervision without multi-teacher distillation;
+5. 无多 teacher 蒸馏的 HCC 弱监督；
+6. fixed-teacher embedding with the same HCC semantic head or prototype module;
+6. 固定 teacher embedding 后接相同 HCC semantic head 或 prototype module；
+7. full HCC-SemPath model;
+7. 完整 HCC-SemPath 模型；
+8. alternative student backbone or projection-head capacities when feasible.
+8. 条件允许时比较不同 student backbone 或 projection-head capacity。
 
 ## 8. Engineering Requirements / 工程要求
 
@@ -235,6 +288,10 @@ Before full-scale training, the implementation should support:
 - 面向当前 whole-matrix feature package 的 feature-cache-aware training sampling；
 - sampled validation subsets;
 - 抽样 validation subset；
+- optional teacher agreement/disagreement caching for selective distillation;
+- 可选的 teacher agreement / disagreement 缓存，用于选择性蒸馏；
+- scheduled loss weighting for gradual HCC semantic activation;
+- 用于渐进启用 HCC 语义约束的 scheduled loss weighting；
 - teacher metadata recording, including model name, version, preprocessing, feature dimension, and normalization convention.
 - teacher metadata 记录，包括模型名称、版本、预处理、feature dimension 和 normalization convention。
 
@@ -246,4 +303,4 @@ The repository should expose code, schemas, configuration templates, small fixtu
 
 The repository should not expose private WSIs, large feature artifacts, patient-identifiable metadata, or institutional file paths.
 
-仓库不应公开私有 WSI、大规模 feature artifact、可识别患者身份的元数据或机构内部文件路径。
+仓库不应公开私有 WSI、大规模 feature artifact、可识别患者身份的元数据或机构内部路径。
