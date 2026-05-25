@@ -15,6 +15,7 @@ from hcc_sempath.teacher.cache import (
     _discover_tile_packages,
     _local_weight_path,
     _pool_virchow2_features,
+    _resolve_feature_dtype,
     _resolve_model_spec,
     _teacher_name,
     cache_teacher_features_from_packages,
@@ -47,6 +48,18 @@ def test_teacher_cache_cli_uses_input_and_teacher_names() -> None:
     assert args.compile_model is True
     assert args.compile_mode == "default"
     assert "--teacher TEACHER" in parser.format_usage()
+
+
+def test_teacher_cache_cli_defaults_for_development_throughput() -> None:
+    parser = _build_arg_parser()
+
+    args = parser.parse_args(["--input", "tiles", "--output", "features", "--teacher", "virchow2"])
+
+    assert args.batch_size == 512
+    assert args.precision == "bf16"
+    assert args.feature_dtype == "auto"
+    assert _resolve_feature_dtype(args.feature_dtype, args.precision, "cuda") == "float16"
+    assert args.compile_model is True
 
 
 def test_teacher_cache_cli_keeps_legacy_aliases_hidden_but_parseable() -> None:

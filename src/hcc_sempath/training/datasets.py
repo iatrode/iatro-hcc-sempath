@@ -207,7 +207,7 @@ class DistillationTileDataset(Dataset):
                 image_tensor = self.transform(image.convert("RGB"))
         teacher_features = {}
         for name, reader in self.feature_readers.items():
-            teacher_feature = torch.from_numpy(reader.read_feature(record.tile_id))
+            teacher_feature = torch.from_numpy(reader.read_feature(record.tile_id)).float()
             if teacher_feature.ndim != 1:
                 raise ValueError(f"teacher feature must be 1D: teacher={name} tile_id={record.tile_id}")
             teacher_features[name] = teacher_feature

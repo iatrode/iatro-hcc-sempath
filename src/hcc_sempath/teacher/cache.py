@@ -269,6 +269,20 @@ def _autocast_context(device: str, precision: str):
     return torch.autocast(device_type="cuda", dtype=dtype_by_precision[precision])
 
 
+def _resolve_feature_dtype(feature_dtype: str, precision: str, device: str) -> str:
+    if feature_dtype != "auto":
+        return feature_dtype
+    return "float16" if _resolve_precision(precision, device) in {"fp16", "bf16"} else "float32"
+
+
+def _torch_feature_dtype(feature_dtype: str) -> torch.dtype:
+    if feature_dtype == "float16":
+        return torch.float16
+    if feature_dtype == "float32":
+        return torch.float32
+    raise ValueError(f"unsupported feature dtype: {feature_dtype}")
+
+
 def _safe_name(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
     return value.strip("._") or "teacher"
@@ -405,6 +419,7 @@ def cache_teacher_features_from_records(
     compression_level: int | None = 6,
     overwrite: bool = False,
     precision: str = "fp32",
+    feature_dtype: str = "float32",
 ) -> None:
     model = model.to(device).eval()
     loader = DataLoader(
@@ -422,7 +437,8 @@ def cache_teacher_features_from_records(
         for batch in tqdm(loader, total=len(loader), desc="teacher batches"):
             images = batch["image"].to(device, non_blocking=device.startswith("cuda"))
             with _autocast_context(device, precision):
-                batch_features = model(images).detach().cpu().numpy().astype(np.float32)
+                batch_features = model(images).detach().to(dtype=_torch_feature_dtype(feature_dtype))
+                batch_features = batch_features.cpu().numpy()
             for feature in batch_features:
                 yield feature
 
@@ -431,7 +447,7 @@ def cache_teacher_features_from_records(
         features(),
         output_path,
         teacher_name=teacher_name,
-        dtype="float32",
+        dtype=feature_dtype,
         compression=compression,
         compression_level=compression_level,
         overwrite=overwrite,
@@ -453,6 +469,7 @@ def cache_teacher_features_from_package(
     compression_level: int | None = 6,
     overwrite: bool = False,
     precision: str = "fp32",
+    feature_dtype: str = "float32",
     data_config: dict | None = None,
 ) -> None:
     if tile_size is None:
@@ -479,7 +496,8 @@ def cache_teacher_features_from_package(
         for batch in tqdm(loader, total=len(loader), desc="teacher batches"):
             images = batch["image"].to(device, non_blocking=device.startswith("cuda"))
             with _autocast_context(device, precision):
-                batch_features = model(images).detach().cpu().numpy().astype(np.float32)
+                batch_features = model(images).detach().to(dtype=_torch_feature_dtype(feature_dtype))
+                batch_features = batch_features.cpu().numpy()
             for feature in batch_features:
                 yield feature
 
@@ -488,7 +506,7 @@ def cache_teacher_features_from_package(
         features(),
         output_path,
         teacher_name=teacher_name,
-        dtype="float32",
+        dtype=feature_dtype,
         compression=compression,
         compression_level=compression_level,
         overwrite=overwrite,
@@ -510,6 +528,7 @@ def cache_teacher_features_from_packages(
     progress_manifest: str | Path | None = None,
     continue_on_error: bool = False,
     precision: str = "fp32",
+    feature_dtype: str = "float32",
     compile_model: bool = False,
     compile_mode: str = "reduce-overhead",
 ) -> None:
@@ -527,6 +546,7 @@ def cache_teacher_features_from_packages(
     data_config = resolve_model_data_config(model.model) if hasattr(model, "model") else None
     runtime_model: torch.nn.Module | None = None
     resolved_precision = _resolve_precision(precision, device)
+    resolved_feature_dtype = _resolve_feature_dtype(feature_dtype, precision, device)
     runtime_config = {
         "packages": len(package_paths),
         "output": str(output_path),
@@ -538,6 +558,8 @@ def cache_teacher_features_from_packages(
         "device": device,
         "precision": precision,
         "resolved_precision": resolved_precision,
+        "feature_dtype": feature_dtype,
+        "resolved_feature_dtype": resolved_feature_dtype,
         "compile": compile_model,
         "compile_mode": compile_mode if compile_model else "",
         "feature_compression": compression,
@@ -591,6 +613,7 @@ def cache_teacher_features_from_packages(
                 compression_level=compression_level,
                 overwrite=overwrite,
                 precision=precision,
+                feature_dtype=resolved_feature_dtype,
                 data_config=data_config,
             )
             metadata = _validate_feature_output(package_output, expected_teacher=teacher_name)
@@ -634,20 +657,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Teacher name recorded in output metadata and filenames. Defaults to the preset teacher name.",
     )
     parser.add_argument("--output-teacher-name", dest="teacher_name", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers for --input reads.")
     parser.add_argument("--prefetch-factor", type=int, default=2, help="Batches prefetched per worker for --input reads.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--precision",
         choices=("fp32", "fp16", "bf16", "auto"),
-        default="fp32",
-        help="Teacher inference precision. fp32 preserves the previous behavior; fp16/bf16/auto use CUDA autocast.",
+        default="bf16",
+        help="Teacher inference precision.",
+    )
+    parser.add_argument(
+        "--feature-dtype",
+        choices=("auto", "float32", "float16"),
+        default="auto",
+        help="Feature matrix dtype written to IAC. auto writes float16 for fp16/bf16 inference and float32 otherwise.",
     )
     parser.add_argument(
         "--compile",
         dest="compile_model",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Compile the teacher with torch.compile before generating features.",
     )
     parser.add_argument(
@@ -688,7 +718,8 @@ def main() -> None:
     teacher_name = _teacher_name(args.teacher, args.teacher_name)
     print(
         f"teacher_cache_start input={args.input} output={args.output} teacher={args.teacher} "
-        f"teacher_name={teacher_name} device={args.device} precision={args.precision} compile={args.compile_model}",
+        f"teacher_name={teacher_name} device={args.device} precision={args.precision} "
+        f"feature_dtype={args.feature_dtype} compile={args.compile_model}",
         flush=True,
     )
     print(f"teacher_cache_scanning_input path={args.input}", flush=True)
@@ -722,6 +753,7 @@ def main() -> None:
         progress_manifest=args.progress_manifest,
         continue_on_error=args.continue_on_error,
         precision=args.precision,
+        feature_dtype=args.feature_dtype,
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
     )
