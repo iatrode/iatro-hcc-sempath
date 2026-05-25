@@ -197,6 +197,19 @@ Prototype supervision should be two-level. Level 1 encodes the primary mutually 
 
 Prototype supervision 应分两级。Level 1 表示互斥的主状态，例如 tumor versus non-tumor / background tissue。Level 2 表示非互斥的形态与微环境属性，例如淋巴细胞浸润、坏死、纤维化、脂肪变、血管上下文和背景肝改变。
 
+The current taxonomy uses nine L1 primary prototypes and seven L2 attribute
+prototypes. L1 covers HCC architectural patterns, background liver, stromal
+regions, degenerative material, indeterminate tissue, and artifact / non-tissue.
+L2 covers necrotic, hemorrhagic-blood-rich, bile-pigment-rich, inflammatory-rich,
+fibrotic, steatotic-vacuolated, and interface-capsule attributes. The detailed
+classification rules are maintained in `docs/PROTOTYPE_TAXONOMY.md`.
+
+当前 taxonomy 包含 9 个 L1 主 prototype 和 7 个 L2 属性 prototype。L1 覆盖 HCC
+结构型、背景肝、纤维间质、退变物、判读不确定组织以及 artifact / non-tissue。L2 覆盖
+necrotic、hemorrhagic-blood-rich、bile-pigment-rich、inflammatory-rich、fibrotic、
+steatotic-vacuolated 和 interface-capsule。详细分类规则见
+`docs/PROTOTYPE_TAXONOMY.md`。
+
 The default target is:
 
 默认目标是：
