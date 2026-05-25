@@ -52,7 +52,7 @@ def main() -> None:
         teacher_name="smoke",
         overwrite=True,
     )
-    torch.save({"anchors": torch.randn(7, teacher_dim)}, root / "anchors.pt")
+    torch.save({"prototypes": torch.randn(7, teacher_dim)}, root / "prototypes.pt")
     print("smoke_data_ok")
 
 

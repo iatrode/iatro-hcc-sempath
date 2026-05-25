@@ -7,9 +7,9 @@ data:
   train_manifest_path: data/manifests/hcc_train.yaml
   feature_root: data/features
   teachers: [h_optimus_1, gigapath]
-  anchors_paths:
-    h_optimus_1: data/anchors/h_optimus_1_hcc_semantic_anchors.pt
-    gigapath: data/anchors/gigapath_hcc_semantic_anchors.pt
+  prototype_paths:
+    h_optimus_1: data/prototypes/h_optimus_1_hcc_semantic_prototypes.pt
+    gigapath: data/prototypes/gigapath_hcc_semantic_prototypes.pt
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
   num_workers: 8

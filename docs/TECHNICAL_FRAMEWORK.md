@@ -129,12 +129,12 @@ representation diagnostics rather than direct biological labels.
 ### 3.5 HCC-specific weak supervision / HCC 专病弱监督
 
 HCC-specific weak supervision should reshape the embedding space beyond teacher
-imitation. Candidate signals include expert morphology anchors, weak region
-labels, structured pathology descriptions, curated retrieval sets, and slide- or
-region-level disease-domain labels.
+imitation through a dynamic prototype module. Candidate signals include expert
+morphology prototypes, weak region labels, structured pathology descriptions,
+curated retrieval sets, and slide- or region-level disease-domain labels.
 
 HCC 专病弱监督应将 embedding space 从 teacher imitation 推向专病语义空间。候选信号
-包括专家形态锚点、弱区域标签、结构化病理描述、人工整理检索集合，以及切片级或
+包括专家形态 prototype、弱区域标签、结构化病理描述、人工整理检索集合，以及切片级或
 区域级专病标签。
 
 Whenever possible, HCC semantic objectives should act directly on the shared
@@ -144,9 +144,14 @@ Whenever possible, HCC semantic objectives should act directly on the shared
 是模型的可复用输出。
 
 A practical strategy is to activate HCC semantic shaping gradually instead of
-using strong prototype constraints from the beginning of training.
+using strong prototype constraints from the beginning of training. The prototype
+module should also provide soft teacher-reliability weights, so teacher signals
+that conflict with HCC prototype responses are down-weighted rather than blindly
+averaged into `z_hcc`.
 
 一个可行策略是渐进启用 HCC semantic shaping，而不是从训练开始阶段就施加强 prototype 约束。
+Prototype 模块还应提供 soft teacher-reliability weight，使与 HCC prototype response
+冲突的 teacher signal 被降权，而不是被直接平均进 `z_hcc`。
 
 ## 4. Evaluation / 评估
 
@@ -176,8 +181,8 @@ representation value.
 
 - expert-reviewed morphology retrieval;
 - 专家审阅的形态检索；
-- HCC semantic anchor consistency;
-- HCC 语义锚点一致性；
+- HCC semantic prototype response consistency;
+- HCC 语义 prototype response 一致性；
 - morphology-group clustering or neighborhood purity;
 - 形态组聚类或邻域纯度；
 - cross-cohort stability;

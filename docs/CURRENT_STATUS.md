@@ -45,9 +45,9 @@ Multi-teacher distillation is not the final objective. It provides generic morph
 
 多教师蒸馏不是最终目标，而是提供通用形态学先验。最终表征需要通过 HCC 专病弱监督进一步重塑，使 embedding geometry 更符合 HCC 组织病理语义。
 
-Potential weak supervision sources include region-level morphology signals, slide-level labels, structured pathology descriptions, expert-defined semantic anchors, weak region labels, or other HCC-specific signals.
+Potential weak supervision sources include region-level morphology signals, slide-level labels, structured pathology descriptions, expert-defined semantic prototypes, weak region labels, or other HCC-specific signals. The repository direction now treats prototype as the only public term for this mechanism.
 
-潜在弱监督来源包括区域级形态信号、切片级标签、结构化病理描述、专家定义语义锚点、弱区域标签，以及其他 HCC 专病信号。
+潜在弱监督来源包括区域级形态信号、切片级标签、结构化病理描述、专家定义语义 prototype、弱区域标签，以及其他 HCC 专病信号。仓库公开表述统一使用 prototype 描述该机制。
 
 The working hypothesis is that a compact student can outperform a general teacher on HCC-specific representation tasks when the student is trained to organize HCC-relevant morphology, rather than simply imitate generic teacher embeddings.
 
@@ -198,8 +198,8 @@ Recommended to include in git:
 - manifest schema；
 - teacher metadata schemas;
 - teacher 元数据 schema；
-- HCC semantic anchor schemas;
-- HCC 语义锚点 schema；
+- HCC semantic prototype schemas;
+- HCC 语义 prototype schema；
 - small smoke-test fixtures;
 - 小型 smoke-test fixtures；
 - benchmark summary tables without protected health information;

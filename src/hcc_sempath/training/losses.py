@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from ..modeling.models import normalized_anchor_logits
+from ..modeling.models import normalized_prototype_logits
 
 
 def feature_distillation_loss(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
@@ -25,11 +25,11 @@ def relation_distillation_loss(student: torch.Tensor, teacher: torch.Tensor) -> 
 def semantic_distillation_loss(
     student: torch.Tensor,
     teacher: torch.Tensor,
-    anchors: torch.Tensor,
+    prototypes: torch.Tensor,
     temperature: float = 1.0,
 ) -> torch.Tensor:
-    student_logits = normalized_anchor_logits(student, anchors) / temperature
-    teacher_logits = normalized_anchor_logits(teacher, anchors) / temperature
+    student_logits = normalized_prototype_logits(student, prototypes) / temperature
+    teacher_logits = normalized_prototype_logits(teacher, prototypes) / temperature
     return F.kl_div(
         F.log_softmax(student_logits, dim=-1),
         F.softmax(teacher_logits, dim=-1),
@@ -40,20 +40,20 @@ def semantic_distillation_loss(
 def total_distillation_loss(
     student: torch.Tensor,
     teacher: torch.Tensor,
-    anchors: torch.Tensor | None,
+    prototypes: torch.Tensor | None,
     relation_weight: float,
     semantic_weight: float,
     semantic_temperature: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     feature = feature_distillation_loss(student, teacher)
     relation = relation_distillation_loss(student, teacher)
-    if anchors is None or semantic_weight == 0:
+    if prototypes is None or semantic_weight == 0:
         semantic = feature.new_zeros(())
     else:
         semantic = semantic_distillation_loss(
             student=student,
             teacher=teacher,
-            anchors=anchors,
+            prototypes=prototypes,
             temperature=semantic_temperature,
         )
     total = feature + relation_weight * relation + semantic_weight * semantic
@@ -67,7 +67,7 @@ def total_distillation_loss(
 def multi_teacher_distillation_loss(
     student_by_teacher: dict[str, torch.Tensor],
     teacher_by_name: dict[str, torch.Tensor],
-    anchors_by_teacher: dict[str, torch.Tensor] | None,
+    prototypes_by_teacher: dict[str, torch.Tensor] | None,
     relation_weight: float,
     semantic_weight: float,
     semantic_temperature: float,
@@ -88,11 +88,11 @@ def multi_teacher_distillation_loss(
         weight = float((teacher_weights or {}).get(name, 1.0))
         if weight <= 0:
             continue
-        anchors = anchors_by_teacher.get(name) if anchors_by_teacher else None
+        prototypes = prototypes_by_teacher.get(name) if prototypes_by_teacher else None
         loss, parts = total_distillation_loss(
             student=student_by_teacher[name],
             teacher=teacher_by_name[name],
-            anchors=anchors,
+            prototypes=prototypes,
             relation_weight=relation_weight,
             semantic_weight=semantic_weight,
             semantic_temperature=semantic_temperature,

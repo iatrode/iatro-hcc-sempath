@@ -15,7 +15,7 @@ def _amp_enabled(device: torch.device, cfg: dict, train: bool) -> bool:
     return bool(train and cfg["train"].get("amp", False) and device.type == "cuda")
 
 
-def run_epoch(model, loader, anchors, optimizer, device, cfg, train: bool, scaler=None) -> dict[str, float]:
+def run_epoch(model, loader, prototypes, optimizer, device, cfg, train: bool, scaler=None) -> dict[str, float]:
     model.train(train)
     totals = {"loss": 0.0, "feature": 0.0, "relation": 0.0, "semantic": 0.0}
     n_batches = 0
@@ -30,7 +30,7 @@ def run_epoch(model, loader, anchors, optimizer, device, cfg, train: bool, scale
                 loss, parts = multi_teacher_distillation_loss(
                     student_by_teacher=student_by_teacher,
                     teacher_by_name=teachers,
-                    anchors_by_teacher=anchors,
+                    prototypes_by_teacher=prototypes,
                     relation_weight=float(cfg["loss"]["relation_weight"]),
                     semantic_weight=float(cfg["loss"]["semantic_weight"]),
                     semantic_temperature=float(cfg["loss"]["semantic_temperature"]),
@@ -77,7 +77,7 @@ def collect_embeddings(
     )
 
 
-def fit(model, train_loader, val_loader, anchors, optimizer, device, cfg) -> dict:
+def fit(model, train_loader, val_loader, prototypes, optimizer, device, cfg) -> dict:
     output_dir = ensure_dir(cfg["runtime"]["output_dir"])
     checkpoints = ensure_dir(output_dir / "checkpoints")
     write_json(output_dir / "resolved_config.json", cfg)
@@ -85,14 +85,14 @@ def fit(model, train_loader, val_loader, anchors, optimizer, device, cfg) -> dic
     best_metrics = {}
     scaler = torch.amp.GradScaler("cuda", enabled=bool(cfg["train"].get("amp", False) and device.type == "cuda"))
     for epoch in range(1, int(cfg["train"]["epochs"]) + 1):
-        train_metrics = run_epoch(model, train_loader, anchors, optimizer, device, cfg, train=True, scaler=scaler)
-        val_metrics = run_epoch(model, val_loader, anchors, optimizer, device, cfg, train=False)
+        train_metrics = run_epoch(model, train_loader, prototypes, optimizer, device, cfg, train=True, scaler=scaler)
+        val_metrics = run_epoch(model, val_loader, prototypes, optimizer, device, cfg, train=False)
         _, student_by_teacher, teacher_by_name = collect_embeddings(model, val_loader, device)
-        cpu_anchors = {name: tensor.cpu() for name, tensor in anchors.items()} if anchors else None
+        cpu_prototypes = {name: tensor.cpu() for name, tensor in prototypes.items()} if prototypes else None
         embedding_metrics = evaluate_teacher_outputs(
             student_by_teacher,
             teacher_by_name,
-            cpu_anchors,
+            cpu_prototypes,
             int(cfg["train"]["topk"]),
         )
         row = {"epoch": epoch, **{f"train_{k}": v for k, v in train_metrics.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}, **embedding_metrics}

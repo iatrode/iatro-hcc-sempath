@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..io.tile_package import read_package_metadata
-from ..modeling.anchors import load_anchors
+from ..modeling.prototypes import load_prototypes
 from ..modeling.models import HCCSemPathModel
 from .config import (
     embedding_dim,
@@ -30,16 +30,16 @@ from .metrics import evaluate_teacher_outputs
 from .utils import write_json
 
 
-def _load_anchor_map(cfg: dict, dims: dict[str, int]) -> dict[str, torch.Tensor] | None:
+def _load_prototype_map(cfg: dict, dims: dict[str, int]) -> dict[str, torch.Tensor] | None:
     if float(cfg["loss"].get("semantic_weight", 0.0)) == 0:
         return None
-    anchor_paths = cfg["data"].get("anchors_paths")
-    if isinstance(anchor_paths, dict):
-        return {name: load_anchors(anchor_paths[name], expected_dim=dim) for name, dim in dims.items()}
-    anchor_path = cfg["data"].get("anchors_path")
-    if anchor_path is None:
+    prototype_paths = cfg["data"].get("prototype_paths")
+    if isinstance(prototype_paths, dict):
+        return {name: load_prototypes(prototype_paths[name], expected_dim=dim) for name, dim in dims.items()}
+    prototype_path = cfg["data"].get("prototype_path")
+    if prototype_path is None:
         return None
-    return {name: load_anchors(anchor_path, expected_dim=dim) for name, dim in dims.items()}
+    return {name: load_prototypes(prototype_path, expected_dim=dim) for name, dim in dims.items()}
 
 
 def main() -> None:
@@ -101,8 +101,8 @@ def main() -> None:
     payload = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(payload["model"])
     _, student_by_teacher, teacher_by_name = collect_embeddings(model, loader, device)
-    anchors = _load_anchor_map(cfg, dims)
-    metrics = evaluate_teacher_outputs(student_by_teacher, teacher_by_name, anchors, int(cfg["train"]["topk"]))
+    prototypes = _load_prototype_map(cfg, dims)
+    metrics = evaluate_teacher_outputs(student_by_teacher, teacher_by_name, prototypes, int(cfg["train"]["topk"]))
     write_json(f"{cfg['runtime']['output_dir']}/eval_{args.split}.json", metrics)
     print("eval_ok " + " ".join(f"{k}={v:.6f}" for k, v in metrics.items()))
 

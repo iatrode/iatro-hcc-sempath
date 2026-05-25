@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..io.tile_package import read_package_metadata
-from ..modeling.anchors import load_anchors
+from ..modeling.prototypes import load_prototypes
 from ..modeling.models import HCCSemPathModel
 from .config import (
     embedding_dim,
@@ -29,17 +29,17 @@ from .manifest import load_training_manifest
 from .utils import seed_everything
 
 
-def _load_anchor_map(cfg: dict, dims: dict[str, int], device: torch.device) -> dict[str, torch.Tensor] | None:
+def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -> dict[str, torch.Tensor] | None:
     semantic_weight = float(cfg["loss"].get("semantic_weight", 0.0))
     if semantic_weight == 0:
         return None
-    anchor_paths = cfg["data"].get("anchors_paths")
-    if isinstance(anchor_paths, dict):
-        return {name: load_anchors(anchor_paths[name], expected_dim=dim).to(device) for name, dim in dims.items()}
-    anchor_path = cfg["data"].get("anchors_path")
-    if anchor_path is None:
-        raise ValueError("data.anchors_path or data.anchors_paths is required when semantic_weight > 0")
-    return {name: load_anchors(anchor_path, expected_dim=dim).to(device) for name, dim in dims.items()}
+    prototype_paths = cfg["data"].get("prototype_paths")
+    if isinstance(prototype_paths, dict):
+        return {name: load_prototypes(prototype_paths[name], expected_dim=dim).to(device) for name, dim in dims.items()}
+    prototype_path = cfg["data"].get("prototype_path")
+    if prototype_path is None:
+        raise ValueError("data.prototype_path or data.prototype_paths is required when semantic_weight > 0")
+    return {name: load_prototypes(prototype_path, expected_dim=dim).to(device) for name, dim in dims.items()}
 
 
 def main() -> None:
@@ -127,7 +127,7 @@ def main() -> None:
         loader_kwargs["persistent_workers"] = bool(cfg["data"].get("persistent_workers", True))
     train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
-    anchors = _load_anchor_map(cfg, dims, device)
+    prototypes = _load_prototype_map(cfg, dims, device)
     model = HCCSemPathModel(
         backbone_name=cfg["model"]["backbone_name"],
         embedding_dim=embedding_dim(cfg),
@@ -140,7 +140,7 @@ def main() -> None:
         model.load_state_dict(payload["model"])
         if "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
-    metrics = fit(model, train_loader, val_loader, anchors, optimizer, device, cfg)
+    metrics = fit(model, train_loader, val_loader, prototypes, optimizer, device, cfg)
     print("train_ok " + " ".join(f"{k}={v}" for k, v in metrics.items()))
 
 

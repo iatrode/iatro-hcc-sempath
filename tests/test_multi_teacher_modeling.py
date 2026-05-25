@@ -29,7 +29,7 @@ def test_multi_teacher_distillation_loss_aggregates_named_heads() -> None:
         "teacher_a": torch.randn(4, 5),
         "teacher_b": torch.randn(4, 7),
     }
-    anchors_by_teacher = {
+    prototypes_by_teacher = {
         "teacher_a": torch.randn(3, 5),
         "teacher_b": torch.randn(3, 7),
     }
@@ -37,7 +37,7 @@ def test_multi_teacher_distillation_loss_aggregates_named_heads() -> None:
     loss, parts = multi_teacher_distillation_loss(
         student_by_teacher=student_by_teacher,
         teacher_by_name=teacher_by_name,
-        anchors_by_teacher=anchors_by_teacher,
+        prototypes_by_teacher=prototypes_by_teacher,
         relation_weight=0.25,
         semantic_weight=0.25,
         semantic_temperature=1.0,
