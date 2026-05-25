@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 import csv
+from dataclasses import dataclass
 import json
 import re
 import time
@@ -237,6 +239,19 @@ class PackageTeacherTileDataset(Dataset):
             self._reader.close()
 
 
+@dataclass
+class PreparedTeacherPackage:
+    package_path: Path
+    records: list[TileRecord]
+    loader: DataLoader
+    iterator: object
+    total_batches: int
+    tile_width: int
+    tile_height: int
+    stride_x: int
+    stride_y: int
+
+
 def _loader_kwargs(num_workers: int, prefetch_factor: int, pin_memory: bool) -> dict:
     kwargs = {
         "num_workers": max(0, int(num_workers)),
@@ -335,6 +350,48 @@ def _tile_size(package_path: str | Path) -> tuple[int, int]:
     return width, height
 
 
+def _prepare_teacher_package(
+    package_path: str | Path,
+    tile_size: tuple[int, int],
+    data_config: dict,
+    batch_size: int,
+    device: str,
+    num_workers: int,
+    prefetch_factor: int,
+) -> PreparedTeacherPackage:
+    package_path = Path(package_path)
+    metadata = read_package_metadata(package_path)
+    if metadata.get("payload_type") != "image_tiles":
+        raise ValueError(f"not an image tile package: {package_path}")
+    tile_width, tile_height = tile_size
+    records = read_package_manifest(package_path)
+    package_data_config = dict(data_config)
+    package_data_config["input_size"] = (3, tile_height, tile_width)
+    transform = create_transform(**package_data_config, is_training=False)
+    dataset = PackageTeacherTileDataset(package_path, records, transform)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        **_loader_kwargs(
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            pin_memory=device.startswith("cuda"),
+        ),
+    )
+    return PreparedTeacherPackage(
+        package_path=package_path,
+        records=records,
+        loader=loader,
+        iterator=iter(loader),
+        total_batches=len(loader),
+        tile_width=int(metadata["tile_width"]),
+        tile_height=int(metadata["tile_height"]),
+        stride_x=int(metadata["stride_x"]),
+        stride_y=int(metadata["stride_y"]),
+    )
+
+
 def _validate_common_tile_size(package_paths: list[Path]) -> tuple[int, int]:
     sizes = {path: _tile_size(path) for path in package_paths}
     unique = set(sizes.values())
@@ -351,11 +408,20 @@ def _default_output_path(package_path: Path, output_dir: Path, teacher_name: str
     return output_dir / f"{stem}.{teacher_name}.features.iac"
 
 
-def _validate_feature_output(package_path: str | Path, expected_teacher: str = "") -> dict:
+def _validate_feature_output(package_path: str | Path, expected_teacher: str = "", full: bool = False) -> dict:
     path = Path(package_path)
     header, slide_table, record_table = read_tables(path)
     _validate_common(header, slide_table, record_table)
-    _validate_teacher_features(str(path), header, record_table, max_payload=0)
+    if full:
+        _validate_teacher_features(str(path), header, record_table, max_payload=0)
+    else:
+        if header.get("payload_type") != "teacher_features":
+            raise ValueError(f"not a teacher feature package: {path}")
+        if not header.get("teacher"):
+            raise ValueError("teacher_features header requires non-empty teacher")
+        if int(header.get("feature_dim", 0)) <= 0:
+            raise ValueError(f"invalid feature_dim: {header.get('feature_dim')}")
+        np.dtype(header["dtype"])
     if expected_teacher and header.get("teacher") != expected_teacher:
         raise ValueError(f"teacher mismatch: got={header.get('teacher')} expected={expected_teacher}")
     return {
@@ -513,6 +579,46 @@ def cache_teacher_features_from_package(
     )
 
 
+@torch.inference_mode()
+def cache_teacher_features_from_prepared_package(
+    model: torch.nn.Module,
+    prepared: PreparedTeacherPackage,
+    output_path: str | Path,
+    device: str,
+    teacher_name: str,
+    compression: str = "zstd",
+    compression_level: int | None = 6,
+    overwrite: bool = False,
+    precision: str = "fp32",
+    feature_dtype: str = "float32",
+) -> None:
+    model = model.to(device).eval()
+
+    def features():
+        for batch in tqdm(prepared.iterator, total=prepared.total_batches, desc="teacher batches"):
+            images = batch["image"].to(device, non_blocking=device.startswith("cuda"))
+            with _autocast_context(device, precision):
+                batch_features = model(images).detach().to(dtype=_torch_feature_dtype(feature_dtype))
+                batch_features = batch_features.cpu().numpy()
+            for feature in batch_features:
+                yield feature
+
+    build_teacher_feature_package(
+        prepared.records,
+        features(),
+        output_path,
+        teacher_name=teacher_name,
+        dtype=feature_dtype,
+        tile_width=prepared.tile_width,
+        tile_height=prepared.tile_height,
+        stride_x=prepared.stride_x,
+        stride_y=prepared.stride_y,
+        compression=compression,
+        compression_level=compression_level,
+        overwrite=overwrite,
+    )
+
+
 def cache_teacher_features_from_packages(
     model: torch.nn.Module,
     package_paths: list[Path],
@@ -531,6 +637,8 @@ def cache_teacher_features_from_packages(
     feature_dtype: str = "float32",
     compile_model: bool = False,
     compile_mode: str = "reduce-overhead",
+    validate_output: bool = False,
+    prefetch_packages: bool = True,
 ) -> None:
     tile_size = _validate_common_tile_size(package_paths)
     output_path = Path(output)
@@ -565,6 +673,8 @@ def cache_teacher_features_from_packages(
         "feature_compression": compression,
         "feature_compression_level": compression_level,
         "overwrite": overwrite,
+        "validate_output": validate_output,
+        "prefetch_packages": prefetch_packages,
         "continue_on_error": continue_on_error,
         "progress_manifest": str(progress_path),
     }
@@ -580,58 +690,112 @@ def cache_teacher_features_from_packages(
                 print("teacher_model_compiled", flush=True)
         return runtime_model
 
-    for package_path in package_paths:
-        package_output = output_path if output_is_file else _default_output_path(package_path, output_path, teacher_name)
-        print(f"feature_package_start tile_package={package_path} output={package_output} teacher={teacher_name}", flush=True)
-        row = {
-            "tile_package": str(package_path),
-            "output": str(package_output),
-            "teacher": teacher_name,
-        }
-        item_started = time.time()
-        try:
-            if package_output.exists() and not overwrite:
-                metadata = _validate_feature_output(package_output, expected_teacher=teacher_name)
+    package_outputs = [
+        output_path if output_is_file else _default_output_path(package_path, output_path, teacher_name)
+        for package_path in package_paths
+    ]
+    prepare_executor = ThreadPoolExecutor(max_workers=1) if prefetch_packages and len(package_paths) > 1 else None
+    prepare_future: Future | None = None
+    prepare_future_path: Path | None = None
+
+    def submit_prepare(package_path: Path) -> Future:
+        print(f"feature_package_prefetch_start tile_package={package_path}", flush=True)
+        assert prepare_executor is not None
+        return prepare_executor.submit(
+            _prepare_teacher_package,
+            package_path,
+            tile_size,
+            data_config or {},
+            batch_size,
+            device,
+            num_workers,
+            prefetch_factor,
+        )
+
+    def schedule_next_prepare(current_index: int) -> None:
+        nonlocal prepare_future, prepare_future_path
+        if prepare_executor is None or prepare_future is not None:
+            return
+        for next_index in range(current_index + 1, len(package_paths)):
+            next_output = package_outputs[next_index]
+            if next_output.exists() and not overwrite:
+                continue
+            prepare_future_path = package_paths[next_index]
+            prepare_future = submit_prepare(prepare_future_path)
+            return
+
+    try:
+        for index, package_path in enumerate(package_paths):
+            package_output = package_outputs[index]
+            print(f"feature_package_start tile_package={package_path} output={package_output} teacher={teacher_name}", flush=True)
+            row = {
+                "tile_package": str(package_path),
+                "output": str(package_output),
+                "teacher": teacher_name,
+            }
+            item_started = time.time()
+            try:
+                if package_output.exists() and not overwrite:
+                    if prepare_future is not None and prepare_future_path == package_path:
+                        prepare_future.cancel()
+                        prepare_future = None
+                        prepare_future_path = None
+                    metadata = _validate_feature_output(package_output, expected_teacher=teacher_name, full=validate_output)
+                    row.update(metadata)
+                    row["status"] = "skipped"
+                    row["elapsed_sec"] = round(time.time() - item_started, 3)
+                    rows.append(row)
+                    _write_progress(progress_path, rows, len(package_paths), started)
+                    print(f"feature_package_skipped existing_valid tile_package={package_path} output={package_output}", flush=True)
+                    schedule_next_prepare(index)
+                    continue
+                if prepare_future is not None and prepare_future_path == package_path:
+                    prepared = prepare_future.result()
+                    prepare_future = None
+                    prepare_future_path = None
+                    print(f"feature_package_prefetch_ready tile_package={package_path}", flush=True)
+                else:
+                    prepared = _prepare_teacher_package(
+                        package_path,
+                        tile_size,
+                        data_config or {},
+                        batch_size,
+                        device,
+                        num_workers,
+                        prefetch_factor,
+                    )
+                schedule_next_prepare(index)
+                cache_teacher_features_from_prepared_package(
+                    model=get_runtime_model(),
+                    prepared=prepared,
+                    output_path=package_output,
+                    device=device,
+                    teacher_name=teacher_name,
+                    compression=compression,
+                    compression_level=compression_level,
+                    overwrite=overwrite,
+                    precision=precision,
+                    feature_dtype=resolved_feature_dtype,
+                )
+                metadata = _validate_feature_output(package_output, expected_teacher=teacher_name, full=validate_output)
                 row.update(metadata)
-                row["status"] = "skipped"
+                row["status"] = "ok"
                 row["elapsed_sec"] = round(time.time() - item_started, 3)
                 rows.append(row)
                 _write_progress(progress_path, rows, len(package_paths), started)
-                print(f"feature_package_skipped existing_valid tile_package={package_path} output={package_output}", flush=True)
-                continue
-            cache_teacher_features_from_package(
-                model=get_runtime_model(),
-                package_path=package_path,
-                output_path=package_output,
-                tile_size=tile_size,
-                batch_size=batch_size,
-                device=device,
-                teacher_name=teacher_name,
-                num_workers=num_workers,
-                prefetch_factor=prefetch_factor,
-                compression=compression,
-                compression_level=compression_level,
-                overwrite=overwrite,
-                precision=precision,
-                feature_dtype=resolved_feature_dtype,
-                data_config=data_config,
-            )
-            metadata = _validate_feature_output(package_output, expected_teacher=teacher_name)
-            row.update(metadata)
-            row["status"] = "ok"
-            row["elapsed_sec"] = round(time.time() - item_started, 3)
-            rows.append(row)
-            _write_progress(progress_path, rows, len(package_paths), started)
-            print(f"feature_package_ok tile_package={package_path} output={package_output}", flush=True)
-        except Exception as exc:
-            row["status"] = "failed"
-            row["elapsed_sec"] = round(time.time() - item_started, 3)
-            row["error"] = str(exc)
-            rows.append(row)
-            _write_progress(progress_path, rows, len(package_paths), started)
-            if not continue_on_error:
-                raise
-            print(f"feature_package_failed tile_package={package_path} output={package_output} error={exc}", flush=True)
+                print(f"feature_package_ok tile_package={package_path} output={package_output}", flush=True)
+            except Exception as exc:
+                row["status"] = "failed"
+                row["elapsed_sec"] = round(time.time() - item_started, 3)
+                row["error"] = str(exc)
+                rows.append(row)
+                _write_progress(progress_path, rows, len(package_paths), started)
+                if not continue_on_error:
+                    raise
+                print(f"feature_package_failed tile_package={package_path} output={package_output} error={exc}", flush=True)
+    finally:
+        if prepare_executor is not None:
+            prepare_executor.shutdown(wait=False, cancel_futures=True)
     print(f"teacher_cache_progress manifest={progress_path} summary={progress_path.with_suffix('.json')}", flush=True)
 
 
@@ -705,6 +869,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Continue directory batch processing after a package fails and record the failure in the progress manifest.",
     )
+    parser.add_argument(
+        "--validate-output",
+        action="store_true",
+        help="Fully validate generated or skipped feature IAC packages by decompressing the feature matrix.",
+    )
+    parser.add_argument(
+        "--prefetch-packages",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prepare the next input IAC package while the current package is running teacher inference.",
+    )
     return parser
 
 
@@ -756,6 +931,8 @@ def main() -> None:
         feature_dtype=args.feature_dtype,
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
+        validate_output=args.validate_output,
+        prefetch_packages=args.prefetch_packages,
     )
 
 

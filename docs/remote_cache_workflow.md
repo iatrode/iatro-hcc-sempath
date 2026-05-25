@@ -52,9 +52,13 @@ have completed.
 image-tile `.iac` files. Tile size is read from each input package header. A
 directory input fails if discovered packages have inconsistent tile dimensions.
 For directory inputs, existing valid outputs are skipped unless `--overwrite`
-is passed. Each generated or skipped output is validated immediately and written
-to `teacher_cache_progress.csv`; a JSON summary with total, processed, ok, and
-failed counts is written beside it.
+is passed. Each generated or skipped output is header-checked immediately and
+written to `teacher_cache_progress.csv`; a JSON summary with total, processed,
+ok, and failed counts is written beside it. `--validate-output` performs full
+feature-matrix validation and is intentionally off by default for large
+directory runs. Directory runs prefetch the next input package while the
+current package is running teacher inference; `--no-prefetch-packages` disables
+that overlap for debugging.
 The planned supported presets are `h_optimus_1`, `gigapath`, `uni2_h`, and
 `virchow2`. `--teacher` also accepts local model directories and custom timm /
 `hf_hub:*` names for controlled experiments.

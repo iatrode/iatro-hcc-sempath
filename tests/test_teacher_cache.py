@@ -60,6 +60,8 @@ def test_teacher_cache_cli_defaults_for_development_throughput() -> None:
     assert args.feature_dtype == "auto"
     assert _resolve_feature_dtype(args.feature_dtype, args.precision, "cuda") == "float16"
     assert args.compile_model is True
+    assert args.validate_output is False
+    assert args.prefetch_packages is True
 
 
 def test_teacher_cache_cli_keeps_legacy_aliases_hidden_but_parseable() -> None:
