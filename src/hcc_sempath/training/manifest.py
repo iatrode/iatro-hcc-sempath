@@ -39,6 +39,14 @@ def _discover_tile_packages(root: str | Path, tile_suffix: str = TILE_SUFFIX) ->
     return sorted(path for path in root.glob(f"*{tile_suffix}") if path.is_file())
 
 
+def _package_tile_count(path: Path) -> int:
+    return len(read_package_manifest(path))
+
+
+def _count_split_tiles(tile_root: str | Path, stems: list[str], tile_suffix: str) -> int:
+    return sum(_package_tile_count(tile_package_path(tile_root, stem, tile_suffix)) for stem in stems)
+
+
 def _split_key_for_package(path: Path, split_key: str) -> str:
     if split_key == "stem":
         return package_stem(path)
@@ -105,6 +113,7 @@ def build_training_manifest(
         raise ValueError("val_frac must be in [0, 1)")
     datasets = {}
     splits = {"train": {}, "val": {}, "exval": {}}
+    summary = {"datasets": {}, "splits": {"train": {}, "val": {}, "exval": {}}}
     for name, root in dev_sources.items():
         packages = _discover_tile_packages(root, tile_suffix=tile_suffix)
         if not packages:
@@ -113,6 +122,19 @@ def build_training_manifest(
         datasets[name] = {"role": "development", "tile_root": str(root)}
         splits["train"][name] = train_stems
         splits["val"][name] = val_stems
+        summary["datasets"][name] = {
+            "role": "development",
+            "package_count": len(packages),
+            "tile_count": sum(_package_tile_count(path) for path in packages),
+        }
+        summary["splits"]["train"][name] = {
+            "package_count": len(train_stems),
+            "tile_count": _count_split_tiles(root, train_stems, tile_suffix),
+        }
+        summary["splits"]["val"][name] = {
+            "package_count": len(val_stems),
+            "tile_count": _count_split_tiles(root, val_stems, tile_suffix),
+        }
     if public_source is not None:
         public_name, public_root = public_source
         packages = _discover_tile_packages(public_root, tile_suffix=tile_suffix)
@@ -122,6 +144,20 @@ def build_training_manifest(
         datasets[public_name] = {"role": "public", "tile_root": str(public_root)}
         splits["train"][public_name] = train_stems
         splits["exval"][f"{public_name}_heldout"] = {"source": public_name, "stems": exval_stems}
+        summary["datasets"][public_name] = {
+            "role": "public",
+            "package_count": len(packages),
+            "tile_count": sum(_package_tile_count(path) for path in packages),
+        }
+        summary["splits"]["train"][public_name] = {
+            "package_count": len(train_stems),
+            "tile_count": _count_split_tiles(public_root, train_stems, tile_suffix),
+        }
+        summary["splits"]["exval"][f"{public_name}_heldout"] = {
+            "source": public_name,
+            "package_count": len(exval_stems),
+            "tile_count": _count_split_tiles(public_root, exval_stems, tile_suffix),
+        }
     return {
         "version": 1,
         "tile_suffix": tile_suffix,
@@ -129,6 +165,7 @@ def build_training_manifest(
         "seed": seed,
         "datasets": datasets,
         "splits": splits,
+        "summary": summary,
     }
 
 
@@ -175,6 +212,50 @@ def manifest_teacher_feature_packages(
     return packages_by_teacher
 
 
+def validate_manifest_artifacts(
+    manifest: dict,
+    splits: list[str],
+    teachers: list[str] | None = None,
+    feature_root: str | Path | None = None,
+    feature_suffix_template: str = FEATURE_SUFFIX_TEMPLATE,
+) -> dict:
+    missing_tiles = []
+    for split in splits:
+        for path in manifest_tile_packages(manifest, split):
+            if not path.exists():
+                missing_tiles.append(str(path))
+    missing_features = []
+    if teachers:
+        if feature_root is None:
+            raise ValueError("feature_root is required when teachers are provided")
+        for split in splits:
+            packages_by_teacher = manifest_teacher_feature_packages(
+                manifest=manifest,
+                split=split,
+                teachers=teachers,
+                feature_root=feature_root,
+                feature_suffix_template=feature_suffix_template,
+            )
+            for teacher, paths in packages_by_teacher.items():
+                for path in paths:
+                    if not path.exists():
+                        missing_features.append({"teacher": teacher, "path": str(path), "split": split})
+    result = {
+        "checked_splits": splits,
+        "missing_tile_packages": missing_tiles,
+        "missing_feature_packages": missing_features,
+    }
+    if missing_tiles or missing_features:
+        missing_tile_sample = ", ".join(missing_tiles[:3])
+        missing_feature_sample = ", ".join(item["path"] for item in missing_features[:3])
+        raise FileNotFoundError(
+            "manifest artifact check failed: "
+            f"missing_tiles={len(missing_tiles)} sample=[{missing_tile_sample}] "
+            f"missing_features={len(missing_features)} sample=[{missing_feature_sample}]"
+        )
+    return result
+
+
 def _parse_source(values: list[str]) -> dict[str, str]:
     sources = {}
     for value in values:
@@ -193,6 +274,10 @@ def main() -> None:
     parser.add_argument("--val-frac", type=float, default=0.15)
     parser.add_argument("--split-key", default="patient_id", choices=["patient_id", "slide_id", "stem"])
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--teacher", action="append", default=[], help="Teacher name to verify under --feature-root.")
+    parser.add_argument("--feature-root", default="", help="Root containing <teacher>/<stem>.<teacher>.features.iac.")
+    parser.add_argument("--feature-suffix-template", default=FEATURE_SUFFIX_TEMPLATE)
+    parser.add_argument("--check-artifacts", action="store_true", help="Fail if tile or teacher feature packages are missing.")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     dev_sources = _parse_source(args.dev_source)
@@ -212,6 +297,14 @@ def main() -> None:
         split_key=args.split_key,
         seed=args.seed,
     )
+    if args.check_artifacts:
+        validate_manifest_artifacts(
+            manifest=manifest,
+            splits=["train", "val", "exval"],
+            teachers=[str(teacher) for teacher in args.teacher] or None,
+            feature_root=args.feature_root or None,
+            feature_suffix_template=args.feature_suffix_template,
+        )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")

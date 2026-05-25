@@ -83,10 +83,14 @@ The current student configuration is:
 当前 student 配置为：
 
 ```yaml
-backbone_name: vit_small_patch14_dinov2.lvd142m
+backbone_name: vit_small_patch14_reg4_dinov2.lvd142m
 teacher_dim: 1536
 pretrained: true
 ```
+
+The `reg4` backbone is the DINOv2 ViT-S/14 variant with four register tokens.
+
+`reg4` backbone 是带 4 个 register token 的 DINOv2 ViT-S/14 变体。
 
 Estimated trainable parameters:
 
@@ -236,8 +240,8 @@ Near-term development should focus on:
 
 近期开发重点：
 
-1. document the training manifest schema and cohort-building workflow;
-1. 记录 training manifest schema 与 cohort 构建流程；
+1. use the training manifest schema and cohort-building workflow for real dry runs;
+1. 使用 training manifest schema 与 cohort 构建流程进行真实 dry run；
 2. add feature-cache-aware training sampling for whole-matrix feature packages;
 2. 为 whole-matrix feature package 增加 feature-cache-aware training sampling；
 3. minimal HCC-specific weak supervision objectives;

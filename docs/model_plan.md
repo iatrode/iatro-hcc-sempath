@@ -246,10 +246,17 @@ Current configuration:
 当前配置：
 
 ```yaml
-backbone_name: vit_small_patch14_dinov2.lvd142m
+backbone_name: vit_small_patch14_reg4_dinov2.lvd142m
 teacher_dim: 1536
 pretrained: true
 ```
+
+The selected student uses the register-token DINOv2 ViT-S/14 variant (`reg4`).
+It keeps the compact ViT-S/14 scale while using four register tokens for more
+stable representation learning.
+
+当前 student 采用带 register token 的 DINOv2 ViT-S/14 变体（`reg4`）。它保持
+ViT-S/14 的轻量规模，同时使用 4 个 register token 以提高表征稳定性。
 
 Estimated trainable parameter count:
 
