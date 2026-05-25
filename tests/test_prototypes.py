@@ -188,3 +188,60 @@ def test_build_prototypes_writes_two_level_package(tmp_path: Path, monkeypatch: 
     assert registry.names == ["primary_non_tumor", "primary_tumor", "lymphocyte_rich"]
     assert registry.levels == [1, 1, 2]
     assert registry.exclusive == [True, True, False]
+
+
+def test_hcc_taxonomy_package_loads_with_expected_levels(tmp_path: Path) -> None:
+    names = [
+        "HCC-trabecular",
+        "HCC-solid",
+        "HCC-pseudoglandular",
+        "HCC-mixed-pattern",
+        "Background-liver",
+        "Fibrous-stromal",
+        "Degenerative-material",
+        "Indeterminate-region",
+        "Artifact-non-tissue",
+        "necrotic",
+        "hemorrhagic-blood-rich",
+        "bile-pigment-rich",
+        "inflammatory-rich",
+        "fibrotic",
+        "steatotic-vacuolated",
+        "interface-capsule",
+    ]
+    package_path = tmp_path / "taxonomy.pt"
+    torch.save(
+        {
+            "version": 1,
+            "prototypes": torch.randn(len(names), 8),
+            "names": names,
+            "groups": [
+                "hcc_architecture",
+                "hcc_architecture",
+                "hcc_architecture",
+                "hcc_architecture",
+                "background_liver",
+                "stroma",
+                "degenerative_material",
+                "indeterminate",
+                "artifact",
+                "degeneration",
+                "hemorrhage",
+                "pigment",
+                "inflammation",
+                "fibrosis",
+                "cellular_change",
+                "interface",
+            ],
+            "levels": [1] * 9 + [2] * 7,
+            "exclusive": [True] * 9 + [False] * 7,
+        },
+        package_path,
+    )
+
+    registry = load_prototype_registry(package_path, expected_dim=8)
+
+    assert registry.primary_indices == list(range(9))
+    assert registry.attribute_indices == list(range(9, 16))
+    assert registry.names[0] == "HCC-trabecular"
+    assert registry.names[-1] == "interface-capsule"

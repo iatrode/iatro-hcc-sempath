@@ -7,7 +7,8 @@ git repository.
 ## Open-source readiness
 
 - Keep `README.md`, `docs/PROJECT_DIRECTION.md`, `docs/model_plan.md`,
-  `docs/TECHNICAL_FRAMEWORK.md`, and `docs/PROTOTYPE_FORMAT.md` aligned
+  `docs/TECHNICAL_FRAMEWORK.md`, `docs/PROTOTYPE_FORMAT.md`, and
+  `docs/PROTOTYPE_TAXONOMY.md` aligned
   around the lightweight vertical HCC representation objective.
 - Add `docs/RELATED_WORK.md` with public citations and model-boundary notes.
 - Add `docs/HCC_SEMANTIC_SPACE.md` describing reusable HCC morphology semantics.

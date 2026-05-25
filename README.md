@@ -256,7 +256,8 @@ hcc-sempath build-prototypes \
 ```
 
 Prototype packages are runtime data with metadata, not hard-coded model classes.
-See `docs/PROTOTYPE_FORMAT.md` for the public package contract.
+See `docs/PROTOTYPE_FORMAT.md` for the public package contract and
+`docs/PROTOTYPE_TAXONOMY.md` for the current L1/L2 classification rules.
 
 Build a training manifest:
 

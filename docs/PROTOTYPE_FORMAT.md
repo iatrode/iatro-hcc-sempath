@@ -2,9 +2,10 @@
 
 This document defines the public prototype package contract for HCC-SemPath.
 Prototypes are runtime data, not hard-coded model classes.
+The current HCC prototype taxonomy is defined in `docs/PROTOTYPE_TAXONOMY.md`.
 
 本文档定义 HCC-SemPath 的公开 prototype package 约定。Prototype 是运行时数据，
-不是写死在模型中的类别。
+不是写死在模型中的类别。当前 HCC prototype 分类体系见 `docs/PROTOTYPE_TAXONOMY.md`。
 
 ## Package
 
@@ -30,9 +31,10 @@ Required fields:
 - `prototypes`: 2D float tensor.
 - `names`: unique prototype names.
 - `levels`: prototype semantic level. Level `1` is the primary mutually
-  exclusive state, such as tumor versus non-tumor / background tissue. Level `2`
-  is a non-exclusive attribute, such as lymphocyte-rich, fibrotic stroma,
-  necrosis, vascular context, or background liver change.
+  exclusive state, such as the dominant HCC architecture, background liver,
+  stromal region, degenerative material, indeterminate tissue, or artifact /
+  non-tissue. Level `2` is a non-exclusive attribute, such as necrotic,
+  hemorrhagic-blood-rich, inflammatory-rich, fibrotic, or interface-capsule.
 - `exclusive`: per-prototype exclusivity flag. Level-1 prototypes must be
   `True`; level-2 prototypes must be `False`.
 
