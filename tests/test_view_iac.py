@@ -4,9 +4,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
+import pyarrow as pa
 
 from hcc_sempath.cli.view_iac import IacViewerData
 from hcc_sempath.io.feature_cache import build_teacher_feature_package
+from hcc_sempath.io.iatrocache import build_pack
 from hcc_sempath.io.manifests import TileRecord
 from hcc_sempath.io.tile_package import build_tile_package_from_records, encode_jxl_array
 
@@ -79,5 +81,50 @@ def test_iac_viewer_reads_feature_cache_as_heatmap() -> None:
             nearest = data.nearest("0", 16.2, 16.1)["record"]
             assert nearest["x"] == 16
             assert nearest["y"] == 16
+        finally:
+            data.close()
+
+
+def test_iac_viewer_does_not_scale_physical_tile_coordinates() -> None:
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "physical.iac"
+        slide_table = pa.table({
+            "slide_idx": pa.array([0], type=pa.uint8()),
+            "slide_id": ["s1"],
+            "patient_id": ["p1"],
+        })
+        record_table = pa.table({
+            "slide_idx": pa.array([0, 0], type=pa.uint8()),
+            "tile_x": pa.array([16, 32], type=pa.uint16()),
+            "tile_y": pa.array([48, 48], type=pa.uint16()),
+            "tile_id": ["s1_0000000", "s1_0000001"],
+            "split": ["train", "train"],
+            "flags": pa.array([0, 0], type=pa.uint8()),
+        })
+        payloads = [
+            encode_jxl_array(np.full((16, 16, 3), value, dtype=np.uint8), lossless=True, distance=None, effort=1)
+            for value in (64, 128)
+        ]
+        build_pack(
+            path,
+            {
+                "payload_type": "image_tiles",
+                "codec": "jxl",
+                "tile_width": 16,
+                "tile_height": 16,
+                "stride_x": 16,
+                "stride_y": 16,
+            },
+            slide_table,
+            record_table,
+            payloads,
+            overwrite=True,
+        )
+
+        data = IacViewerData(path)
+        try:
+            nearest = data.nearest("0", 16.2, 48.1)["record"]
+            assert nearest["x"] == 16
+            assert nearest["y"] == 48
         finally:
             data.close()
