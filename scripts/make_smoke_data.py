@@ -52,7 +52,34 @@ def main() -> None:
         teacher_name="smoke",
         overwrite=True,
     )
-    torch.save({"prototypes": torch.randn(7, teacher_dim)}, root / "prototypes.pt")
+    torch.save(
+        {
+            "version": 1,
+            "prototypes": torch.randn(7, teacher_dim),
+            "names": [
+                "primary_tumor",
+                "primary_non_tumor",
+                "lymphocyte_rich",
+                "fibrotic_stroma",
+                "necrotic_change",
+                "vascular_context",
+                "background_liver_change",
+            ],
+            "groups": [
+                "primary_state",
+                "primary_state",
+                "microenvironment",
+                "stroma",
+                "tumor_attribute",
+                "vascular",
+                "background_liver",
+            ],
+            "levels": [1, 1, 2, 2, 2, 2, 2],
+            "exclusive": [True, True, False, False, False, False, False],
+            "source": {"builder": "scripts/make_smoke_data.py"},
+        },
+        root / "prototypes.pt",
+    )
     print("smoke_data_ok")
 
 

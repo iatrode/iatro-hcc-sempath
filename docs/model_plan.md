@@ -144,6 +144,8 @@ prototype_package.pth
     "prototypes": Tensor[num_prototypes, dim],
     "names": list[str],
     "groups": optional list[str],
+    "levels": list[int],
+    "exclusive": list[bool],
     "thresholds": optional Tensor[num_prototypes],
     "source": metadata
   }
@@ -152,9 +154,9 @@ config:
   data.prototype_path or data.prototype_dir
 ```
 
-The model must treat the number and identity of prototypes as data, not code. Prototype names, group membership, confidence thresholds, source notes, and initialization counts belong in metadata. This keeps future open-source releases clean: public code exposes the mechanism, while institution-specific prototype curation can remain outside the repository.
+The model must treat the number and identity of prototypes as data, not code. Prototype names, group membership, semantic levels, exclusivity flags, confidence thresholds, source notes, and initialization counts belong in metadata. This keeps future open-source releases clean: public code exposes the mechanism, while institution-specific prototype curation can remain outside the repository.
 
-模型必须把 prototype 的数量和身份视为数据，而不是代码。Prototype 名称、group 归属、置信阈值、来源说明和初始化样本量应写入 metadata。这样开源仓库只公开机制，机构内 prototype curate 过程可以留在仓库外部。
+模型必须把 prototype 的数量和身份视为数据，而不是代码。Prototype 名称、group 归属、语义层级、互斥标记、置信阈值、来源说明和初始化样本量应写入 metadata。这样开源仓库只公开机制，机构内 prototype curate 过程可以留在仓库外部。
 
 ### 3.5 Prototype-filtered distillation / Prototype 筛选蒸馏
 
@@ -189,23 +191,24 @@ This preserves gradient signal from all teachers while preventing one inconsiste
 
 这能保留所有 teacher 的梯度信号，同时避免单个语义不一致的 teacher 主导共享 HCC 空间。
 
-### 3.6 Multi-label prototype target / 多标签 prototype 目标
+### 3.6 Two-level prototype target / 两级 prototype 目标
 
-A tile can match multiple prototypes at the same time. HCC tumor morphology, lymphocytic infiltration, necrosis, fibrosis, steatosis, vascular context, and background liver changes are not mutually exclusive. Therefore prototype supervision should be formulated as multi-label regression rather than single-label multi-class classification.
+Prototype supervision should be two-level. Level 1 encodes the primary mutually exclusive state, such as tumor versus non-tumor / background tissue. Level 2 encodes non-exclusive morphology and microenvironment attributes, such as lymphocytic infiltration, necrosis, fibrosis, steatosis, vascular context, and background liver changes.
 
-一个 tile 可以同时匹配多个 prototype。HCC 肿瘤形态、淋巴细胞浸润、坏死、纤维化、脂肪变、血管上下文和背景肝改变并不互斥。因此 prototype supervision 应采用多标签回归，而不是单标签多分类。
+Prototype supervision 应分两级。Level 1 表示互斥的主状态，例如 tumor versus non-tumor / background tissue。Level 2 表示非互斥的形态与微环境属性，例如淋巴细胞浸润、坏死、纤维化、脂肪变、血管上下文和背景肝改变。
 
-The default target is a vector of soft prototype affinities:
+The default target is:
 
-默认目标是 soft prototype affinity vector：
+默认目标是：
 
 ```text
-y_proto in [0, 1] ^ num_prototypes
+y_primary: one mutually exclusive distribution over level-1 prototypes
+y_attr:    soft affinities in [0, 1] over level-2 prototypes
 ```
 
-When direct weak labels are available, use binary cross entropy or focal BCE on prototype logits. When only curated examples are available, use similarity regression or positive-unlabeled contrastive loss. When no explicit tile-level label is available, use prototype consistency as a self-training signal with confidence thresholds recorded in prototype metadata.
+Level-1 supervision should use softmax cross-entropy or soft-label KL over primary states. Level-2 supervision should use binary cross entropy, focal BCE, similarity regression, or positive-unlabeled contrastive loss. When no explicit tile-level label is available, use prototype consistency as a self-training signal with confidence thresholds recorded in prototype metadata.
 
-有直接弱标签时，使用 BCE 或 focal BCE 作用于 prototype logits；只有 curate example 时，使用 similarity regression 或 positive-unlabeled contrastive loss；没有显式 tile-level 标签时，使用带置信阈值的 prototype consistency self-training，阈值写入 prototype metadata。
+Level 1 使用 softmax cross-entropy 或 soft-label KL 约束主状态；Level 2 使用 BCE、focal BCE、similarity regression 或 positive-unlabeled contrastive loss。没有显式 tile-level 标签时，使用带置信阈值的 prototype consistency self-training，阈值写入 prototype metadata。
 
 ### 3.7 Loss schedule / Loss 阶段调度
 
