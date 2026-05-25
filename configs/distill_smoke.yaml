@@ -6,7 +6,7 @@ runtime:
 data:
   image_tile_package_path: smoke_data/tiles.iac
   teacher_feature_package_path: smoke_data/smoke.features.iac
-  anchors_path: smoke_data/anchors.pt
+  prototype_path: smoke_data/prototypes.pt
   num_workers: 0
 
 model:

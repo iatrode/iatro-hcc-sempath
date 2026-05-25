@@ -94,18 +94,22 @@ Potential agreement signals include pairwise teacher similarity consistency, tea
 
 潜在 agreement signal 包括 teacher 之间的相似性结构一致性、teacher-neighborhood overlap、teacher-rank consistency，或基于 sampled batch / cached feature subset 计算的 normalized disagreement score。这些分数应作为 loss weighting 和诊断指标，而不是直接生物学标签。
 
-### 3.3 HCC-specific weak supervision on `z_hcc` / 作用于 `z_hcc` 的 HCC 专病弱监督
+### 3.3 Prototype-guided HCC weak supervision on `z_hcc` / Prototype 引导的 HCC 专病弱监督
 
 HCC-specific weak supervision should reshape the shared embedding space beyond teacher imitation. In the selective-distillation setting, this component should be activated gradually rather than applied as a strong constraint from the first training step.
 
 HCC 专病弱监督应将共享 embedding space 从 teacher imitation 推向专病语义空间。在选择性蒸馏设定下，该部分应渐进启用，而不是从训练第一步开始施加强约束。
 
-Potential supervision sources:
+The weak-supervision mechanism is prototype-based. A prototype represents one reusable HCC morphology or tissue-context concept in the `z_hcc` space. Prototypes are not a fixed class list in model code. They are loaded at runtime from a prototype directory, a prebuilt prototype package, or a `.pt/.pth` payload with metadata, so new prototypes can be added, removed, merged, or revised without changing the student architecture.
+
+弱监督机制采用 prototype。一个 prototype 表示 `z_hcc` 空间中的一个可复用 HCC 形态或组织上下文概念。Prototype 不是写死在模型代码中的类别表，而是在运行时从 prototype 目录、预构建 prototype package，或带 metadata 的 `.pt/.pth` 文件加载，因此新 prototype 的添加、删除、合并或修订不需要修改 student 架构。
+
+Prototype sources:
 
 潜在监督来源：
 
-- expert-defined morphology anchors;
-- 专家定义的形态锚点；
+- expert-defined morphology prototypes;
+- 专家定义的形态 prototype；
 - semantic prototypes initialized from curated concept embeddings or reviewed examples;
 - 基于 curated concept embeddings 或人工审阅样本初始化的语义原型；
 - weak region labels;
@@ -119,18 +123,102 @@ Potential supervision sources:
 - other disease-domain signals that do not require dense pixel-level annotation.
 - 其他不需要密集像素级标注的专病信号。
 
-The HCC semantic loss should act on the shared `z_hcc` representation whenever possible, because `z_hcc` is the reusable model output. Teacher-specific heads may still be used for teacher alignment, but they should not be the only location where HCC semantic constraints are applied.
+The HCC semantic loss should act on the shared `z_hcc` representation, because `z_hcc` is the reusable model output. Teacher-specific heads remain useful for teacher alignment, but prototype constraints should not be applied only inside teacher-specific feature spaces.
 
-HCC semantic loss 应尽可能直接作用于共享 `z_hcc`，因为 `z_hcc` 是可复用模型输出。teacher-specific heads 仍可用于 teacher alignment，但不应成为 HCC 语义约束的唯一作用位置。
+HCC semantic loss 应直接作用于共享 `z_hcc`，因为 `z_hcc` 是可复用模型输出。Teacher-specific heads 仍可用于 teacher alignment，但 prototype 约束不应只作用在各 teacher-specific feature space 内。
+
+### 3.4 Prototype module and dynamic prototype registry / Prototype 模块与动态注册
+
+The prototype system should be implemented as a module with three public inputs:
+
+Prototype 系统应实现为一个模块，并支持三类公开输入：
+
+```text
+prototype_dir/
+  prototype_manifest.yaml
+  prototypes.pt or one file per prototype group
+
+prototype_package.pth
+  {
+    "version": 1,
+    "prototypes": Tensor[num_prototypes, dim],
+    "names": list[str],
+    "groups": optional list[str],
+    "thresholds": optional Tensor[num_prototypes],
+    "source": metadata
+  }
+
+config:
+  data.prototype_path or data.prototype_dir
+```
+
+The model must treat the number and identity of prototypes as data, not code. Prototype names, group membership, confidence thresholds, source notes, and initialization counts belong in metadata. This keeps future open-source releases clean: public code exposes the mechanism, while institution-specific prototype curation can remain outside the repository.
+
+模型必须把 prototype 的数量和身份视为数据，而不是代码。Prototype 名称、group 归属、置信阈值、来源说明和初始化样本量应写入 metadata。这样开源仓库只公开机制，机构内 prototype curate 过程可以留在仓库外部。
+
+### 3.5 Prototype-filtered distillation / Prototype 筛选蒸馏
+
+Prototype is not only an auxiliary label signal. It should control how much each teacher is trusted for each tile. Different teachers may organize the same HCC morphology differently, so direct teacher averaging can force conflicting semantics into `z_hcc`. Prototype response in the shared HCC semantic space should provide a filtering signal:
+
+Prototype 不只是辅助标签信号，还应控制每个 tile 对每个 teacher 的信任程度。不同 teacher 对同一 HCC 形态的语义组织不一定一致，直接平均会把冲突压进 `z_hcc`。共享 HCC 语义空间中的 prototype response 应提供筛选信号：
+
+```text
+z_hcc -> prototype responses r_i
+teacher_t feature/head -> teacher-specific semantic response q_ti
+agreement(z_hcc, teacher_t, prototypes) -> reliability alpha_t
+
+L = sum_t alpha_t * L_teacher_t
+  + lambda_proto * L_proto_multi_label
+  + lambda_cons * L_prototype_consistency
+  + lambda_rel * L_relation
+```
+
+`alpha_t` should be a soft weight, not a hard exclusion. A practical form is to compute teacher reliability from agreement between the teacher-specific response and the current `z_hcc` prototype response, optionally combined with cross-teacher disagreement. Tiles whose teachers agree with HCC prototype semantics receive stronger distillation; tiles with teacher conflict receive weaker hard imitation and stronger prototype shaping.
+
+`alpha_t` 应是软权重，不是硬排除。可行做法是根据 teacher-specific response 与当前 `z_hcc` prototype response 的一致性计算 teacher reliability，并可结合跨 teacher disagreement。与 HCC prototype 语义一致的 tile 接受更强蒸馏；teacher 冲突明显的 tile 降低硬模仿权重，并增强 prototype shaping。
+
+The first implementation should use a bounded reliability weight:
+
+第一版实现采用有界 reliability weight：
+
+```text
+alpha_t = clamp(alpha_min + (1 - alpha_min) * agreement_t, alpha_min, 1)
+```
+
+This preserves gradient signal from all teachers while preventing one inconsistent teacher from dominating the shared HCC space.
+
+这能保留所有 teacher 的梯度信号，同时避免单个语义不一致的 teacher 主导共享 HCC 空间。
+
+### 3.6 Multi-label prototype target / 多标签 prototype 目标
+
+A tile can match multiple prototypes at the same time. HCC tumor morphology, lymphocytic infiltration, necrosis, fibrosis, steatosis, vascular context, and background liver changes are not mutually exclusive. Therefore prototype supervision should be formulated as multi-label regression rather than single-label multi-class classification.
+
+一个 tile 可以同时匹配多个 prototype。HCC 肿瘤形态、淋巴细胞浸润、坏死、纤维化、脂肪变、血管上下文和背景肝改变并不互斥。因此 prototype supervision 应采用多标签回归，而不是单标签多分类。
+
+The default target is a vector of soft prototype affinities:
+
+默认目标是 soft prototype affinity vector：
+
+```text
+y_proto in [0, 1] ^ num_prototypes
+```
+
+When direct weak labels are available, use binary cross entropy or focal BCE on prototype logits. When only curated examples are available, use similarity regression or positive-unlabeled contrastive loss. When no explicit tile-level label is available, use prototype consistency as a self-training signal with confidence thresholds recorded in prototype metadata.
+
+有直接弱标签时，使用 BCE 或 focal BCE 作用于 prototype logits；只有 curate example 时，使用 similarity regression 或 positive-unlabeled contrastive loss；没有显式 tile-level 标签时，使用带置信阈值的 prototype consistency self-training，阈值写入 prototype metadata。
+
+### 3.7 Loss schedule / Loss 阶段调度
 
 A practical schedule is:
 
 一个可行训练调度为：
 
 ```text
-early training:    teacher distillation dominates; HCC prototype loss is zero or small
-middle training:   HCC semantic/prototype loss is gradually warmed up
-later training:    high-disagreement tiles receive less hard imitation and more HCC shaping
+stage 0: contract smoke and feature sanity checks only
+stage 1: teacher distillation dominates; prototype loss is zero or very small
+stage 2: prototype response loss warms up; teacher reliability remains weakly bounded
+stage 3: prototype-filtered distillation is active; high-conflict teacher signals are down-weighted
+stage 4: freeze or slow prototype updates; evaluate retrieval, clustering, and cross-cohort stability
 ```
 
 This can be implemented either as explicit staged training or as a single training run with scheduled loss weights. In both cases, the scientific interpretation should remain conservative: the objective is to organize HCC-relevant morphology, not to claim that prototypes are exhaustive or definitive pathology categories.
@@ -232,8 +320,8 @@ These metrics verify successful distillation and characterize teacher consistenc
 
 - expert-reviewed morphology retrieval;
 - 专家审阅的形态检索；
-- HCC semantic anchor or prototype response consistency;
-- HCC 语义锚点或原型响应一致性；
+- HCC semantic prototype response consistency;
+- HCC 语义 prototype response 一致性；
 - clustering or neighborhood purity for HCC-relevant morphology groups;
 - HCC 相关形态组的聚类或邻域纯度；
 - cross-cohort stability;

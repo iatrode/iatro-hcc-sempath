@@ -112,7 +112,7 @@ class ToyTeacherEncoder(nn.Module):
         return self.head(x)
 
 
-def normalized_anchor_logits(features: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
+def normalized_prototype_logits(features: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
     features = F.normalize(features, dim=-1)
-    anchors = F.normalize(anchors, dim=-1)
-    return features @ anchors.transpose(0, 1)
+    prototypes = F.normalize(prototypes, dim=-1)
+    return features @ prototypes.transpose(0, 1)

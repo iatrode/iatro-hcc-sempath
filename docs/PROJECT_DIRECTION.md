@@ -63,24 +63,24 @@ morphology and tissue semantics.
 第一阶段使用多教师蒸馏注入通用病理形态先验。第二阶段使用 HCC 专病弱监督塑造
 `z_hcc`，使其围绕 HCC 形态和组织语义组织。
 
-The weak supervision signals should act on the shared embedding space rather
-than only making the student imitate teacher features more closely. Suitable
-public-safe signal types include expert-defined morphology anchors, weak region
-labels, curated retrieval sets, structured pathology descriptors, and
-slide- or region-level disease-domain labels.
+The weak supervision mechanism should be prototype-based and should act on the
+shared embedding space rather than only making the student imitate teacher
+features more closely. Suitable public-safe signal types include expert-defined
+morphology prototypes, weak region labels, curated retrieval sets, structured
+pathology descriptors, and slide- or region-level disease-domain labels.
 
 弱监督信号应直接作用于共享 embedding space，而不是只让 student 更接近 teacher
-feature。适合公开描述的信号包括专家定义形态锚点、弱区域标签、人工整理检索集合、
-结构化病理描述，以及切片级或区域级专病标签。
+feature。机制应围绕 prototype 组织；适合公开描述的信号包括专家定义形态 prototype、
+弱区域标签、人工整理检索集合、结构化病理描述，以及切片级或区域级专病标签。
 
 ## 5. Data Organization / 数据组织
 
 Training data should be organized around patient- or WSI-level splits. Tile
-packages, teacher feature packages, weak labels, and semantic anchors should be
-joined by stable tile identifiers and reproducible WSI coordinates.
+packages, teacher feature packages, weak labels, and semantic prototypes should
+be joined by stable tile identifiers and reproducible WSI coordinates.
 
 训练数据应按 patient 或 WSI 级别划分。Tile package、teacher feature package、弱标签和
-semantic anchors 通过稳定 tile identifier 与可复现 WSI 坐标对齐。
+semantic prototype 通过稳定 tile identifier 与可复现 WSI 坐标对齐。
 
 The public repository should contain schemas, configuration templates, synthetic
 fixtures, aggregate benchmark summaries, and reproducibility scripts. It should
@@ -108,7 +108,7 @@ Teacher-alignment metrics are quality-control metrics:
 HCC representation metrics are the main scientific evidence:
 
 - expert-reviewed HCC morphology retrieval;
-- HCC semantic anchor consistency;
+- HCC semantic prototype response consistency;
 - morphology-group clustering or neighborhood purity;
 - cross-cohort stability;
 - lightweight downstream adaptation;

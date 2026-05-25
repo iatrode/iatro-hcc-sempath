@@ -24,8 +24,14 @@ git repository.
   teacher feature packages.
 - Add benchmark scripts for teacher-feature storage tradeoffs before changing
   the feature package layout.
+- Add dynamic prototype loading from a prototype directory or prebuilt `.pt/.pth`
+  prototype package.
 - Add minimal HCC-specific weak-supervision objectives on the shared `z_hcc`
-  embedding.
+  embedding with multi-label prototype targets.
+- Implement prototype-filtered distillation so prototype response agreement
+  provides soft teacher-reliability weights.
+- Add scheduled loss weights for teacher distillation, prototype response loss,
+  prototype-filtered teacher weighting, and relation preservation.
 - Implement semantic prototype initialization from curated concept embeddings.
 - Add bounded prototype updates, prototype diagnostics, and prototype capacity
   scaling experiments.

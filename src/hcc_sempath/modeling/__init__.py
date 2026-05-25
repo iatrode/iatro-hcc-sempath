@@ -1,2 +1,2 @@
-"""Model definitions and embedding-anchor utilities."""
+"""Model definitions and embedding-prototype utilities."""
 

@@ -64,7 +64,7 @@ machine paths.
 src/hcc_sempath/
   io/        offline cache readers/writers, manifests, QC
   teacher/   teacher model loading and offline feature-cache construction
-  modeling/  student models and semantic anchors
+  modeling/  student models and semantic prototypes
   training/  datasets, losses, metrics, engine, train/evaluate/benchmark CLIs
   cli/       installed command-line entry points
 ```
@@ -120,7 +120,7 @@ multi-teacher distillation training.
 ## Smoke Test
 
 The contract smoke test uses synthetic data and validates package loading,
-anchor loading, training, checkpointing, evaluation output, and throughput
+prototype loading, training, checkpointing, evaluation output, and throughput
 benchmarking.
 
 ```bash
@@ -246,12 +246,12 @@ feature-cache environment before building caches. Local snapshots can also be
 loaded directly with `--teacher weights/teachers/uni2_h` or
 `--teacher weights/teachers/virchow2`; the `weights/` tree is git-ignored.
 
-Build semantic anchors:
+Build semantic prototypes:
 
 ```bash
-hcc-sempath build-anchors \
+hcc-sempath build-prototypes \
   --concept-dir data/concept_features \
-  --output data/anchors/hcc_semantic_anchors.pt
+  --output data/prototypes/hcc_semantic_prototypes.pt
 ```
 
 Train:
