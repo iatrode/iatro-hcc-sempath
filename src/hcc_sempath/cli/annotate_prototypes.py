@@ -10,6 +10,7 @@ import socket
 import tempfile
 import threading
 import webbrowser
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -111,6 +112,7 @@ class AnnotationState:
         self.state_path = Path(state_path)
         self.input_path = str(Path(input_path).resolve())
         self.annotations: dict[str, dict] = {}
+        self.revision = 0
         if self.state_path.exists():
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
             self.input_path = str(Path(payload.get("input_path", self.input_path)).resolve())
@@ -157,6 +159,7 @@ class AnnotationState:
             "l2": list(l2),
         }
         self.annotations[_annotation_key(package, record)] = payload
+        self.revision += 1
         self.flush()
         LOG.info(
             "annotation_save iac=%s row=%d tile_id=%s x=%d y=%d l1=%s l2=%s total_annotations=%d",
@@ -209,6 +212,9 @@ class AnnotationData:
         self._scan_done = False
         self._scan_error = ""
         self._scan_thread: threading.Thread | None = None
+        self._thumbnail_token = ""
+        self._thumbnail_cache: OrderedDict[tuple[str, int | None, int], bytes] = OrderedDict()
+        self._thumbnail_cache_limit = 48
         if async_scan:
             self._scan_thread = threading.Thread(target=self._scan_packages, name="iac-scan", daemon=True)
             self._scan_thread.start()
@@ -249,6 +255,35 @@ class AnnotationData:
     def package(self, index: int) -> AnnotationPackage:
         with self._lock:
             return self.packages[index]
+
+    def activate_thumbnail_token(self, token: str) -> None:
+        with self._lock:
+            if token and token != self._thumbnail_token:
+                LOG.info("thumbnail_token_activate token=%s", token)
+                self._thumbnail_token = token
+
+    def thumbnail_token_active(self, token: str | None) -> bool:
+        if not token:
+            return True
+        with self._lock:
+            return token == self._thumbnail_token
+
+    def _thumbnail_cache_get(self, key: tuple[str, int | None, int]) -> bytes | None:
+        with self._lock:
+            value = self._thumbnail_cache.get(key)
+            if value is None:
+                return None
+            self._thumbnail_cache.move_to_end(key)
+            LOG.info("thumbnail_cache_hit iac=%s pass=%s revision=%d bytes=%d", key[0], key[1], key[2], len(value))
+            return value
+
+    def _thumbnail_cache_put(self, key: tuple[str, int | None, int], value: bytes) -> None:
+        with self._lock:
+            self._thumbnail_cache[key] = value
+            self._thumbnail_cache.move_to_end(key)
+            while len(self._thumbnail_cache) > self._thumbnail_cache_limit:
+                evicted, _ = self._thumbnail_cache.popitem(last=False)
+                LOG.info("thumbnail_cache_evict iac=%s pass=%s revision=%d", evicted[0], evicted[1], evicted[2])
 
     def viewer(self, index: int) -> IacViewerData:
         with self._lock:
@@ -345,9 +380,21 @@ class AnnotationData:
         viewer = self.viewer(index)
         return {record.row for record in viewer.records if self.state.is_annotated(package, record)}
 
-    def thumbnail_png(self, index: int, max_size: int = 1200, pass_count: int | None = None) -> bytes:
+    def thumbnail_png(
+        self,
+        index: int,
+        max_size: int = 1200,
+        pass_count: int | None = None,
+        token: str | None = None,
+    ) -> bytes:
+        if token:
+            self.activate_thumbnail_token(token)
         with self._lock:
             package = self.packages[index]
+            cache_key = (package.rel_path, pass_count, self.state.revision)
+        cached = self._thumbnail_cache_get(cache_key)
+        if cached is not None:
+            return cached
         viewer = self.viewer(index)
         start = perf_counter()
         records = viewer.records
@@ -378,8 +425,12 @@ class AnnotationData:
         lengths = viewer.record_table.column("length")
 
         def decode_overview_tile(record: IacRecord) -> tuple[int, int, Image.Image] | None:
+            if not self.thumbnail_token_active(token):
+                return None
             try:
                 payload = read_payload(package.path, viewer.header, offsets[record.row].as_py(), lengths[record.row].as_py())
+                if not self.thumbnail_token_active(token):
+                    return None
                 tile = decode_jxl(payload).convert("RGB")
                 tile = tile.resize((tile_px_w, tile_px_h), Image.Resampling.LANCZOS)
                 x = int((record.display_x - min_x) * scale)
@@ -390,14 +441,23 @@ class AnnotationData:
                 return None
 
         workers = min(12, max(1, len(sampled_records)))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        cancelled = False
+        try:
             futures = [executor.submit(decode_overview_tile, record) for record in sampled_records]
             for future in as_completed(futures):
+                if not self.thumbnail_token_active(token):
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    cancelled = True
+                    break
                 item = future.result()
                 if item is None:
                     continue
                 x, y, tile = item
                 canvas.paste(tile, (x, y))
+        finally:
+            if not cancelled:
+                executor.shutdown(wait=True, cancel_futures=True)
         draw = ImageDraw.Draw(canvas, "RGBA")
         for item in annotated:
             x = int((int(item["x"]) - min_x) * scale)
@@ -405,6 +465,9 @@ class AnnotationData:
             draw.rectangle([x, y, x + tile_px_w, y + tile_px_h], outline=(0, 140, 80, 220), width=2)
         buffer = io.BytesIO()
         canvas.save(buffer, format="PNG")
+        body = buffer.getvalue()
+        if self.thumbnail_token_active(token):
+            self._thumbnail_cache_put(cache_key, body)
         LOG.info(
             "thumbnail_render iac=%s mode=spatial pass=%s records=%d sampled=%d workers=%d annotated=%d bounds=(%d,%d,%d,%d) footprint=%dx%d canvas=%dx%d tile_px=%dx%d elapsed=%.3fs",
             package.rel_path,
@@ -425,7 +488,7 @@ class AnnotationData:
             tile_px_h,
             perf_counter() - start,
         )
-        return buffer.getvalue()
+        return body
 
 
 HTML = r"""<!doctype html>
@@ -463,7 +526,7 @@ function prototypeButton(name, selected, onClick){const b=document.createElement
 function renderLabels(){const a=document.getElementById('l1'); a.innerHTML=''; L1.forEach(x=>a.appendChild(prototypeButton(x,l1===x,()=>{l1=x;renderLabels()}))); const b=document.getElementById('l2'); b.innerHTML=''; L2.forEach(x=>b.appendChild(prototypeButton(x,l2.has(x),()=>{l2.has(x)?l2.delete(x):l2.add(x);renderLabels()})));}
 function statRow(name,count,maxCount){const pct=maxCount?Math.round(count/maxCount*100):0; return `<div class=stat style="--pct:${pct}%"><div class=row><span>${name}</span><span class=count>${count}</span></div></div>`;}
 function statBlock(title, counts){const values=Object.values(counts); const maxCount=Math.max(1,...values); return `<b>${title}</b>`+Object.entries(counts).map(([name,count])=>statRow(name,count,maxCount)).join('');}
-function setThumbnailSrc(){const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); let pass=1; const token=Date.now(); img.dataset.token=String(token); loading.style.display='block'; loading.textContent='Loading overview...'; img.style.display='none'; const loadPass=()=>{if(img.dataset.token!==String(token)) return; img.onload=()=>{loading.style.display='none'; img.style.display='block'; if(pass<12){pass+=1; setTimeout(loadPass,350);}}; img.onerror=()=>{loading.textContent='Overview failed to load.';}; img.src=`/api/thumbnail?package=${pkg}&pass=${pass}&t=${Date.now()}`;}; loadPass();}
+function setThumbnailSrc(){const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); let pass=1; const token=`${Date.now()}-${pkg}`; img.dataset.token=String(token); loading.style.display='block'; loading.textContent='Loading overview...'; img.style.display='none'; const loadPass=()=>{if(img.dataset.token!==String(token)) return; img.onload=()=>{if(img.dataset.token!==String(token)) return; loading.style.display='none'; img.style.display='block'; if(pass<12){pass+=1; setTimeout(loadPass,350);}}; img.onerror=()=>{if(img.dataset.token===String(token)) loading.textContent='Overview failed to load.';}; img.src=`/api/thumbnail?package=${pkg}&pass=${pass}&token=${encodeURIComponent(token)}&t=${Date.now()}`;}; loadPass();}
 async function loadPackages(){packages=await api('/api/packages'); const scan=await api('/api/scan-status'); document.getElementById('packageSummary').textContent=`${packages.length} IAC package${packages.length===1?'':'s'}${scan.done?'':' · scanning...'}`; if(scan.error){document.getElementById('status').textContent=scan.error;} const box=document.getElementById('packages'); box.innerHTML=''; packages.forEach(p=>{const pct=p.total?Math.round(p.annotated/p.total*100):0; const d=document.createElement('div'); d.className='pkg'+(p.index===pkg?' active':''); d.style.setProperty('--pct',pct+'%'); d.innerHTML=`<b>${p.name}</b><div class=muted>${p.dataset||'no dataset'} · ${p.annotated}/${p.total} · ${pct}%</div>`; d.onclick=()=>{pkg=p.index; refreshPackage();}; box.appendChild(d)}); return scan;}
 async function refreshPackage(){const scan=await loadPackages(); if(!packages.length){document.getElementById('recordMeta').textContent=scan.done?'No image-tile IAC packages found.':'Scanning IAC packages...'; setTimeout(refreshPackage,1000); return;} if(pkg>=packages.length) pkg=0; setThumbnailSrc(); await progress(); await nextRandom();}
 async function progress(){const p=await api('/api/progress?package='+pkg); const pct=p.package.total?Math.round(p.package.annotated/p.package.total*100):0; document.getElementById('progress').innerHTML=`<div>${p.package.annotated}/${p.package.total} (${pct}%)</div><div class=bar><div style="width:${pct}%"></div></div>${statBlock('L1',p.l1)}${statBlock('L2',p.l2)}`;}
@@ -528,7 +591,8 @@ def make_handler(data: AnnotationData):
                     return
                 if parsed.path == "/api/thumbnail":
                     pass_count = int(qs["pass"][0]) if "pass" in qs else None
-                    body = data.thumbnail_png(index, pass_count=pass_count)
+                    token = qs.get("token", [""])[0]
+                    body = data.thumbnail_png(index, pass_count=pass_count, token=token)
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "image/png")
                     self.send_header("Content-Length", str(len(body)))
