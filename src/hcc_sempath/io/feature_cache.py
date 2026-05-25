@@ -1,21 +1,15 @@
 from __future__ import annotations
 
-import lzma
-import zlib
 from pathlib import Path
 from collections.abc import Iterable
 
-import imagecodecs
 import numpy as np
 import pyarrow as pa
 
-from .iatrocache import PackReader, build_pack_data_segment, read_payload, read_tables
+from .iatrocache import PackReader, build_pack_data_segment, read_tables
 from .manifests import TileRecord
 from .tile_package import read_package_manifest, read_package_metadata
 from .tile_package import _build_slide_table, _ensure_unique_column, _infer_coordinate_stride, _slide_map
-
-
-FEATURE_COMPRESSIONS = {"none", "zstd", "zlib", "lzma"}
 
 
 def _ensure_unique_tile_ids(records: list[TileRecord]) -> None:
@@ -64,32 +58,6 @@ def _build_feature_table(
     )
 
 
-def _compress_feature_matrix(raw: bytes, compression: str, compression_level: int | None) -> bytes:
-    if compression == "none":
-        return raw
-    if compression == "zstd":
-        return imagecodecs.zstd_encode(raw, level=compression_level)
-    if compression == "zlib":
-        level = 6 if compression_level is None else compression_level
-        return zlib.compress(raw, level=level)
-    if compression == "lzma":
-        preset = 6 if compression_level is None else compression_level
-        return lzma.compress(raw, preset=preset)
-    raise ValueError(f"unsupported feature compression: {compression}")
-
-
-def _decompress_feature_matrix(payload: bytes, compression: str) -> bytes:
-    if compression == "none":
-        return payload
-    if compression == "zstd":
-        return imagecodecs.zstd_decode(payload)
-    if compression == "zlib":
-        return zlib.decompress(payload)
-    if compression == "lzma":
-        return lzma.decompress(payload)
-    raise ValueError(f"unsupported feature compression: {compression}")
-
-
 def build_teacher_feature_package(
     records: list[TileRecord],
     features: Iterable[np.ndarray],
@@ -101,8 +69,6 @@ def build_teacher_feature_package(
     tile_height: int | None = None,
     stride_x: int | None = None,
     stride_y: int | None = None,
-    compression: str = "zstd",
-    compression_level: int | None = 6,
     overwrite: bool = False,
 ) -> None:
     if not records:
@@ -110,9 +76,6 @@ def build_teacher_feature_package(
     if not teacher_name:
         raise ValueError("teacher_name is required for teacher feature packages")
     dtype = np.dtype(dtype).name
-    compression = compression.lower()
-    if compression not in FEATURE_COMPRESSIONS:
-        raise ValueError(f"unsupported feature compression: {compression}")
     _ensure_unique_tile_ids(records)
     slide_table, slide_to_idx = _build_slide_table(records)
     if len(slide_to_idx) > 255:
@@ -164,20 +127,13 @@ def build_teacher_feature_package(
     table = _build_feature_table(records, slide_to_idx, stride_x, stride_y)
     matrix = collect_matrix()
     raw_matrix = matrix.tobytes(order="C")
-    compressed_matrix = _compress_feature_matrix(raw_matrix, compression, compression_level)
+    record_bytes = int(feature_dim) * np.dtype(dtype).itemsize
     header = {
         "payload_type": "teacher_features",
         "teacher": teacher_name,
         "feature_dim": int(feature_dim),
         "dtype": dtype,
-        "feature_layout": "matrix",
-        "compression": compression,
-        "compression_level": compression_level,
-        "matrix_offset": 0,
-        "matrix_length": len(compressed_matrix),
-        "matrix_crc32": zlib.crc32(compressed_matrix) & 0xFFFFFFFF,
-        "matrix_uncompressed_length": len(raw_matrix),
-        "matrix_shape": [len(records), int(feature_dim)],
+        "feature_record_bytes": record_bytes,
         "tile_width": tile_width,
         "tile_height": tile_height,
         "stride_x": stride_x,
@@ -190,7 +146,7 @@ def build_teacher_feature_package(
         "checksum": "crc32",
         "created_by": "hcc-sempath",
     }
-    build_pack_data_segment(output_path, header, slide_table, table, compressed_matrix, overwrite=overwrite)
+    build_pack_data_segment(output_path, header, slide_table, table, raw_matrix, overwrite=overwrite)
 
 
 def build_teacher_feature_package_from_feature_map(
@@ -203,8 +159,6 @@ def build_teacher_feature_package_from_feature_map(
     tile_height: int | None = None,
     stride_x: int | None = None,
     stride_y: int | None = None,
-    compression: str = "zstd",
-    compression_level: int | None = 6,
     overwrite: bool = False,
 ) -> None:
     def features() -> Iterable[np.ndarray]:
@@ -224,8 +178,6 @@ def build_teacher_feature_package_from_feature_map(
         tile_height=tile_height,
         stride_x=stride_x,
         stride_y=stride_y,
-        compression=compression,
-        compression_level=compression_level,
         overwrite=overwrite,
     )
 
@@ -237,8 +189,6 @@ def build_teacher_feature_package_from_tile_package(
     teacher_name: str = "",
     dtype: str = "float32",
     feature_dim: int | None = None,
-    compression: str = "zstd",
-    compression_level: int | None = 6,
     overwrite: bool = False,
 ) -> None:
     metadata = read_package_metadata(tile_package_path)
@@ -255,8 +205,6 @@ def build_teacher_feature_package_from_tile_package(
         tile_height=int(metadata["tile_height"]),
         stride_x=int(metadata["stride_x"]),
         stride_y=int(metadata["stride_y"]),
-        compression=compression,
-        compression_level=compression_level,
         overwrite=overwrite,
     )
 
@@ -265,7 +213,6 @@ class FeatureCacheReader:
     def __init__(self, package_path: str | Path) -> None:
         self._reader = PackReader(package_path)
         self._tile_index: dict[str, int] | None = None
-        self._matrix: np.ndarray | None = None
 
     @property
     def header(self) -> dict:
@@ -293,42 +240,27 @@ class FeatureCacheReader:
             raise ValueError(f"duplicate tile_id values in feature package: count={len(duplicates)} sample={sample}")
         self._tile_index = {tile_ids[i].as_py(): i for i in range(len(tile_ids))}
 
-    def _ensure_matrix(self) -> None:
-        if self._matrix is not None:
-            return
-        self._ensure_index()
+    def _record_bytes(self) -> int:
         header = self._reader.header
-        if header.get("feature_layout") != "matrix":
-            raise ValueError(f"unsupported teacher feature layout: {header.get('feature_layout')}")
         dtype = np.dtype(header["dtype"])
         feature_dim = int(header["feature_dim"])
-        num_records = int(header["num_records"])
-        expected_shape = (num_records, feature_dim)
-        expected_length = num_records * feature_dim * dtype.itemsize
-        matrix_offset = int(header.get("matrix_offset", 0))
-        matrix_length = int(header["matrix_length"])
-        payload = read_payload(self._reader.package_path, header, matrix_offset, matrix_length)
-        expected_crc = int(header["matrix_crc32"])
-        actual_crc = zlib.crc32(payload) & 0xFFFFFFFF
-        if actual_crc != expected_crc:
-            raise ValueError(f"feature matrix crc32 mismatch: expected={expected_crc} actual={actual_crc}")
-        raw = _decompress_feature_matrix(payload, str(header.get("compression", "none")).lower())
-        if len(raw) != expected_length:
-            raise ValueError(f"invalid feature matrix byte length: expected={expected_length} got={len(raw)}")
-        matrix = np.frombuffer(raw, dtype=dtype)
-        if matrix.shape != (num_records * feature_dim,):
-            raise ValueError(f"invalid feature matrix flat shape: {matrix.shape}")
-        self._matrix = matrix.reshape(expected_shape)
+        record_bytes = int(header["feature_record_bytes"])
+        expected = feature_dim * dtype.itemsize
+        if record_bytes != expected:
+            raise ValueError(f"invalid feature_record_bytes: expected={expected} got={record_bytes}")
+        return record_bytes
 
     def read_feature(self, tile_id: str) -> np.ndarray:
-        self._ensure_matrix()
+        self._ensure_index()
         assert self._tile_index is not None
-        assert self._matrix is not None
         row = self._tile_index.get(tile_id)
         if row is None:
             raise FileNotFoundError(f"missing packaged teacher feature: {tile_id}")
+        record_bytes = self._record_bytes()
+        dtype = np.dtype(self._reader.header["dtype"])
         feature_dim = int(self._reader.header["feature_dim"])
-        feature = self._matrix[row]
+        payload = self._reader.read_data_span(row * record_bytes, record_bytes)
+        feature = np.frombuffer(payload, dtype=dtype)
         if feature.shape != (feature_dim,):
             raise ValueError(f"invalid feature payload shape for {tile_id}: {feature.shape}")
         return feature.astype(np.float32, copy=True)
@@ -336,7 +268,6 @@ class FeatureCacheReader:
     def close(self) -> None:
         self._reader.close()
         self._tile_index = None
-        self._matrix = None
 
     def __getstate__(self) -> dict:
         return {"package_path": self._reader.package_path}
@@ -344,7 +275,6 @@ class FeatureCacheReader:
     def __setstate__(self, state: dict) -> None:
         self._reader = PackReader(state["package_path"])
         self._tile_index = None
-        self._matrix = None
 
     def __del__(self) -> None:
         self.close()

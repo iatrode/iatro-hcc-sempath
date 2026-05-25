@@ -153,13 +153,14 @@ decode, and decoded image size against `tile_width` and `tile_height`.
 
 ## `teacher_features`
 
-Teacher-feature packages store one package-level feature matrix. Feature
-packages are generated from the same tile set as an image-tile package and keep
-the same slide identity, tile-grid coordinates, and `tile_id` join key. The
-record table order is the matrix row order:
+Teacher-feature packages store one fixed-length raw feature record per tile.
+Feature packages are generated from the same tile set as an image-tile package
+and keep the same slide identity, tile-grid coordinates, and `tile_id` join key.
+The record table order is the feature-record order in the data segment:
 
 ```text
-matrix.shape = (num_records, feature_dim)
+feature_offset(row) = data_offset + row * feature_record_bytes
+feature_record_bytes = feature_dim * numpy.dtype(dtype).itemsize
 ```
 
 Additional header fields:
@@ -168,49 +169,28 @@ Additional header fields:
 teacher
 feature_dim
 dtype
-feature_layout = matrix
-compression = none | zstd | zlib | lzma
-compression_level
-matrix_offset
-matrix_length
-matrix_crc32
-matrix_uncompressed_length
-matrix_shape
+feature_record_bytes
 ```
 
 `teacher` is the required source-teacher label. `feature_dim` and `dtype`
-determine how the decompressed matrix is parsed:
+determine the fixed byte length of every feature record:
 
 ```text
-matrix_uncompressed_length = num_records * feature_dim * numpy.dtype(dtype).itemsize
+data_length = num_records * feature_record_bytes
 ```
 
-The data segment stores the compressed matrix block. `matrix_offset` is relative
-to the data segment and is normally `0`. `matrix_length` is the compressed byte
-length. `matrix_crc32` is the CRC32 of the compressed matrix block.
+The data segment stores raw contiguous feature bytes with no feature-level
+compression and no per-record `offset/length/crc32` columns. Fixed-length
+records make random access a direct seek by row number while keeping the record
+table focused on identity and spatial coordinates.
 
-Supported feature matrix compression values are deliberately small:
-
-```text
-none
-zstd
-zlib
-lzma
-```
-
-The default writer uses `zstd` because it gives strong general-purpose
-lossless compression with fast decompression. `zlib` and `lzma` are retained as
-simple alternatives for compatibility or space-focused experiments. JXL is not
-used for teacher features because teacher embeddings are not image payloads.
-
-Teacher-feature payloads are raw contiguous matrix bytes after decompression.
 IAC v1 does not store model revision, model path, preprocessing provenance,
 hashes, experiment splits, or training provenance in the package header. If
 needed, those belong in an external experiment manifest.
 
 Validators check the common layout, CRC32, slide references, tile-id uniqueness,
 non-empty `teacher`, positive `feature_dim`, valid NumPy `dtype`, and feature
-matrix byte length / shape. They do not attempt image decoding for
+record byte length / data segment length. They do not attempt image decoding for
 `teacher_features`.
 
 ## CLI
@@ -226,5 +206,5 @@ Typical success output:
 
 ```text
 package_valid type=image_tiles records=...
-package_valid type=teacher_features teacher=... dim=... dtype=...
+package_valid type=teacher_features records=... teacher=... dim=... dtype=... rows_checked=...
 ```
