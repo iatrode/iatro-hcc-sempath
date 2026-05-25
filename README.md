@@ -207,8 +207,9 @@ hcc-sempath build-teacher-cache \
   --teacher h_optimus_1 \
   --feature-compression zstd \
   --feature-compression-level 6 \
-  --batch-size 1024 \
-  --precision fp16 \
+  --batch-size 512 \
+  --precision bf16 \
+  --feature-dtype auto \
   --compile \
   --num-workers 8 \
   --prefetch-factor 2 \
@@ -231,9 +232,10 @@ The planned supported presets are `h_optimus_1`, `gigapath`, `uni2_h`, and
 `virchow2`. Local model directories and custom timm / `hf_hub:*` names remain
 available for controlled experiments, but the documented path should use the
 supported presets.
-Use `--precision fp16` or `--precision bf16` for CUDA mixed-precision teacher
-inference, and add `--compile` to run the teacher through `torch.compile`.
-The feature matrix is still written as float32 after inference.
+Teacher-cache defaults are tuned for the development workflow: batch size 512,
+bf16 CUDA inference, `torch.compile`, and `--feature-dtype auto`, which writes
+float16 feature matrices for fp16/bf16 inference to keep IAC caches compact.
+Training casts teacher features back to float32 before computing losses.
 
 `uni2_h` and `virchow2` are gated Hugging Face models. Request access with an
 institutional account, accept the model terms, and run `hf auth login` in the
