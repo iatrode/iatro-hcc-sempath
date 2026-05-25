@@ -8,18 +8,21 @@ import logging
 import random
 import socket
 import tempfile
+import threading
 import webbrowser
-from time import perf_counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from time import perf_counter
 from urllib.parse import parse_qs, urlparse
 
 from PIL import Image, ImageDraw
 
 from hcc_sempath.cli.view_iac import IacRecord, IacViewerData
-from hcc_sempath.io.iatrocache import read_header
+from hcc_sempath.io.iatrocache import read_header, read_payload
+from hcc_sempath.io.tile_package import decode_jxl
 
 
 LOG = logging.getLogger("hcc_sempath.annotate_prototypes")
@@ -63,26 +66,36 @@ def _find_free_port(host: str, preferred: int) -> int:
         return int(sock.getsockname()[1])
 
 
+def _candidate_iac_paths(root: Path) -> list[Path]:
+    return [root] if root.is_file() and root.suffix == ".iac" else sorted(root.rglob("*.iac"))
+
+
+def _package_from_path(root: Path, path: Path) -> AnnotationPackage | None:
+    header = read_header(path)
+    if header.get("payload_type") != "image_tiles":
+        if root.is_file():
+            raise ValueError(f"annotation requires image-tile IAC package: {path}")
+        LOG.info("discover_iac_skip path=%s payload_type=%s", path, header.get("payload_type"))
+        return None
+    total = int(header.get("num_records", 0))
+    rel = path.name if root.is_file() else str(path.relative_to(root))
+    dataset = ""
+    if not root.is_file():
+        parent = path.parent.relative_to(root)
+        dataset = "" if str(parent) == "." else parent.parts[0]
+    return AnnotationPackage(path=path, rel_path=rel, dataset=dataset, total=total)
+
+
 def discover_iac_packages(input_path: str | Path) -> list[AnnotationPackage]:
     root = Path(input_path).resolve()
     LOG.info("discover_iac_start input=%s", root)
-    paths = [root] if root.is_file() and root.suffix == ".iac" else sorted(root.rglob("*.iac"))
     packages = []
-    for path in paths:
-        header = read_header(path)
-        if header.get("payload_type") != "image_tiles":
-            if root.is_file():
-                raise ValueError(f"annotation requires image-tile IAC package: {path}")
-            LOG.info("discover_iac_skip path=%s payload_type=%s", path, header.get("payload_type"))
+    for path in _candidate_iac_paths(root):
+        package = _package_from_path(root, path)
+        if package is None:
             continue
-        total = int(header.get("num_records", 0))
-        rel = path.name if root.is_file() else str(path.relative_to(root))
-        dataset = ""
-        if not root.is_file():
-            parent = path.parent.relative_to(root)
-            dataset = "" if str(parent) == "." else parent.parts[0]
-        packages.append(AnnotationPackage(path=path, rel_path=rel, dataset=dataset, total=total))
-        LOG.info("discover_iac_add rel_path=%s dataset=%s records=%d", rel, dataset or "-", total)
+        packages.append(package)
+        LOG.info("discover_iac_add rel_path=%s dataset=%s records=%d", package.rel_path, package.dataset or "-", package.total)
     if not packages:
         raise FileNotFoundError(f"no image-tile .iac packages found under: {root}")
     LOG.info("discover_iac_done input=%s packages=%d", root, len(packages))
@@ -187,25 +200,69 @@ class AnnotationState:
 
 
 class AnnotationData:
-    def __init__(self, input_path: str | Path, state_path: str | Path) -> None:
-        self.packages = discover_iac_packages(input_path)
+    def __init__(self, input_path: str | Path, state_path: str | Path, *, async_scan: bool = False) -> None:
+        self.input_root = Path(input_path).resolve()
+        self.packages: list[AnnotationPackage] = []
         self.state = AnnotationState(state_path, input_path)
         self._viewers: dict[int, IacViewerData] = {}
+        self._lock = threading.RLock()
+        self._scan_done = False
+        self._scan_error = ""
+        self._scan_thread: threading.Thread | None = None
+        if async_scan:
+            self._scan_thread = threading.Thread(target=self._scan_packages, name="iac-scan", daemon=True)
+            self._scan_thread.start()
+        else:
+            self.packages = discover_iac_packages(self.input_root)
+            self._scan_done = True
+
+    def _scan_packages(self) -> None:
+        LOG.info("discover_iac_background_start input=%s", self.input_root)
+        try:
+            count = 0
+            for path in _candidate_iac_paths(self.input_root):
+                package = _package_from_path(self.input_root, path)
+                if package is None:
+                    continue
+                with self._lock:
+                    self.packages.append(package)
+                    count = len(self.packages)
+                LOG.info("discover_iac_add rel_path=%s dataset=%s records=%d count=%d", package.rel_path, package.dataset or "-", package.total, count)
+            if count == 0:
+                self._scan_error = f"no image-tile .iac packages found under: {self.input_root}"
+                LOG.error("discover_iac_background_empty input=%s", self.input_root)
+        except Exception as exc:
+            self._scan_error = str(exc)
+            LOG.exception("discover_iac_background_failed input=%s", self.input_root)
+        finally:
+            self._scan_done = True
+            LOG.info("discover_iac_background_done input=%s packages=%d error=%s", self.input_root, len(self.packages), self._scan_error or "-")
 
     def close(self) -> None:
         for viewer in self._viewers.values():
             viewer.close()
 
+    def scan_status(self) -> dict:
+        with self._lock:
+            return {"done": self._scan_done, "error": self._scan_error, "packages": len(self.packages)}
+
+    def package(self, index: int) -> AnnotationPackage:
+        with self._lock:
+            return self.packages[index]
+
     def viewer(self, index: int) -> IacViewerData:
-        if index not in self._viewers:
+        with self._lock:
             package = self.packages[index]
+            cached = self._viewers.get(index)
+        if cached is None:
             start = perf_counter()
             LOG.info("iac_open_start index=%d rel_path=%s path=%s", index, package.rel_path, package.path)
-            viewer = IacViewerData(self.packages[index].path)
+            viewer = IacViewerData(package.path)
             if viewer.payload_type != "image_tiles":
                 viewer.close()
-                raise ValueError(f"annotation requires image-tile IAC package: {self.packages[index].path}")
-            self._viewers[index] = viewer
+                raise ValueError(f"annotation requires image-tile IAC package: {package.path}")
+            with self._lock:
+                self._viewers[index] = viewer
             LOG.info(
                 "iac_open_done index=%d rel_path=%s records=%d tile=%dx%d stride=%dx%d elapsed=%.3fs",
                 index,
@@ -217,11 +274,14 @@ class AnnotationData:
                 viewer.stride_y,
                 perf_counter() - start,
             )
-        return self._viewers[index]
+            return viewer
+        return cached
 
     def package_json(self) -> list[dict]:
         items = []
-        for idx, package in enumerate(self.packages):
+        with self._lock:
+            packages = list(self.packages)
+        for idx, package in enumerate(packages):
             counts = self.state.lightweight_counts_for_package(package)
             items.append(
                 {
@@ -238,7 +298,8 @@ class AnnotationData:
         return items
 
     def progress(self, index: int) -> dict:
-        package = self.packages[index]
+        with self._lock:
+            package = self.packages[index]
         viewer = self.viewer(index)
         counts = self.state.counts_for_package(package, viewer.records)
         l1_counts = {name: 0 for name in L1_PROTOTYPES}
@@ -257,7 +318,8 @@ class AnnotationData:
         return {"package": counts, "l1": l1_counts, "l2": l2_counts}
 
     def random_record(self, index: int) -> dict:
-        package = self.packages[index]
+        with self._lock:
+            package = self.packages[index]
         viewer = self.viewer(index)
         remaining = [record for record in viewer.records if not self.state.is_annotated(package, record)]
         if not remaining:
@@ -272,16 +334,20 @@ class AnnotationData:
         result = viewer.nearest("__all__", x, y)
         record = result.get("record")
         if record:
-            LOG.info("nearest_tile iac=%s x=%.1f y=%.1f row=%s tile_id=%s", self.packages[index].rel_path, x, y, record.get("row"), record.get("tile_id"))
+            with self._lock:
+                package = self.packages[index]
+            LOG.info("nearest_tile iac=%s x=%.1f y=%.1f row=%s tile_id=%s", package.rel_path, x, y, record.get("row"), record.get("tile_id"))
         return result
 
     def annotated_rows(self, index: int) -> set[int]:
-        package = self.packages[index]
+        with self._lock:
+            package = self.packages[index]
         viewer = self.viewer(index)
         return {record.row for record in viewer.records if self.state.is_annotated(package, record)}
 
-    def thumbnail_png(self, index: int, max_size: int = 1200) -> bytes:
-        package = self.packages[index]
+    def thumbnail_png(self, index: int, max_size: int = 1200, pass_count: int | None = None) -> bytes:
+        with self._lock:
+            package = self.packages[index]
         viewer = self.viewer(index)
         start = perf_counter()
         records = viewer.records
@@ -299,19 +365,39 @@ class AnnotationData:
         tile_px_w = max(3, int(footprint_w * scale))
         tile_px_h = max(3, int(footprint_h * scale))
         sampled_records = records
-        max_tiles = 6000
-        if len(records) > max_tiles:
-            sampled_records = random.Random(0).sample(records, max_tiles)
-        for record in sampled_records:
-            x = int((record.display_x - min_x) * scale)
-            y = int((record.display_y - min_y) * scale)
+        passes_total = 12
+        if pass_count is not None:
+            ys = sorted({record.display_y for record in records})
+            rows_per_pass = max(1, (len(ys) + passes_total - 1) // passes_total)
+            y_limit = ys[min(len(ys) - 1, max(0, int(pass_count)) * rows_per_pass - 1)]
+            sampled_records = [record for record in records if record.display_y <= y_limit]
+        max_tiles = 12000
+        if len(sampled_records) > max_tiles:
+            sampled_records = sorted(sampled_records, key=lambda record: (record.display_y, record.display_x, record.row))[:max_tiles]
+        offsets = viewer.record_table.column("offset")
+        lengths = viewer.record_table.column("length")
+
+        def decode_overview_tile(record: IacRecord) -> tuple[int, int, Image.Image] | None:
             try:
-                tile = Image.open(io.BytesIO(viewer.read_tile_png(record.row))).convert("RGB")
+                payload = read_payload(package.path, viewer.header, offsets[record.row].as_py(), lengths[record.row].as_py())
+                tile = decode_jxl(payload).convert("RGB")
                 tile = tile.resize((tile_px_w, tile_px_h), Image.Resampling.LANCZOS)
-                canvas.paste(tile, (x, y))
+                x = int((record.display_x - min_x) * scale)
+                y = int((record.display_y - min_y) * scale)
+                return x, y, tile
             except Exception:
                 LOG.exception("thumbnail_tile_decode_failed iac=%s row=%d", package.rel_path, record.row)
-                pass
+                return None
+
+        workers = min(12, max(1, len(sampled_records)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(decode_overview_tile, record) for record in sampled_records]
+            for future in as_completed(futures):
+                item = future.result()
+                if item is None:
+                    continue
+                x, y, tile = item
+                canvas.paste(tile, (x, y))
         draw = ImageDraw.Draw(canvas, "RGBA")
         for item in annotated:
             x = int((int(item["x"]) - min_x) * scale)
@@ -320,10 +406,12 @@ class AnnotationData:
         buffer = io.BytesIO()
         canvas.save(buffer, format="PNG")
         LOG.info(
-            "thumbnail_render iac=%s mode=spatial records=%d sampled=%d annotated=%d bounds=(%d,%d,%d,%d) footprint=%dx%d canvas=%dx%d tile_px=%dx%d elapsed=%.3fs",
+            "thumbnail_render iac=%s mode=spatial pass=%s records=%d sampled=%d workers=%d annotated=%d bounds=(%d,%d,%d,%d) footprint=%dx%d canvas=%dx%d tile_px=%dx%d elapsed=%.3fs",
             package.rel_path,
+            "-" if pass_count is None else pass_count,
             len(records),
             len(sampled_records),
+            workers,
             len(annotated),
             min_x,
             max_x,
@@ -375,9 +463,9 @@ function prototypeButton(name, selected, onClick){const b=document.createElement
 function renderLabels(){const a=document.getElementById('l1'); a.innerHTML=''; L1.forEach(x=>a.appendChild(prototypeButton(x,l1===x,()=>{l1=x;renderLabels()}))); const b=document.getElementById('l2'); b.innerHTML=''; L2.forEach(x=>b.appendChild(prototypeButton(x,l2.has(x),()=>{l2.has(x)?l2.delete(x):l2.add(x);renderLabels()})));}
 function statRow(name,count,maxCount){const pct=maxCount?Math.round(count/maxCount*100):0; return `<div class=stat style="--pct:${pct}%"><div class=row><span>${name}</span><span class=count>${count}</span></div></div>`;}
 function statBlock(title, counts){const values=Object.values(counts); const maxCount=Math.max(1,...values); return `<b>${title}</b>`+Object.entries(counts).map(([name,count])=>statRow(name,count,maxCount)).join('');}
-function setThumbnailSrc(){const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); loading.style.display='block'; img.style.display='none'; img.onload=()=>{loading.style.display='none'; img.style.display='block';}; img.onerror=()=>{loading.textContent='Overview failed to load.';}; img.src='/api/thumbnail?package='+pkg+'&t='+Date.now();}
-async function loadPackages(){packages=await api('/api/packages'); document.getElementById('packageSummary').textContent=`${packages.length} IAC package${packages.length===1?'':'s'}`; const box=document.getElementById('packages'); box.innerHTML=''; packages.forEach(p=>{const pct=p.total?Math.round(p.annotated/p.total*100):0; const d=document.createElement('div'); d.className='pkg'+(p.index===pkg?' active':''); d.style.setProperty('--pct',pct+'%'); d.innerHTML=`<b>${p.name}</b><div class=muted>${p.dataset||'no dataset'} · ${p.annotated}/${p.total} · ${pct}%</div>`; d.onclick=()=>{pkg=p.index; refreshPackage();}; box.appendChild(d)});}
-async function refreshPackage(){await loadPackages(); setThumbnailSrc(); await progress(); await nextRandom();}
+function setThumbnailSrc(){const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); let pass=1; const token=Date.now(); img.dataset.token=String(token); loading.style.display='block'; loading.textContent='Loading overview...'; img.style.display='none'; const loadPass=()=>{if(img.dataset.token!==String(token)) return; img.onload=()=>{loading.style.display='none'; img.style.display='block'; if(pass<12){pass+=1; setTimeout(loadPass,350);}}; img.onerror=()=>{loading.textContent='Overview failed to load.';}; img.src=`/api/thumbnail?package=${pkg}&pass=${pass}&t=${Date.now()}`;}; loadPass();}
+async function loadPackages(){packages=await api('/api/packages'); const scan=await api('/api/scan-status'); document.getElementById('packageSummary').textContent=`${packages.length} IAC package${packages.length===1?'':'s'}${scan.done?'':' · scanning...'}`; if(scan.error){document.getElementById('status').textContent=scan.error;} const box=document.getElementById('packages'); box.innerHTML=''; packages.forEach(p=>{const pct=p.total?Math.round(p.annotated/p.total*100):0; const d=document.createElement('div'); d.className='pkg'+(p.index===pkg?' active':''); d.style.setProperty('--pct',pct+'%'); d.innerHTML=`<b>${p.name}</b><div class=muted>${p.dataset||'no dataset'} · ${p.annotated}/${p.total} · ${pct}%</div>`; d.onclick=()=>{pkg=p.index; refreshPackage();}; box.appendChild(d)}); return scan;}
+async function refreshPackage(){const scan=await loadPackages(); if(!packages.length){document.getElementById('recordMeta').textContent=scan.done?'No image-tile IAC packages found.':'Scanning IAC packages...'; setTimeout(refreshPackage,1000); return;} if(pkg>=packages.length) pkg=0; setThumbnailSrc(); await progress(); await nextRandom();}
 async function progress(){const p=await api('/api/progress?package='+pkg); const pct=p.package.total?Math.round(p.package.annotated/p.package.total*100):0; document.getElementById('progress').innerHTML=`<div>${p.package.annotated}/${p.package.total} (${pct}%)</div><div class=bar><div style="width:${pct}%"></div></div>${statBlock('L1',p.l1)}${statBlock('L2',p.l2)}`;}
 async function showRecord(rec){current=rec; l1=""; l2=new Set(); renderLabels(); if(!rec){document.getElementById('recordMeta').textContent='All tiles in this IAC are annotated.'; document.getElementById('tile').removeAttribute('src'); return;} document.getElementById('recordMeta').textContent=`${packages[pkg].rel_path} · ${rec.tile_id} · x=${rec.x} y=${rec.y} row=${rec.row}`; document.getElementById('tile').src=`/api/tile?package=${pkg}&row=${rec.row}`;}
 async function nextRandom(){const r=await api('/api/random?package='+pkg); await showRecord(r.record);}
@@ -419,6 +507,9 @@ def make_handler(data: AnnotationData):
                 if parsed.path == "/api/packages":
                     _json_response(self, data.package_json())
                     return
+                if parsed.path == "/api/scan-status":
+                    _json_response(self, data.scan_status())
+                    return
                 index = int(qs.get("package", ["0"])[0])
                 if parsed.path == "/api/progress":
                     _json_response(self, data.progress(index))
@@ -431,14 +522,13 @@ def make_handler(data: AnnotationData):
                     rx = float(qs.get("rx", ["0"])[0])
                     ry = float(qs.get("ry", ["0"])[0])
                     bounds = viewer._bounds(viewer.records)
-                    tile_w = max(1, int(viewer.header.get("tile_width", viewer.stride_x)))
-                    tile_h = max(1, int(viewer.header.get("tile_height", viewer.stride_y)))
-                    x = bounds[0] + rx * max(1, bounds[1] - bounds[0] + tile_w)
-                    y = bounds[2] + ry * max(1, bounds[3] - bounds[2] + tile_h)
+                    x = bounds[0] + rx * max(1, bounds[1] - bounds[0] + viewer.stride_x)
+                    y = bounds[2] + ry * max(1, bounds[3] - bounds[2] + viewer.stride_y)
                     _json_response(self, data.select_nearest(index, x, y))
                     return
                 if parsed.path == "/api/thumbnail":
-                    body = data.thumbnail_png(index)
+                    pass_count = int(qs["pass"][0]) if "pass" in qs else None
+                    body = data.thumbnail_png(index, pass_count=pass_count)
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "image/png")
                     self.send_header("Content-Length", str(len(body)))
@@ -447,7 +537,7 @@ def make_handler(data: AnnotationData):
                     return
                 if parsed.path == "/api/tile":
                     row = int(qs["row"][0])
-                    package = data.packages[index]
+                    package = data.package(index)
                     LOG.info("tile_read iac=%s row=%d", package.rel_path, row)
                     body = data.viewer(index).read_tile_png(row)
                     self.send_response(HTTPStatus.OK)
@@ -473,8 +563,9 @@ def make_handler(data: AnnotationData):
                 row = int(payload["row"])
                 viewer = data.viewer(index)
                 record = viewer._by_row[row]
-                LOG.info("annotation_request iac=%s row=%d l1=%s l2=%s", data.packages[index].rel_path, row, payload.get("l1"), payload.get("l2", []))
-                data.state.save_annotation(data.packages[index], record, str(payload["l1"]), list(payload.get("l2", [])))
+                package = data.package(index)
+                LOG.info("annotation_request iac=%s row=%d l1=%s l2=%s", package.rel_path, row, payload.get("l1"), payload.get("l2", []))
+                data.state.save_annotation(package, record, str(payload["l1"]), list(payload.get("l2", [])))
                 _json_response(self, {"ok": True})
             except Exception as exc:
                 LOG.exception("api_post_failed path=%s", parsed.path)
@@ -492,12 +583,12 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--no-open", action="store_true")
     args = parser.parse_args()
-    data = AnnotationData(args.input, args.state)
+    data = AnnotationData(args.input, args.state, async_scan=True)
     port = _find_free_port(args.host, args.port)
     server = ThreadingHTTPServer((args.host, port), make_handler(data))
     url = f"http://{args.host}:{port}/"
-    LOG.info("server_start url=%s packages=%d state=%s csv=%s", url, len(data.packages), args.state, data.state.csv_path)
-    print(f"annotation_ui url={url} packages={len(data.packages)} state={args.state} csv={data.state.csv_path}", flush=True)
+    LOG.info("server_start url=%s state=%s csv=%s", url, args.state, data.state.csv_path)
+    print(f"annotation_ui url={url} state={args.state} csv={data.state.csv_path}", flush=True)
     if not args.no_open:
         LOG.info("browser_open url=%s", url)
         webbrowser.open(url)
