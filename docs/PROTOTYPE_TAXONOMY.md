@@ -33,29 +33,29 @@ L2 非互斥，表示可在同一 tile 内共存、也可跨 L1 类型出现的�
 
 ## L1: Mutually Exclusive Primary Prototypes / 互斥主 Prototype
 
-| Prototype | Definition |
+| Prototype | Definition / 定义 |
 | --- | --- |
-| `HCC-trabecular` | HCC dominated by trabecular, plate-like, or cord-like architecture. |
-| `HCC-solid` | HCC dominated by compact solid, nested, or weakly structured growth. |
-| `HCC-pseudoglandular` | HCC dominated by pseudoglandular, acinar-like, or lumen-like architecture. |
-| `HCC-mixed-pattern` | Definite HCC with mixed structural patterns that cannot be stably assigned to one HCC architecture. |
-| `Background-liver` | Non-neoplastic background liver parenchyma. |
-| `Fibrous-stromal` | Fibrous septa, capsule, collagen, or stromal tissue-dominant tile. |
-| `Degenerative-material` | Necrosis, hemorrhage, clot, bile lake, debris, or treatment-related degenerative material-dominant tile. |
-| `Indeterminate-region` | Tissue-containing region with insufficient confidence for stable tissue or lesion assignment. |
-| `Artifact-non-tissue` | Blank area, severe artifact, severe out-of-focus region, contamination, or non-tissue area. |
+| `HCC-trabecular` | HCC dominated by trabecular, plate-like, or cord-like architecture. / 以梁索状、板状或条索状排列为主的 HCC。 |
+| `HCC-solid` | HCC dominated by compact solid, nested, or weakly structured growth. / 以致密实性、巢状或结构感弱的生长方式为主的 HCC。 |
+| `HCC-pseudoglandular` | HCC dominated by pseudoglandular, acinar-like, or lumen-like architecture. / 以假腺样、腺泡样或腔样结构为主的 HCC。 |
+| `HCC-mixed-pattern` | Definite HCC with mixed structural patterns that cannot be stably assigned to one HCC architecture. Use only when the tile is confidently HCC but the dominant architecture is mixed or unstable across L1 HCC architecture classes. / 明确为 HCC，但结构模式混合，不能稳定归入单一 HCC 结构型；仅用于 HCC 置信度明确但主导结构在多个 HCC architecture 类别之间混合或不稳定的 tile。 |
+| `Background-liver` | Non-neoplastic background liver parenchyma. / 非肿瘤性背景肝实质。 |
+| `Fibrous-stromal` | Fibrous septa, capsule, collagen, or stromal tissue-dominant tile. / 以纤维隔、包膜、胶原或间质组织为主的 tile。 |
+| `Degenerative-material` | Necrosis, hemorrhage, clot, bile lake, debris, or treatment-related degenerative material-dominant tile. / 以坏死、出血、血凝块、胆汁湖、碎屑或治疗后退变物为主的 tile。 |
+| `Indeterminate-region` | Tissue-containing region with insufficient confidence for stable tissue or lesion assignment. This is not artifact; tissue information is present but category confidence is insufficient. / 有组织信息，但区域归属或病变判读置信度不足；不同于 artifact，该类应包含可见组织信息，只是类别归属不稳定。 |
+| `Artifact-non-tissue` | Blank area, severe artifact, severe out-of-focus region, contamination, or non-tissue area. / 空白、严重伪影、严重失焦、污染或非组织区域。 |
 
 ## L2: Non-Exclusive Attribute Prototypes / 非互斥属性 Prototype
 
-| Prototype | Definition |
+| Prototype | Definition / 定义 |
 | --- | --- |
-| `necrotic` | Obvious necrotic component. |
-| `hemorrhagic-blood-rich` | Hemorrhage, blood pool, clot, or erythrocyte-rich area. |
-| `bile-pigment-rich` | Obvious bile, bile pigment, or pigment deposition. |
-| `inflammatory-rich` | Inflammatory-cell-rich area. |
-| `fibrotic` | Obvious fibrosis, collagen, or scar-like component. |
-| `steatotic-vacuolated` | Steatosis, vacuolated change, or optically clear cytoplasmic change. |
-| `interface-capsule` | Capsule, boundary, or tumor-non-tumor interface area. |
+| `necrotic` | Obvious necrotic component. / 坏死成分明显。 |
+| `hemorrhagic-blood-rich` | Hemorrhage, blood pool, clot, or erythrocyte-rich area. / 出血、血池、血凝块或红细胞丰富。 |
+| `bile-pigment-rich` | Obvious bile, bile pigment, or pigment deposition. / 胆汁、胆色素或色素沉积明显。 |
+| `inflammatory-rich` | Inflammatory-cell-rich area; can coexist with HCC, background liver, or stromal L1 classes. / 炎症细胞丰富；可与 HCC、背景肝或纤维间质等 L1 类别同时存在。 |
+| `fibrotic` | Obvious fibrosis, collagen, or scar-like component. / 纤维化、胶原或瘢痕样成分明显。 |
+| `steatotic-vacuolated` | Steatosis, vacuolated change, or optically clear cytoplasmic change. / 脂肪变、空泡样改变或胞质空亮改变。 |
+| `interface-capsule` | Capsule, boundary, or tumor-non-tumor interface area. / 包膜、边界或肿瘤-非肿瘤交界区域。 |
 
 ## Package Encoding / Package 编码
 
@@ -106,23 +106,3 @@ groups = [
     "interface",
 ]
 ```
-
-## Interpretation Notes / 判读说明
-
-`HCC-mixed-pattern` should be used only when the tile is confidently HCC but
-its dominant architecture is mixed or unstable across the L1 HCC architecture
-classes.
-
-`HCC-mixed-pattern` 仅用于明确为 HCC、但主导结构在多个 HCC architecture 类别之间混合或
-不稳定的 tile。
-
-`Indeterminate-region` is not the same as artifact. It should contain tissue
-information, but the tissue or lesion assignment is uncertain.
-
-`Indeterminate-region` 不等于 artifact。它应包含组织信息，只是组织或病变归属置信度不足。
-
-L2 attributes can be active across L1 classes. For example, `inflammatory-rich`
-can coexist with `HCC-trabecular`, `Background-liver`, or `Fibrous-stromal`.
-
-L2 attribute 可跨 L1 类别出现。例如 `inflammatory-rich` 可以与 `HCC-trabecular`、
-`Background-liver` 或 `Fibrous-stromal` 同时存在。
