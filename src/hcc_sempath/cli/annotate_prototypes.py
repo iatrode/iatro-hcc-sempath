@@ -287,17 +287,17 @@ class AnnotationData:
         records = viewer.records
         bounds = viewer._bounds(records)
         min_x, max_x, min_y, max_y = bounds
-        tile_w = max(1, int(viewer.header.get("tile_width", viewer.stride_x)))
-        tile_h = max(1, int(viewer.header.get("tile_height", viewer.stride_y)))
-        width_span = max(1, max_x - min_x + tile_w)
-        height_span = max(1, max_y - min_y + tile_h)
+        footprint_w = max(1, viewer.stride_x)
+        footprint_h = max(1, viewer.stride_y)
+        width_span = max(1, max_x - min_x + footprint_w)
+        height_span = max(1, max_y - min_y + footprint_h)
         scale = min(max_size / width_span, max_size / height_span)
         canvas_w = max(1, int(width_span * scale))
         canvas_h = max(1, int(height_span * scale))
         canvas = Image.new("RGB", (canvas_w, canvas_h), "white")
         annotated = self.state.annotations_for_package(package)
-        tile_px_w = max(3, int(tile_w * scale))
-        tile_px_h = max(3, int(tile_h * scale))
+        tile_px_w = max(3, int(footprint_w * scale))
+        tile_px_h = max(3, int(footprint_h * scale))
         sampled_records = records
         max_tiles = 6000
         if len(records) > max_tiles:
@@ -320,7 +320,7 @@ class AnnotationData:
         buffer = io.BytesIO()
         canvas.save(buffer, format="PNG")
         LOG.info(
-            "thumbnail_render iac=%s mode=spatial records=%d sampled=%d annotated=%d bounds=(%d,%d,%d,%d) canvas=%dx%d tile_px=%dx%d elapsed=%.3fs",
+            "thumbnail_render iac=%s mode=spatial records=%d sampled=%d annotated=%d bounds=(%d,%d,%d,%d) footprint=%dx%d canvas=%dx%d tile_px=%dx%d elapsed=%.3fs",
             package.rel_path,
             len(records),
             len(sampled_records),
@@ -329,6 +329,8 @@ class AnnotationData:
             max_x,
             min_y,
             max_y,
+            footprint_w,
+            footprint_h,
             canvas_w,
             canvas_h,
             tile_px_w,
