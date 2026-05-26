@@ -25,11 +25,6 @@ from ..io.validate_package import _validate_common, _validate_teacher_features
 
 
 TEACHER_MODEL_PRESETS: dict[str, dict] = {
-    "h_optimus_1": {
-        "model_name": "hf_hub:bioptimus/H-optimus-1",
-        "teacher_name": "h_optimus_1",
-        "description": "Planned supported H-optimus-1 teacher.",
-    },
     "gigapath": {
         "model_name": "hf_hub:prov-gigapath/prov-gigapath",
         "teacher_name": "gigapath",
@@ -864,7 +859,7 @@ def main() -> None:
     if not args.input:
         parser.error("--input is required")
     if not args.teacher:
-        parser.error("--teacher is required, for example --teacher h_optimus_1")
+        parser.error("--teacher is required, for example --teacher gigapath")
     teacher_name = _teacher_name(args.teacher, args.teacher_name)
     print(
         f"teacher_cache_start input={args.input} output={args.output} teacher={args.teacher} "

@@ -16,6 +16,7 @@ from .config import (
     teacher_dims,
     teacher_feature_package_paths,
     teacher_names,
+    validate_training_config,
 )
 from .datasets import (
     DistillationTileDataset,
@@ -59,6 +60,7 @@ def main() -> None:
         tile_packages = image_tile_package_paths(cfg)
         teacher_packages = teacher_feature_package_paths(cfg)
         names = list(teacher_packages)
+    validate_training_config(cfg, names)
     dims = teacher_dims(cfg, names)
     tile_metadata = read_package_metadata(tile_packages[0])
     image_size = (int(tile_metadata["tile_height"]), int(tile_metadata["tile_width"]))

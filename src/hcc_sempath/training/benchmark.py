@@ -14,6 +14,7 @@ from .config import (
     teacher_dims,
     teacher_feature_package_paths,
     teacher_names,
+    validate_training_config,
 )
 from ..modeling.models import HCCSemPathModel
 from .manifest import load_training_manifest
@@ -40,6 +41,7 @@ def main() -> None:
     if names is None:
         teacher_packages = teacher_feature_package_paths(cfg)
         names = list(teacher_packages)
+    validate_training_config(cfg, names)
     dims = teacher_dims(cfg, names)
     model = HCCSemPathModel(
         cfg["model"]["backbone_name"],

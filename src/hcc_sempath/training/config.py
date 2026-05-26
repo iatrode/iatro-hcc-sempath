@@ -8,19 +8,61 @@ from ..io.feature_cache import FeatureCacheReader
 from .manifest import manifest_teacher_feature_packages, manifest_tile_packages
 
 
+EXCLUDED_TEACHER_NAMES = {
+    "h1",
+    "h-1",
+    "h_1",
+    "h1-family",
+    "h1_family",
+    "h1family",
+    "h-optimus-1",
+    "h_optimus_1",
+    "hoptimus1",
+}
+
+
 def load_config(path: str | Path) -> dict:
     with Path(path).open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
 
 
+def _normalize_teacher_name(name: str) -> str:
+    return str(name).strip().lower()
+
+
+def validate_teacher_names(names: list[str]) -> None:
+    if not names:
+        raise ValueError("at least one teacher is required")
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate teacher names: {duplicates}")
+    excluded = [name for name in names if _normalize_teacher_name(name) in EXCLUDED_TEACHER_NAMES]
+    if excluded:
+        raise ValueError(f"excluded teacher configured after H1 removal: {excluded}")
+
+
+def _unexpected_keys(payload: dict | None, expected: set[str], label: str) -> None:
+    if not isinstance(payload, dict):
+        return
+    extras = sorted(str(name) for name in payload if str(name) not in expected)
+    if extras:
+        raise ValueError(f"{label} contains unknown teacher entries: {extras}; expected={sorted(expected)}")
+
+
 def teacher_names(cfg: dict) -> list[str]:
     teachers = cfg["data"].get("teachers")
     if teachers is not None:
-        return [str(teacher) for teacher in teachers]
+        names = [str(teacher) for teacher in teachers]
+        validate_teacher_names(names)
+        return names
     dims = cfg["model"].get("teacher_dims")
     if isinstance(dims, dict):
-        return [str(name) for name in dims]
-    return list(teacher_feature_package_paths(cfg))
+        names = [str(name) for name in dims]
+        validate_teacher_names(names)
+        return names
+    names = list(teacher_feature_package_paths(cfg))
+    validate_teacher_names(names)
+    return names
 
 
 def image_tile_package_paths(cfg: dict) -> list[str]:
@@ -74,6 +116,11 @@ def teacher_dims(cfg: dict, teacher_names: list[str]) -> dict[str, int]:
     model = cfg["model"]
     dims = model.get("teacher_dims")
     if isinstance(dims, dict):
+        expected = set(teacher_names)
+        _unexpected_keys(dims, expected, "model.teacher_dims")
+        missing = sorted(name for name in teacher_names if name not in dims)
+        if missing:
+            raise ValueError(f"model.teacher_dims missing teacher entries: {missing}")
         return {name: int(dims[name]) for name in teacher_names}
     dim = int(model["teacher_dim"])
     return {name: dim for name in teacher_names}
@@ -81,6 +128,23 @@ def teacher_dims(cfg: dict, teacher_names: list[str]) -> dict[str, int]:
 
 def embedding_dim(cfg: dict) -> int:
     return int(cfg["model"].get("embedding_dim", cfg["model"].get("teacher_dim", 256)))
+
+
+def validate_training_config(cfg: dict, names: list[str]) -> None:
+    validate_teacher_names(names)
+    expected = set(names)
+    _unexpected_keys(cfg.get("model", {}).get("teacher_dims"), expected, "model.teacher_dims")
+    _unexpected_keys(cfg.get("loss", {}).get("teacher_weights"), expected, "loss.teacher_weights")
+
+    semantic_weight = float(cfg.get("loss", {}).get("semantic_weight", 0.0))
+    prototype_filter_weight = float(cfg.get("loss", {}).get("prototype_filter_weight", 0.0))
+    prototype_paths = cfg.get("data", {}).get("prototype_paths")
+    if isinstance(prototype_paths, dict):
+        _unexpected_keys(prototype_paths, expected, "data.prototype_paths")
+        if semantic_weight > 0 or prototype_filter_weight > 0:
+            missing = sorted(name for name in names if name not in prototype_paths)
+            if missing:
+                raise ValueError(f"data.prototype_paths missing teacher entries: {missing}")
 
 
 def manifest_data_paths(cfg: dict, manifest: dict, split: str) -> tuple[list[str], dict[str, list[str]]]:

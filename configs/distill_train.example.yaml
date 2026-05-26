@@ -6,10 +6,11 @@ runtime:
 data:
   train_manifest_path: data/manifests/hcc_train.yaml
   feature_root: data/features
-  teachers: [h_optimus_1, gigapath]
+  teachers: [gigapath, uni2_h, virchow2]
   prototype_paths:
-    h_optimus_1: data/prototypes/h_optimus_1_hcc_semantic_prototypes.pt
     gigapath: data/prototypes/gigapath_hcc_semantic_prototypes.pt
+    uni2_h: data/prototypes/uni2_h_hcc_semantic_prototypes.pt
+    virchow2: data/prototypes/virchow2_hcc_semantic_prototypes.pt
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
   num_workers: 8
@@ -20,14 +21,16 @@ model:
   backbone_name: vit_small_patch14_reg4_dinov2.lvd142m
   embedding_dim: 1536
   teacher_dims:
-    h_optimus_1: 1536
     gigapath: 1536
+    uni2_h: 1536
+    virchow2: 2560
   pretrained: true
 
 loss:
   teacher_weights:
-    h_optimus_1: 1.0
     gigapath: 1.0
+    uni2_h: 1.0
+    virchow2: 1.0
   relation_weight: 0.25
   semantic_weight: 0.25
   semantic_warmup_epochs: 1

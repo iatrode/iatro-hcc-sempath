@@ -217,8 +217,8 @@ Build teacher features:
 ```bash
 hcc-sempath build-teacher-cache \
   --input data/packages \
-  --output data/features/h_optimus_1 \
-  --teacher h_optimus_1 \
+  --output data/features/gigapath \
+  --teacher gigapath \
   --batch-size 512 \
   --precision bf16 \
   --feature-dtype auto \
@@ -245,8 +245,8 @@ it decompresses each feature matrix and is intentionally off by default for
 large directory runs.
 Directory runs prefetch the next input package while the current package is
 running teacher inference; use `--no-prefetch-packages` only for debugging.
-The planned supported presets are `h_optimus_1`, `gigapath`, `uni2_h`, and
-`virchow2`. Local model directories and custom timm / `hf_hub:*` names remain
+The training teacher queue is `gigapath`, `uni2_h`, and `virchow2`. Local model
+directories and custom timm / `hf_hub:*` names remain
 available for controlled experiments, but the documented path should use the
 supported presets.
 Teacher-cache defaults are tuned for the development workflow: batch size 512,
@@ -282,14 +282,21 @@ hcc-sempath build-train-manifest \
   --public-exval-n 50 \
   --val-frac 0.15 \
   --split-key patient_id \
-  --teacher h_optimus_1 \
   --teacher gigapath \
+  --teacher uni2_h \
+  --teacher virchow2 \
   --feature-root /data/hcc_features \
   --check-artifacts \
   --output data/manifests/hcc_train.yaml
 ```
 
 See `docs/TRAINING_MANIFEST.md` for the cohort manifest contract.
+
+Run a preflight check before a long training job:
+
+```bash
+hcc-sempath preflight --config configs/distill_train.example.yaml
+```
 
 Train:
 
