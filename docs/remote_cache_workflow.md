@@ -25,8 +25,8 @@ python -m pip install --no-deps -e .
 python scripts/download_teacher.py
 hcc-sempath build-teacher-cache \
   --input data/packages \
-  --output data/features/h_optimus_1 \
-  --teacher h_optimus_1 \
+  --output data/features/gigapath \
+  --teacher gigapath \
   --batch-size 512 \
   --precision bf16 \
   --feature-dtype auto \
@@ -59,8 +59,8 @@ feature-matrix validation and is intentionally off by default for large
 directory runs. Directory runs prefetch the next input package while the
 current package is running teacher inference; `--no-prefetch-packages` disables
 that overlap for debugging.
-The planned supported presets are `h_optimus_1`, `gigapath`, `uni2_h`, and
-`virchow2`. `--teacher` also accepts local model directories and custom timm /
+The training teacher queue is `gigapath`, `uni2_h`, and `virchow2`.
+`--teacher` also accepts local model directories and custom timm /
 `hf_hub:*` names for controlled experiments.
 
 ## Output naming
@@ -76,15 +76,16 @@ Examples:
 
 ```text
 slide_a.gigapath.features.iac
-slide_a.h_optimus_1.features.iac
+slide_a.uni2_h.features.iac
+slide_a.virchow2.features.iac
 ```
 
 ## Outputs copied back after teacher inference
 
 ```text
-data/features/h_optimus_1/*.h_optimus_1.features.iac
-data/features/h_optimus_1/teacher_cache_progress.csv
-data/features/h_optimus_1/teacher_cache_progress.json
+data/features/gigapath/*.gigapath.features.iac
+data/features/gigapath/teacher_cache_progress.csv
+data/features/gigapath/teacher_cache_progress.json
 ```
 
 Training uses the `*.features.iac` package as the distillation target. Teacher

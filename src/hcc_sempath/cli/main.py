@@ -13,6 +13,7 @@ COMMANDS: dict[str, tuple[str, str]] = {
     "build-teacher-cache": ("hcc_sempath.teacher.cache", "Run a teacher model and write <teacher-name>.features.iac directly."),
     "build-prototypes": ("hcc_sempath.modeling.build_prototypes", "Build semantic prototypes from concept feature arrays."),
     "build-train-manifest": ("hcc_sempath.training.manifest", "Build a training manifest from per-WSI IAC packages."),
+    "preflight": ("hcc_sempath.training.preflight", "Validate training config and inputs before a long run."),
     "train": ("hcc_sempath.training.train", "Train the HCC-SemPath student model."),
     "evaluate": ("hcc_sempath.training.evaluate", "Evaluate a trained checkpoint."),
     "benchmark": ("hcc_sempath.training.benchmark", "Benchmark student encoder throughput."),

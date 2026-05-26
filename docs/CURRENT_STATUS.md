@@ -31,8 +31,8 @@ image tile
   -> shared student encoder
   -> z_hcc
        -> head_gigapath  -> GigaPath feature space
-       -> head_hoptimus  -> H-optimus feature space
-       -> head_other     -> other teacher feature spaces
+       -> head_uni2_h    -> UNI2-h feature space
+       -> head_virchow2  -> Virchow2 feature space
 ```
 
 The teacher-specific heads are training-time alignment modules. The reusable output of the model is the shared HCC embedding `z_hcc`.
@@ -170,17 +170,19 @@ Implemented training-system foundations:
 - 支持 development source 与 public source held-out external validation 的 training manifest 构建；
 - convention-based teacher feature package resolution from manifest WSI stems.
 - 基于 manifest WSI stem 与命名约定解析 teacher feature package。
+- training preflight checks that reject stale or removed teacher entries, including H-optimus-1/H1.
+- 训练前配置检查会拒绝残留或已移除的 teacher 条目，包括 H-optimus-1/H1。
 
 Important engineering requirements before full-scale training:
 
 正式全量训练前的重要工程要求：
 
-- support multiple teacher feature sources;
-- 支持多个 teacher feature 来源；
-- add feature-cache-aware sampling for current whole-matrix teacher feature packages;
-- 为当前 whole-matrix teacher feature package 增加 feature-cache-aware sampling；
 - use fixed or sampled validation subsets for frequent validation;
 - 高频验证时使用固定或抽样 validation subset；
+- add training-time WSI-window or feature-cache-aware sampling if measured I/O locality becomes the bottleneck;
+- 若实测 I/O locality 成为瓶颈，再加入训练期 WSI-window 或 feature-cache-aware sampling；
+- add HCC-specific representation evaluation beyond teacher imitation before manuscript-grade conclusions;
+- 在论文级结论前补齐超越 teacher imitation 的 HCC 专病表征评估；
 - benchmark teacher-feature storage alternatives on real extracted features before changing the feature package layout.
 - 在修改 feature package layout 前，基于真实提取特征评估不同 teacher-feature 存储方案。
 
@@ -242,13 +244,11 @@ Near-term development should focus on:
 
 1. use the training manifest schema and cohort-building workflow for real dry runs;
 1. 使用 training manifest schema 与 cohort 构建流程进行真实 dry run；
-2. add feature-cache-aware training sampling for whole-matrix feature packages;
-2. 为 whole-matrix feature package 增加 feature-cache-aware training sampling；
-3. minimal HCC-specific weak supervision objectives;
-3. 建立最小可执行的 HCC 专病弱监督目标；
-4. representation evaluation protocols beyond teacher imitation;
-4. 建立超越 teacher imitation 的表征评估协议；
-5. benchmark teacher-feature storage alternatives after real feature extraction;
-5. 在真实 feature 提取后评估 teacher-feature 存储方案；
-6. bilingual open-source documentation for public release.
-6. 为未来公开发布准备中英双语文档。
+2. fixed or sampled validation subset export for frequent validation;
+2. 导出固定或抽样 validation subset，用于高频验证；
+3. representation evaluation protocols beyond teacher imitation;
+3. 建立超越 teacher imitation 的表征评估协议；
+4. benchmark teacher-feature storage alternatives after real feature extraction;
+4. 在真实 feature 提取后评估 teacher-feature 存储方案；
+5. bilingual open-source documentation for public release.
+5. 为未来公开发布准备中英双语文档。

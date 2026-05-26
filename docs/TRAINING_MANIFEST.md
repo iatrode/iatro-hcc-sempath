@@ -76,8 +76,9 @@ hcc-sempath build-train-manifest \
   --public-exval-n 50 \
   --val-frac 0.15 \
   --split-key patient_id \
-  --teacher h_optimus_1 \
   --teacher gigapath \
+  --teacher uni2_h \
+  --teacher virchow2 \
   --feature-root /data/hcc_features \
   --check-artifacts \
   --output data/manifests/hcc_train.yaml

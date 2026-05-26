@@ -16,6 +16,7 @@ from .config import (
     teacher_dims,
     teacher_feature_package_paths,
     teacher_names,
+    validate_training_config,
 )
 from .datasets import (
     DistillationTileDataset,
@@ -67,6 +68,7 @@ def main() -> None:
         train_teacher_packages = teacher_packages
         val_teacher_packages = teacher_packages
         names = list(teacher_packages)
+    validate_training_config(cfg, names)
     dims = teacher_dims(cfg, names)
     all_tile_packages = sorted(set(train_tile_packages + val_tile_packages))
     tile_metadata = read_package_metadata(all_tile_packages[0])
