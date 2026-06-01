@@ -27,8 +27,9 @@ from .datasets import (
     read_packaged_tile_records,
     validate_teacher_cache,
 )
-from .engine import fit
+from .engine import build_lr_scheduler, fit
 from .manifest import load_training_manifest
+from .prototype_labels import load_prototype_labels
 from .utils import seed_everything
 
 
@@ -190,6 +191,24 @@ def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -
     return {name: load_prototype_registry(prototype_path, expected_dim=dim).to(device) for name, dim in dims.items()}
 
 
+def _load_zhcc_prototypes(cfg: dict, device: torch.device) -> PrototypeRegistry | None:
+    prototype_path = cfg["data"].get("zhcc_prototype_path")
+    if prototype_path is None:
+        if float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0:
+            raise ValueError("data.zhcc_prototype_path is required when loss.zhcc_proto_weight > 0")
+        return None
+    return load_prototype_registry(prototype_path, expected_dim=embedding_dim(cfg)).to(device)
+
+
+def _prototype_source_splits(cfg: dict, key: str, default: list[str]) -> set[str] | None:
+    value = cfg["data"].get(key, default)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return {value}
+    return {str(item) for item in value}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train HCC-SemPath distillation model.")
     parser.add_argument("--config", required=True)
@@ -221,6 +240,20 @@ def main() -> None:
         names = list(teacher_packages)
     validate_training_config(cfg, names)
     dims = teacher_dims(cfg, names)
+    zhcc_prototypes = _load_zhcc_prototypes(cfg, device)
+    prototype_manifest_path = cfg["data"].get("prototype_supervision_manifest_path")
+    if float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0 and prototype_manifest_path is None:
+        raise ValueError("data.prototype_supervision_manifest_path is required when loss.zhcc_proto_weight > 0")
+    train_prototype_labels = load_prototype_labels(
+        prototype_manifest_path,
+        zhcc_prototypes.to("cpu") if zhcc_prototypes is not None else None,
+        allowed_source_splits=_prototype_source_splits(cfg, "prototype_supervision_train_splits", ["train"]),
+    )
+    val_prototype_labels = load_prototype_labels(
+        prototype_manifest_path,
+        zhcc_prototypes.to("cpu") if zhcc_prototypes is not None else None,
+        allowed_source_splits=_prototype_source_splits(cfg, "prototype_supervision_val_splits", ["val"]),
+    )
     all_tile_packages = sorted(set(train_tile_packages + val_tile_packages))
     tile_metadata = read_package_metadata(all_tile_packages[0])
     image_size = (int(tile_metadata["tile_height"]), int(tile_metadata["tile_width"]))
@@ -243,6 +276,9 @@ def main() -> None:
             max_records=int(cfg["data"].get("max_train_records", 0)),
             seed=int(cfg["runtime"]["seed"]),
             expected_dims=dims,
+            train=True,
+            augmentation=cfg.get("augmentation"),
+            prototype_labels=train_prototype_labels,
         )
         val_ds = PackageSampledDistillationDataset(
             val_tile_packages,
@@ -251,6 +287,9 @@ def main() -> None:
             max_records=int(cfg["data"].get("max_val_records", 0)),
             seed=int(cfg["runtime"]["seed"]) + 1,
             expected_dims=dims,
+            train=False,
+            augmentation=cfg.get("augmentation"),
+            prototype_labels=val_prototype_labels,
         )
     elif manifest_path or explicit_split_packages:
         train_records = read_packaged_tile_records(train_tile_packages)
@@ -281,11 +320,17 @@ def main() -> None:
             train_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=train_teacher_packages,
+            train=True,
+            augmentation=cfg.get("augmentation"),
+            prototype_labels=train_prototype_labels,
         )
         val_ds = DistillationTileDataset(
             val_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=val_teacher_packages,
+            train=False,
+            augmentation=cfg.get("augmentation"),
+            prototype_labels=val_prototype_labels,
         )
     else:
         records = read_packaged_tile_records(train_tile_packages)
@@ -322,11 +367,17 @@ def main() -> None:
             train_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=train_teacher_packages,
+            train=True,
+            augmentation=cfg.get("augmentation"),
+            prototype_labels=train_prototype_labels,
         )
         val_ds = DistillationTileDataset(
             val_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=val_teacher_packages,
+            train=False,
+            augmentation=cfg.get("augmentation"),
+            prototype_labels=val_prototype_labels,
         )
     num_workers = int(cfg["data"]["num_workers"])
     loader_kwargs = {
@@ -374,14 +425,32 @@ def main() -> None:
         embedding_dim=embedding_dim(cfg),
         teacher_dims=dims,
         pretrained=cfg["model"]["pretrained"],
+        projector_type=cfg["model"].get("projector_type", "linear"),
+        projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
+        teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
+    scheduler = build_lr_scheduler(optimizer, cfg, len(train_loader))
+    resume_state = None
     if args.resume:
-        payload = torch.load(args.resume, map_location=device)
-        model.load_state_dict(payload["model"])
-        if "optimizer" in payload:
-            optimizer.load_state_dict(payload["optimizer"])
-    metrics = fit(model, train_loader, val_loader, prototypes, optimizer, device, cfg)
+        resume_state = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(resume_state["model"])
+        if "optimizer" in resume_state:
+            optimizer.load_state_dict(resume_state["optimizer"])
+        if scheduler is not None and resume_state.get("scheduler") is not None:
+            scheduler.load_state_dict(resume_state["scheduler"])
+    metrics = fit(
+        model,
+        train_loader,
+        val_loader,
+        prototypes,
+        optimizer,
+        device,
+        cfg,
+        scheduler=scheduler,
+        zhcc_prototypes=zhcc_prototypes,
+        resume_state=resume_state,
+    )
     print("train_ok " + " ".join(f"{k}={v}" for k, v in metrics.items()))
 
 

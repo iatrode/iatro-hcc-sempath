@@ -13,19 +13,19 @@ HCC 语义 embedding 空间，而不是通用病理基础模型，也不是单�
 The main training design is a shared student encoder with HCC-centered
 embeddings. During training, teacher-specific projection heads align the student
 space to multiple pathology foundation teachers. At inference time, downstream
-users consume the student embedding itself; teacher heads are training-time
-adapters.
+users consume the normalized student embedding (`embedding_norm`) by default;
+teacher heads are training-time adapters.
 
 当前设计采用共享学生编码器生成 HCC 专病 embedding。训练时通过多个 teacher 专属
-projection head 对接不同病理基座模型；推理和下游任务使用学生 embedding 本身，teacher
-head 只是训练阶段的适配层。
+projection head 对接不同病理基座模型；推理和下游任务默认使用归一化学生 embedding
+（`embedding_norm`），teacher head 只是训练阶段的适配层。
 
-HCC weak supervision is expected to further shape the embedding space around
-domain-specific morphology and tissue semantics, such as tumor architecture,
+HCC prototype supervision is expected to further shape the embedding space
+around domain-specific morphology and tissue semantics, such as tumor architecture,
 cholangiocytic components, liver lobule context, necrosis, fibrosis, and immune
 microenvironment patterns.
 
-HCC 弱监督用于进一步把 embedding 空间塑造成专病语义空间，覆盖肿瘤结构、胆管样成分、
+HCC 原型监督用于进一步把 embedding 空间塑造成专病语义空间，覆盖肿瘤结构、胆管样成分、
 肝小叶背景、坏死、纤维化和免疫微环境等 HCC 相关形态语义。
 
 The guiding public research direction is maintained in
@@ -273,6 +273,19 @@ Prototype packages are runtime data with metadata, not hard-coded model classes.
 See `docs/PROTOTYPE_FORMAT.md` for the public package contract and
 `docs/PROTOTYPE_TAXONOMY.md` for the current L1/L2 classification rules.
 
+Prototype supervision is provided through a dynamic CSV manifest rather than a
+fixed code-level label set:
+
+```csv
+tile_id,level1_label,level2_labels,source_split,expert_a,expert_b,adjudicated
+```
+
+`level1_label` and `level2_labels` are resolved by name against the configured
+`data.zhcc_prototype_path`, so future prototype packages can add or revise
+prototype names without changing dataset code. Training supervision uses only
+the configured `data.prototype_supervision_train_splits`; validation and
+external validation use their own configured supervision splits.
+
 Build a training manifest:
 
 ```bash
@@ -332,6 +345,11 @@ hcc-sempath evaluate \
   --checkpoint outputs/hcc_sempath_v1/checkpoints/best.pt \
   --split val
 ```
+
+Evaluation writes `eval_<split>.json` and reports teacher-imitation metrics
+plus direct `z_hcc` prototype metrics computed from `embedding_norm`, including
+Level-1 accuracy, Level-2 macro F1/AUC, prototype top-k precision, and
+neighborhood purity.
 
 ## Documentation
 

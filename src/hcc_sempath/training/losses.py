@@ -7,16 +7,31 @@ from ..modeling.models import normalized_prototype_logits
 from ..modeling.prototypes import PrototypeRegistry
 
 
-def feature_distillation_loss(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
-    return feature_distillation_loss_per_sample(student, teacher).mean()
+def feature_distillation_loss(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    loss_type: str = "cosine",
+) -> torch.Tensor:
+    return feature_distillation_loss_per_sample(student, teacher, loss_type=loss_type).mean()
 
 
-def feature_distillation_loss_per_sample(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
+def feature_distillation_loss_per_sample(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    loss_type: str = "cosine",
+) -> torch.Tensor:
     cosine = 1.0 - F.cosine_similarity(student, teacher, dim=-1)
+    if loss_type == "cosine":
+        return cosine
     student_norm = F.normalize(student, dim=-1)
     teacher_norm = F.normalize(teacher, dim=-1)
-    mse = F.mse_loss(student_norm, teacher_norm, reduction="none").mean(dim=-1)
-    return cosine + mse
+    if loss_type == "cosine_plus_norm_mse":
+        mse = F.mse_loss(student_norm, teacher_norm, reduction="none").mean(dim=-1)
+        return cosine + mse
+    if loss_type == "cosine_plus_raw_mse":
+        mse = F.mse_loss(student, teacher, reduction="none").mean(dim=-1)
+        return cosine + mse
+    raise ValueError(f"unsupported feature_loss_type: {loss_type}")
 
 
 def relation_distillation_loss(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
@@ -31,10 +46,11 @@ def semantic_distillation_loss(
     student: torch.Tensor,
     teacher: torch.Tensor,
     prototypes: PrototypeRegistry,
-    temperature: float = 1.0,
+    primary_temperature: float = 1.0,
+    attribute_temperature: float = 1.0,
 ) -> torch.Tensor:
-    primary = primary_prototype_kl_loss(student, teacher, prototypes, temperature=temperature)
-    attributes = attribute_prototype_bce_loss(student, teacher, prototypes, temperature=temperature)
+    primary = primary_prototype_kl_loss(student, teacher, prototypes, temperature=primary_temperature)
+    attributes = attribute_prototype_bce_loss(student, teacher, prototypes, temperature=attribute_temperature)
     return primary + attributes
 
 
@@ -103,6 +119,9 @@ def total_distillation_loss(
     semantic_temperature: float,
     prototype_filter_weight: float = 0.0,
     prototype_filter_alpha_min: float = 0.25,
+    feature_loss_type: str = "cosine",
+    primary_temperature: float | None = None,
+    attribute_temperature: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     reliability = None
     if prototypes is not None and prototype_filter_weight > 0:
@@ -112,12 +131,12 @@ def total_distillation_loss(
             prototypes=prototypes,
             alpha_min=prototype_filter_alpha_min,
         )
-        feature_per_sample = feature_distillation_loss_per_sample(student, teacher)
+        feature_per_sample = feature_distillation_loss_per_sample(student, teacher, loss_type=feature_loss_type)
         filtered_feature = (reliability * feature_per_sample).mean()
         raw_feature = feature_per_sample.mean()
         feature = (1.0 - prototype_filter_weight) * raw_feature + prototype_filter_weight * filtered_feature
     else:
-        feature = feature_distillation_loss(student, teacher)
+        feature = feature_distillation_loss(student, teacher, loss_type=feature_loss_type)
     relation = relation_distillation_loss(student, teacher)
     if prototypes is None or semantic_weight == 0:
         semantic = feature.new_zeros(())
@@ -126,7 +145,8 @@ def total_distillation_loss(
             student=student,
             teacher=teacher,
             prototypes=prototypes,
-            temperature=semantic_temperature,
+            primary_temperature=semantic_temperature if primary_temperature is None else primary_temperature,
+            attribute_temperature=semantic_temperature if attribute_temperature is None else attribute_temperature,
         )
     relation_scale = reliability.mean() if reliability is not None else relation.new_ones(())
     total = feature + relation_weight * relation_scale * relation + semantic_weight * semantic
@@ -148,6 +168,9 @@ def multi_teacher_distillation_loss(
     teacher_weights: dict[str, float] | None = None,
     prototype_filter_weight: float = 0.0,
     prototype_filter_alpha_min: float = 0.25,
+    feature_loss_type: str = "cosine",
+    primary_temperature: float | None = None,
+    attribute_temperature: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if set(student_by_teacher) != set(teacher_by_name):
         raise ValueError(
@@ -175,6 +198,9 @@ def multi_teacher_distillation_loss(
             semantic_temperature=semantic_temperature,
             prototype_filter_weight=prototype_filter_weight,
             prototype_filter_alpha_min=prototype_filter_alpha_min,
+            feature_loss_type=feature_loss_type,
+            primary_temperature=primary_temperature,
+            attribute_temperature=attribute_temperature,
         )
         total = weight * loss if total is None else total + weight * loss
         for key in totals:

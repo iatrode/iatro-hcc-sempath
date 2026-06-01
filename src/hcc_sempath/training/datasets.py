@@ -16,12 +16,81 @@ from ..io.feature_cache import FeatureCacheReader
 from ..io.iatrocache import read_header
 from ..io.manifests import TileRecord
 from ..io.tile_package import TilePackageReader
+from .prototype_labels import PrototypeLabel
 
 
 @dataclass(frozen=True)
 class PackagedTileRecord:
     record: TileRecord
     tile_package_path: Path | None = None
+
+
+def _build_image_transform(
+    image_size: int | tuple[int, int],
+    mean: list[float] | tuple[float, ...] | None,
+    std: list[float] | tuple[float, ...] | None,
+    *,
+    train: bool = False,
+    augmentation: dict | None = None,
+    resize: bool = True,
+) -> transforms.Compose:
+    resize_size = (image_size, image_size) if isinstance(image_size, int) else image_size
+    transform_steps = []
+    if resize:
+        transform_steps.append(transforms.Resize(resize_size))
+    aug = augmentation or {}
+    if train and aug.get("enabled", False):
+        if aug.get("horizontal_flip", False):
+            transform_steps.append(transforms.RandomHorizontalFlip())
+        if aug.get("vertical_flip", False):
+            transform_steps.append(transforms.RandomVerticalFlip())
+        if aug.get("random_rotation_90", False):
+            transform_steps.append(
+                transforms.RandomChoice(
+                    [
+                        transforms.RandomRotation((0, 0)),
+                        transforms.RandomRotation((90, 90)),
+                        transforms.RandomRotation((180, 180)),
+                        transforms.RandomRotation((270, 270)),
+                    ]
+                )
+            )
+        color_jitter = aug.get("color_jitter") or {}
+        if color_jitter:
+            transform_steps.append(
+                transforms.ColorJitter(
+                    brightness=float(color_jitter.get("brightness", 0.0)),
+                    contrast=float(color_jitter.get("contrast", 0.0)),
+                    saturation=float(color_jitter.get("saturation", 0.0)),
+                    hue=float(color_jitter.get("hue", 0.0)),
+                )
+            )
+    transform_steps.append(transforms.ToTensor())
+    if mean is not None and std is not None:
+        transform_steps.append(transforms.Normalize(mean=mean, std=std))
+    return transforms.Compose(transform_steps)
+
+
+def _prototype_payload(tile_id: str, prototype_labels: dict[str, PrototypeLabel] | None) -> dict:
+    if not prototype_labels:
+        return {
+            "prototype_mask": False,
+            "prototype_level1": -1,
+            "prototype_level2": torch.zeros(0, dtype=torch.float32),
+        }
+    label = prototype_labels.get(tile_id)
+    if label is None:
+        first = next(iter(prototype_labels.values()))
+        return {
+            "prototype_mask": False,
+            "prototype_level1": -1,
+            "prototype_level2": torch.zeros_like(first.level2),
+        }
+    return {
+        "prototype_mask": True,
+        "prototype_level1": label.level1,
+        "prototype_level2": label.level2.clone(),
+    }
 
 
 def _record_tile_id(record: TileRecord | PackagedTileRecord) -> str:
@@ -246,6 +315,9 @@ class DistillationTileDataset(Dataset):
             | tuple[str | Path, ...]
             | None
         ) = None,
+        train: bool = False,
+        augmentation: dict | None = None,
+        prototype_labels: dict[str, PrototypeLabel] | None = None,
     ) -> None:
         self.records = records
         if teacher_cache_dir is not None:
@@ -258,14 +330,15 @@ class DistillationTileDataset(Dataset):
             teacher_cache_package_paths=teacher_cache_package_paths,
         )
         self.feature_readers = {name: _FeatureReaderSet(paths) for name, paths in self.teacher_package_paths.items()}
-        resize_size = (image_size, image_size) if isinstance(image_size, int) else image_size
-        transform_steps = [
-            transforms.Resize(resize_size),
-            transforms.ToTensor(),
-        ]
-        if mean is not None and std is not None:
-            transform_steps.append(transforms.Normalize(mean=mean, std=std))
-        self.transform = transforms.Compose(transform_steps)
+        self.transform = _build_image_transform(
+            image_size,
+            mean,
+            std,
+            train=train,
+            augmentation=augmentation,
+            resize=True,
+        )
+        self.prototype_labels = prototype_labels or {}
 
     def _packaged_reader(self, package_path: Path) -> TilePackageReader:
         if self.active_package_path != package_path:
@@ -302,6 +375,7 @@ class DistillationTileDataset(Dataset):
             "tile_id": record.tile_id,
             "image": image_tensor,
             "teacher_features": teacher_features,
+            **_prototype_payload(record.tile_id, self.prototype_labels),
         }
 
     def close(self) -> None:
@@ -340,6 +414,9 @@ class PackageSampledDistillationDataset(Dataset):
         mean: list[float] | tuple[float, ...] | None = None,
         std: list[float] | tuple[float, ...] | None = None,
         expected_dims: dict[str, int] | None = None,
+        train: bool = False,
+        augmentation: dict | None = None,
+        prototype_labels: dict[str, PrototypeLabel] | None = None,
     ) -> None:
         self.tile_paths = [Path(path) for path in image_tile_package_paths]
         self.teacher_package_paths = {
@@ -371,12 +448,15 @@ class PackageSampledDistillationDataset(Dataset):
             self.sample_count,
             rng,
         )
-        transform_steps = [
-            transforms.ToTensor(),
-        ]
-        if mean is not None and std is not None:
-            transform_steps.append(transforms.Normalize(mean=mean, std=std))
-        self.transform = transforms.Compose(transform_steps)
+        self.transform = _build_image_transform(
+            image_size,
+            mean,
+            std,
+            train=train,
+            augmentation=augmentation,
+            resize=False,
+        )
+        self.prototype_labels = prototype_labels or {}
         self.mean_tensor = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1) if mean is not None else None
         self.std_tensor = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1) if std is not None else None
 
@@ -510,6 +590,7 @@ class PackageSampledDistillationDataset(Dataset):
                             name: reader.read_feature_at(row)
                             for name, reader in feature_readers.items()
                         },
+                        **_prototype_payload(tile_reader.tile_id_at(row), self.prototype_labels),
                     }
                 )
             return samples
@@ -568,6 +649,7 @@ class PackageSampledDistillationDataset(Dataset):
             "tile_id": tile_id,
             "image": image,
             "teacher_features": teacher_features,
+            **_prototype_payload(tile_id, self.prototype_labels),
         }
 
     def __getitems__(self, indices: list[int]) -> list[dict]:
@@ -593,6 +675,7 @@ class PackageSampledDistillationDataset(Dataset):
                             name: reader.read_feature_at(row)
                             for name, reader in feature_readers.items()
                         },
+                        **_prototype_payload(tile_id, self.prototype_labels),
                     }
             finally:
                 tile_reader.close()
@@ -604,13 +687,16 @@ class PackageSampledDistillationDataset(Dataset):
         teacher_names = list(batch[0]["teacher_features"].keys())
         return {
             "tile_id": [item["tile_id"] for item in batch],
-            "images": self._arrays_to_tensor([item["image"] for item in batch]),
+            "images": torch.stack([self.transform(Image.fromarray(item["image"]).convert("RGB")) for item in batch]),
             "teacher_features": {
                 name: torch.from_numpy(
                     np.stack([item["teacher_features"][name] for item in batch], axis=0)
                 ).float()
                 for name in teacher_names
             },
+            "prototype_mask": torch.tensor([bool(item["prototype_mask"]) for item in batch], dtype=torch.bool),
+            "prototype_level1": torch.tensor([int(item["prototype_level1"]) for item in batch], dtype=torch.long),
+            "prototype_level2": torch.stack([item["prototype_level2"] for item in batch]),
         }
 
     def close(self) -> None:
@@ -682,4 +768,7 @@ def collate_distillation(batch: list[dict]) -> dict:
         "teacher_features": {
             name: torch.stack([item["teacher_features"][name] for item in batch]) for name in teacher_names
         },
+        "prototype_mask": torch.tensor([bool(item.get("prototype_mask", False)) for item in batch], dtype=torch.bool),
+        "prototype_level1": torch.tensor([int(item.get("prototype_level1", -1)) for item in batch], dtype=torch.long),
+        "prototype_level2": torch.stack([item.get("prototype_level2", torch.zeros(0, dtype=torch.float32)) for item in batch]),
     }

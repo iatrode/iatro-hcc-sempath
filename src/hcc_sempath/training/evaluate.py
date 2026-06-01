@@ -28,7 +28,9 @@ from .datasets import (
 from .engine import collect_embeddings
 from .manifest import load_training_manifest
 from .metrics import evaluate_teacher_outputs
+from .prototype_labels import load_prototype_labels
 from .utils import write_json
+from .zhcc_metrics import evaluate_zhcc_prototypes
 
 
 def _load_prototype_map(cfg: dict, dims: dict[str, int]) -> dict[str, PrototypeRegistry] | None:
@@ -41,6 +43,22 @@ def _load_prototype_map(cfg: dict, dims: dict[str, int]) -> dict[str, PrototypeR
     if prototype_path is None:
         return None
     return {name: load_prototype_registry(prototype_path, expected_dim=dim) for name, dim in dims.items()}
+
+
+def _load_zhcc_prototypes(cfg: dict) -> PrototypeRegistry | None:
+    prototype_path = cfg["data"].get("zhcc_prototype_path")
+    if prototype_path is None:
+        return None
+    return load_prototype_registry(prototype_path, expected_dim=embedding_dim(cfg))
+
+
+def _prototype_source_splits(cfg: dict, split: str) -> set[str] | None:
+    value = cfg["data"].get(f"prototype_supervision_{split}_splits", [split])
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return {value}
+    return {str(item) for item in value}
 
 
 def main() -> None:
@@ -85,6 +103,12 @@ def main() -> None:
         dims,
         teacher_cache_package_paths=teacher_packages,
     )
+    zhcc_prototypes = _load_zhcc_prototypes(cfg)
+    prototype_labels = load_prototype_labels(
+        cfg["data"].get("prototype_supervision_manifest_path"),
+        zhcc_prototypes,
+        allowed_source_splits=_prototype_source_splits(cfg, args.split),
+    )
     dataset = DistillationTileDataset(
         records,
         None,
@@ -92,6 +116,9 @@ def main() -> None:
         mean=cfg["data"].get("mean"),
         std=cfg["data"].get("std"),
         teacher_cache_package_paths=teacher_packages,
+        train=False,
+        augmentation=cfg.get("augmentation"),
+        prototype_labels=prototype_labels,
     )
     loader = DataLoader(dataset, batch_size=cfg["train"]["batch_size"], shuffle=False, num_workers=cfg["data"]["num_workers"], collate_fn=collate_distillation)
     model = HCCSemPathModel(
@@ -99,10 +126,13 @@ def main() -> None:
         embedding_dim=embedding_dim(cfg),
         teacher_dims=dims,
         pretrained=cfg["model"]["pretrained"],
+        projector_type=cfg["model"].get("projector_type", "linear"),
+        projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
+        teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),
     ).to(device)
-    payload = torch.load(args.checkpoint, map_location=device)
+    payload = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(payload["model"])
-    _, student_by_teacher, teacher_by_name = collect_embeddings(
+    embeddings, student_by_teacher, teacher_by_name, supervised = collect_embeddings(
         model,
         loader,
         device,
@@ -110,6 +140,16 @@ def main() -> None:
     )
     prototypes = _load_prototype_map(cfg, dims)
     metrics = evaluate_teacher_outputs(student_by_teacher, teacher_by_name, prototypes, int(cfg["train"]["topk"]))
+    metrics.update(
+        evaluate_zhcc_prototypes(
+            embeddings,
+            supervised["prototype_mask"],
+            supervised["prototype_level1"],
+            supervised["prototype_level2"],
+            zhcc_prototypes,
+            topk=int(cfg["train"]["topk"]),
+        )
+    )
     write_json(f"{cfg['runtime']['output_dir']}/eval_{args.split}.json", metrics)
     print("eval_ok " + " ".join(f"{k}={v:.6f}" for k, v in metrics.items()))
 

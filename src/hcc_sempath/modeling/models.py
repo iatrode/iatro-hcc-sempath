@@ -14,6 +14,8 @@ class StudentEncoder(nn.Module):
         backbone_name: str = "vit_tiny_patch16_224",
         embedding_dim: int = 256,
         pretrained: bool = False,
+        projector_type: str = "linear",
+        projector_hidden_dim: int = 2048,
     ) -> None:
         super().__init__()
         self.backbone = timm.create_model(
@@ -23,10 +25,20 @@ class StudentEncoder(nn.Module):
             global_pool="avg",
         )
         student_dim = int(self.backbone.num_features)
-        self.projector = nn.Sequential(
-            nn.LayerNorm(student_dim),
-            nn.Linear(student_dim, embedding_dim),
-        )
+        if projector_type == "linear":
+            self.projector = nn.Sequential(
+                nn.LayerNorm(student_dim),
+                nn.Linear(student_dim, embedding_dim),
+            )
+        elif projector_type == "mlp":
+            self.projector = nn.Sequential(
+                nn.LayerNorm(student_dim),
+                nn.Linear(student_dim, int(projector_hidden_dim)),
+                nn.GELU(),
+                nn.Linear(int(projector_hidden_dim), embedding_dim),
+            )
+        else:
+            raise ValueError(f"unsupported projector_type: {projector_type}")
         self.embedding_dim = embedding_dim
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -37,12 +49,28 @@ class StudentEncoder(nn.Module):
 class TeacherProjectionHead(nn.Module):
     """Teacher-specific alignment head used during distillation."""
 
-    def __init__(self, embedding_dim: int, teacher_dim: int) -> None:
+    def __init__(
+        self,
+        embedding_dim: int,
+        teacher_dim: int,
+        head_type: str = "linear",
+        hidden_dim: int = 2048,
+    ) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(embedding_dim),
-            nn.Linear(embedding_dim, teacher_dim),
-        )
+        if head_type == "linear":
+            self.net = nn.Sequential(
+                nn.LayerNorm(embedding_dim),
+                nn.Linear(embedding_dim, teacher_dim),
+            )
+        elif head_type == "mlp":
+            self.net = nn.Sequential(
+                nn.LayerNorm(embedding_dim),
+                nn.Linear(embedding_dim, int(hidden_dim)),
+                nn.GELU(),
+                nn.Linear(int(hidden_dim), teacher_dim),
+            )
+        else:
+            raise ValueError(f"unsupported teacher_head_type: {head_type}")
 
     def forward(self, embedding: torch.Tensor) -> torch.Tensor:
         return self.net(embedding)
@@ -57,6 +85,9 @@ class HCCSemPathModel(nn.Module):
         embedding_dim: int = 256,
         teacher_dims: dict[str, int] | None = None,
         pretrained: bool = False,
+        projector_type: str = "linear",
+        projector_hidden_dim: int = 2048,
+        teacher_head_type: str = "linear",
     ) -> None:
         super().__init__()
         if not teacher_dims:
@@ -65,9 +96,19 @@ class HCCSemPathModel(nn.Module):
             backbone_name=backbone_name,
             embedding_dim=embedding_dim,
             pretrained=pretrained,
+            projector_type=projector_type,
+            projector_hidden_dim=projector_hidden_dim,
         )
         self.teacher_heads = nn.ModuleDict(
-            {name: TeacherProjectionHead(embedding_dim, int(dim)) for name, dim in teacher_dims.items()}
+            {
+                name: TeacherProjectionHead(
+                    embedding_dim,
+                    int(dim),
+                    head_type=teacher_head_type,
+                    hidden_dim=projector_hidden_dim,
+                )
+                for name, dim in teacher_dims.items()
+            }
         )
 
     @property
@@ -82,8 +123,10 @@ class HCCSemPathModel(nn.Module):
 
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
         embedding = self.encode(images)
+        embedding_norm = F.normalize(embedding, dim=-1)
         return {
             "embedding": embedding,
+            "embedding_norm": embedding_norm,
             "teacher_outputs": self.project_teachers(embedding),
         }
 

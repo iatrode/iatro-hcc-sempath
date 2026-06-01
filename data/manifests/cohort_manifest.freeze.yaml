@@ -1,0 +1,11 @@
+version: 1
+description: Public template for the locked cohort split used in a formal run.
+records: []
+required_record_fields:
+  - patient_id
+  - slide_id
+  - source
+  - center
+  - split
+  - tile_package_path
+  - tile_package_checksum

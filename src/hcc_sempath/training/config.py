@@ -18,9 +18,29 @@ EXCLUDED_TEACHER_NAMES = {
 }
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    result = dict(base)
+    for key, value in override.items():
+        if key == "inherits":
+            continue
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
 def load_config(path: str | Path) -> dict:
-    with Path(path).open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle) or {}
+    parent = cfg.get("inherits")
+    if parent is None:
+        return cfg
+    parent_path = Path(parent)
+    if not parent_path.is_absolute():
+        parent_path = path.parent / parent_path
+    return _deep_merge(load_config(parent_path), cfg)
 
 
 def _normalize_teacher_name(name: str) -> str:

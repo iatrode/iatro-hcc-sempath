@@ -1,0 +1,11 @@
+version: 1
+description: Public template for locked HCC prototype supervision used in a formal run.
+prototypes: []
+required_prototype_fields:
+  - prototype_name
+  - level
+  - source_split
+  - supervised_tile_count
+  - expert_agreement
+  - adjudication_rule
+  - checksum

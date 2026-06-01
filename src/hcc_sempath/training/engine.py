@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import math
+import random
 import time
 
+import numpy as np
 import torch
 
 from .losses import multi_teacher_distillation_loss
 from .metrics import evaluate_teacher_outputs
 from .utils import append_csv, ensure_dir, write_json
+from .zhcc_losses import zhcc_prototype_loss
+from .zhcc_metrics import evaluate_zhcc_prototypes
 
 
 def _move_teachers(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
     return {name: value.to(device) for name, value in batch["teacher_features"].items()}
+
+
+def _move_prototype_batch(batch: dict, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        batch.get("prototype_mask", torch.zeros(len(batch["tile_id"]), dtype=torch.bool)).to(device),
+        batch.get("prototype_level1", torch.full((len(batch["tile_id"]),), -1, dtype=torch.long)).to(device),
+        batch.get("prototype_level2", torch.zeros((len(batch["tile_id"]), 0), dtype=torch.float32)).to(device),
+    )
 
 
 def _amp_enabled(device: torch.device, cfg: dict, train: bool) -> bool:
@@ -35,6 +48,7 @@ def _cuda_memory_mb(device: torch.device) -> float:
 
 def scheduled_loss_config(cfg: dict, epoch: int) -> dict[str, float | dict]:
     loss_cfg = cfg["loss"]
+    semantic_temperature = float(loss_cfg.get("semantic_temperature", 1.0))
     return {
         "teacher_weights": loss_cfg.get("teacher_weights"),
         "relation_weight": float(loss_cfg["relation_weight"]),
@@ -43,14 +57,66 @@ def scheduled_loss_config(cfg: dict, epoch: int) -> dict[str, float | dict]:
             epoch,
             int(loss_cfg.get("semantic_warmup_epochs", 0)),
         ),
-        "semantic_temperature": float(loss_cfg["semantic_temperature"]),
+        "semantic_temperature": semantic_temperature,
+        "primary_temperature": float(loss_cfg.get("primary_temperature", semantic_temperature)),
+        "attribute_temperature": float(loss_cfg.get("attribute_temperature", 1.0)),
         "prototype_filter_weight": _linear_warmup(
             float(loss_cfg.get("prototype_filter_weight", 0.0)),
             epoch,
             int(loss_cfg.get("prototype_filter_warmup_epochs", 0)),
         ),
         "prototype_filter_alpha_min": float(loss_cfg.get("prototype_filter_alpha_min", 0.25)),
+        "feature_loss_type": str(loss_cfg.get("feature_loss_type", "cosine")),
+        "zhcc_proto_weight": _linear_warmup(
+            float(loss_cfg.get("zhcc_proto_weight", 0.0)),
+            epoch,
+            int(loss_cfg.get("zhcc_proto_warmup_epochs", 0)),
+        ),
+        "zhcc_level2_weight": float(loss_cfg.get("zhcc_level2_weight", 0.5)),
     }
+
+
+def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, steps_per_epoch: int):
+    if str(cfg["train"].get("scheduler", "none")).lower() != "cosine":
+        return None
+    total_steps = max(1, int(cfg["train"]["epochs"]) * max(1, int(steps_per_epoch)))
+    warmup_steps = max(0, int(cfg["train"].get("warmup_epochs", 0)) * max(1, int(steps_per_epoch)))
+    base_lr = float(cfg["train"]["lr"])
+    min_factor = float(cfg["train"].get("min_lr", 0.0)) / base_lr if base_lr > 0 else 0.0
+
+    def lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return max(min_factor, float(step + 1) / float(warmup_steps))
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, float(step - warmup_steps) / float(decay_steps)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_factor + (1.0 - min_factor) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def _rng_state() -> dict:
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: dict | None) -> None:
+    if not state:
+        return
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
 
 
 def run_epoch(
@@ -62,11 +128,22 @@ def run_epoch(
     cfg,
     train: bool,
     scaler=None,
+    scheduler=None,
     loss_cfg: dict | None = None,
     max_batches: int | None = None,
+    zhcc_prototypes=None,
 ) -> dict[str, float]:
     model.train(train)
-    totals = {"loss": 0.0, "feature": 0.0, "relation": 0.0, "semantic": 0.0, "reliability": 0.0}
+    totals = {
+        "loss": 0.0,
+        "feature": 0.0,
+        "relation": 0.0,
+        "semantic": 0.0,
+        "reliability": 0.0,
+        "zhcc_proto": 0.0,
+        "zhcc_l1": 0.0,
+        "zhcc_l2": 0.0,
+    }
     n_batches = 0
     n_tiles = 0
     start = time.perf_counter()
@@ -91,6 +168,7 @@ def run_epoch(
         n_tiles += int(images.shape[0])
         interval_tiles += int(images.shape[0])
         teachers = _move_teachers(batch, device)
+        prototype_mask, prototype_level1, prototype_level2 = _move_prototype_batch(batch, device)
         with torch.set_grad_enabled(train):
             with torch.autocast(device_type=device.type, enabled=_amp_enabled(device, cfg, train)):
                 outputs = model(images)
@@ -105,7 +183,22 @@ def run_epoch(
                     teacher_weights=teacher_weights,
                     prototype_filter_weight=float(loss_cfg["prototype_filter_weight"]),
                     prototype_filter_alpha_min=float(loss_cfg["prototype_filter_alpha_min"]),
+                    feature_loss_type=str(loss_cfg["feature_loss_type"]),
+                    primary_temperature=float(loss_cfg["primary_temperature"]),
+                    attribute_temperature=float(loss_cfg["attribute_temperature"]),
                 )
+                zhcc_loss, zhcc_parts = zhcc_prototype_loss(
+                    embedding_norm=outputs["embedding_norm"],
+                    prototype_mask=prototype_mask,
+                    prototype_level1=prototype_level1,
+                    prototype_level2=prototype_level2,
+                    prototypes=zhcc_prototypes,
+                    level2_weight=float(loss_cfg["zhcc_level2_weight"]),
+                ) if zhcc_prototypes is not None and float(loss_cfg["zhcc_proto_weight"]) > 0 else (
+                    loss.new_zeros(()),
+                    {"zhcc_proto": loss.new_zeros(()), "zhcc_l1": loss.new_zeros(()), "zhcc_l2": loss.new_zeros(())},
+                )
+                loss = loss + float(loss_cfg["zhcc_proto_weight"]) * zhcc_loss
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 if scaler is not None and scaler.is_enabled():
@@ -115,9 +208,13 @@ def run_epoch(
                 else:
                     loss.backward()
                     optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
         totals["loss"] += float(loss.detach().cpu())
         for key in ("feature", "relation", "semantic", "reliability"):
             totals[key] += float(parts[key].cpu())
+        for key in ("zhcc_proto", "zhcc_l1", "zhcc_l2"):
+            totals[key] += float(zhcc_parts[key].detach().cpu())
         n_batches += 1
         if log_interval > 0 and (n_batches == 1 or n_batches % log_interval == 0):
             if device.type == "cuda":
@@ -140,6 +237,7 @@ def run_epoch(
             interval_tiles = 0
     elapsed = max(time.perf_counter() - start, 1e-9)
     result = {key: value / max(1, n_batches) for key, value in totals.items()}
+    result["lr"] = float(optimizer.param_groups[0]["lr"])
     result["tiles_per_sec"] = n_tiles / elapsed
     result["tiles"] = float(n_tiles)
     result["seconds"] = elapsed
@@ -152,9 +250,12 @@ def collect_embeddings(
     loader,
     device,
     max_batches: int | None = None,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     model.eval()
     embeddings = []
+    prototype_masks = []
+    prototype_level1 = []
+    prototype_level2 = []
     students_by_teacher: dict[str, list[torch.Tensor]] = {}
     teachers_by_name: dict[str, list[torch.Tensor]] = {}
     for batch_idx, batch in enumerate(loader):
@@ -162,7 +263,10 @@ def collect_embeddings(
             break
         images = batch["images"].to(device)
         outputs = model(images)
-        embeddings.append(outputs["embedding"].cpu())
+        embeddings.append(outputs["embedding_norm"].cpu())
+        prototype_masks.append(batch.get("prototype_mask", torch.zeros(len(batch["tile_id"]), dtype=torch.bool)).cpu())
+        prototype_level1.append(batch.get("prototype_level1", torch.full((len(batch["tile_id"]),), -1, dtype=torch.long)).cpu())
+        prototype_level2.append(batch.get("prototype_level2", torch.zeros((len(batch["tile_id"]), 0), dtype=torch.float32)).cpu())
         for name, tensor in outputs["teacher_outputs"].items():
             students_by_teacher.setdefault(name, []).append(tensor.cpu())
         for name, tensor in batch["teacher_features"].items():
@@ -171,17 +275,39 @@ def collect_embeddings(
         torch.cat(embeddings),
         {name: torch.cat(values) for name, values in students_by_teacher.items()},
         {name: torch.cat(values) for name, values in teachers_by_name.items()},
+        {
+            "prototype_mask": torch.cat(prototype_masks),
+            "prototype_level1": torch.cat(prototype_level1),
+            "prototype_level2": torch.cat(prototype_level2),
+        },
     )
 
 
-def fit(model, train_loader, val_loader, prototypes, optimizer, device, cfg) -> dict:
+def fit(
+    model,
+    train_loader,
+    val_loader,
+    prototypes,
+    optimizer,
+    device,
+    cfg,
+    *,
+    scheduler=None,
+    zhcc_prototypes=None,
+    resume_state: dict | None = None,
+) -> dict:
     output_dir = ensure_dir(cfg["runtime"]["output_dir"])
     checkpoints = ensure_dir(output_dir / "checkpoints")
     write_json(output_dir / "resolved_config.json", cfg)
-    best_loss = float("inf")
-    best_metrics = {}
+    best_loss = float((resume_state or {}).get("best_loss", float("inf")))
+    best_metrics = dict((resume_state or {}).get("best_metrics", {}))
+    start_epoch = int((resume_state or {}).get("epoch", 0)) + 1
+    global_step = int((resume_state or {}).get("global_step", 0))
     scaler = torch.amp.GradScaler("cuda", enabled=bool(cfg["train"].get("amp", False) and device.type == "cuda"))
-    for epoch in range(1, int(cfg["train"]["epochs"]) + 1):
+    if resume_state and "scaler" in resume_state:
+        scaler.load_state_dict(resume_state["scaler"])
+    _restore_rng_state((resume_state or {}).get("rng_state"))
+    for epoch in range(start_epoch, int(cfg["train"]["epochs"]) + 1):
         loss_cfg = scheduled_loss_config(cfg, epoch)
         train_metrics = run_epoch(
             model,
@@ -192,9 +318,12 @@ def fit(model, train_loader, val_loader, prototypes, optimizer, device, cfg) -> 
             cfg,
             train=True,
             scaler=scaler,
+            scheduler=scheduler,
             loss_cfg=loss_cfg,
             max_batches=cfg["train"].get("max_train_batches"),
+            zhcc_prototypes=zhcc_prototypes,
         )
+        global_step += int((train_metrics["tiles"] + int(cfg["train"]["batch_size"]) - 1) // int(cfg["train"]["batch_size"]))
         val_metrics = run_epoch(
             model,
             val_loader,
@@ -205,8 +334,9 @@ def fit(model, train_loader, val_loader, prototypes, optimizer, device, cfg) -> 
             train=False,
             loss_cfg=loss_cfg,
             max_batches=cfg["train"].get("max_val_batches"),
+            zhcc_prototypes=zhcc_prototypes,
         )
-        _, student_by_teacher, teacher_by_name = collect_embeddings(
+        embeddings, student_by_teacher, teacher_by_name, prototype_labels = collect_embeddings(
             model,
             val_loader,
             device,
@@ -219,24 +349,51 @@ def fit(model, train_loader, val_loader, prototypes, optimizer, device, cfg) -> 
             cpu_prototypes,
             int(cfg["train"]["topk"]),
         )
+        zhcc_metrics = evaluate_zhcc_prototypes(
+            embeddings,
+            prototype_labels["prototype_mask"],
+            prototype_labels["prototype_level1"],
+            prototype_labels["prototype_level2"],
+            zhcc_prototypes.to("cpu") if zhcc_prototypes is not None else None,
+            topk=int(cfg["train"]["topk"]),
+        )
         row = {
             "epoch": epoch,
+            "global_step": global_step,
+            "feature_loss_type": str(loss_cfg["feature_loss_type"]),
+            "lr": float(optimizer.param_groups[0]["lr"]),
             "scheduled_semantic_weight": float(loss_cfg["semantic_weight"]),
             "scheduled_prototype_filter_weight": float(loss_cfg["prototype_filter_weight"]),
+            "scheduled_zhcc_proto_weight": float(loss_cfg["zhcc_proto_weight"]),
             **{f"train_{k}": v for k, v in train_metrics.items()},
             **{f"val_{k}": v for k, v in val_metrics.items()},
             **embedding_metrics,
+            **zhcc_metrics,
         }
         append_csv(output_dir / "metrics.csv", row)
+        checkpoint = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "scaler": scaler.state_dict(),
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_loss": best_loss,
+            "best_metrics": best_metrics,
+            "rng_state": _rng_state(),
+            "config": cfg,
+        }
         torch.save(
-            {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(), "epoch": epoch, "config": cfg},
+            checkpoint,
             checkpoints / "last.pt",
         )
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
             best_metrics = row
+            checkpoint["best_loss"] = best_loss
+            checkpoint["best_metrics"] = best_metrics
             torch.save(
-                {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(), "epoch": epoch, "config": cfg},
+                checkpoint,
                 checkpoints / "best.pt",
             )
     write_json(output_dir / "summary.json", best_metrics)

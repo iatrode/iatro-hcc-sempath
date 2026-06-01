@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from PIL import Image
+import torch
 
 from hcc_sempath.io.feature_cache import build_teacher_feature_package_from_feature_map
 from hcc_sempath.io.manifests import write_tile_manifest
@@ -23,6 +24,7 @@ from hcc_sempath.training.datasets import (
 from hcc_sempath.training.manifest import build_training_manifest
 from hcc_sempath.training.manifest import validate_manifest_artifacts
 from hcc_sempath.training.train import _PackageShuffleBatchLoader
+from hcc_sempath.training.prototype_labels import PrototypeLabel
 
 
 def _write_package(root: Path, slide_id: str, value: int, count: int = 1) -> tuple[Path, Path]:
@@ -94,8 +96,35 @@ def test_multi_package_dataset_uses_external_slide_split(tmp_path: Path) -> None
     batch = collate_distillation([dataset[0], dataset[1]])
 
     assert batch["images"].shape == (2, 3, 32, 32)
+    assert batch["prototype_mask"].tolist() == [False, False]
     np.testing.assert_allclose(batch["teacher_features"]["toy"][0].numpy(), np.full((4,), 10, dtype=np.float32))
     np.testing.assert_allclose(batch["teacher_features"]["toy"][1].numpy(), np.full((4,), 20, dtype=np.float32))
+
+
+def test_dataset_adds_dynamic_prototype_supervision_fields(tmp_path: Path) -> None:
+    tile_a, feature_a = _write_package(tmp_path, "slide_a", 10, count=2)
+    records = read_packaged_tile_records([tile_a])
+    labels = {
+        "slide_a_0000000": PrototypeLabel(
+            tile_id="slide_a_0000000",
+            level1=1,
+            level2=torch.tensor([1.0, 0.0]),
+            source_split="train",
+        )
+    }
+
+    dataset = DistillationTileDataset(
+        records,
+        teacher_cache_dir=None,
+        image_size=(32, 32),
+        teacher_cache_package_paths={"toy": [feature_a]},
+        prototype_labels=labels,
+    )
+    batch = collate_distillation([dataset[0], dataset[1]])
+
+    assert batch["prototype_mask"].tolist() == [True, False]
+    assert batch["prototype_level1"].tolist() == [1, -1]
+    assert batch["prototype_level2"].shape == (2, 2)
 
 
 def test_build_training_manifest_splits_public_heldout_by_count(tmp_path: Path) -> None:

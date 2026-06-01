@@ -17,6 +17,8 @@ def test_hcc_sempath_model_returns_shared_embedding_and_teacher_outputs() -> Non
     outputs = model(torch.randn(2, 3, 224, 224))
 
     assert outputs["embedding"].shape == (2, 11)
+    assert outputs["embedding_norm"].shape == (2, 11)
+    torch.testing.assert_close(outputs["embedding_norm"].norm(dim=-1), torch.ones(2), rtol=1e-5, atol=1e-5)
     assert outputs["teacher_outputs"]["teacher_a"].shape == (2, 5)
     assert outputs["teacher_outputs"]["teacher_b"].shape == (2, 7)
 

@@ -1,0 +1,10 @@
+inherits: ../distill_train.example.yaml
+
+loss:
+  feature_loss_type: cosine
+  relation_weight: 0.0
+  semantic_weight: 0.0
+  zhcc_proto_weight: 0.2
+  zhcc_proto_warmup_epochs: 3
+  zhcc_level2_weight: 0.5
+  prototype_filter_weight: 0.0
