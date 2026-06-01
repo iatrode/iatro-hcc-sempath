@@ -4,51 +4,64 @@ import csv
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from hcc_sempath.io.feature_cache import build_teacher_feature_package_from_feature_map
 from hcc_sempath.io.manifests import write_tile_manifest
-from hcc_sempath.io.tile_package import build_tile_package
+from hcc_sempath.io.tile_package import build_tile_package, read_package_metadata
 from hcc_sempath.training.config import manifest_data_paths
 from hcc_sempath.training.datasets import (
     DistillationTileDataset,
+    PackageSampledDistillationDataset,
     apply_split_overrides,
     collate_distillation,
     read_packaged_tile_records,
+    validate_teacher_feature_package_pairs,
     validate_teacher_cache,
 )
 from hcc_sempath.training.manifest import build_training_manifest
 from hcc_sempath.training.manifest import validate_manifest_artifacts
+from hcc_sempath.training.train import _PackageShuffleBatchLoader
 
 
-def _write_package(root: Path, slide_id: str, value: int) -> tuple[Path, Path]:
+def _write_package(root: Path, slide_id: str, value: int, count: int = 1) -> tuple[Path, Path]:
     tile_dir = root / f"{slide_id}_tiles"
     tile_dir.mkdir()
-    tile_id = f"{slide_id}_0000000"
-    tile_path = tile_dir / f"{tile_id}.png"
-    Image.new("RGB", (32, 32), (value, 30, 120)).save(tile_path)
-    rows = [
-        {
-            "tile_id": tile_id,
-            "patient_id": f"p_{slide_id}",
-            "slide_id": slide_id,
-            "tile_path": str(tile_path),
-            "x": 0,
-            "y": 0,
-            "split": "train",
-        }
-    ]
+    rows = []
+    feature_by_tile_id = {}
+    for idx in range(count):
+        tile_id = f"{slide_id}_{idx:07d}"
+        tile_path = tile_dir / f"{tile_id}.png"
+        Image.new("RGB", (32, 32), ((value + idx) % 255, 30, 120)).save(tile_path)
+        rows.append(
+            {
+                "tile_id": tile_id,
+                "patient_id": f"p_{slide_id}",
+                "slide_id": slide_id,
+                "tile_path": str(tile_path),
+                "x": idx * 32,
+                "y": 0,
+                "split": "train",
+            }
+        )
+        feature_by_tile_id[tile_id] = np.full((4,), value + idx, dtype=np.float32)
     manifest_path = root / f"{slide_id}.csv"
     tile_package_path = root / f"{slide_id}.tiles.iac"
     feature_package_path = root / f"{slide_id}.toy.features.iac"
     write_tile_manifest(manifest_path, rows)
     build_tile_package(manifest_path, tile_package_path)
+    metadata = read_package_metadata(tile_package_path)
     records = read_packaged_tile_records([tile_package_path])
     build_teacher_feature_package_from_feature_map(
         [item.record for item in records],
-        {tile_id: np.full((4,), value, dtype=np.float32)},
+        feature_by_tile_id,
         feature_package_path,
         teacher_name="toy",
+        tile_width=int(metadata["tile_width"]),
+        tile_height=int(metadata["tile_height"]),
+        stride_x=int(metadata["stride_x"]),
+        stride_y=int(metadata["stride_y"]),
     )
     return tile_package_path, feature_package_path
 
@@ -165,3 +178,64 @@ def test_validate_manifest_artifacts_checks_teacher_feature_packages(tmp_path: P
     assert result["missing_tile_packages"] == []
     assert result["missing_feature_packages"] == []
     assert tile_path.exists()
+
+
+def test_package_pair_validation_rejects_wrong_feature_stem(tmp_path: Path) -> None:
+    tile_a, _ = _write_package(tmp_path, "slide_a", 10, count=3)
+    _, feature_b = _write_package(tmp_path, "slide_b", 20, count=3)
+
+    with pytest.raises(ValueError, match="stem mismatch"):
+        validate_teacher_feature_package_pairs([tile_a], {"toy": [feature_b]}, expected_dims={"toy": 4})
+
+
+def test_package_sampled_dataset_uses_every_selected_package_with_spread_rows(tmp_path: Path) -> None:
+    tile_paths = []
+    feature_paths = []
+    for idx in range(4):
+        tile_path, feature_path = _write_package(tmp_path, f"slide_{idx}", idx * 20, count=8)
+        tile_paths.append(tile_path)
+        feature_paths.append(feature_path)
+
+    dataset = PackageSampledDistillationDataset(
+        tile_paths,
+        {"toy": feature_paths},
+        image_size=(32, 32),
+        max_records=8,
+        seed=13,
+        expected_dims={"toy": 4},
+    )
+
+    assert set(dataset.package_order) == {0, 1, 2, 3}
+    for rows in dataset.package_sample_rows:
+        assert rows is not None
+        assert len(rows) == 2
+        assert int(rows[1] - rows[0]) >= 2
+
+
+def test_package_shuffle_loader_mixes_packages_single_thread(tmp_path: Path) -> None:
+    tile_paths = []
+    feature_paths = []
+    for idx in range(6):
+        tile_path, feature_path = _write_package(tmp_path, f"slide_{idx}", idx * 20, count=6)
+        tile_paths.append(tile_path)
+        feature_paths.append(feature_path)
+    dataset = PackageSampledDistillationDataset(
+        tile_paths,
+        {"toy": feature_paths},
+        image_size=(32, 32),
+        max_records=24,
+        seed=13,
+        expected_dims={"toy": 4},
+    )
+    loader = _PackageShuffleBatchLoader(
+        dataset,
+        batch_size=8,
+        num_workers=0,
+        prefetch_batches=2,
+        collate_fn=lambda batch: batch,
+        seed=13,
+    )
+
+    first_batch = next(iter(loader))
+
+    assert len({sample["_package_idx"] for sample in first_batch}) > 1

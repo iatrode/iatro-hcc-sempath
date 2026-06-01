@@ -13,6 +13,7 @@ from hcc_sempath.io.tile_package import read_package_manifest
 
 DEFAULT_TEACHER_DIMS = {
     "gigapath": 1536,
+    "h_optimus_1": 1536,
     "uni2_h": 1536,
     "virchow2": 2560,
 }

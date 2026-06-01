@@ -84,7 +84,12 @@ The current student configuration is:
 
 ```yaml
 backbone_name: vit_small_patch14_reg4_dinov2.lvd142m
-teacher_dim: 1536
+embedding_dim: 1536
+teacher_dims:
+  gigapath: 1536
+  h_optimus_1: 1536
+  uni2_h: 1536
+  virchow2: 2560
 pretrained: true
 ```
 
@@ -98,10 +103,14 @@ Estimated trainable parameters:
 
 - ViT-S/14 DINOv2 backbone: approximately 21M parameters.
 - ViT-S/14 DINOv2 backbone：约 21M 参数。
-- Projection head from 384 to 1536 dimensions: approximately 0.592M parameters.
-- 384 到 1536 维 projection head：约 0.592M 参数。
-- Total: approximately 21.6M trainable parameters.
-- 合计：约 21.6M 可训练参数。
+- Shared encoder projector from 384 to 1536 dimensions: approximately 0.592M parameters.
+- 384 到 1536 维共享 encoder projector：约 0.592M 参数。
+- Reusable encoder total: approximately 21.6M trainable parameters.
+- 可复用 encoder 合计：约 21.6M 可训练参数。
+- Four training-time teacher heads add approximately 11.0M parameters.
+- 4 个训练阶段 teacher head 额外增加约 11.0M 参数。
+- Full training graph: approximately 32.6M trainable parameters.
+- 完整训练图合计：约 32.6M 可训练参数。
 
 The `lvd142m` suffix refers to the DINOv2 pretraining data scale and should not be interpreted as the model parameter count.
 
@@ -123,12 +132,14 @@ Approximate storage planning:
 
 - compressed image tiles: approximately 230 GB at about 13 KB per tile;
 - 压缩图像 tile：按约 13 KB/tile 估计，约 230 GB；
-- teacher features: approximately 110 GB for 1536-dimensional float32 features;
-- teacher feature：1536 维 float32 约 110 GB；
-- total training inputs: approximately 340 GB or more;
-- 训练输入合计：约 340 GB 或更高；
-- recommended working storage: at least 500 GB after indexes, outputs, checkpoints, and intermediate files.
-- 考虑索引、输出、checkpoint 和中间文件后，建议至少预留 500 GB。
+- teacher features: approximately 110 GB per 1536-dimensional float32 teacher;
+- teacher feature：每个 1536 维 float32 teacher 约 110 GB；
+- current four-teacher queue: approximately 516 GB as float32 feature payloads, or approximately 258 GB when fp16/bf16 extraction writes float16 caches;
+- 当前 4 teacher 队列：float32 feature payload 约 516 GB；fp16/bf16 提取并写入 float16 cache 时约 258 GB；
+- total training inputs: approximately 500 GB or more with float16 teacher caches, and higher with float32 caches;
+- 训练输入合计：使用 float16 teacher cache 时约 500 GB 或更高；float32 cache 更高；
+- recommended working storage: at least 750 GB after indexes, outputs, checkpoints, and intermediate files.
+- 考虑索引、输出、checkpoint 和中间文件后，建议至少预留 750 GB。
 
 Approximate training steps:
 
@@ -168,19 +179,29 @@ Implemented training-system foundations:
 - 在不改变生产 image-tile IAC 格式的前提下支持 per-WSI multi-package dataset；
 - training manifest construction for development sources plus a public source with held-out external validation;
 - 支持 development source 与 public source held-out external validation 的 training manifest 构建；
-- convention-based teacher feature package resolution from manifest WSI stems.
-- 基于 manifest WSI stem 与命名约定解析 teacher feature package。
-- training preflight checks that reject stale or removed teacher entries, including H-optimus-1/H1.
-- 训练前配置检查会拒绝残留或已移除的 teacher 条目，包括 H-optimus-1/H1。
+- convention-based teacher feature package resolution from manifest WSI stems;
+- 基于 manifest WSI stem 与命名约定解析 teacher feature package；
+- supported teacher presets and training config entries for `gigapath`, `h_optimus_1`, `uni2_h`, and `virchow2`;
+- 已支持 `gigapath`、`h_optimus_1`、`uni2_h` 和 `virchow2` 的 teacher preset 与训练配置；
+- preflight checks that reject stale teacher config entries and unsupported H1-family teacher names;
+- 训练前配置检查会拒绝残留 teacher 配置项和不支持的 H1-family teacher 名称；
+- bounded teacher-cache batch prefetch with package-level prefetch disabled;
+- teacher cache 使用有界 batch prefetch，package-level prefetch 已禁用；
+- optional explicit train/val package paths, dynamic package sampling, and max record caps for dry runs;
+- 支持可选显式 train/val package 路径、dynamic package sampling，以及 dry run 用 max record 上限；
+- package-pair validation by filename stem and IAC headers before dynamic package sampling;
+- dynamic package sampling 前基于文件名 stem 与 IAC header 进行 package 配对校验；
+- package-local row chunk reads with cross-package shuffle-buffer batch construction.
+- 按 package 聚合读取 row chunk，并通过跨 package shuffle buffer 构建 batch。
 
 Important engineering requirements before full-scale training:
 
 正式全量训练前的重要工程要求：
 
-- use fixed or sampled validation subsets for frequent validation;
-- 高频验证时使用固定或抽样 validation subset；
-- add training-time WSI-window or feature-cache-aware sampling if measured I/O locality becomes the bottleneck;
-- 若实测 I/O locality 成为瓶颈，再加入训练期 WSI-window 或 feature-cache-aware sampling；
+- export fixed validation subsets for reproducible frequent validation;
+- 导出固定 validation subset，用于可复现的高频验证；
+- benchmark dynamic package sampling and add stronger WSI-window sampling if measured I/O locality remains the bottleneck;
+- 评估 dynamic package sampling，如实测 I/O locality 仍是瓶颈，再加入更强的 WSI-window sampling；
 - add HCC-specific representation evaluation beyond teacher imitation before manuscript-grade conclusions;
 - 在论文级结论前补齐超越 teacher imitation 的 HCC 专病表征评估；
 - benchmark teacher-feature storage alternatives on real extracted features before changing the feature package layout.

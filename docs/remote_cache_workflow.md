@@ -38,9 +38,9 @@ hcc-sempath build-teacher-cache \
 ```
 
 `--num-workers` controls parallel IatroCache tile reads and JXL decode during
-teacher inference. `--prefetch-factor` controls the number of prefetched batches
-per worker. Keep `--batch-size` as the GPU-memory knob and tune workers only
-when GPU utilization is low.
+teacher inference. `--prefetch-factor` controls the global number of prefetched
+batches beyond the current batch. Keep `--batch-size` as the GPU-memory knob and
+tune workers only when GPU utilization is low.
 `--precision bf16` enables CUDA autocast for teacher inference. With
 `--feature-dtype auto`, fp16/bf16 inference writes float16 feature matrices to
 keep IAC caches compact; training casts teacher features back to float32 before
@@ -56,10 +56,10 @@ is passed. Each generated or skipped output is header-checked immediately and
 written to `teacher_cache_progress.csv`; a JSON summary with total, processed,
 ok, and failed counts is written beside it. `--validate-output` performs full
 feature-matrix validation and is intentionally off by default for large
-directory runs. Directory runs prefetch the next input package while the
-current package is running teacher inference; `--no-prefetch-packages` disables
-that overlap for debugging.
-The training teacher queue is `gigapath`, `uni2_h`, and `virchow2`.
+directory runs. Package-level prefetch is not part of the public teacher-cache
+interface; bounded batch prefetch is controlled by `--prefetch-factor`.
+The training teacher queue is `gigapath`, `h_optimus_1`, `uni2_h`, and
+`virchow2`.
 `--teacher` also accepts local model directories and custom timm /
 `hf_hub:*` names for controlled experiments.
 
@@ -76,6 +76,7 @@ Examples:
 
 ```text
 slide_a.gigapath.features.iac
+slide_a.h_optimus_1.features.iac
 slide_a.uni2_h.features.iac
 slide_a.virchow2.features.iac
 ```

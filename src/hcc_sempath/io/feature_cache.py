@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from collections.abc import Iterable
+from tempfile import NamedTemporaryFile
 
 import numpy as np
 import pyarrow as pa
 
-from .iatrocache import PackReader, build_pack_data_segment, read_tables
+from .iatrocache import PackReader, build_pack_data_segment_from_file, read_tables
 from .manifests import TileRecord
 from .tile_package import read_package_manifest, read_package_metadata
 from .tile_package import _build_slide_table, _ensure_unique_column, _infer_coordinate_stride, _slide_map
@@ -89,22 +90,23 @@ def build_teacher_feature_package(
     if tile_width <= 0 or tile_height <= 0:
         raise ValueError(f"tile size must be positive, got ({tile_width}, {tile_height})")
 
-    def collect_matrix() -> np.ndarray:
+    def write_matrix_stream(data_path: Path) -> tuple[int, int]:
         nonlocal feature_dim
-        rows: list[np.ndarray] = []
         count = 0
-        for feature in features:
-            feature = np.asarray(feature).astype(dtype, copy=False)
-            if feature.ndim != 1:
-                raise ValueError(f"teacher feature must be 1D, got {feature.shape}")
-            feature_dim = feature.shape[0] if feature_dim is None else feature_dim
-            if feature.shape[0] != feature_dim:
-                raise ValueError(f"inconsistent feature dim: got {feature.shape[0]} expected {feature_dim}")
-            rows.append(np.ascontiguousarray(feature))
-            count += 1
+        with data_path.open("wb") as handle:
+            for feature in features:
+                feature = np.asarray(feature).astype(dtype, copy=False)
+                if feature.ndim != 1:
+                    raise ValueError(f"teacher feature must be 1D, got {feature.shape}")
+                feature_dim = feature.shape[0] if feature_dim is None else feature_dim
+                if feature.shape[0] != feature_dim:
+                    raise ValueError(f"inconsistent feature dim: got {feature.shape[0]} expected {feature_dim}")
+                handle.write(np.ascontiguousarray(feature).tobytes(order="C"))
+                count += 1
         if count != len(records):
             raise ValueError(f"feature count mismatch: features={count} records={len(records)}")
-        return np.stack(rows, axis=0).astype(dtype, copy=False)
+        assert feature_dim is not None
+        return count, int(feature_dim)
 
     first_feature = None
     if feature_dim is None:
@@ -125,28 +127,47 @@ def build_teacher_feature_package(
         features = features_with_first()
 
     table = _build_feature_table(records, slide_to_idx, stride_x, stride_y)
-    matrix = collect_matrix()
-    raw_matrix = matrix.tobytes(order="C")
-    record_bytes = int(feature_dim) * np.dtype(dtype).itemsize
-    header = {
-        "payload_type": "teacher_features",
-        "teacher": teacher_name,
-        "feature_dim": int(feature_dim),
-        "dtype": dtype,
-        "feature_record_bytes": record_bytes,
-        "tile_width": tile_width,
-        "tile_height": tile_height,
-        "stride_x": stride_x,
-        "stride_y": stride_y,
-        "coordinate_mode": "tile_grid",
-        "origin": "top_left",
-        "slide_idx_dtype": "uint8",
-        "tile_xy_dtype": "uint16",
-        "flags_dtype": "uint8",
-        "checksum": "crc32",
-        "created_by": "hcc-sempath",
-    }
-    build_pack_data_segment(output_path, header, slide_table, table, raw_matrix, overwrite=overwrite)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(dir=output_path.parent, delete=False) as tmp:
+        data_path = Path(tmp.name)
+    try:
+        feature_count, resolved_feature_dim = write_matrix_stream(data_path)
+        feature_dim = resolved_feature_dim
+        record_bytes = int(feature_dim) * np.dtype(dtype).itemsize
+        data_length = feature_count * record_bytes
+        if data_path.stat().st_size != data_length:
+            raise ValueError(f"feature data size mismatch: expected={data_length} got={data_path.stat().st_size}")
+        header = {
+            "payload_type": "teacher_features",
+            "teacher": teacher_name,
+            "feature_dim": int(feature_dim),
+            "dtype": dtype,
+            "feature_record_bytes": record_bytes,
+            "tile_width": tile_width,
+            "tile_height": tile_height,
+            "stride_x": stride_x,
+            "stride_y": stride_y,
+            "coordinate_mode": "tile_grid",
+            "origin": "top_left",
+            "slide_idx_dtype": "uint8",
+            "tile_xy_dtype": "uint16",
+            "flags_dtype": "uint8",
+            "checksum": "crc32",
+            "created_by": "hcc-sempath",
+        }
+        build_pack_data_segment_from_file(
+            output_path,
+            header,
+            slide_table,
+            table,
+            data_path,
+            data_length=data_length,
+            overwrite=overwrite,
+        )
+    finally:
+        if data_path.exists():
+            data_path.unlink()
 
 
 def build_teacher_feature_package_from_feature_map(
@@ -256,14 +277,28 @@ class FeatureCacheReader:
         row = self._tile_index.get(tile_id)
         if row is None:
             raise FileNotFoundError(f"missing packaged teacher feature: {tile_id}")
+        return self.read_feature_at(row)
+
+    def read_feature_at(self, row: int) -> np.ndarray:
+        if row < 0 or row >= int(self._reader.header["num_records"]):
+            raise IndexError(f"feature row out of range: {row}")
         record_bytes = self._record_bytes()
         dtype = np.dtype(self._reader.header["dtype"])
         feature_dim = int(self._reader.header["feature_dim"])
         payload = self._reader.read_data_span(row * record_bytes, record_bytes)
         feature = np.frombuffer(payload, dtype=dtype)
         if feature.shape != (feature_dim,):
-            raise ValueError(f"invalid feature payload shape for {tile_id}: {feature.shape}")
+            raise ValueError(f"invalid feature payload shape at row={row}: {feature.shape}")
         return feature.astype(np.float32, copy=True)
+
+    def tile_id_at(self, row: int) -> str:
+        if row < 0 or row >= len(self._reader.record_table):
+            raise IndexError(f"feature row out of range: {row}")
+        return str(self._reader.record_table.column("tile_id")[row].as_py())
+
+    @property
+    def record_count(self) -> int:
+        return int(self._reader.header["num_records"])
 
     def close(self) -> None:
         self._reader.close()

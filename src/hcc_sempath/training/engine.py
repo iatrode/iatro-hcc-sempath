@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import torch
 
 from .losses import multi_teacher_distillation_loss
@@ -19,6 +21,16 @@ def _linear_warmup(base_value: float, epoch: int, warmup_epochs: int) -> float:
     if warmup_epochs <= 0:
         return base_value
     return base_value * min(1.0, max(0.0, epoch / warmup_epochs))
+
+
+def _log(message: str) -> None:
+    print(message, flush=True)
+
+
+def _cuda_memory_mb(device: torch.device) -> float:
+    if device.type != "cuda":
+        return 0.0
+    return float(torch.cuda.memory_allocated(device) / (1024 * 1024))
 
 
 def scheduled_loss_config(cfg: dict, epoch: int) -> dict[str, float | dict]:
@@ -56,12 +68,28 @@ def run_epoch(
     model.train(train)
     totals = {"loss": 0.0, "feature": 0.0, "relation": 0.0, "semantic": 0.0, "reliability": 0.0}
     n_batches = 0
+    n_tiles = 0
+    start = time.perf_counter()
+    interval_start = start
+    interval_tiles = 0
+    phase = "train" if train else "val"
+    log_interval = int(cfg["train"].get("log_interval", 0) or 0)
     loss_cfg = loss_cfg or scheduled_loss_config(cfg, epoch=1)
     teacher_weights = loss_cfg.get("teacher_weights")
-    for batch in loader:
+    iterator = iter(loader)
+    while True:
+        data_wait_start = time.perf_counter()
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            break
+        data_wait = time.perf_counter() - data_wait_start
         if max_batches is not None and n_batches >= max_batches:
             break
+        batch_start = time.perf_counter()
         images = batch["images"].to(device)
+        n_tiles += int(images.shape[0])
+        interval_tiles += int(images.shape[0])
         teachers = _move_teachers(batch, device)
         with torch.set_grad_enabled(train):
             with torch.autocast(device_type=device.type, enabled=_amp_enabled(device, cfg, train)):
@@ -91,7 +119,31 @@ def run_epoch(
         for key in ("feature", "relation", "semantic", "reliability"):
             totals[key] += float(parts[key].cpu())
         n_batches += 1
-    return {key: value / max(1, n_batches) for key, value in totals.items()}
+        if log_interval > 0 and (n_batches == 1 or n_batches % log_interval == 0):
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            now = time.perf_counter()
+            interval_elapsed = max(now - interval_start, 1e-9)
+            total_elapsed = max(now - start, 1e-9)
+            batch_elapsed = max(now - batch_start, 1e-9)
+            _log(
+                f"{phase}_progress "
+                f"batch={n_batches} tiles={n_tiles} "
+                f"interval_tiles_per_sec={interval_tiles / interval_elapsed:.2f} "
+                f"total_tiles_per_sec={n_tiles / total_elapsed:.2f} "
+                f"last_data_wait_sec={data_wait:.3f} "
+                f"last_batch_sec={batch_elapsed:.3f} "
+                f"loss={float(loss.detach().cpu()):.6f} "
+                f"cuda_mem_mb={_cuda_memory_mb(device):.1f}"
+            )
+            interval_start = now
+            interval_tiles = 0
+    elapsed = max(time.perf_counter() - start, 1e-9)
+    result = {key: value / max(1, n_batches) for key, value in totals.items()}
+    result["tiles_per_sec"] = n_tiles / elapsed
+    result["tiles"] = float(n_tiles)
+    result["seconds"] = elapsed
+    return result
 
 
 @torch.no_grad()
