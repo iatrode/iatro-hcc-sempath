@@ -39,6 +39,11 @@ The teacher-specific heads are training-time alignment modules. The reusable out
 
 teacher-specific heads 是训练阶段的对齐模块。模型最终复用的是共享 HCC embedding，即 `z_hcc`。
 
+The inference and evaluation feature is the normalized reusable embedding
+`embedding_norm`, not a teacher-specific head.
+
+推理和评估默认使用归一化的可复用 embedding（`embedding_norm`），不是 teacher-specific head。
+
 ### 2.2 HCC-specific weak supervision / HCC 专病弱监督
 
 Multi-teacher distillation is not the final objective. It provides generic morphology priors. The final representation should be reshaped by HCC-specific weak supervision so that the embedding geometry better reflects HCC histopathology.
@@ -173,6 +178,12 @@ Implemented training-system foundations:
 - 共享 HCC embedding 与 teacher-specific projection heads；
 - multi-teacher distillation losses and teacher-specific metrics;
 - 多 teacher 蒸馏损失与 teacher-specific 指标；
+- direct prototype supervision on `embedding_norm`, with runtime-resolved L1/L2 prototype labels;
+- 已支持直接作用于 `embedding_norm` 的 prototype 监督，并按运行时 prototype package 解析 L1/L2 标签；
+- `z_hcc` prototype metrics, including L1 accuracy, L2 macro F1/AUC, prototype top-k precision, and neighborhood purity;
+- 已支持 `z_hcc` prototype 指标，包括 L1 accuracy、L2 macro F1/AUC、prototype top-k precision 与 neighborhood purity；
+- train-only tile augmentation, step-level warmup plus cosine LR decay, and checkpoint resume for scheduler, scaler, best metrics, global step, and RNG state;
+- 已支持 train-only tile augmentation、step-level warmup + cosine LR decay，以及 scheduler、scaler、best metrics、global step 和 RNG state 的 checkpoint resume；
 - CUDA mixed precision training with autocast and gradient scaling;
 - CUDA 混合精度训练，包括 autocast 与 gradient scaling；
 - per-WSI multi-package dataset loading without changing the production image-tile IAC format;
@@ -202,8 +213,8 @@ Important engineering requirements before full-scale training:
 - 导出固定 validation subset，用于可复现的高频验证；
 - benchmark dynamic package sampling and add stronger WSI-window sampling if measured I/O locality remains the bottleneck;
 - 评估 dynamic package sampling，如实测 I/O locality 仍是瓶颈，再加入更强的 WSI-window sampling；
-- add HCC-specific representation evaluation beyond teacher imitation before manuscript-grade conclusions;
-- 在论文级结论前补齐超越 teacher imitation 的 HCC 专病表征评估；
+- lock the final prototype supervision manifest and external validation protocol before manuscript-grade conclusions;
+- 在论文级结论前锁定最终 prototype supervision manifest 与 external validation protocol；
 - benchmark teacher-feature storage alternatives on real extracted features before changing the feature package layout.
 - 在修改 feature package layout 前，基于真实提取特征评估不同 teacher-feature 存储方案。
 

@@ -223,6 +223,18 @@ Level-1 supervision should use softmax cross-entropy or soft-label KL over prima
 
 Level 1 使用 softmax cross-entropy 或 soft-label KL 约束主状态；Level 2 使用 BCE、focal BCE、similarity regression 或 positive-unlabeled contrastive loss。没有显式 tile-level 标签时，使用带置信阈值的 prototype consistency self-training，阈值写入 prototype metadata。
 
+The implemented supervised path applies the prototype objective directly to
+the normalized reusable embedding (`embedding_norm`): Level 1 uses cross
+entropy over runtime-loaded primary prototypes, and Level 2 uses BCE over
+runtime-loaded attribute prototypes. Prototype labels are resolved by prototype
+name from `data.prototype_supervision_manifest_path`, so the prototype set can
+evolve without changing model code.
+
+当前已实现的监督路径直接作用于归一化的可复用 embedding（`embedding_norm`）：Level 1
+对运行时加载的主 prototype 使用 cross entropy，Level 2 对运行时加载的属性 prototype
+使用 BCE。Prototype label 通过 `data.prototype_supervision_manifest_path` 中的名称
+与 prototype package 对齐，因此 prototype 集合演进不需要改模型代码。
+
 ### 3.7 Loss schedule / Loss 阶段调度
 
 A practical schedule is:
@@ -361,6 +373,8 @@ These metrics verify successful distillation and characterize teacher consistenc
 - HCC 语义 prototype response 一致性；
 - clustering or neighborhood purity for HCC-relevant morphology groups;
 - HCC 相关形态组的聚类或邻域纯度；
+- direct `z_hcc` Level-1 accuracy, Level-2 macro F1/AUC, prototype top-k precision, and neighborhood purity on supervised prototype tiles;
+- 基于 prototype 监督 tile 的直接 `z_hcc` Level-1 accuracy、Level-2 macro F1/AUC、prototype top-k precision 与 neighborhood purity；
 - cross-cohort stability;
 - 跨队列稳定性；
 - downstream adaptation with lightweight heads or weakly supervised modules;

@@ -6,7 +6,9 @@ outputs/
 annotations/
 smoke_data/
 weights/
-data/
+data/*
+!data/manifests/
+!data/manifests/*.freeze.yaml
 real_smoke/
 results/
 results/**/*.iac

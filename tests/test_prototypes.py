@@ -8,7 +8,9 @@ import torch
 import yaml
 
 from hcc_sempath.modeling.build_prototypes import main as build_prototypes_main
+from hcc_sempath.modeling.prototypes import PrototypeRegistry
 from hcc_sempath.modeling.prototypes import load_prototype_registry, load_prototypes
+from hcc_sempath.training.prototype_labels import load_prototype_labels
 
 
 def test_load_prototype_registry_from_package(tmp_path: Path) -> None:
@@ -245,3 +247,26 @@ def test_hcc_taxonomy_package_loads_with_expected_levels(tmp_path: Path) -> None
     assert registry.attribute_indices == list(range(9, 16))
     assert registry.names[0] == "HCC-trabecular"
     assert registry.names[-1] == "interface-capsule"
+
+
+def test_prototype_supervision_manifest_is_resolved_by_registry_names(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "prototype_supervision.csv"
+    manifest_path.write_text(
+        "tile_id,level1_label,level2_labels,source_split,expert_a,expert_b,adjudicated\n"
+        "tile_1,primary_tumor,lymphocyte_rich;fibrotic_stroma,train,a,b,true\n"
+        "tile_2,primary_non_tumor,,val,a,b,true\n",
+        encoding="utf-8",
+    )
+    registry = PrototypeRegistry(
+        prototypes=torch.randn(4, 3),
+        names=["primary_tumor", "primary_non_tumor", "lymphocyte_rich", "fibrotic_stroma"],
+        groups=["primary", "primary", "immune", "stroma"],
+        levels=[1, 1, 2, 2],
+        exclusive=[True, True, False, False],
+    )
+
+    labels = load_prototype_labels(manifest_path, registry, allowed_source_splits={"train"})
+
+    assert set(labels) == {"tile_1"}
+    assert labels["tile_1"].level1 == 0
+    assert labels["tile_1"].level2.tolist() == [1.0, 1.0]
