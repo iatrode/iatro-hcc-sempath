@@ -28,10 +28,15 @@ def encode_jxl(image_path: Path, lossless: bool, distance: float | None, effort:
 
 
 def decode_jxl(payload: bytes) -> Image.Image:
+    arr = decode_jxl_array(payload)
+    return Image.fromarray(arr, mode="RGB")
+
+
+def decode_jxl_array(payload: bytes) -> np.ndarray:
     arr = imagecodecs.jpegxl_decode(payload)
     if arr.ndim == 2:
         arr = np.stack([arr, arr, arr], axis=-1)
-    return Image.fromarray(arr[:, :, :3].astype(np.uint8), mode="RGB")
+    return arr[:, :, :3].astype(np.uint8, copy=False)
 
 
 def _build_slide_table(records: list[TileRecord]) -> tuple[pa.Table, dict[str, int]]:
@@ -392,11 +397,34 @@ class TilePackageReader:
         row = self._tile_index.get(tile_id)
         if row is None:
             raise FileNotFoundError(f"missing packaged tile: {tile_id}")
+        return self.read_image_at(row)
+
+    def read_image_at(self, row: int) -> Image.Image:
+        if row < 0 or row >= len(self._reader.record_table):
+            raise IndexError(f"tile row out of range: {row}")
         image = decode_jxl(self._reader.read_payload(row))
         expected_size = (int(self._reader.header["tile_width"]), int(self._reader.header["tile_height"]))
         if image.size != expected_size:
-            raise ValueError(f"invalid tile size for {tile_id}: expected={expected_size} got={image.size}")
+            raise ValueError(f"invalid tile size at row={row}: expected={expected_size} got={image.size}")
         return image
+
+    def read_array_at(self, row: int) -> np.ndarray:
+        if row < 0 or row >= len(self._reader.record_table):
+            raise IndexError(f"tile row out of range: {row}")
+        arr = decode_jxl_array(self._reader.read_payload(row))
+        expected_shape = (int(self._reader.header["tile_height"]), int(self._reader.header["tile_width"]))
+        if arr.shape[:2] != expected_shape:
+            raise ValueError(f"invalid tile shape at row={row}: expected={expected_shape} got={arr.shape[:2]}")
+        return arr
+
+    def tile_id_at(self, row: int) -> str:
+        if row < 0 or row >= len(self._reader.record_table):
+            raise IndexError(f"tile row out of range: {row}")
+        return str(self._reader.record_table.column("tile_id")[row].as_py())
+
+    @property
+    def record_count(self) -> int:
+        return len(self._reader.record_table)
 
     def close(self) -> None:
         self._reader.close()

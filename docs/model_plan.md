@@ -260,7 +260,12 @@ Current configuration:
 
 ```yaml
 backbone_name: vit_small_patch14_reg4_dinov2.lvd142m
-teacher_dim: 1536
+embedding_dim: 1536
+teacher_dims:
+  gigapath: 1536
+  h_optimus_1: 1536
+  uni2_h: 1536
+  virchow2: 2560
 pretrained: true
 ```
 
@@ -310,6 +315,8 @@ Data organization should support:
 - 基于 WSI stem 与配置的 teacher 通过命名约定解析 teacher feature package；
 - multi-package or per-slide package reading without changing the image-tile IAC format;
 - 在不改变 image-tile IAC 格式的前提下进行 multi-package 或 per-slide package 读取；
+- package-local chunk reads with cross-package shuffle-buffer batch construction;
+- 按 package 聚合读取 chunk，并通过跨 package shuffle buffer 构建 batch；
 - reproducible tile coordinates and preprocessing metadata;
 - 可复现的 tile 坐标和预处理元数据；
 - optional cached teacher-agreement or disagreement summaries for efficient selective distillation;

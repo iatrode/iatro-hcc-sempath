@@ -243,10 +243,10 @@ recorded without stopping the whole teacher-cache run.
 Use `--validate-output` only when a full output IAC matrix validation is needed;
 it decompresses each feature matrix and is intentionally off by default for
 large directory runs.
-Directory runs prefetch the next input package while the current package is
-running teacher inference; use `--no-prefetch-packages` only for debugging.
-The training teacher queue is `gigapath`, `uni2_h`, and `virchow2`. Local model
-directories and custom timm / `hf_hub:*` names remain
+Directory runs use bounded batch prefetch through `--prefetch-factor`.
+Package-level prefetch is not part of the public teacher-cache interface.
+The training teacher queue is `gigapath`, `h_optimus_1`, `uni2_h`, and
+`virchow2`. Local model directories and custom timm / `hf_hub:*` names remain
 available for controlled experiments, but the documented path should use the
 supported presets.
 Teacher-cache defaults are tuned for the development workflow: batch size 512,
@@ -254,11 +254,11 @@ bf16 CUDA inference, `torch.compile`, and `--feature-dtype auto`, which writes
 float16 feature matrices for fp16/bf16 inference to keep IAC caches compact.
 Training casts teacher features back to float32 before computing losses.
 
-`uni2_h` and `virchow2` are gated Hugging Face models. Request access with an
-institutional account, accept the model terms, and run `hf auth login` in the
-feature-cache environment before building caches. Local snapshots can also be
-loaded directly with `--teacher weights/teachers/uni2_h` or
-`--teacher weights/teachers/virchow2`; the `weights/` tree is git-ignored.
+Some teacher presets, including `h_optimus_1`, `uni2_h`, and `virchow2`, may
+require gated Hugging Face access. Request access with an institutional account,
+accept the model terms, and run `hf auth login` in the feature-cache environment
+before building caches. Local snapshots can also be loaded directly with
+`--teacher weights/teachers/<teacher>`; the `weights/` tree is git-ignored.
 
 Build semantic prototypes:
 
@@ -283,6 +283,7 @@ hcc-sempath build-train-manifest \
   --val-frac 0.15 \
   --split-key patient_id \
   --teacher gigapath \
+  --teacher h_optimus_1 \
   --teacher uni2_h \
   --teacher virchow2 \
   --feature-root /data/hcc_features \
@@ -303,6 +304,12 @@ Train:
 ```bash
 hcc-sempath train --config configs/distill_train.example.yaml
 ```
+
+Large multi-package training uses `data.dynamic_package_sampling: true` in the
+example config. All packages selected by the manifest or explicit train/val
+package paths participate. The loader reads package-local row chunks for I/O
+locality, then builds batches from a cross-package shuffle buffer so batches are
+not dominated by a single WSI/package.
 
 For large cohorts, validation and embedding metrics should be sampled with
 `train.max_val_batches` and `train.max_eval_batches`; prototype semantic and

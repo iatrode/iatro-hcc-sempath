@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 import csv
-from dataclasses import dataclass
+import gc
 import json
+import queue
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -15,13 +18,16 @@ import timm
 import torch
 from safetensors.torch import load_file as load_safetensors_file
 from timm.data import create_transform, resolve_model_data_config
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 from tqdm import tqdm
 from ..io.feature_cache import build_teacher_feature_package, build_teacher_feature_package_from_tile_package
 from ..io.iatrocache import read_tables
 from ..io.manifests import TileRecord
 from ..io.tile_package import TilePackageReader, read_package_manifest, read_package_metadata
 from ..io.validate_package import _validate_common, _validate_teacher_features
+
+
+_THREAD_LOCAL = threading.local()
 
 
 TEACHER_MODEL_PRESETS: dict[str, dict] = {
@@ -60,6 +66,11 @@ TEACHER_MODEL_PRESETS: dict[str, dict] = {
             "act_layer": torch.nn.SiLU,
         },
     },
+    "h_optimus_1": {
+        "model_name": "hf-hub:bioptimus/H-optimus-1",
+        "teacher_name": "h_optimus_1",
+        "description": "Supported H-optimus-1 teacher.",
+    },
 }
 
 
@@ -77,11 +88,6 @@ def _preset_help() -> str:
         "but are not part of the planned supported/tested teacher set."
     )
     return "\n".join(lines)
-
-
-def _resolve_model_name(model_name: str) -> str:
-    preset = TEACHER_MODEL_PRESETS.get(model_name)
-    return preset["model_name"] if preset else model_name
 
 
 def _resolve_model_spec(model_name: str) -> dict:
@@ -175,9 +181,19 @@ class TimmTeacherEncoder(torch.nn.Module):
             if not architecture:
                 raise ValueError(f"local teacher config missing architecture: {config_path}")
             model_args = _decode_model_args(config.get("model_args", {}))
+            for key in ("num_classes", "global_pool", "img_size", "patch_size"):
+                if key in config and key not in model_args:
+                    model_args[key] = config[key]
+            pretrained_cfg = config.get("pretrained_cfg")
+            if "img_size" not in model_args and isinstance(pretrained_cfg, dict):
+                input_size = pretrained_cfg.get("input_size")
+                if isinstance(input_size, (list, tuple)) and len(input_size) == 3:
+                    model_args["img_size"] = int(input_size[1])
             model_args.update(model_kwargs)
             model_args.setdefault("num_classes", 0)
             self.model = timm.create_model(architecture, pretrained=False, **model_args)
+            if isinstance(pretrained_cfg, dict):
+                self.model.pretrained_cfg = {**getattr(self.model, "pretrained_cfg", {}), **config["pretrained_cfg"]}
             if pretrained:
                 weight_path = _local_weight_path(model_path, config)
                 state_dict = _load_state_dict(weight_path)
@@ -202,14 +218,14 @@ class TimmTeacherEncoder(torch.nn.Module):
 
 
 class PackageTeacherTileDataset(Dataset):
-    def __init__(self, package_path: str | Path, records: list[TileRecord], transform) -> None:
+    def __init__(self, package_path: str | Path, tile_ids: list[str], transform) -> None:
         self.package_path = Path(package_path)
-        self.records = records
+        self.tile_ids = tile_ids
         self.transform = transform
         self._reader: TilePackageReader | None = None
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.tile_ids)
 
     def _ensure_reader(self) -> TilePackageReader:
         if self._reader is None:
@@ -217,10 +233,15 @@ class PackageTeacherTileDataset(Dataset):
         return self._reader
 
     def __getitem__(self, index: int) -> dict:
-        record = self.records[index]
-        image = self._ensure_reader().read_image(record.tile_id)
+        return self._read_item(index)
+
+    def __getitems__(self, indices: list[int]) -> list[dict]:
+        return [self._read_item(index) for index in indices]
+
+    def _read_item(self, index: int) -> dict:
+        image = self._ensure_reader().read_image_at(index)
         return {
-            "tile_id": record.tile_id,
+            "tile_id": self.tile_ids[index],
             "image": self.transform(image.convert("RGB")),
         }
 
@@ -229,33 +250,273 @@ class PackageTeacherTileDataset(Dataset):
         state["_reader"] = None
         return state
 
-    def __del__(self) -> None:
+    def close(self) -> None:
         if self._reader is not None:
             self._reader.close()
+            self._reader = None
+
+    def __del__(self) -> None:
+        self.close()
 
 
-@dataclass
-class PreparedTeacherPackage:
-    package_path: Path
-    records: list[TileRecord]
-    loader: DataLoader
-    iterator: object
-    total_batches: int
-    tile_width: int
-    tile_height: int
-    stride_x: int
-    stride_y: int
+def _release_inference_memory(device: str) -> None:
+    gc.collect()
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
-def _loader_kwargs(num_workers: int, prefetch_factor: int, pin_memory: bool) -> dict:
-    kwargs = {
-        "num_workers": max(0, int(num_workers)),
-        "pin_memory": bool(pin_memory),
+def _collate_teacher_samples(samples: list[dict]) -> dict:
+    return {
+        "tile_id": [sample["tile_id"] for sample in samples],
+        "image": torch.stack([sample["image"] for sample in samples], dim=0),
     }
-    if kwargs["num_workers"] > 0:
-        kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
-        kwargs["persistent_workers"] = True
-    return kwargs
+
+
+def _batch_count(total: int, batch_size: int) -> int:
+    return (total + batch_size - 1) // batch_size
+
+
+def _thread_tile_reader(package_path: Path) -> TilePackageReader:
+    readers = getattr(_THREAD_LOCAL, "tile_readers", None)
+    if readers is None:
+        readers = {}
+        _THREAD_LOCAL.tile_readers = readers
+    key = str(package_path)
+    reader = readers.get(key)
+    if reader is None:
+        reader = TilePackageReader(package_path)
+        readers[key] = reader
+    return reader
+
+
+def _read_teacher_tile_sample(package_path: Path, tile_ids: list[str], transform, index: int) -> dict:
+    image = _thread_tile_reader(package_path).read_image_at(index)
+    return {
+        "tile_id": tile_ids[index],
+        "image": transform(image.convert("RGB")),
+    }
+
+
+def _read_teacher_tile_chunk(package_path: Path, tile_ids: list[str], transform, indices: list[int]) -> list[dict]:
+    reader = _thread_tile_reader(package_path)
+    samples = []
+    for index in indices:
+        image = reader.read_image_at(index)
+        samples.append(
+            {
+                "tile_id": tile_ids[index],
+                "image": transform(image.convert("RGB")),
+            }
+        )
+    return samples
+
+
+def _chunk_indices(indices: list[int], num_workers: int) -> list[list[int]]:
+    if not indices:
+        return []
+    chunk_size = max(1, min(64, (len(indices) + max(1, num_workers) - 1) // max(1, num_workers)))
+    return [indices[start : start + chunk_size] for start in range(0, len(indices), chunk_size)]
+
+
+def _build_teacher_batch(
+    executor: ThreadPoolExecutor,
+    package_path: Path,
+    tile_ids: list[str],
+    transform,
+    indices: list[int],
+    num_workers: int,
+) -> dict:
+    futures = [
+        executor.submit(_read_teacher_tile_chunk, package_path, tile_ids, transform, chunk)
+        for chunk in _chunk_indices(indices, num_workers)
+    ]
+    samples = []
+    for future in futures:
+        samples.extend(future.result())
+    return _collate_teacher_samples(samples)
+
+
+class BoundedTeacherBatchIterator:
+    def __init__(
+        self,
+        package_path: Path,
+        tile_ids: list[str],
+        transform,
+        *,
+        batch_size: int,
+        num_workers: int,
+        prefetch_factor: int,
+        initial_prefetch: int | None = None,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        self.package_path = package_path
+        self.tile_ids = tile_ids
+        self.transform = transform
+        self.batch_size = batch_size
+        self.num_workers = int(num_workers)
+        self.total = len(tile_ids)
+        self._next_start = 0
+        self._closed = False
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._max_prefetch = max(0, int(prefetch_factor))
+        self._capacity = self._max_prefetch if initial_prefetch is None else max(0, min(int(initial_prefetch), self._max_prefetch))
+        self._ready_batches: queue.Queue[dict | BaseException | None] | None = None
+        self._slots: threading.Semaphore | None = None
+
+        if self.total == 0 or self.num_workers <= 0 or self._max_prefetch <= 0:
+            return
+
+        self._ready_batches = queue.Queue(maxsize=self._max_prefetch)
+        self._slots = threading.Semaphore(self._capacity)
+        self._thread = threading.Thread(target=self._producer, name="teacher-batch-producer", daemon=True)
+        self._thread.start()
+
+    def promote(self) -> None:
+        if self._slots is None:
+            return
+        extra_slots = self._max_prefetch - self._capacity
+        if extra_slots <= 0:
+            return
+        for _ in range(extra_slots):
+            self._slots.release()
+        self._capacity = self._max_prefetch
+
+    def _producer(self) -> None:
+        assert self._ready_batches is not None
+        assert self._slots is not None
+        try:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                for start in range(0, self.total, self.batch_size):
+                    if self._stop_event.is_set():
+                        return
+                    self._slots.acquire()
+                    if self._stop_event.is_set():
+                        return
+                    end = min(start + self.batch_size, self.total)
+                    batch = _build_teacher_batch(
+                        executor,
+                        self.package_path,
+                        self.tile_ids,
+                        self.transform,
+                        list(range(start, end)),
+                        self.num_workers,
+                    )
+                    self._ready_batches.put(batch)
+            self._ready_batches.put(None)
+        except BaseException as exc:
+            self._ready_batches.put(exc)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> dict:
+        if self._closed or self.total == 0:
+            raise StopIteration
+
+        if self._ready_batches is None:
+            if self._next_start >= self.total:
+                self.close()
+                raise StopIteration
+            start = self._next_start
+            end = min(start + self.batch_size, self.total)
+            self._next_start = end
+            samples = [
+                _read_teacher_tile_sample(self.package_path, self.tile_ids, self.transform, index)
+                for index in range(start, end)
+            ]
+            return _collate_teacher_samples(samples)
+
+        item = self._ready_batches.get()
+        if item is None:
+            self.close()
+            raise StopIteration
+        if self._slots is not None:
+            self._slots.release()
+        if isinstance(item, BaseException):
+            self.close()
+            raise item
+        return item
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop_event.set()
+        if self._slots is not None:
+            self._slots.release()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+
+def _iter_bounded_teacher_batches(
+    package_path: Path,
+    tile_ids: list[str],
+    transform,
+    *,
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+    initial_prefetch: int | None = None,
+) -> BoundedTeacherBatchIterator:
+    return BoundedTeacherBatchIterator(
+        package_path,
+        tile_ids,
+        transform,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        initial_prefetch=initial_prefetch,
+    )
+
+
+def _read_dataset_sample(dataset: Dataset, index: int) -> dict:
+    return dataset[index]
+
+
+def _iter_bounded_dataset_batches(
+    dataset: Dataset,
+    *,
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+):
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    total = len(dataset)
+    if total == 0:
+        return
+    max_inflight = batch_size * (max(0, int(prefetch_factor)) + 1)
+    max_inflight = max(batch_size, max_inflight)
+
+    if num_workers <= 0:
+        for start in range(0, total, batch_size):
+            samples = [dataset[index] for index in range(start, min(start + batch_size, total))]
+            yield _collate_teacher_samples(samples)
+        return
+
+    with ThreadPoolExecutor(max_workers=int(num_workers)) as executor:
+        pending: dict[int, Future] = {}
+        next_submit = 0
+        next_yield = 0
+
+        def fill_window(current_batch_items: int = 0) -> None:
+            nonlocal next_submit
+            while next_submit < total and len(pending) + current_batch_items < max_inflight:
+                pending[next_submit] = executor.submit(_read_dataset_sample, dataset, next_submit)
+                next_submit += 1
+
+        fill_window()
+        while next_yield < total:
+            end = min(next_yield + batch_size, total)
+            samples = []
+            for index in range(next_yield, end):
+                future = pending.pop(index)
+                samples.append(future.result())
+                fill_window(len(samples))
+            next_yield = end
+            yield _collate_teacher_samples(samples)
 
 
 def _resolve_precision(precision: str, device: str) -> str:
@@ -345,48 +606,6 @@ def _tile_size(package_path: str | Path) -> tuple[int, int]:
     return width, height
 
 
-def _prepare_teacher_package(
-    package_path: str | Path,
-    tile_size: tuple[int, int],
-    data_config: dict,
-    batch_size: int,
-    device: str,
-    num_workers: int,
-    prefetch_factor: int,
-) -> PreparedTeacherPackage:
-    package_path = Path(package_path)
-    metadata = read_package_metadata(package_path)
-    if metadata.get("payload_type") != "image_tiles":
-        raise ValueError(f"not an image tile package: {package_path}")
-    tile_width, tile_height = tile_size
-    records = read_package_manifest(package_path)
-    package_data_config = dict(data_config)
-    package_data_config["input_size"] = (3, tile_height, tile_width)
-    transform = create_transform(**package_data_config, is_training=False)
-    dataset = PackageTeacherTileDataset(package_path, records, transform)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        **_loader_kwargs(
-            num_workers=num_workers,
-            prefetch_factor=prefetch_factor,
-            pin_memory=device.startswith("cuda"),
-        ),
-    )
-    return PreparedTeacherPackage(
-        package_path=package_path,
-        records=records,
-        loader=loader,
-        iterator=iter(loader),
-        total_batches=len(loader),
-        tile_width=int(metadata["tile_width"]),
-        tile_height=int(metadata["tile_height"]),
-        stride_x=int(metadata["stride_x"]),
-        stride_y=int(metadata["stride_y"]),
-    )
-
-
 def _validate_common_tile_size(package_paths: list[Path]) -> tuple[int, int]:
     sizes = {path: _tile_size(path) for path in package_paths}
     unique = set(sizes.values())
@@ -464,6 +683,61 @@ def _write_progress(progress_path: Path, rows: list[dict], total: int, started: 
     progress_path.with_suffix(".json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
 
 
+@dataclass
+class TeacherPackageWork:
+    package_path: Path
+    metadata: dict
+    records: list[TileRecord]
+    tile_ids: list[str]
+    batches: BoundedTeacherBatchIterator
+
+    def promote(self) -> None:
+        self.batches.promote()
+
+    def close(self) -> None:
+        self.batches.close()
+
+
+def _prepare_teacher_package_work(
+    model: torch.nn.Module,
+    package_path: str | Path,
+    tile_size: tuple[int, int] | None,
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+    data_config: dict | None,
+    initial_prefetch: int | None = None,
+) -> TeacherPackageWork:
+    package_path = Path(package_path)
+    metadata = read_package_metadata(package_path)
+    if metadata.get("payload_type") != "image_tiles":
+        raise ValueError(f"not an image tile package: {package_path}")
+    if tile_size is None:
+        tile_size = (int(metadata["tile_width"]), int(metadata["tile_height"]))
+    tile_width, tile_height = tile_size
+    resolved_data_config = dict(data_config) if data_config is not None else resolve_model_data_config(model.model)
+    resolved_data_config["input_size"] = (3, tile_height, tile_width)
+    transform = create_transform(**resolved_data_config, is_training=False)
+    records = read_package_manifest(package_path)
+    tile_ids = [record.tile_id for record in records]
+    batches = _iter_bounded_teacher_batches(
+        package_path,
+        tile_ids,
+        transform,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        initial_prefetch=initial_prefetch,
+    )
+    return TeacherPackageWork(
+        package_path=package_path,
+        metadata=metadata,
+        records=records,
+        tile_ids=tile_ids,
+        batches=batches,
+    )
+
+
 @torch.inference_mode()
 def cache_teacher_features_from_records(
     model: torch.nn.Module,
@@ -481,25 +755,28 @@ def cache_teacher_features_from_records(
     feature_dtype: str = "float32",
 ) -> None:
     model = model.to(device).eval()
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        **_loader_kwargs(
-            num_workers=num_workers,
-            prefetch_factor=prefetch_factor,
-            pin_memory=device.startswith("cuda"),
-        ),
-    )
 
     def features():
-        for batch in tqdm(loader, total=len(loader), desc="teacher batches"):
-            images = batch["image"].to(device, non_blocking=device.startswith("cuda"))
-            with _autocast_context(device, precision):
-                batch_features = model(images).detach().to(dtype=_torch_feature_dtype(feature_dtype))
-                batch_features = batch_features.cpu().numpy()
-            for feature in batch_features:
-                yield feature
+        try:
+            batches = _iter_bounded_dataset_batches(
+                dataset,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor,
+            )
+            for batch in tqdm(batches, total=_batch_count(len(dataset), batch_size), desc="teacher batches"):
+                images = batch["image"].to(device, non_blocking=device.startswith("cuda"))
+                with _autocast_context(device, precision):
+                    batch_features = model(images).detach().to(dtype=_torch_feature_dtype(feature_dtype))
+                    batch_features = batch_features.cpu().numpy()
+                for feature in batch_features:
+                    yield feature
+                del batch, images, batch_features
+        finally:
+            close = getattr(dataset, "close", None)
+            if close is not None:
+                close()
+            _release_inference_memory(device)
 
     build_teacher_feature_package(
         records,
@@ -526,67 +803,44 @@ def cache_teacher_features_from_package(
     precision: str = "fp32",
     feature_dtype: str = "float32",
     data_config: dict | None = None,
-) -> None:
-    if tile_size is None:
-        tile_size = _tile_size(package_path)
-    tile_width, tile_height = tile_size
-    data_config = dict(data_config) if data_config is not None else resolve_model_data_config(model.model)
-    data_config["input_size"] = (3, tile_height, tile_width)
-    transform = create_transform(**data_config, is_training=False)
-    records = read_package_manifest(package_path)
-    dataset = PackageTeacherTileDataset(package_path, records, transform)
-    model = model.to(device).eval()
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        **_loader_kwargs(
-            num_workers=num_workers,
-            prefetch_factor=prefetch_factor,
-            pin_memory=device.startswith("cuda"),
-        ),
-    )
-
-    def features():
-        for batch in tqdm(loader, total=len(loader), desc="teacher batches"):
-            images = batch["image"].to(device, non_blocking=device.startswith("cuda"))
-            with _autocast_context(device, precision):
-                batch_features = model(images).detach().to(dtype=_torch_feature_dtype(feature_dtype))
-                batch_features = batch_features.cpu().numpy()
-            for feature in batch_features:
-                yield feature
-
-    build_teacher_feature_package_from_tile_package(
-        package_path,
-        features(),
-        output_path,
-        teacher_name=teacher_name,
-        dtype=feature_dtype,
-        overwrite=overwrite,
-    )
-
-
-@torch.inference_mode()
-def cache_teacher_features_from_prepared_package(
-    model: torch.nn.Module,
-    prepared: PreparedTeacherPackage,
-    output_path: str | Path,
-    device: str,
-    teacher_name: str,
-    overwrite: bool = False,
-    precision: str = "fp32",
-    feature_dtype: str = "float32",
+    work: TeacherPackageWork | None = None,
 ) -> None:
     model = model.to(device).eval()
+    prepared = work
+    if prepared is None:
+        prepared = _prepare_teacher_package_work(
+            model,
+            package_path,
+            tile_size,
+            batch_size,
+            num_workers,
+            prefetch_factor,
+            data_config,
+        )
+    else:
+        prepared.promote()
+    metadata = prepared.metadata
+    tile_width = int(metadata["tile_width"])
+    tile_height = int(metadata["tile_height"])
 
     def features():
-        for batch in tqdm(prepared.iterator, total=prepared.total_batches, desc="teacher batches"):
-            images = batch["image"].to(device, non_blocking=device.startswith("cuda"))
-            with _autocast_context(device, precision):
-                batch_features = model(images).detach().to(dtype=_torch_feature_dtype(feature_dtype))
-                batch_features = batch_features.cpu().numpy()
-            for feature in batch_features:
-                yield feature
+        try:
+            for batch in tqdm(
+                prepared.batches,
+                total=_batch_count(len(prepared.tile_ids), batch_size),
+                desc="teacher batches",
+            ):
+                images = batch["image"].to(device, non_blocking=device.startswith("cuda"))
+                with _autocast_context(device, precision):
+                    batch_features_tensor = model(images)
+                batch_features_tensor = batch_features_tensor.detach().to(dtype=_torch_feature_dtype(feature_dtype))
+                batch_features = batch_features_tensor.cpu().numpy()
+                for feature in batch_features:
+                    yield feature
+                del batch, images, batch_features, batch_features_tensor
+        finally:
+            prepared.close()
+            _release_inference_memory(device)
 
     build_teacher_feature_package(
         prepared.records,
@@ -594,10 +848,10 @@ def cache_teacher_features_from_prepared_package(
         output_path,
         teacher_name=teacher_name,
         dtype=feature_dtype,
-        tile_width=prepared.tile_width,
-        tile_height=prepared.tile_height,
-        stride_x=prepared.stride_x,
-        stride_y=prepared.stride_y,
+        tile_width=tile_width,
+        tile_height=tile_height,
+        stride_x=int(metadata["stride_x"]),
+        stride_y=int(metadata["stride_y"]),
         overwrite=overwrite,
     )
 
@@ -619,7 +873,6 @@ def cache_teacher_features_from_packages(
     compile_model: bool = False,
     compile_mode: str = "reduce-overhead",
     validate_output: bool = False,
-    prefetch_packages: bool = True,
 ) -> None:
     tile_size = _validate_common_tile_size(package_paths)
     output_path = Path(output)
@@ -653,7 +906,6 @@ def cache_teacher_features_from_packages(
         "compile_mode": compile_mode if compile_model else "",
         "overwrite": overwrite,
         "validate_output": validate_output,
-        "prefetch_packages": prefetch_packages,
         "continue_on_error": continue_on_error,
         "progress_manifest": str(progress_path),
     }
@@ -673,35 +925,34 @@ def cache_teacher_features_from_packages(
         output_path if output_is_file else _default_output_path(package_path, output_path, teacher_name)
         for package_path in package_paths
     ]
-    prepare_executor = ThreadPoolExecutor(max_workers=1) if prefetch_packages and len(package_paths) > 1 else None
-    prepare_future: Future | None = None
-    prepare_future_path: Path | None = None
+    warmed_index: int | None = None
+    warmed_work: TeacherPackageWork | None = None
 
-    def submit_prepare(package_path: Path) -> Future:
-        print(f"feature_package_prefetch_start tile_package={package_path}", flush=True)
-        assert prepare_executor is not None
-        return prepare_executor.submit(
-            _prepare_teacher_package,
-            package_path,
+    def next_build_index(start: int) -> int | None:
+        for candidate_index in range(start, len(package_paths)):
+            candidate_output = package_outputs[candidate_index]
+            if overwrite or not candidate_output.exists():
+                return candidate_index
+        return None
+
+    def warm_next(start: int) -> None:
+        nonlocal warmed_index, warmed_work
+        if warmed_work is not None:
+            return
+        candidate_index = next_build_index(start)
+        if candidate_index is None:
+            return
+        warmed_index = candidate_index
+        warmed_work = _prepare_teacher_package_work(
+            get_runtime_model(),
+            package_paths[candidate_index],
             tile_size,
-            data_config or {},
             batch_size,
-            device,
             num_workers,
             prefetch_factor,
+            data_config,
+            initial_prefetch=1,
         )
-
-    def schedule_next_prepare(current_index: int) -> None:
-        nonlocal prepare_future, prepare_future_path
-        if prepare_executor is None or prepare_future is not None:
-            return
-        for next_index in range(current_index + 1, len(package_paths)):
-            next_output = package_outputs[next_index]
-            if next_output.exists() and not overwrite:
-                continue
-            prepare_future_path = package_paths[next_index]
-            prepare_future = submit_prepare(prepare_future_path)
-            return
 
     try:
         for index, package_path in enumerate(package_paths):
@@ -715,10 +966,6 @@ def cache_teacher_features_from_packages(
             item_started = time.time()
             try:
                 if package_output.exists() and not overwrite:
-                    if prepare_future is not None and prepare_future_path == package_path:
-                        prepare_future.cancel()
-                        prepare_future = None
-                        prepare_future_path = None
                     metadata = _validate_feature_output(package_output, expected_teacher=teacher_name, full=validate_output)
                     row.update(metadata)
                     row["status"] = "skipped"
@@ -726,33 +973,38 @@ def cache_teacher_features_from_packages(
                     rows.append(row)
                     _write_progress(progress_path, rows, len(package_paths), started)
                     print(f"feature_package_skipped existing_valid tile_package={package_path} output={package_output}", flush=True)
-                    schedule_next_prepare(index)
                     continue
-                if prepare_future is not None and prepare_future_path == package_path:
-                    prepared = prepare_future.result()
-                    prepare_future = None
-                    prepare_future_path = None
-                    print(f"feature_package_prefetch_ready tile_package={package_path}", flush=True)
+                if warmed_index == index and warmed_work is not None:
+                    work = warmed_work
+                    warmed_index = None
+                    warmed_work = None
+                    work.promote()
                 else:
-                    prepared = _prepare_teacher_package(
+                    work = _prepare_teacher_package_work(
+                        get_runtime_model(),
                         package_path,
                         tile_size,
-                        data_config or {},
                         batch_size,
-                        device,
                         num_workers,
                         prefetch_factor,
+                        data_config,
                     )
-                schedule_next_prepare(index)
-                cache_teacher_features_from_prepared_package(
+                warm_next(index + 1)
+                cache_teacher_features_from_package(
                     model=get_runtime_model(),
-                    prepared=prepared,
+                    package_path=package_path,
                     output_path=package_output,
+                    tile_size=tile_size,
+                    batch_size=batch_size,
                     device=device,
                     teacher_name=teacher_name,
+                    num_workers=num_workers,
+                    prefetch_factor=prefetch_factor,
                     overwrite=overwrite,
                     precision=precision,
                     feature_dtype=resolved_feature_dtype,
+                    data_config=data_config,
+                    work=work,
                 )
                 metadata = _validate_feature_output(package_output, expected_teacher=teacher_name, full=validate_output)
                 row.update(metadata)
@@ -771,8 +1023,8 @@ def cache_teacher_features_from_packages(
                     raise
                 print(f"feature_package_failed tile_package={package_path} output={package_output} error={exc}", flush=True)
     finally:
-        if prepare_executor is not None:
-            prepare_executor.shutdown(wait=False, cancel_futures=True)
+        if warmed_work is not None:
+            warmed_work.close()
     print(f"teacher_cache_progress manifest={progress_path} summary={progress_path.with_suffix('.json')}", flush=True)
 
 
@@ -784,23 +1036,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--input", help="Input image-tile .iac file or directory recursively scanned for image-tile .iac packages.")
-    parser.add_argument("--tile-package", dest="input", help=argparse.SUPPRESS)
     parser.add_argument("--output", required=True, help="Output .features.iac file, or output directory for multiple input packages.")
     parser.add_argument(
         "--teacher",
         help="Teacher preset, timm model name, hf_hub:* model name, or local model directory.",
     )
-    parser.add_argument("--model", dest="teacher", help=argparse.SUPPRESS)
-    parser.add_argument("--model-name", dest="teacher", help=argparse.SUPPRESS)
     parser.add_argument(
         "--teacher-name",
         default="",
         help="Teacher name recorded in output metadata and filenames. Defaults to the preset teacher name.",
     )
-    parser.add_argument("--output-teacher-name", dest="teacher_name", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers for --input reads.")
-    parser.add_argument("--prefetch-factor", type=int, default=2, help="Batches prefetched per worker for --input reads.")
+    parser.add_argument("--num-workers", type=int, default=8, help="Tile read/decode worker threads for --input reads.")
+    parser.add_argument("--prefetch-factor", type=int, default=2, help="Global prefetched batches beyond the current batch.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--precision",
@@ -843,12 +1091,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--validate-output",
         action="store_true",
         help="Fully validate generated or skipped feature IAC packages by checking fixed-length feature records.",
-    )
-    parser.add_argument(
-        "--prefetch-packages",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Prepare the next input IAC package while the current package is running teacher inference.",
     )
     return parser
 
@@ -900,7 +1142,6 @@ def main() -> None:
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
         validate_output=args.validate_output,
-        prefetch_packages=args.prefetch_packages,
     )
 
 

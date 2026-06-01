@@ -15,9 +15,6 @@ EXCLUDED_TEACHER_NAMES = {
     "h1-family",
     "h1_family",
     "h1family",
-    "h-optimus-1",
-    "h_optimus_1",
-    "hoptimus1",
 }
 
 
@@ -38,7 +35,7 @@ def validate_teacher_names(names: list[str]) -> None:
         raise ValueError(f"duplicate teacher names: {duplicates}")
     excluded = [name for name in names if _normalize_teacher_name(name) in EXCLUDED_TEACHER_NAMES]
     if excluded:
-        raise ValueError(f"excluded teacher configured after H1 removal: {excluded}")
+        raise ValueError(f"excluded unsupported teacher name configured: {excluded}")
 
 
 def _unexpected_keys(payload: dict | None, expected: set[str], label: str) -> None:

@@ -1,7 +1,9 @@
 __pycache__/
 *.pyc
 *.egg-info/
+*.local.sh
 outputs/
+annotations/
 smoke_data/
 weights/
 data/

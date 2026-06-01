@@ -312,6 +312,63 @@ def build_pack_data_segment(
             tmp_path.unlink()
 
 
+def build_pack_data_segment_from_file(
+    output_path: str | Path,
+    header_json: dict,
+    slide_table: pa.Table,
+    record_table: pa.Table,
+    data_path: str | Path,
+    *,
+    data_length: int,
+    overwrite: bool = False,
+) -> None:
+    """Assemble an IatroCache pack while copying a caller-managed data file."""
+    output_path = Path(output_path)
+    data_path = Path(data_path)
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"pack already exists: {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    slide_bytes = _arrow_to_bytes(slide_table)
+    record_bytes = _arrow_to_bytes(record_table)
+    data_offset = HEADER_BYTES + len(slide_bytes) + len(record_bytes)
+    full_header = {
+        **header_json,
+        "format": "IatroCache",
+        "version": FORMAT_VERSION,
+        "header_bytes": HEADER_BYTES,
+        "slide_table_offset": HEADER_BYTES,
+        "slide_table_length": len(slide_bytes),
+        "record_table_offset": HEADER_BYTES + len(slide_bytes),
+        "record_table_length": len(record_bytes),
+        "data_offset": data_offset,
+        "data_length": int(data_length),
+        "num_slides": len(slide_table),
+        "num_records": len(record_table),
+    }
+    fixed = _build_fixed_header(
+        json.dumps(full_header, indent=2, sort_keys=True).encode("utf-8")
+    )
+
+    with NamedTemporaryFile(dir=output_path.parent, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        copied = 0
+        with tmp_path.open("wb") as out, data_path.open("rb") as data_in:
+            out.write(fixed)
+            out.write(slide_bytes)
+            out.write(record_bytes)
+            while chunk := data_in.read(1024 * 1024 * 16):
+                copied += len(chunk)
+                out.write(chunk)
+        if copied != int(data_length):
+            raise ValueError(f"data_length mismatch: expected={data_length} copied={copied}")
+        tmp_path.replace(output_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
 # ---- public API: read --------------------------------------------------------
 
 def read_header(package_path: str | Path) -> dict:
@@ -380,12 +437,19 @@ class PackReader:
         self._slide_table: pa.Table | None = None
         self._record_table: pa.Table | None = None
 
-    def _ensure_loaded(self) -> None:
+    def _ensure_header(self) -> None:
         if self._header is not None:
             return
         self._file = self.package_path.open("rb")
         self._header = _read_fixed_header(self._file)
         _validate_layout(self._header, _file_size(self._file))
+
+    def _ensure_loaded(self) -> None:
+        if self._slide_table is not None and self._record_table is not None:
+            return
+        self._ensure_header()
+        assert self._file is not None
+        assert self._header is not None
         self._slide_table = _read_arrow_table(
             self._file, self._header["slide_table_offset"], self._header["slide_table_length"]
         )
@@ -401,7 +465,7 @@ class PackReader:
 
     @property
     def header(self) -> dict:
-        self._ensure_loaded()
+        self._ensure_header()
         assert self._header is not None
         return self._header
 
@@ -433,7 +497,7 @@ class PackReader:
         return payload
 
     def read_data_span(self, offset: int, length: int) -> bytes:
-        self._ensure_loaded()
+        self._ensure_header()
         assert self._file is not None
         assert self._header is not None
         if offset < 0 or length < 0 or offset + length > int(self._header["data_length"]):

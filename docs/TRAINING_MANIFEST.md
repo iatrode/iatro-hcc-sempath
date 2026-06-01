@@ -77,6 +77,7 @@ hcc-sempath build-train-manifest \
   --val-frac 0.15 \
   --split-key patient_id \
   --teacher gigapath \
+  --teacher h_optimus_1 \
   --teacher uni2_h \
   --teacher virchow2 \
   --feature-root /data/hcc_features \
@@ -94,6 +95,9 @@ package is missing.
 - Keep private paths and patient-identifiable manifests outside public git.
 - Use the generated `summary` to confirm package counts and tile counts before
   launching training.
+- Large runs should use `data.dynamic_package_sampling: true`; every package in
+  the configured train/val split participates, while batch construction mixes
+  samples across packages from an in-memory shuffle buffer.
 - For multi-million tile training, keep frequent validation bounded with
   `train.max_val_batches` and `train.max_eval_batches`; reserve full validation
   for selected checkpoints.

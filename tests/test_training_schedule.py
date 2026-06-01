@@ -29,44 +29,46 @@ def test_scheduled_loss_config_warms_prototype_terms() -> None:
     assert epoch_4["prototype_filter_weight"] == pytest.approx(0.8)
 
 
-def test_teacher_names_reject_removed_h1_teacher() -> None:
+def test_teacher_names_allows_h_optimus_1_teacher() -> None:
     cfg = {"data": {"teachers": ["gigapath", "h_optimus_1"]}, "model": {"teacher_dims": {"gigapath": 1536, "h_optimus_1": 1536}}}
 
-    with pytest.raises(ValueError, match="excluded teacher"):
-        teacher_names(cfg)
+    assert teacher_names(cfg) == ["gigapath", "h_optimus_1"]
 
 
 def test_training_config_rejects_stale_teacher_entries() -> None:
     cfg = {
         "data": {
-            "teachers": ["gigapath", "uni2_h", "virchow2"],
+            "teachers": ["gigapath", "h_optimus_1", "uni2_h", "virchow2"],
             "prototype_paths": {
                 "gigapath": "g.pt",
+                "h_optimus_1": "h.pt",
                 "uni2_h": "u.pt",
                 "virchow2": "v.pt",
-                "h_optimus_1": "removed.pt",
+                "stale_teacher": "removed.pt",
             },
         },
         "model": {
             "teacher_dims": {
                 "gigapath": 1536,
+                "h_optimus_1": 1536,
                 "uni2_h": 1536,
                 "virchow2": 2560,
-                "h_optimus_1": 1536,
+                "stale_teacher": 1536,
             }
         },
         "loss": {
             "teacher_weights": {
                 "gigapath": 1.0,
+                "h_optimus_1": 1.0,
                 "uni2_h": 1.0,
                 "virchow2": 1.0,
-                "h_optimus_1": 1.0,
+                "stale_teacher": 1.0,
             },
             "semantic_weight": 0.25,
             "prototype_filter_weight": 0.5,
         },
     }
-    names = ["gigapath", "uni2_h", "virchow2"]
+    names = ["gigapath", "h_optimus_1", "uni2_h", "virchow2"]
 
     with pytest.raises(ValueError, match="model.teacher_dims contains unknown teacher entries"):
         validate_training_config(cfg, names)
