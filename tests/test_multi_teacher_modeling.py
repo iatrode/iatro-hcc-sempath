@@ -56,13 +56,31 @@ def test_multi_teacher_distillation_loss_aggregates_named_heads() -> None:
         relation_weight=0.25,
         semantic_weight=0.25,
         semantic_temperature=1.0,
-        prototype_filter_weight=1.0,
-        prototype_filter_alpha_min=0.2,
     )
 
     assert loss.ndim == 0
     assert set(parts) == {"feature", "relation", "semantic", "reliability"}
-    assert 0.2 <= float(parts["reliability"]) <= 1.0
+    assert float(parts["reliability"]) == 1.0
     loss.backward()
     assert student_by_teacher["teacher_a"].grad is not None
     assert student_by_teacher["teacher_b"].grad is not None
+
+
+def test_multi_teacher_distillation_loss_accepts_per_sample_teacher_weights() -> None:
+    student_by_teacher = {"teacher": torch.tensor([[1.0, 0.0], [0.0, 1.0]], requires_grad=True)}
+    teacher_by_name = {"teacher": torch.tensor([[1.0, 0.0], [1.0, 0.0]])}
+
+    loss, parts = multi_teacher_distillation_loss(
+        student_by_teacher=student_by_teacher,
+        teacher_by_name=teacher_by_name,
+        prototypes_by_teacher=None,
+        relation_weight=0.0,
+        semantic_weight=0.0,
+        semantic_temperature=1.0,
+        teacher_sample_weights={"teacher": torch.tensor([1.0, 0.25])},
+    )
+
+    assert abs(parts["feature"].item() - 0.125) < 1e-6
+    assert abs(parts["reliability"].item() - 0.625) < 1e-6
+    loss.backward()
+    assert student_by_teacher["teacher"].grad is not None

@@ -182,6 +182,8 @@ Implemented training-system foundations:
 - 已支持直接作用于 `embedding_norm` 的 prototype 监督，并按运行时 prototype package 解析 L1/L2 标签；
 - `z_hcc` prototype metrics, including L1 accuracy, L2 macro F1/AUC, prototype top-k precision, and neighborhood purity;
 - 已支持 `z_hcc` prototype 指标，包括 L1 accuracy、L2 macro F1/AUC、prototype top-k precision 与 neighborhood purity；
+- prototype-adjudicated multi-teacher reliability weights with consensus, expert-anchor, and `z_hcc` response diagnostics;
+- 已支持包含跨 teacher 共识、专家 anchor 与 `z_hcc` response 诊断的原型裁决多 teacher 可靠性权重；
 - train-only tile augmentation, step-level warmup plus cosine LR decay, and checkpoint resume for scheduler, scaler, best metrics, global step, and RNG state;
 - 已支持 train-only tile augmentation、step-level warmup + cosine LR decay，以及 scheduler、scaler、best metrics、global step 和 RNG state 的 checkpoint resume；
 - CUDA mixed precision training with autocast and gradient scaling;

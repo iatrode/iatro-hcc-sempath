@@ -14,15 +14,17 @@ model:
   teacher_dim: 256
   pretrained: false
 
-semantic:
 loss:
+  feature_loss_type: cosine
   relation_weight: 0.25
-  semantic_weight: 0.25
-  semantic_warmup_epochs: 2
+  semantic_weight: 0.0
+  semantic_warmup_epochs: 0
   semantic_temperature: 1.0
-  prototype_filter_weight: 0.5
-  prototype_filter_warmup_epochs: 2
+  prototype_filter_weight: 0.0
+  prototype_filter_warmup_epochs: 0
   prototype_filter_alpha_min: 0.25
+  zhcc_proto_weight: 0.0
+  zhcc_level2_weight: 0.5
 
 train:
   batch_size: 2
