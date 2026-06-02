@@ -82,6 +82,35 @@ def test_review_state_accept_and_adjust_write_review_fields(tmp_path: Path) -> N
     assert (tmp_path / "reviewed.review.csv").exists()
 
 
+def test_review_state_resumes_existing_output_and_updates_candidate_cache(tmp_path: Path) -> None:
+    module = _load_module()
+    annotation_json = tmp_path / "annotations.json"
+    output_json = tmp_path / "reviewed.json"
+    source_payload = {
+        "annotations": {
+            "done": {"tile_id": "done", "l1": "HCC-tumor"},
+            "todo": {"tile_id": "todo", "l1": "Fibrous-stromal"},
+        }
+    }
+    resumed_payload = {
+        "annotations": {
+            "done": {"tile_id": "done", "l1": "HCC-tumor", "reviewed": True},
+            "todo": {"tile_id": "todo", "l1": "Fibrous-stromal"},
+        }
+    }
+    annotation_json.write_text(json.dumps(source_payload), encoding="utf-8")
+    output_json.write_text(json.dumps(resumed_payload), encoding="utf-8")
+    state = module.ReviewState(annotation_json, output_json, mode="l1", binary_a="HCC-tumor", binary_b="Fibrous-stromal")
+
+    assert [candidate.key for candidate in state.candidates()] == ["todo"]
+
+    state.review("todo", "reject")
+    assert state.candidates() == []
+
+    repeated = state.review("todo", "reject")
+    assert repeated["review_decision"] == "reject"
+
+
 def test_binary_mode_filters_to_requested_classes() -> None:
     module = _load_module()
     payload = {

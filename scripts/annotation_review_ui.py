@@ -276,13 +276,15 @@ class ReviewState:
     ) -> None:
         self.annotation_json = annotation_json
         self.output_json = output_json or annotation_json
-        self.payload = _load_payload(annotation_json)
+        state_path = self.output_json if self.output_json.exists() else annotation_json
+        self.payload = _load_payload(state_path)
         self.mode = mode
         self.binary_a = binary_a
         self.binary_b = binary_b
         self._viewers: dict[str, IacViewerData] = {}
         self.unstable_l1 = unstable_l1 or DEFAULT_UNSTABLE_L1
         self.scorer: FeatureL1Scorer | None = None
+        self._candidate_cache: list[ReviewCandidate] | None = None
         teachers = teachers or []
         teacher_paths = _teacher_paths_from_arg(teacher_feature_packages)
         if teacher_feature_root and teachers:
@@ -296,14 +298,20 @@ class ReviewState:
         return self.output_json.with_suffix(".review.csv")
 
     def candidates(self) -> list[ReviewCandidate]:
-        return build_candidates(
-            self.payload,
-            mode=self.mode,
-            binary_a=self.binary_a,
-            binary_b=self.binary_b,
-            scorer=self.scorer,
-            unstable_l1=self.unstable_l1,
-        )
+        if self._candidate_cache is None:
+            self._candidate_cache = build_candidates(
+                self.payload,
+                mode=self.mode,
+                binary_a=self.binary_a,
+                binary_b=self.binary_b,
+                scorer=self.scorer,
+                unstable_l1=self.unstable_l1,
+            )
+        return list(self._candidate_cache)
+
+    def candidate(self, key: str) -> ReviewCandidate:
+        candidates = {candidate.key: candidate for candidate in self.candidates()}
+        return candidates[key]
 
     def candidate_payload(self) -> dict:
         candidates = self.candidates()
@@ -332,6 +340,8 @@ class ReviewState:
 
     def review(self, key: str, decision: str, new_l1: str = "") -> dict:
         item = self.item(key)
+        if bool(item.get("reviewed")):
+            return item
         current = str(item.get("l1") or "")
         suggested = _suggest_l1(item, self.mode, self.binary_a, self.binary_b, self.scorer)[0]
         if decision == "accept":
@@ -346,6 +356,8 @@ class ReviewState:
         item["review_decision"] = decision
         item["review_previous_l1"] = current
         item["review_suggested_l1"] = suggested
+        if self._candidate_cache is not None:
+            self._candidate_cache = [candidate for candidate in self._candidate_cache if candidate.key != key]
         self.flush()
         return item
 
@@ -375,24 +387,102 @@ HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Annotation Review</title>
 <style>
-body{margin:0;font:14px system-ui,-apple-system,Segoe UI,sans-serif;background:#f6f7f8;color:#202124}
-.layout{display:grid;grid-template-columns:320px 1fr 300px;height:100vh}.side{background:#fff;border-right:1px solid #d8dadd;overflow:auto;padding:12px}.right{border-left:1px solid #d8dadd;border-right:0}.main{padding:16px;overflow:auto}
-.row{padding:8px;border-bottom:1px solid #e5e7eb;cursor:pointer}.row.active{background:#eaf2ff}.muted{color:#6b7280;font-size:12px}.tile{max-width:680px;width:100%;image-rendering:auto;background:#fff;border:1px solid #c7cbd1}
-button{padding:8px 10px;margin:4px;border:1px solid #c7cbd1;background:#fff;cursor:pointer}button.primary{background:#1a73e8;color:white;border-color:#1a73e8}
-select{width:100%;padding:8px;margin:8px 0}
-</style></head><body><div class="layout"><div class="side"><h3>Review queue</h3><div id="count" class="muted"></div><div id="list"></div></div>
-<div class="main"><h2 id="title">No tile selected</h2><div id="meta" class="muted"></div><p><img id="tile" class="tile"></p></div>
-<div class="side right"><h3>Decision</h3><div id="decision"></div><select id="newL1"></select><button class="primary" onclick="act('adjust')">Adjust</button><pre id="status"></pre></div></div>
+:root{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--line:#d7dce2;--text:#1f2933;--muted:#687381;--blue:#1a73e8;--blue-soft:#e8f0fe;--danger:#b42318}
+*{box-sizing:border-box}body{margin:0;font:14px system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--text);height:100svh;overflow:hidden}
+button,select{font:inherit}button{min-height:40px;border:1px solid var(--line);background:var(--panel);color:var(--text);cursor:pointer}button.primary{background:var(--blue);border-color:var(--blue);color:#fff}button.danger{color:var(--danger)}button.ghost{background:transparent}button:disabled{opacity:.55;cursor:default}
+.layout{display:grid;grid-template-columns:320px minmax(0,1fr);height:100svh}.layout.queue-collapsed{grid-template-columns:0 minmax(0,1fr)}
+.queue{background:var(--panel);border-right:1px solid var(--line);overflow:hidden;display:flex;flex-direction:column}.queueHead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px;border-bottom:1px solid var(--line)}.queueTitle{font-weight:650}.queueBody{overflow:auto}.layout.queue-collapsed .queue{border-right:0}.layout.queue-collapsed .queue>*{display:none}
+.workspace{min-width:0;display:grid;grid-template-rows:auto minmax(0,1fr) auto;height:100svh}.topbar{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--panel)}.topbarTitle{min-width:0;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.muted{color:var(--muted);font-size:12px}
+.viewer{min-height:0;overflow:auto;display:flex;align-items:center;justify-content:center;padding:14px}.tileFrame{width:min(760px,100%);display:flex;align-items:center;justify-content:center}.tile{display:block;max-width:100%;max-height:calc(100svh - 250px);background:#fff;border:1px solid #b9c0c8;object-fit:contain}
+.controls{background:var(--panel);border-top:1px solid var(--line);padding:12px}.controlGrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,300px);gap:12px;align-items:end}.labels{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}.chip{border:1px solid var(--line);border-radius:999px;padding:5px 8px;background:#fff}.chip.suggested{background:var(--blue-soft);border-color:#b8cdf8;color:#174ea6}.scores{margin-top:8px;color:var(--muted);font-size:12px;line-height:1.35}
+.decisionPanel{display:grid;grid-template-columns:1fr;gap:8px}.pairButtons{display:grid;grid-template-columns:1fr 1fr;gap:8px}.choiceRow{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.selectRow{display:grid;grid-template-columns:1fr;gap:4px}.selectLabel{font-size:12px;color:var(--muted)}select{min-height:40px;border:1px solid var(--line);background:#fff;padding:0 10px;width:100%}.status{min-height:18px;color:var(--muted);font-size:12px;white-space:pre-wrap}
+.row{padding:10px 12px;border-bottom:1px solid #edf0f3;cursor:pointer}.row.active{background:var(--blue-soft)}.rowTitle{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.rowMeta{margin-top:3px;color:var(--muted);font-size:12px;line-height:1.25}.empty{padding:18px;color:var(--muted)}.hidden{display:none!important}
+@media(max-width:760px){
+  body{overflow:auto}.layout,.layout.queue-collapsed{display:block;height:auto;min-height:100svh}.queue{position:fixed;inset:0 0 auto 0;z-index:4;max-height:45svh;border-right:0;border-bottom:1px solid var(--line);box-shadow:0 8px 24px rgba(15,23,42,.16)}.layout.queue-collapsed .queue{display:none}.layout.queue-collapsed .queue>*{display:none}
+  .workspace{height:100svh;grid-template-rows:auto minmax(0,1fr) auto}.topbar{position:sticky;top:0;z-index:3}.viewer{align-items:center;padding:8px}.tile{max-height:calc(100svh - 310px)}
+  .controls{position:sticky;bottom:0;z-index:2;padding:10px}.controlGrid{grid-template-columns:1fr;gap:10px}.scores{max-height:42px;overflow:auto}.pairButtons{grid-template-columns:1fr 1fr}.choiceRow{grid-template-columns:1fr}
+}
+</style></head><body><div id="layout" class="layout queue-collapsed">
+<aside id="queuePanel" class="queue"><div class="queueHead"><div><div class="queueTitle">Review queue</div><div id="count" class="muted"></div></div><button id="hideQueue" class="ghost" type="button">Hide</button></div><div id="list" class="queueBody"></div></aside>
+<main class="workspace"><div class="topbar"><button id="toggleQueue" type="button">Tiles</button><div class="topbarTitle" id="title">No tile selected</div><div id="progress" class="muted"></div></div>
+<section class="viewer"><div class="tileFrame"><img id="tile" class="tile" alt=""></div></section>
+<section class="controls"><div class="controlGrid"><div><div class="labels"><span class="chip" id="currentChip">Current: -</span><span class="chip suggested" id="suggestedChip">Suggested: -</span></div><div id="scores" class="scores"></div></div>
+<div class="decisionPanel"><div id="pairButtons" class="pairButtons hidden"></div><div id="l1Choices" class="choiceRow"><button id="acceptBtn" class="primary" type="button">Accept suggested</button><button id="rejectBtn" type="button">Keep current</button><button id="adjustBtn" type="button">Use selected</button></div><div class="selectRow"><div class="selectLabel">Selected L1</div><select id="newL1"></select></div><div id="status" class="status"></div></div></div></section></main></div>
 <script>
-let queue=[], current=null, labels=[];
+let queue=[], current=null, labels=[], mode='l1', classA='', classB='';
+const layout=document.getElementById('layout');
+const els={
+  count:document.getElementById('count'), list:document.getElementById('list'), title:document.getElementById('title'),
+  progress:document.getElementById('progress'), tile:document.getElementById('tile'), currentChip:document.getElementById('currentChip'),
+  suggestedChip:document.getElementById('suggestedChip'), scores:document.getElementById('scores'), select:document.getElementById('newL1'),
+  status:document.getElementById('status'), pairButtons:document.getElementById('pairButtons'), l1Choices:document.getElementById('l1Choices')
+};
+let busy=false;
 async function api(path, opts){const r=await fetch(path,opts); if(!r.ok) throw new Error(await r.text()); return r.headers.get('content-type')?.includes('json')?r.json():r.blob();}
-let mode='l1', binaryA='', binaryB='';
-async function load(){const p=await api('/api/candidates'); queue=p.candidates; labels=p.l1_prototypes; mode=p.mode; binaryA=p.binary_a; binaryB=p.binary_b; document.getElementById('count').textContent=`${p.remaining} remaining · ${p.mode}`; const sel=document.getElementById('newL1'); sel.innerHTML=''; labels.forEach(x=>{const o=document.createElement('option');o.value=x;o.textContent=x;sel.appendChild(o)}); renderList(); if(queue.length) show(queue[0].key);}
-function renderList(){const box=document.getElementById('list'); box.innerHTML=''; queue.forEach(c=>{const d=document.createElement('div');d.className='row'+(current&&current.key===c.key?' active':'');d.innerHTML=`<b>${c.tile_id}</b><div class=muted>${c.current_l1} -> ${c.suggested_l1} · ${c.uncertainty.toFixed(3)}</div>`;d.onclick=()=>show(c.key);box.appendChild(d);});}
-async function show(key){const data=await api('/api/item?key='+encodeURIComponent(key)); current=data.candidate; document.getElementById('title').textContent=data.item.tile_id; document.getElementById('meta').textContent=`Current: ${current.current_l1} · Suggested: ${current.suggested_l1} · ${current.score_summary||''}`; document.getElementById('tile').src='/api/tile?key='+encodeURIComponent(key)+'&t='+Date.now(); document.getElementById('newL1').value=current.suggested_l1; if(mode==='binary'){document.getElementById('decision').innerHTML=`<button class=primary onclick="choose('${binaryA}')">${binaryA}</button><button class=primary onclick="choose('${binaryB}')">${binaryB}</button>`;}else{document.getElementById('decision').innerHTML=`<button class=primary onclick="act('accept')">Accept suggested</button><button onclick="act('reject')">Reject</button>`;} renderList();}
-async function choose(label){document.getElementById('newL1').value=label; await act('adjust');}
-async function act(decision){if(!current)return; const newL1=document.getElementById('newL1').value; await api('/api/review',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({key:current.key,decision,new_l1:newL1})}); document.getElementById('status').textContent='saved'; await load();}
-load().catch(e=>document.getElementById('status').textContent=e);
+function setQueueOpen(open){layout.classList.toggle('queue-collapsed',!open);}
+function text(el,value){el.textContent=value;}
+async function load(selectIndex=0){
+  const p=await api('/api/candidates'); queue=p.candidates; labels=p.l1_prototypes; mode=p.mode; classA=p.binary_a; classB=p.binary_b;
+  text(els.count,`${p.remaining} remaining - ${p.mode}`); fillLabels(); renderList();
+  if(queue.length){await show(queue[Math.max(0,Math.min(selectIndex,queue.length-1))].key);} else {complete();}
+}
+function fillLabels(){els.select.innerHTML=''; labels.forEach(label=>{const o=document.createElement('option'); o.value=label; o.textContent=label; els.select.appendChild(o);});}
+function renderList(){
+  els.list.innerHTML='';
+  if(!queue.length){const d=document.createElement('div'); d.className='empty'; d.textContent='No remaining tiles.'; els.list.appendChild(d); return;}
+  queue.forEach((candidate,index)=>{
+    const row=document.createElement('div'); row.className='row'+(current&&current.key===candidate.key?' active':'');
+    const title=document.createElement('div'); title.className='rowTitle'; title.textContent=candidate.tile_id;
+    const meta=document.createElement('div'); meta.className='rowMeta'; meta.textContent=`${index+1}. ${candidate.current_l1} -> ${candidate.suggested_l1} - ${candidate.uncertainty.toFixed(3)}`;
+    row.append(title,meta); row.addEventListener('click',()=>{show(candidate.key); setQueueOpen(false);}); els.list.appendChild(row);
+  });
+}
+async function show(key){
+  const data=await api('/api/item?key='+encodeURIComponent(key)); current=data.candidate;
+  const index=queue.findIndex(candidate=>candidate.key===key);
+  text(els.title,data.item.tile_id||current.tile_id); text(els.progress,index>=0?`${index+1}/${queue.length}`:'');
+  text(els.currentChip,`Current: ${current.current_l1}`); text(els.suggestedChip,`Suggested: ${current.suggested_l1}`);
+  text(els.scores,current.score_summary||`Uncertainty: ${current.uncertainty.toFixed(3)}`);
+  els.tile.src='/api/tile?key='+encodeURIComponent(key)+'&t='+Date.now(); els.tile.alt=data.item.tile_id||current.tile_id;
+  els.select.value=current.suggested_l1; renderDecision(); renderList();
+}
+function renderDecision(){
+  els.pairButtons.innerHTML='';
+  if(mode==='binary'){
+    els.pairButtons.classList.remove('hidden'); els.l1Choices.classList.add('hidden');
+    [classA,classB].forEach(label=>{const b=document.createElement('button'); b.type='button'; b.className='primary'; b.textContent=label; b.addEventListener('click',()=>choose(label)); els.pairButtons.appendChild(b);});
+  }else{
+    els.pairButtons.classList.add('hidden'); els.l1Choices.classList.remove('hidden');
+  }
+  setBusy(busy);
+}
+function complete(){
+  current=null; text(els.title,'Review complete'); text(els.progress,''); text(els.currentChip,'Current: -'); text(els.suggestedChip,'Suggested: -'); text(els.scores,'No remaining tiles.'); els.tile.removeAttribute('src'); els.list.innerHTML='<div class="empty">No remaining tiles.</div>';
+}
+async function choose(label){els.select.value=label; await act('adjust');}
+function setBusy(value){
+  busy=value;
+  document.querySelectorAll('button,select').forEach(el=>{el.disabled=value;});
+}
+async function act(decision){
+  if(!current||busy)return; const doneKey=current.key; const index=queue.findIndex(candidate=>candidate.key===doneKey); const newL1=els.select.value;
+  setBusy(true);
+  text(els.status,'Saving...');
+  try{
+    await api('/api/review',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({key:doneKey,decision,new_l1:newL1})});
+    text(els.status,'Saved.'); await load(Math.max(0,index));
+  }catch(e){
+    text(els.status,e.message||String(e));
+  }finally{
+    setBusy(false);
+  }
+}
+document.getElementById('toggleQueue').addEventListener('click',()=>setQueueOpen(layout.classList.contains('queue-collapsed')));
+document.getElementById('hideQueue').addEventListener('click',()=>setQueueOpen(false));
+document.getElementById('acceptBtn').addEventListener('click',()=>act('accept'));
+document.getElementById('rejectBtn').addEventListener('click',()=>act('reject'));
+document.getElementById('adjustBtn').addEventListener('click',()=>act('adjust'));
+load().catch(e=>text(els.status,e.message||String(e)));
 </script></body></html>"""
 
 
@@ -427,8 +517,7 @@ def make_handler(state: ReviewState):
                     return
                 if parsed.path == "/api/item":
                     key = qs["key"][0]
-                    candidates = {candidate.key: candidate for candidate in state.candidates()}
-                    _json_response(self, {"candidate": candidates[key].__dict__, "item": state.item(key)})
+                    _json_response(self, {"candidate": state.candidate(key).__dict__, "item": state.item(key)})
                     return
                 if parsed.path == "/api/tile":
                     body = state.tile_png(qs["key"][0])
