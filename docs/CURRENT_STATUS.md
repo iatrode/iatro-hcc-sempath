@@ -184,6 +184,8 @@ Implemented training-system foundations:
 - 已支持 `z_hcc` prototype 指标，包括 L1 accuracy、L2 macro F1/AUC、prototype top-k precision 与 neighborhood purity；
 - prototype-adjudicated multi-teacher reliability weights with consensus, expert-anchor, and `z_hcc` response diagnostics;
 - 已支持包含跨 teacher 共识、专家 anchor 与 `z_hcc` response 诊断的原型裁决多 teacher 可靠性权重；
+- plateau-triggered prototype intervention with step ramps and checkpointed schedule state;
+- 已支持基于 teacher prior plateau 的 prototype 介入、step 级 ramp，以及写入 checkpoint 的 schedule state；
 - train-only tile augmentation, step-level warmup plus cosine LR decay, and checkpoint resume for scheduler, scaler, best metrics, global step, and RNG state;
 - 已支持 train-only tile augmentation、step-level warmup + cosine LR decay，以及 scheduler、scaler、best metrics、global step 和 RNG state 的 checkpoint resume；
 - CUDA mixed precision training with autocast and gradient scaling;

@@ -1,7 +1,6 @@
 inherits: ../distill_train.example.yaml
 
 loss:
-  intervention_schedule: plateau_gate
   zhcc_proto_weight: 0.2
   prototype_filter_weight: 0.5
   zhcc_response_weight: 0.0

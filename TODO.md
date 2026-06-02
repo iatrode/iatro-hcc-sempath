@@ -19,13 +19,12 @@ git repository.
 ## Training system
 
 - Extend training-manifest checks with optional fixed validation subset export.
-- Add sampled validation subsets for large-scale training.
 - Add WSI-window or feature-cache-aware sampling if real dry-run profiling shows
   feature-cache locality limits throughput.
 - Add benchmark scripts for teacher-feature storage tradeoffs before changing
   the feature package layout.
-- Add dynamic prototype loading from a prototype directory or prebuilt `.pt/.pth`
-  prototype package.
+- Add prototype directory manifest loading; prebuilt `.pt/.pth` prototype
+  packages are already supported.
 - Implement semantic prototype initialization from curated concept embeddings.
 - Add bounded prototype updates, prototype diagnostics, and prototype capacity
   scaling experiments.

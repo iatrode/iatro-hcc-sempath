@@ -12,7 +12,6 @@ from hcc_sempath.training.engine import (
 def _cfg() -> dict:
     return {
         "loss": {
-            "intervention_schedule": "plateau_gate",
             "relation_weight": 0.05,
             "semantic_weight": 0.0,
             "semantic_temperature": 1.0,
