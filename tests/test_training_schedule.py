@@ -8,37 +8,35 @@ from hcc_sempath.training.losses import feature_distillation_loss_per_sample
 import torch
 
 
-def test_scheduled_loss_config_warms_prototype_terms() -> None:
+def test_scheduled_loss_config_keeps_prototype_terms_gated_before_plateau() -> None:
     cfg = {
         "loss": {
             "relation_weight": 0.25,
             "semantic_weight": 0.4,
             "semantic_warmup_epochs": 4,
             "semantic_temperature": 1.0,
+            "intervention_schedule": "plateau_gate",
             "prototype_filter_weight": 0.8,
-            "prototype_filter_warmup_epochs": 2,
             "prototype_filter_alpha_min": 0.3,
             "zhcc_proto_weight": 0.2,
-            "zhcc_proto_warmup_epochs": 2,
             "zhcc_response_weight": 0.3,
-            "zhcc_response_warmup_epochs": 3,
         }
     }
 
-    epoch_1 = scheduled_loss_config(cfg, epoch=1)
-    epoch_4 = scheduled_loss_config(cfg, epoch=4)
+    epoch_1 = scheduled_loss_config(cfg, epoch=1, global_step=0, schedule_state={})
+    epoch_4 = scheduled_loss_config(cfg, epoch=4, global_step=0, schedule_state={})
 
     assert epoch_1["semantic_weight"] == pytest.approx(0.1)
-    assert epoch_1["prototype_filter_weight"] == pytest.approx(0.4)
+    assert epoch_1["prototype_filter_weight"] == pytest.approx(0.0)
     assert epoch_1["prototype_filter_alpha_min"] == 0.3
     assert epoch_1["feature_loss_type"] == "cosine"
-    assert epoch_1["zhcc_proto_weight"] == pytest.approx(0.1)
-    assert epoch_1["zhcc_response_weight"] == pytest.approx(0.1)
+    assert epoch_1["zhcc_proto_weight"] == pytest.approx(0.0)
+    assert epoch_1["zhcc_response_weight"] == pytest.approx(0.0)
     assert epoch_1["scale_relation_by_alpha"] is False
+    assert epoch_1["intervention_stage"] == "teacher_prior"
     assert epoch_4["semantic_weight"] == pytest.approx(0.4)
-    assert epoch_4["prototype_filter_weight"] == pytest.approx(0.8)
-    assert epoch_4["zhcc_proto_weight"] == pytest.approx(0.2)
-    assert epoch_4["zhcc_response_weight"] == pytest.approx(0.3)
+    assert epoch_4["prototype_filter_weight"] == pytest.approx(0.0)
+    assert epoch_4["zhcc_proto_weight"] == pytest.approx(0.0)
 
 
 def test_feature_loss_type_defaults_to_cosine() -> None:

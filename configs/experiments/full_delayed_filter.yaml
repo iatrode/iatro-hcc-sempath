@@ -6,12 +6,9 @@ loss:
   scale_relation_by_alpha: false
   semantic_weight: 0.0
   zhcc_proto_weight: 0.2
-  zhcc_proto_warmup_epochs: 3
   zhcc_level2_weight: 0.5
   prototype_filter_weight: 0.5
-  prototype_filter_warmup_epochs: 5
   prototype_filter_alpha_min: 0.25
   consensus_weight: 0.4
   anchor_weight: 0.4
-  zhcc_response_weight: 0.2
-  zhcc_response_warmup_epochs: 3
+  zhcc_response_weight: 0.0
