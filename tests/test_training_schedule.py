@@ -15,7 +15,6 @@ def test_scheduled_loss_config_keeps_prototype_terms_gated_before_plateau() -> N
             "semantic_weight": 0.4,
             "semantic_warmup_epochs": 4,
             "semantic_temperature": 1.0,
-            "intervention_schedule": "plateau_gate",
             "prototype_filter_weight": 0.8,
             "prototype_filter_alpha_min": 0.3,
             "zhcc_proto_weight": 0.2,

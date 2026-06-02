@@ -243,15 +243,22 @@ A practical schedule is:
 
 ```text
 stage 0: contract smoke and feature sanity checks only
-stage 1: teacher distillation dominates; prototype loss is zero or very small
-stage 2: prototype response loss warms up; teacher reliability remains weakly bounded
-stage 3: prototype-filtered distillation is active; high-conflict teacher signals are down-weighted
-stage 4: freeze or slow prototype updates; evaluate retrieval, clustering, and cross-cohort stability
+stage 1: teacher prior distillation only; prototype loss and prototype filtering are gated off
+stage 2: when teacher prior loss plateaus or reaches the maximum warmup step, prototype loss ramps in
+stage 3: after a step delay, prototype-filtered distillation ramps in and high-conflict teacher signals are down-weighted
+stage 4: evaluate retrieval, clustering, prototype utilization, and cross-cohort stability
 ```
 
-This can be implemented either as explicit staged training or as a single training run with scheduled loss weights. In both cases, the scientific interpretation should remain conservative: the objective is to organize HCC-relevant morphology, not to claim that prototypes are exhaustive or definitive pathology categories.
+The current implementation uses a single training run with a plateau-triggered
+step schedule. The trigger monitors the teacher prior loss, persists schedule
+state in checkpoints, and avoids choosing a manual fixed intervention step.
+The scientific interpretation remains conservative: the objective is to
+organize HCC-relevant morphology, not to claim that prototypes are exhaustive or
+definitive pathology categories.
 
-该策略既可以实现为显式分阶段训练，也可以实现为单次训练中的 scheduled loss weights。无论采用哪种工程实现，科学表述均应保持克制：目标是组织 HCC 相关形态，而不是声称 prototypes 构成穷尽或确定性的病理类别。
+当前实现采用单次训练中的 plateau-triggered step schedule。触发器监测 teacher
+prior loss，将 schedule state 写入 checkpoint，并避免人工猜测固定介入 step。
+科学表述仍应保持克制：目标是组织 HCC 相关形态，而不是声称 prototypes 构成穷尽或确定性的病理类别。
 
 At multi-million tile scale, validation and embedding metrics should use fixed
 or bounded sampled subsets during training. Full validation should be reserved

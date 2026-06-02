@@ -56,7 +56,6 @@ loss:
   feature_loss_type: cosine
   relation_weight: 0.05
   scale_relation_by_alpha: false
-  intervention_schedule: plateau_gate
   semantic_weight: 0.0
   semantic_warmup_epochs: 0
   semantic_temperature: 1.0

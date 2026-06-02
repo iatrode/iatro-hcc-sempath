@@ -166,8 +166,6 @@ def scheduled_loss_config(
     loss_cfg = cfg["loss"]
     semantic_temperature = float(loss_cfg.get("semantic_temperature", 1.0))
     state = _ensure_schedule_state(schedule_state)
-    if str(loss_cfg.get("intervention_schedule", "plateau_gate")) != "plateau_gate":
-        raise ValueError("only intervention_schedule=plateau_gate is supported")
     prototype_start = state.get("prototype_start_step")
     filter_start = state.get("filter_start_step")
     zhcc_proto_weight = _step_ramp(
