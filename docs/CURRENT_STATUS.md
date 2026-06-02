@@ -215,8 +215,8 @@ Important engineering requirements before full-scale training:
 
 - export fixed validation subsets for reproducible frequent validation;
 - 导出固定 validation subset，用于可复现的高频验证；
-- benchmark dynamic package sampling and add stronger WSI-window sampling if measured I/O locality remains the bottleneck;
-- 评估 dynamic package sampling，如实测 I/O locality 仍是瓶颈，再加入更强的 WSI-window sampling；
+- add stronger WSI-window or feature-cache-aware sampling only if measured I/O locality remains the bottleneck;
+- 仅在实测 I/O locality 仍是瓶颈时，加入更强的 WSI-window 或 feature-cache-aware sampling；
 - lock the final prototype supervision manifest and external validation protocol before manuscript-grade conclusions;
 - 在论文级结论前锁定最终 prototype supervision manifest 与 external validation protocol；
 - benchmark teacher-feature storage alternatives on real extracted features before changing the feature package layout.
@@ -278,12 +278,15 @@ Near-term development should focus on:
 
 近期开发重点：
 
-1. use the training manifest schema and cohort-building workflow for real dry runs;
-1. 使用 training manifest schema 与 cohort 构建流程进行真实 dry run；
-2. fixed or sampled validation subset export for frequent validation;
-2. 导出固定或抽样 validation subset，用于高频验证；
-3. representation evaluation protocols beyond teacher imitation;
-3. 建立超越 teacher imitation 的表征评估协议；
+1. fixed validation subset export for reproducible frequent validation;
+1. 导出固定 validation subset，用于可复现的高频验证；
+2. representation evaluation reports that separate teacher imitation from HCC
+   representation quality;
+2. 建立区分 teacher imitation 与 HCC representation quality 的评估报告；
+3. morphology retrieval, clustering, cross-center stability, and prototype
+   utilization diagnostics;
+3. 建立 morphology retrieval、clustering、cross-center stability 与 prototype
+   utilization 诊断；
 4. benchmark teacher-feature storage alternatives after real feature extraction;
 4. 在真实 feature 提取后评估 teacher-feature 存储方案；
 5. bilingual open-source documentation for public release.
