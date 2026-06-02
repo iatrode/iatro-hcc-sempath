@@ -129,9 +129,10 @@ HCC semantic loss 应直接作用于共享 `z_hcc`，因为 `z_hcc` 是可复用
 
 ### 3.4 Prototype module and dynamic prototype registry / Prototype 模块与动态注册
 
-The prototype system should be implemented as a module with three public inputs:
+The prototype system is implemented as a runtime registry with public package
+inputs:
 
-Prototype 系统应实现为一个模块，并支持三类公开输入：
+Prototype 系统已实现为 runtime registry，并支持公开 package 输入：
 
 ```text
 prototype_dir/
@@ -151,14 +152,27 @@ prototype_package.pth
   }
 
 config:
-  data.prototype_path or data.prototype_dir
+  data.prototype_path or data.prototype_paths for teacher-space prototypes
+  data.zhcc_prototype_path for shared z_hcc prototypes
 ```
+
+`prototype_path`, each value in `prototype_paths`, and `zhcc_prototype_path` can
+point to either a `.pt/.pth` package or a directory containing
+`prototype_manifest.yaml`.
+
+`prototype_path`、`prototype_paths` 中的每个路径，以及 `zhcc_prototype_path`
+均可指向 `.pt/.pth` package，或包含 `prototype_manifest.yaml` 的目录。
 
 The model must treat the number and identity of prototypes as data, not code. Prototype names, group membership, semantic levels, exclusivity flags, confidence thresholds, source notes, and initialization counts belong in metadata. This keeps future open-source releases clean: public code exposes the mechanism, while institution-specific prototype curation can remain outside the repository.
 
 模型必须把 prototype 的数量和身份视为数据，而不是代码。Prototype 名称、group 归属、语义层级、互斥标记、置信阈值、来源说明和初始化样本量应写入 metadata。这样开源仓库只公开机制，机构内 prototype curate 过程可以留在仓库外部。
 
 ### 3.5 Prototype-filtered distillation / Prototype 筛选蒸馏
+
+The implemented method is PAMT-D, Prototype-Adjudicated Multi-Teacher
+Distillation.
+
+当前实现方法为 PAMT-D，即 Prototype-Adjudicated Multi-Teacher Distillation。
 
 Prototype is not only an auxiliary label signal. It should control how much each teacher is trusted for each tile. Different teachers may organize the same HCC morphology differently, so direct teacher averaging can force conflicting semantics into `z_hcc`. Prototype response in the shared HCC semantic space should provide a filtering signal:
 
@@ -179,9 +193,9 @@ L = sum_t alpha_t * L_teacher_t
 
 `alpha_t` 应是软权重，不是硬排除。可行做法是根据 teacher-specific response 与当前 `z_hcc` prototype response 的一致性计算 teacher reliability，并可结合跨 teacher disagreement。与 HCC prototype 语义一致的 tile 接受更强蒸馏；teacher 冲突明显的 tile 降低硬模仿权重，并增强 prototype shaping。
 
-The first implementation should use a bounded reliability weight:
+The implementation uses a bounded reliability weight:
 
-第一版实现采用有界 reliability weight：
+当前实现采用有界 reliability weight：
 
 ```text
 alpha_t = clamp(alpha_min + (1 - alpha_min) * agreement_t, alpha_min, 1)
@@ -416,9 +430,9 @@ Required comparisons:
 
 ## 8. Engineering Requirements / 工程要求
 
-Before full-scale training, the implementation should support:
+The current implementation supports:
 
-全量训练前，实现应支持：
+当前实现已支持：
 
 - CUDA mixed precision training;
 - CUDA 混合精度训练；
@@ -430,16 +444,31 @@ Before full-scale training, the implementation should support:
 - WSI-level split 管理；
 - manifest-based public held-out external validation;
 - 基于 manifest 的 public held-out external validation；
-- feature-cache-aware training sampling for current whole-matrix feature packages;
-- 面向当前 whole-matrix feature package 的 feature-cache-aware training sampling；
-- sampled validation subsets;
-- 抽样 validation subset；
-- optional teacher agreement/disagreement caching for selective distillation;
-- 可选的 teacher agreement / disagreement 缓存，用于选择性蒸馏；
-- scheduled loss weighting for gradual HCC semantic activation;
-- 用于渐进启用 HCC 语义约束的 scheduled loss weighting；
+- dynamic package sampling with package-local row chunks and a cross-package
+  shuffle buffer;
+- 基于 package-local row chunk 与跨 package shuffle buffer 的 dynamic package
+  sampling；
+- bounded validation and embedding metrics through `train.max_val_batches` and
+  `train.max_eval_batches`;
+- 通过 `train.max_val_batches` 与 `train.max_eval_batches` 控制 validation 和
+  embedding metrics 的采样规模；
+- plateau-triggered step schedule for gradual HCC semantic activation;
+- 用于渐进启用 HCC 语义约束的 plateau-triggered step schedule；
 - teacher metadata recording, including model name, version, preprocessing, feature dimension, and normalization convention.
 - teacher metadata 记录，包括模型名称、版本、预处理、feature dimension 和 normalization convention。
+
+Remaining full-scale operations work:
+
+全量训练前剩余的运维工作：
+
+- fixed validation subset export for reproducible frequent validation;
+- 导出固定 validation subset，用于可复现的高频验证；
+- WSI-window or stronger feature-cache-aware sampling only if real profiling
+  shows current package-local reads are the bottleneck;
+- 仅在真实 profiling 显示当前 package-local reads 仍为瓶颈时，加入 WSI-window
+  或更强的 feature-cache-aware sampling；
+- teacher-feature storage benchmark before changing the feature package layout.
+- 在修改 feature package layout 前评估 teacher-feature 存储方案。
 
 ## 9. Public Release Notes / 公开发布注意事项
 
