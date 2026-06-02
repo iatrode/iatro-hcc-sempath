@@ -28,6 +28,15 @@ microenvironment patterns.
 HCC 原型监督用于进一步把 embedding 空间塑造成专病语义空间，覆盖肿瘤结构、胆管样成分、
 肝小叶背景、坏死、纤维化和免疫微环境等 HCC 相关形态语义。
 
+The current method configuration is PAMT-D, prototype-adjudicated multi-teacher
+distillation. Two-level HCC prototypes compute per-tile, per-teacher reliability
+from cross-teacher consensus, expert anchor agreement, and agreement with the
+current shared `z_hcc` prototype response.
+
+当前方法配置为 PAMT-D，即原型裁决的多教师蒸馏。两级 HCC prototype 通过跨 teacher
+共识、专家 anchor 一致性，以及与当前共享 `z_hcc` prototype response 的一致性，计算
+每个 tile / teacher 的软可靠性权重。
+
 The guiding public research direction is maintained in
 [`docs/PROJECT_DIRECTION.md`](docs/PROJECT_DIRECTION.md).
 

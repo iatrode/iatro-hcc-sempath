@@ -194,8 +194,11 @@ def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -
 def _load_zhcc_prototypes(cfg: dict, device: torch.device) -> PrototypeRegistry | None:
     prototype_path = cfg["data"].get("zhcc_prototype_path")
     if prototype_path is None:
-        if float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0:
-            raise ValueError("data.zhcc_prototype_path is required when loss.zhcc_proto_weight > 0")
+        if float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0 or float(cfg["loss"].get("prototype_filter_weight", 0.0)) > 0:
+            raise ValueError(
+                "data.zhcc_prototype_path is required when zhcc prototype supervision "
+                "or prototype adjudication is enabled"
+            )
         return None
     return load_prototype_registry(prototype_path, expected_dim=embedding_dim(cfg)).to(device)
 
@@ -242,8 +245,15 @@ def main() -> None:
     dims = teacher_dims(cfg, names)
     zhcc_prototypes = _load_zhcc_prototypes(cfg, device)
     prototype_manifest_path = cfg["data"].get("prototype_supervision_manifest_path")
-    if float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0 and prototype_manifest_path is None:
-        raise ValueError("data.prototype_supervision_manifest_path is required when loss.zhcc_proto_weight > 0")
+    anchor_required = (
+        float(cfg["loss"].get("prototype_filter_weight", 0.0)) > 0
+        and float(cfg["loss"].get("anchor_weight", 0.4)) > 0
+    )
+    if (float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0 or anchor_required) and prototype_manifest_path is None:
+        raise ValueError(
+            "data.prototype_supervision_manifest_path is required when zhcc prototype supervision "
+            "or anchor adjudication is enabled"
+        )
     train_prototype_labels = load_prototype_labels(
         prototype_manifest_path,
         zhcc_prototypes.to("cpu") if zhcc_prototypes is not None else None,

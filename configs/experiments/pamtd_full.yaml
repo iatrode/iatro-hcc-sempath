@@ -8,7 +8,7 @@ loss:
   zhcc_proto_warmup_epochs: 3
   zhcc_level2_weight: 0.5
   prototype_filter_weight: 0.5
-  prototype_filter_warmup_epochs: 5
+  prototype_filter_warmup_epochs: 3
   prototype_filter_alpha_min: 0.25
   consensus_weight: 0.4
   anchor_weight: 0.4

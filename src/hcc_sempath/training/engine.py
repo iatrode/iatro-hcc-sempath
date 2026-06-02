@@ -7,6 +7,7 @@ import time
 import numpy as np
 import torch
 
+from .adjudication import prototype_adjudicated_teacher_weights
 from .losses import multi_teacher_distillation_loss
 from .metrics import evaluate_teacher_outputs
 from .utils import append_csv, ensure_dir, write_json
@@ -73,6 +74,9 @@ def scheduled_loss_config(cfg: dict, epoch: int) -> dict[str, float | dict]:
             int(loss_cfg.get("zhcc_proto_warmup_epochs", 0)),
         ),
         "zhcc_level2_weight": float(loss_cfg.get("zhcc_level2_weight", 0.5)),
+        "consensus_weight": float(loss_cfg.get("consensus_weight", 0.4)),
+        "anchor_weight": float(loss_cfg.get("anchor_weight", 0.4)),
+        "zhcc_response_weight": float(loss_cfg.get("zhcc_response_weight", 0.2)),
     }
 
 
@@ -173,6 +177,27 @@ def run_epoch(
             with torch.autocast(device_type=device.type, enabled=_amp_enabled(device, cfg, train)):
                 outputs = model(images)
                 student_by_teacher = outputs["teacher_outputs"]
+                if float(loss_cfg["prototype_filter_weight"]) > 0:
+                    if prototypes is None or zhcc_prototypes is None:
+                        raise ValueError(
+                            "prototype adjudication requires data.prototype_paths and data.zhcc_prototype_path"
+                        )
+                    alpha_by_teacher, alpha_diag = prototype_adjudicated_teacher_weights(
+                        teacher_by_name=teachers,
+                        prototypes_by_teacher=prototypes,
+                        zhcc_embedding_norm=outputs["embedding_norm"].detach(),
+                        zhcc_prototypes=zhcc_prototypes,
+                        prototype_mask=prototype_mask,
+                        prototype_level1=prototype_level1,
+                        prototype_level2=prototype_level2,
+                        alpha_min=float(loss_cfg["prototype_filter_alpha_min"]),
+                        consensus_weight=float(loss_cfg["consensus_weight"]),
+                        anchor_weight=float(loss_cfg["anchor_weight"]),
+                        zhcc_response_weight=float(loss_cfg["zhcc_response_weight"]),
+                    )
+                else:
+                    alpha_by_teacher = None
+                    alpha_diag = {}
                 loss, parts = multi_teacher_distillation_loss(
                     student_by_teacher=student_by_teacher,
                     teacher_by_name=teachers,
@@ -181,8 +206,7 @@ def run_epoch(
                     semantic_weight=float(loss_cfg["semantic_weight"]),
                     semantic_temperature=float(loss_cfg["semantic_temperature"]),
                     teacher_weights=teacher_weights,
-                    prototype_filter_weight=float(loss_cfg["prototype_filter_weight"]),
-                    prototype_filter_alpha_min=float(loss_cfg["prototype_filter_alpha_min"]),
+                    teacher_sample_weights=alpha_by_teacher,
                     feature_loss_type=str(loss_cfg["feature_loss_type"]),
                     primary_temperature=float(loss_cfg["primary_temperature"]),
                     attribute_temperature=float(loss_cfg["attribute_temperature"]),
@@ -215,6 +239,9 @@ def run_epoch(
             totals[key] += float(parts[key].cpu())
         for key in ("zhcc_proto", "zhcc_l1", "zhcc_l2"):
             totals[key] += float(zhcc_parts[key].detach().cpu())
+        for key, value in alpha_diag.items():
+            totals.setdefault(key, 0.0)
+            totals[key] += float(value.detach().cpu())
         n_batches += 1
         if log_interval > 0 and (n_batches == 1 or n_batches % log_interval == 0):
             if device.type == "cuda":

@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from ..io.tile_package import read_package_metadata
 from ..modeling.models import HCCSemPathModel
 from ..modeling.prototypes import PrototypeRegistry, load_prototype_registry
+from .adjudication import prototype_adjudicated_teacher_weights
 from .config import (
     embedding_dim,
     image_tile_package_paths,
@@ -27,6 +28,7 @@ from .datasets import (
 )
 from .losses import multi_teacher_distillation_loss
 from .manifest import load_training_manifest
+from .prototype_labels import load_prototype_labels
 from .utils import seed_everything
 
 
@@ -44,6 +46,27 @@ def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -
             "data.prototype_path or data.prototype_paths is required when semantic_weight or prototype_filter_weight > 0"
         )
     return {name: load_prototype_registry(prototype_path, expected_dim=dim).to(device) for name, dim in dims.items()}
+
+
+def _load_zhcc_prototypes(cfg: dict, device: torch.device) -> PrototypeRegistry | None:
+    prototype_path = cfg["data"].get("zhcc_prototype_path")
+    if prototype_path is None:
+        if float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0 or float(cfg["loss"].get("prototype_filter_weight", 0.0)) > 0:
+            raise ValueError(
+                "data.zhcc_prototype_path is required when zhcc prototype supervision "
+                "or prototype adjudication is enabled"
+            )
+        return None
+    return load_prototype_registry(prototype_path, expected_dim=embedding_dim(cfg)).to(device)
+
+
+def _prototype_source_splits(cfg: dict, key: str, default: list[str]) -> set[str] | None:
+    value = cfg["data"].get(key, default)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return {value}
+    return {str(item) for item in value}
 
 
 def _check_tile_package_sizes(package_paths: list[str]) -> tuple[int, int]:
@@ -117,6 +140,22 @@ def main() -> None:
     validate_teacher_cache(sampled_train, None, dims, teacher_cache_package_paths=train_teacher_packages)
     validate_teacher_cache(sampled_val, None, dims, teacher_cache_package_paths=val_teacher_packages)
     prototypes = _load_prototype_map(cfg, dims, device)
+    zhcc_prototypes = _load_zhcc_prototypes(cfg, device)
+    prototype_manifest_path = cfg["data"].get("prototype_supervision_manifest_path")
+    anchor_required = (
+        float(cfg["loss"].get("prototype_filter_weight", 0.0)) > 0
+        and float(cfg["loss"].get("anchor_weight", 0.4)) > 0
+    )
+    if (float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0 or anchor_required) and prototype_manifest_path is None:
+        raise ValueError(
+            "data.prototype_supervision_manifest_path is required when zhcc prototype supervision "
+            "or anchor adjudication is enabled"
+        )
+    train_prototype_labels = load_prototype_labels(
+        prototype_manifest_path,
+        zhcc_prototypes.to("cpu") if zhcc_prototypes is not None else None,
+        allowed_source_splits=_prototype_source_splits(cfg, "prototype_supervision_train_splits", ["train"]),
+    )
 
     if not args.skip_model:
         dataset = DistillationTileDataset(
@@ -126,6 +165,7 @@ def main() -> None:
             mean=cfg["data"].get("mean"),
             std=cfg["data"].get("std"),
             teacher_cache_package_paths=train_teacher_packages,
+            prototype_labels=train_prototype_labels,
         )
         loader = DataLoader(
             dataset,
@@ -143,6 +183,24 @@ def main() -> None:
         images = batch["images"].to(device)
         teachers = {name: tensor.to(device) for name, tensor in batch["teacher_features"].items()}
         outputs = model(images)
+        if float(cfg["loss"].get("prototype_filter_weight", 0.0)) > 0:
+            if prototypes is None or zhcc_prototypes is None:
+                raise ValueError("prototype adjudication requires teacher and zhcc prototype packages")
+            teacher_sample_weights, _ = prototype_adjudicated_teacher_weights(
+                teacher_by_name=teachers,
+                prototypes_by_teacher=prototypes,
+                zhcc_embedding_norm=outputs["embedding_norm"].detach(),
+                zhcc_prototypes=zhcc_prototypes,
+                prototype_mask=batch["prototype_mask"].to(device),
+                prototype_level1=batch["prototype_level1"].to(device),
+                prototype_level2=batch["prototype_level2"].to(device),
+                alpha_min=float(cfg["loss"].get("prototype_filter_alpha_min", 0.25)),
+                consensus_weight=float(cfg["loss"].get("consensus_weight", 0.4)),
+                anchor_weight=float(cfg["loss"].get("anchor_weight", 0.4)),
+                zhcc_response_weight=float(cfg["loss"].get("zhcc_response_weight", 0.2)),
+            )
+        else:
+            teacher_sample_weights = None
         multi_teacher_distillation_loss(
             student_by_teacher=outputs["teacher_outputs"],
             teacher_by_name=teachers,
@@ -151,8 +209,7 @@ def main() -> None:
             semantic_weight=float(cfg["loss"].get("semantic_weight", 0.0)),
             semantic_temperature=float(cfg["loss"]["semantic_temperature"]),
             teacher_weights=cfg["loss"].get("teacher_weights"),
-            prototype_filter_weight=float(cfg["loss"].get("prototype_filter_weight", 0.0)),
-            prototype_filter_alpha_min=float(cfg["loss"].get("prototype_filter_alpha_min", 0.25)),
+            teacher_sample_weights=teacher_sample_weights,
         )
 
     print(
