@@ -20,6 +20,8 @@ def test_scheduled_loss_config_warms_prototype_terms() -> None:
             "prototype_filter_alpha_min": 0.3,
             "zhcc_proto_weight": 0.2,
             "zhcc_proto_warmup_epochs": 2,
+            "zhcc_response_weight": 0.3,
+            "zhcc_response_warmup_epochs": 3,
         }
     }
 
@@ -31,9 +33,12 @@ def test_scheduled_loss_config_warms_prototype_terms() -> None:
     assert epoch_1["prototype_filter_alpha_min"] == 0.3
     assert epoch_1["feature_loss_type"] == "cosine"
     assert epoch_1["zhcc_proto_weight"] == pytest.approx(0.1)
+    assert epoch_1["zhcc_response_weight"] == pytest.approx(0.1)
+    assert epoch_1["scale_relation_by_alpha"] is False
     assert epoch_4["semantic_weight"] == pytest.approx(0.4)
     assert epoch_4["prototype_filter_weight"] == pytest.approx(0.8)
     assert epoch_4["zhcc_proto_weight"] == pytest.approx(0.2)
+    assert epoch_4["zhcc_response_weight"] == pytest.approx(0.3)
 
 
 def test_feature_loss_type_defaults_to_cosine() -> None:

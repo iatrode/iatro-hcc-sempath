@@ -75,53 +75,93 @@ def _anchor_agreement(
     *,
     primary_response: torch.Tensor,
     attribute_response: torch.Tensor,
-    fallback: torch.Tensor,
     prototype_mask: torch.Tensor,
     prototype_level1: torch.Tensor,
     prototype_level2: torch.Tensor,
 ) -> torch.Tensor:
-    anchor = fallback.clone()
+    mask = prototype_mask.to(device=primary_response.device, dtype=torch.bool)
+    anchor = primary_response.new_zeros(primary_response.shape[0])
     if not bool(prototype_mask.any()):
         return anchor
-    out_of_range = (prototype_level1[prototype_mask] < 0) | (
-        prototype_level1[prototype_mask] >= primary_response.shape[1]
+    out_of_range = (prototype_level1[mask] < 0) | (
+        prototype_level1[mask] >= primary_response.shape[1]
     )
     if bool(out_of_range.any()):
         raise ValueError("prototype_level1 contains labels outside the level-1 prototype range")
-    masked_primary = primary_response[prototype_mask]
-    masked_level1 = prototype_level1[prototype_mask].long()
+    masked_primary = primary_response[mask]
+    masked_level1 = prototype_level1[mask].long()
     primary_agreement = masked_primary.gather(1, masked_level1[:, None]).squeeze(1)
     if attribute_response.shape[1] == 0:
-        anchor[prototype_mask] = primary_agreement.clamp(0.0, 1.0)
+        anchor[mask] = primary_agreement.clamp(0.0, 1.0)
         return anchor
     if prototype_level2.shape[1] != attribute_response.shape[1]:
         raise ValueError(
             f"prototype_level2 width does not match level-2 prototypes: "
             f"labels={prototype_level2.shape[1]} prototypes={attribute_response.shape[1]}"
         )
-    level2_targets = prototype_level2[prototype_mask].to(attribute_response.dtype)
-    attribute_agreement = 1.0 - (attribute_response[prototype_mask] - level2_targets).abs().mean(dim=-1)
-    anchor[prototype_mask] = (0.5 * primary_agreement + 0.5 * attribute_agreement.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+    level2_targets = prototype_level2[mask].to(attribute_response.dtype)
+    attribute_agreement = 1.0 - (attribute_response[mask] - level2_targets).abs().mean(dim=-1)
+    anchor[mask] = (0.5 * primary_agreement + 0.5 * attribute_agreement.clamp(0.0, 1.0)).clamp(0.0, 1.0)
     return anchor
+
+
+def _combine_reliability(
+    *,
+    consensus: torch.Tensor,
+    anchor: torch.Tensor,
+    zhcc: torch.Tensor,
+    prototype_mask: torch.Tensor,
+    consensus_weight: float,
+    anchor_weight: float,
+    zhcc_response_weight: float,
+) -> torch.Tensor:
+    w_c = float(consensus_weight)
+    w_a = float(anchor_weight)
+    w_z = float(zhcc_response_weight)
+    mask = prototype_mask.to(device=consensus.device, dtype=torch.bool)
+    reliability = consensus.new_empty(consensus.shape)
+
+    anchor_denom = max(w_c + w_a + w_z, 1e-6)
+    reliability_anchor = (w_c * consensus + w_a * anchor + w_z * zhcc) / anchor_denom
+
+    non_anchor_denom = w_c + w_z
+    if non_anchor_denom <= 0:
+        reliability_non_anchor = consensus
+    else:
+        reliability_non_anchor = (w_c * consensus + w_z * zhcc) / non_anchor_denom
+
+    reliability[mask] = reliability_anchor[mask]
+    reliability[~mask] = reliability_non_anchor[~mask]
+    return reliability.clamp(0.0, 1.0)
 
 
 def _diagnostics(
     name: str,
-    alpha: torch.Tensor,
+    alpha_raw: torch.Tensor,
+    alpha_effective: torch.Tensor,
     consensus: torch.Tensor,
     anchor: torch.Tensor,
     zhcc: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    alpha_float = alpha.float()
+    raw = alpha_raw.float()
+    effective = alpha_effective.float()
     return {
-        f"alpha_mean/{name}": alpha_float.mean().detach(),
-        f"alpha_p25/{name}": torch.quantile(alpha_float, 0.25).detach(),
-        f"alpha_p50/{name}": torch.quantile(alpha_float, 0.50).detach(),
-        f"alpha_p75/{name}": torch.quantile(alpha_float, 0.75).detach(),
+        f"alpha_mean/{name}": effective.mean().detach(),
+        f"alpha_p25/{name}": torch.quantile(effective, 0.25).detach(),
+        f"alpha_p50/{name}": torch.quantile(effective, 0.50).detach(),
+        f"alpha_p75/{name}": torch.quantile(effective, 0.75).detach(),
+        f"alpha_raw_mean/{name}": raw.mean().detach(),
+        f"alpha_raw_p25/{name}": torch.quantile(raw, 0.25).detach(),
+        f"alpha_raw_p50/{name}": torch.quantile(raw, 0.50).detach(),
+        f"alpha_raw_p75/{name}": torch.quantile(raw, 0.75).detach(),
+        f"alpha_effective_mean/{name}": effective.mean().detach(),
+        f"alpha_effective_p25/{name}": torch.quantile(effective, 0.25).detach(),
+        f"alpha_effective_p50/{name}": torch.quantile(effective, 0.50).detach(),
+        f"alpha_effective_p75/{name}": torch.quantile(effective, 0.75).detach(),
         f"consensus_mean/{name}": consensus.float().mean().detach(),
         f"anchor_agreement_mean/{name}": anchor.float().mean().detach(),
         f"zhcc_agreement_mean/{name}": zhcc.float().mean().detach(),
-        f"rejected_fraction_alpha_lt_0.5/{name}": (alpha_float < 0.5).float().mean().detach(),
+        f"rejected_fraction_alpha_lt_0.5/{name}": (effective < 0.5).float().mean().detach(),
     }
 
 
@@ -139,6 +179,7 @@ def prototype_adjudicated_teacher_weights(
     consensus_weight: float = 0.4,
     anchor_weight: float = 0.4,
     zhcc_response_weight: float = 0.2,
+    filter_strength: float = 1.0,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     if set(teacher_by_name) != set(prototypes_by_teacher):
         raise ValueError(
@@ -149,6 +190,9 @@ def prototype_adjudicated_teacher_weights(
         raise ValueError("at least one teacher is required for prototype adjudication")
     if not 0.0 <= float(alpha_min) <= 1.0:
         raise ValueError(f"alpha_min must be in [0, 1], got {alpha_min}")
+    filter_strength_value = float(filter_strength)
+    if not 0.0 <= filter_strength_value <= 1.0:
+        raise ValueError(f"filter_strength must be in [0, 1], got {filter_strength}")
 
     primary_names = _prototype_names(zhcc_prototypes, zhcc_prototypes.primary_indices)
     attribute_names = _prototype_names(zhcc_prototypes, zhcc_prototypes.attribute_indices)
@@ -189,19 +233,24 @@ def prototype_adjudicated_teacher_weights(
         anchor = _anchor_agreement(
             primary_response=primary,
             attribute_response=attributes,
-            fallback=consensus,
             prototype_mask=prototype_mask.to(primary.device),
             prototype_level1=prototype_level1.to(primary.device),
             prototype_level2=prototype_level2.to(primary.device),
         )
         zhcc = _agreement(primary, attributes, zhcc_primary, zhcc_attributes)
-        reliability = (
-            float(consensus_weight) * consensus
-            + float(anchor_weight) * anchor
-            + float(zhcc_response_weight) * zhcc
-        ).clamp(0.0, 1.0)
-        alpha = (alpha_min_value + (1.0 - alpha_min_value) * reliability).clamp(alpha_min_value, 1.0)
-        alpha_by_teacher[name] = alpha
-        diagnostics.update(_diagnostics(name, alpha, consensus, anchor, zhcc))
+        reliability = _combine_reliability(
+            consensus=consensus,
+            anchor=anchor,
+            zhcc=zhcc,
+            prototype_mask=prototype_mask.to(primary.device),
+            consensus_weight=consensus_weight,
+            anchor_weight=anchor_weight,
+            zhcc_response_weight=zhcc_response_weight,
+        )
+        alpha_raw = (alpha_min_value + (1.0 - alpha_min_value) * reliability).clamp(alpha_min_value, 1.0)
+        alpha_effective = 1.0 - filter_strength_value * (1.0 - alpha_raw)
+        alpha_effective = alpha_effective.clamp(alpha_min_value, 1.0)
+        alpha_by_teacher[name] = alpha_effective
+        diagnostics.update(_diagnostics(name, alpha_raw, alpha_effective, consensus, anchor, zhcc))
 
     return alpha_by_teacher, diagnostics

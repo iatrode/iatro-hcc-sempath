@@ -34,6 +34,15 @@ def feature_distillation_loss_per_sample(
     raise ValueError(f"unsupported feature_loss_type: {loss_type}")
 
 
+def _weighted_mean(loss_per_sample: torch.Tensor, weight: torch.Tensor | None) -> torch.Tensor:
+    if weight is None:
+        return loss_per_sample.mean()
+    weight = weight.to(device=loss_per_sample.device, dtype=loss_per_sample.dtype)
+    if weight.shape != loss_per_sample.shape:
+        raise ValueError(f"weight shape mismatch: weight={tuple(weight.shape)} loss={tuple(loss_per_sample.shape)}")
+    return (weight * loss_per_sample).sum() / weight.sum().clamp_min(1e-6)
+
+
 def relation_distillation_loss(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
     student_norm = F.normalize(student, dim=-1)
     teacher_norm = F.normalize(teacher, dim=-1)
@@ -99,6 +108,7 @@ def total_distillation_loss(
     primary_temperature: float | None = None,
     attribute_temperature: float | None = None,
     teacher_sample_weight: torch.Tensor | None = None,
+    scale_relation_by_alpha: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     reliability = None
     if teacher_sample_weight is not None:
@@ -107,10 +117,8 @@ def total_distillation_loss(
             raise ValueError(
                 f"teacher_sample_weight must have shape=({student.shape[0]},), got {tuple(reliability.shape)}"
         )
-        feature_per_sample = feature_distillation_loss_per_sample(student, teacher, loss_type=feature_loss_type)
-        feature = (reliability * feature_per_sample).mean()
-    else:
-        feature = feature_distillation_loss(student, teacher, loss_type=feature_loss_type)
+    feature_per_sample = feature_distillation_loss_per_sample(student, teacher, loss_type=feature_loss_type)
+    feature = _weighted_mean(feature_per_sample, reliability)
     relation = relation_distillation_loss(student, teacher)
     if prototypes is None or semantic_weight == 0:
         semantic = feature.new_zeros(())
@@ -122,13 +130,15 @@ def total_distillation_loss(
             primary_temperature=semantic_temperature if primary_temperature is None else primary_temperature,
             attribute_temperature=semantic_temperature if attribute_temperature is None else attribute_temperature,
         )
-    relation_scale = reliability.mean() if reliability is not None else relation.new_ones(())
+    reliability_mean = reliability.mean() if reliability is not None else relation.new_ones(())
+    relation_scale = reliability_mean if reliability is not None and scale_relation_by_alpha else relation.new_ones(())
     total = feature + relation_weight * relation_scale * relation + semantic_weight * semantic
     return total, {
         "feature": feature.detach(),
         "relation": relation.detach(),
         "semantic": semantic.detach(),
-        "reliability": relation_scale.detach(),
+        "reliability": reliability_mean.detach(),
+        "relation_scale": relation_scale.detach(),
     }
 
 
@@ -144,6 +154,7 @@ def multi_teacher_distillation_loss(
     feature_loss_type: str = "cosine",
     primary_temperature: float | None = None,
     attribute_temperature: float | None = None,
+    scale_relation_by_alpha: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if set(student_by_teacher) != set(teacher_by_name):
         raise ValueError(
@@ -160,6 +171,7 @@ def multi_teacher_distillation_loss(
         "relation": next(iter(student_by_teacher.values())).new_zeros(()),
         "semantic": next(iter(student_by_teacher.values())).new_zeros(()),
         "reliability": next(iter(student_by_teacher.values())).new_zeros(()),
+        "relation_scale": next(iter(student_by_teacher.values())).new_zeros(()),
     }
     weight_sum = 0.0
     for name in sorted(student_by_teacher):
@@ -178,6 +190,7 @@ def multi_teacher_distillation_loss(
             primary_temperature=primary_temperature,
             attribute_temperature=attribute_temperature,
             teacher_sample_weight=teacher_sample_weights.get(name) if teacher_sample_weights is not None else None,
+            scale_relation_by_alpha=scale_relation_by_alpha,
         )
         total = weight * loss if total is None else total + weight * loss
         for key in totals:
