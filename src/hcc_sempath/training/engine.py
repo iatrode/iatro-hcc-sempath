@@ -37,6 +37,115 @@ def _linear_warmup(base_value: float, epoch: int, warmup_epochs: int) -> float:
     return base_value * min(1.0, max(0.0, epoch / warmup_epochs))
 
 
+def _step_ramp(target: float, global_step: int, start_step: int | None, ramp_steps: int) -> float:
+    if start_step is None or global_step < start_step:
+        return 0.0
+    if ramp_steps <= 0:
+        return float(target)
+    progress = (global_step - start_step) / float(ramp_steps)
+    return float(target) * max(0.0, min(1.0, progress))
+
+
+def default_schedule_state() -> dict:
+    return {
+        "teacher_prior_loss_ema": None,
+        "teacher_prior_prev_window_ema": None,
+        "teacher_prior_window_loss_sum": 0.0,
+        "teacher_prior_window_count": 0,
+        "teacher_prior_relative_improvement": None,
+        "teacher_prior_plateau_count": 0,
+        "prototype_start_step": None,
+        "filter_start_step": None,
+    }
+
+
+def _ensure_schedule_state(schedule_state: dict | None) -> dict:
+    defaults = default_schedule_state()
+    if schedule_state is None:
+        return defaults
+    for key, value in defaults.items():
+        schedule_state.setdefault(key, value)
+    return schedule_state
+
+
+def _set_intervention_steps(cfg: dict, schedule_state: dict, global_step: int) -> None:
+    if schedule_state.get("prototype_start_step") is not None:
+        return
+    delay = int(cfg["loss"].get("proto_to_filter_delay_steps", 1000))
+    schedule_state["prototype_start_step"] = int(global_step)
+    schedule_state["filter_start_step"] = int(global_step) + delay
+
+
+def update_plateau_schedule_state(
+    cfg: dict,
+    schedule_state: dict,
+    *,
+    global_step: int,
+    teacher_prior_loss: float,
+) -> dict:
+    loss_cfg = cfg["loss"]
+    schedule_state = _ensure_schedule_state(schedule_state)
+    if schedule_state.get("prototype_start_step") is not None:
+        return schedule_state
+
+    max_warmup = int(loss_cfg.get("max_teacher_warmup_steps", 10000))
+    if global_step >= max_warmup:
+        _set_intervention_steps(cfg, schedule_state, global_step)
+        return schedule_state
+
+    schedule_state["teacher_prior_window_loss_sum"] = (
+        float(schedule_state.get("teacher_prior_window_loss_sum") or 0.0) + float(teacher_prior_loss)
+    )
+    schedule_state["teacher_prior_window_count"] = int(schedule_state.get("teacher_prior_window_count") or 0) + 1
+    window_steps = max(1, int(loss_cfg.get("teacher_prior_plateau_window_steps", 1000)))
+    if int(schedule_state["teacher_prior_window_count"]) < window_steps:
+        return schedule_state
+
+    window_mean = float(schedule_state["teacher_prior_window_loss_sum"]) / float(schedule_state["teacher_prior_window_count"])
+    beta = float(loss_cfg.get("teacher_prior_ema_beta", 0.9))
+    current_ema = schedule_state.get("teacher_prior_loss_ema")
+    if current_ema is None:
+        current_ema = window_mean
+    else:
+        current_ema = beta * float(current_ema) + (1.0 - beta) * window_mean
+    prev_ema = schedule_state.get("teacher_prior_prev_window_ema")
+    schedule_state["teacher_prior_loss_ema"] = float(current_ema)
+    schedule_state["teacher_prior_window_loss_sum"] = 0.0
+    schedule_state["teacher_prior_window_count"] = 0
+
+    if prev_ema is not None:
+        relative_improvement = (float(prev_ema) - float(current_ema)) / max(float(prev_ema), 1e-8)
+        schedule_state["teacher_prior_relative_improvement"] = float(relative_improvement)
+        min_warmup = int(loss_cfg.get("min_teacher_warmup_steps", 2000))
+        threshold = float(loss_cfg.get("teacher_prior_plateau_threshold", 0.01))
+        if global_step >= min_warmup and relative_improvement < threshold:
+            schedule_state["teacher_prior_plateau_count"] = int(schedule_state.get("teacher_prior_plateau_count") or 0) + 1
+        else:
+            schedule_state["teacher_prior_plateau_count"] = 0
+        patience = int(loss_cfg.get("teacher_prior_plateau_patience", 2))
+        if int(schedule_state["teacher_prior_plateau_count"]) >= patience:
+            _set_intervention_steps(cfg, schedule_state, global_step)
+    schedule_state["teacher_prior_prev_window_ema"] = float(current_ema)
+    return schedule_state
+
+
+def intervention_stage(cfg: dict, global_step: int, schedule_state: dict | None) -> str:
+    state = _ensure_schedule_state(schedule_state)
+    prototype_start = state.get("prototype_start_step")
+    filter_start = state.get("filter_start_step")
+    if prototype_start is None or global_step < int(prototype_start):
+        return "teacher_prior"
+    prototype_ramp_steps = int(cfg["loss"].get("prototype_ramp_steps", 1000))
+    if global_step < int(prototype_start) + max(0, prototype_ramp_steps):
+        return "prototype_ramp"
+    if filter_start is None or global_step < int(filter_start):
+        return "prototype_active"
+    filter_ramp_steps = int(cfg["loss"].get("filter_ramp_steps", 1000))
+    if global_step < int(filter_start) + max(0, filter_ramp_steps):
+        return "filter_ramp"
+    return "pamtd_active"
+
+
 def _log(message: str) -> None:
     print(message, flush=True)
 
@@ -47,9 +156,38 @@ def _cuda_memory_mb(device: torch.device) -> float:
     return float(torch.cuda.memory_allocated(device) / (1024 * 1024))
 
 
-def scheduled_loss_config(cfg: dict, epoch: int) -> dict[str, float | dict]:
+def scheduled_loss_config(
+    cfg: dict,
+    *,
+    epoch: int,
+    global_step: int,
+    schedule_state: dict | None = None,
+) -> dict[str, float | dict | bool | str | None]:
     loss_cfg = cfg["loss"]
     semantic_temperature = float(loss_cfg.get("semantic_temperature", 1.0))
+    state = _ensure_schedule_state(schedule_state)
+    if str(loss_cfg.get("intervention_schedule", "plateau_gate")) != "plateau_gate":
+        raise ValueError("only intervention_schedule=plateau_gate is supported")
+    prototype_start = state.get("prototype_start_step")
+    filter_start = state.get("filter_start_step")
+    zhcc_proto_weight = _step_ramp(
+        float(loss_cfg.get("zhcc_proto_weight", 0.0)),
+        int(global_step),
+        int(prototype_start) if prototype_start is not None else None,
+        int(loss_cfg.get("prototype_ramp_steps", 1000)),
+    )
+    prototype_filter_weight = _step_ramp(
+        float(loss_cfg.get("prototype_filter_weight", 0.0)),
+        int(global_step),
+        int(filter_start) if filter_start is not None else None,
+        int(loss_cfg.get("filter_ramp_steps", 1000)),
+    )
+    zhcc_response_weight = _step_ramp(
+        float(loss_cfg.get("zhcc_response_weight", 0.0)),
+        int(global_step),
+        int(filter_start) if filter_start is not None else None,
+        int(loss_cfg.get("filter_ramp_steps", 1000)),
+    )
     return {
         "teacher_weights": loss_cfg.get("teacher_weights"),
         "relation_weight": float(loss_cfg["relation_weight"]),
@@ -61,27 +199,21 @@ def scheduled_loss_config(cfg: dict, epoch: int) -> dict[str, float | dict]:
         "semantic_temperature": semantic_temperature,
         "primary_temperature": float(loss_cfg.get("primary_temperature", semantic_temperature)),
         "attribute_temperature": float(loss_cfg.get("attribute_temperature", 1.0)),
-        "prototype_filter_weight": _linear_warmup(
-            float(loss_cfg.get("prototype_filter_weight", 0.0)),
-            epoch,
-            int(loss_cfg.get("prototype_filter_warmup_epochs", 0)),
-        ),
+        "prototype_filter_weight": prototype_filter_weight,
         "prototype_filter_alpha_min": float(loss_cfg.get("prototype_filter_alpha_min", 0.25)),
         "feature_loss_type": str(loss_cfg.get("feature_loss_type", "cosine")),
-        "zhcc_proto_weight": _linear_warmup(
-            float(loss_cfg.get("zhcc_proto_weight", 0.0)),
-            epoch,
-            int(loss_cfg.get("zhcc_proto_warmup_epochs", 0)),
-        ),
+        "zhcc_proto_weight": zhcc_proto_weight,
         "zhcc_level2_weight": float(loss_cfg.get("zhcc_level2_weight", 0.5)),
         "consensus_weight": float(loss_cfg.get("consensus_weight", 0.4)),
         "anchor_weight": float(loss_cfg.get("anchor_weight", 0.4)),
-        "zhcc_response_weight": _linear_warmup(
-            float(loss_cfg.get("zhcc_response_weight", 0.2)),
-            epoch,
-            int(loss_cfg.get("zhcc_response_warmup_epochs", loss_cfg.get("zhcc_proto_warmup_epochs", 0))),
-        ),
+        "zhcc_response_weight": zhcc_response_weight,
         "scale_relation_by_alpha": bool(loss_cfg.get("scale_relation_by_alpha", False)),
+        "prototype_start_step": prototype_start,
+        "filter_start_step": filter_start,
+        "teacher_prior_loss_ema": state.get("teacher_prior_loss_ema"),
+        "teacher_prior_relative_improvement": state.get("teacher_prior_relative_improvement"),
+        "teacher_prior_plateau_count": int(state.get("teacher_prior_plateau_count") or 0),
+        "intervention_stage": intervention_stage(cfg, int(global_step), state),
     }
 
 
@@ -138,11 +270,14 @@ def run_epoch(
     train: bool,
     scaler=None,
     scheduler=None,
-    loss_cfg: dict | None = None,
     max_batches: int | None = None,
     zhcc_prototypes=None,
+    epoch: int = 1,
+    global_step: int = 0,
+    schedule_state: dict | None = None,
 ) -> dict[str, float]:
     model.train(train)
+    schedule_state = _ensure_schedule_state(schedule_state)
     totals = {
         "loss": 0.0,
         "feature": 0.0,
@@ -161,8 +296,12 @@ def run_epoch(
     interval_tiles = 0
     phase = "train" if train else "val"
     log_interval = int(cfg["train"].get("log_interval", 0) or 0)
-    loss_cfg = loss_cfg or scheduled_loss_config(cfg, epoch=1)
-    teacher_weights = loss_cfg.get("teacher_weights")
+    last_loss_cfg = scheduled_loss_config(
+        cfg,
+        epoch=epoch,
+        global_step=global_step,
+        schedule_state=schedule_state,
+    )
     iterator = iter(loader)
     while True:
         data_wait_start = time.perf_counter()
@@ -181,6 +320,13 @@ def run_epoch(
         prototype_mask, prototype_level1, prototype_level2 = _move_prototype_batch(batch, device)
         with torch.set_grad_enabled(train):
             with torch.autocast(device_type=device.type, enabled=_amp_enabled(device, cfg, train)):
+                loss_cfg = scheduled_loss_config(
+                    cfg,
+                    epoch=epoch,
+                    global_step=global_step,
+                    schedule_state=schedule_state,
+                )
+                last_loss_cfg = loss_cfg
                 outputs = model(images)
                 student_by_teacher = outputs["teacher_outputs"]
                 if float(loss_cfg["prototype_filter_weight"]) > 0:
@@ -212,7 +358,7 @@ def run_epoch(
                     relation_weight=float(loss_cfg["relation_weight"]),
                     semantic_weight=float(loss_cfg["semantic_weight"]),
                     semantic_temperature=float(loss_cfg["semantic_temperature"]),
-                    teacher_weights=teacher_weights,
+                    teacher_weights=loss_cfg.get("teacher_weights"),
                     teacher_sample_weights=alpha_by_teacher,
                     feature_loss_type=str(loss_cfg["feature_loss_type"]),
                     primary_temperature=float(loss_cfg["primary_temperature"]),
@@ -242,6 +388,16 @@ def run_epoch(
                     optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
+                global_step += 1
+                teacher_prior_loss = float(parts["feature"].detach().cpu()) + float(loss_cfg["relation_weight"]) * float(
+                    parts["relation"].detach().cpu()
+                )
+                update_plateau_schedule_state(
+                    cfg,
+                    schedule_state,
+                    global_step=global_step,
+                    teacher_prior_loss=teacher_prior_loss,
+                )
         totals["loss"] += float(loss.detach().cpu())
         for key in ("feature", "relation", "semantic", "reliability", "relation_scale"):
             totals[key] += float(parts[key].cpu())
@@ -276,6 +432,15 @@ def run_epoch(
     result["tiles_per_sec"] = n_tiles / elapsed
     result["tiles"] = float(n_tiles)
     result["seconds"] = elapsed
+    result["global_step_end"] = float(global_step)
+    result["scheduled_zhcc_proto_weight"] = float(last_loss_cfg["zhcc_proto_weight"])
+    result["scheduled_prototype_filter_weight"] = float(last_loss_cfg["prototype_filter_weight"])
+    result["scheduled_zhcc_response_weight"] = float(last_loss_cfg["zhcc_response_weight"])
+    result["prototype_start_step"] = float(schedule_state["prototype_start_step"] or -1)
+    result["filter_start_step"] = float(schedule_state["filter_start_step"] or -1)
+    result["teacher_prior_loss_ema"] = float(schedule_state["teacher_prior_loss_ema"] or 0.0)
+    result["teacher_prior_relative_improvement"] = float(schedule_state["teacher_prior_relative_improvement"] or 0.0)
+    result["teacher_prior_plateau_count"] = float(schedule_state["teacher_prior_plateau_count"] or 0)
     return result
 
 
@@ -338,12 +503,12 @@ def fit(
     best_metrics = dict((resume_state or {}).get("best_metrics", {}))
     start_epoch = int((resume_state or {}).get("epoch", 0)) + 1
     global_step = int((resume_state or {}).get("global_step", 0))
+    schedule_state = _ensure_schedule_state((resume_state or {}).get("schedule_state"))
     scaler = torch.amp.GradScaler("cuda", enabled=bool(cfg["train"].get("amp", False) and device.type == "cuda"))
     if resume_state and "scaler" in resume_state:
         scaler.load_state_dict(resume_state["scaler"])
     _restore_rng_state((resume_state or {}).get("rng_state"))
     for epoch in range(start_epoch, int(cfg["train"]["epochs"]) + 1):
-        loss_cfg = scheduled_loss_config(cfg, epoch)
         train_metrics = run_epoch(
             model,
             train_loader,
@@ -354,11 +519,13 @@ def fit(
             train=True,
             scaler=scaler,
             scheduler=scheduler,
-            loss_cfg=loss_cfg,
             max_batches=cfg["train"].get("max_train_batches"),
             zhcc_prototypes=zhcc_prototypes,
+            epoch=epoch,
+            global_step=global_step,
+            schedule_state=schedule_state,
         )
-        global_step += int((train_metrics["tiles"] + int(cfg["train"]["batch_size"]) - 1) // int(cfg["train"]["batch_size"]))
+        global_step = int(train_metrics["global_step_end"])
         val_metrics = run_epoch(
             model,
             val_loader,
@@ -367,9 +534,11 @@ def fit(
             device,
             cfg,
             train=False,
-            loss_cfg=loss_cfg,
             max_batches=cfg["train"].get("max_val_batches"),
             zhcc_prototypes=zhcc_prototypes,
+            epoch=epoch,
+            global_step=global_step,
+            schedule_state=schedule_state,
         )
         embeddings, student_by_teacher, teacher_by_name, prototype_labels = collect_embeddings(
             model,
@@ -392,6 +561,12 @@ def fit(
             zhcc_prototypes.to("cpu") if zhcc_prototypes is not None else None,
             topk=int(cfg["train"]["topk"]),
         )
+        loss_cfg = scheduled_loss_config(
+            cfg,
+            epoch=epoch,
+            global_step=global_step,
+            schedule_state=schedule_state,
+        )
         row = {
             "epoch": epoch,
             "global_step": global_step,
@@ -401,6 +576,16 @@ def fit(
             "scheduled_prototype_filter_weight": float(loss_cfg["prototype_filter_weight"]),
             "scheduled_zhcc_proto_weight": float(loss_cfg["zhcc_proto_weight"]),
             "scheduled_zhcc_response_weight": float(loss_cfg["zhcc_response_weight"]),
+            "prototype_start_step": -1 if loss_cfg["prototype_start_step"] is None else int(loss_cfg["prototype_start_step"]),
+            "filter_start_step": -1 if loss_cfg["filter_start_step"] is None else int(loss_cfg["filter_start_step"]),
+            "teacher_prior_loss_ema": 0.0
+            if loss_cfg["teacher_prior_loss_ema"] is None
+            else float(loss_cfg["teacher_prior_loss_ema"]),
+            "teacher_prior_relative_improvement": 0.0
+            if loss_cfg["teacher_prior_relative_improvement"] is None
+            else float(loss_cfg["teacher_prior_relative_improvement"]),
+            "teacher_prior_plateau_count": int(loss_cfg["teacher_prior_plateau_count"]),
+            "intervention_stage": str(loss_cfg["intervention_stage"]),
             **{f"train_{k}": v for k, v in train_metrics.items()},
             **{f"val_{k}": v for k, v in val_metrics.items()},
             **embedding_metrics,
@@ -417,6 +602,7 @@ def fit(
             "best_loss": best_loss,
             "best_metrics": best_metrics,
             "rng_state": _rng_state(),
+            "schedule_state": schedule_state,
             "config": cfg,
         }
         torch.save(

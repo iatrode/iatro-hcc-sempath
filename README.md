@@ -334,9 +334,11 @@ locality, then builds batches from a cross-package shuffle buffer so batches are
 not dominated by a single WSI/package.
 
 For large cohorts, validation and embedding metrics should be sampled with
-`train.max_val_batches` and `train.max_eval_batches`; prototype semantic and
-filtering weights can be warmed up with `loss.semantic_warmup_epochs` and
-`loss.prototype_filter_warmup_epochs`.
+`train.max_val_batches` and `train.max_eval_batches`. The default PAMT-D
+intervention schedule is `loss.intervention_schedule: plateau_gate`: teacher
+priors train first, prototype intervention starts after the teacher prior loss
+plateaus or reaches `loss.max_teacher_warmup_steps`, and prototype filtering
+then follows after `loss.proto_to_filter_delay_steps`.
 
 Resume:
 
