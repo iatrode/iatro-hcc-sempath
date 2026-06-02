@@ -402,7 +402,7 @@ button,select{font:inherit}button{min-height:40px;border:1px solid var(--line);b
   .workspace{height:100svh;grid-template-rows:auto minmax(0,1fr) auto}.topbar{position:sticky;top:0;z-index:3}.viewer{align-items:center;padding:8px}.tile{max-height:calc(100svh - 310px)}
   .controls{position:sticky;bottom:0;z-index:2;padding:10px}.controlGrid{grid-template-columns:1fr;gap:10px}.scores{max-height:42px;overflow:auto}.pairButtons{grid-template-columns:1fr 1fr}.choiceRow{grid-template-columns:1fr}
 }
-</style></head><body><div id="layout" class="layout queue-collapsed">
+</style></head><body><div id="layout" class="layout">
 <aside id="queuePanel" class="queue"><div class="queueHead"><div><div class="queueTitle">Review queue</div><div id="count" class="muted"></div></div><button id="hideQueue" class="ghost" type="button">Hide</button></div><div id="list" class="queueBody"></div></aside>
 <main class="workspace"><div class="topbar"><button id="toggleQueue" type="button">Tiles</button><div class="topbarTitle" id="title">No tile selected</div><div id="progress" class="muted"></div></div>
 <section class="viewer"><div class="tileFrame"><img id="tile" class="tile" alt=""></div></section>
@@ -420,6 +420,7 @@ const els={
 let busy=false;
 async function api(path, opts){const r=await fetch(path,opts); if(!r.ok) throw new Error(await r.text()); return r.headers.get('content-type')?.includes('json')?r.json():r.blob();}
 function setQueueOpen(open){layout.classList.toggle('queue-collapsed',!open);}
+function isMobile(){return window.matchMedia('(max-width:760px)').matches;}
 function text(el,value){el.textContent=value;}
 async function load(selectIndex=0){
   const p=await api('/api/candidates'); queue=p.candidates; labels=p.l1_prototypes; mode=p.mode; classA=p.binary_a; classB=p.binary_b;
@@ -434,7 +435,7 @@ function renderList(){
     const row=document.createElement('div'); row.className='row'+(current&&current.key===candidate.key?' active':'');
     const title=document.createElement('div'); title.className='rowTitle'; title.textContent=candidate.tile_id;
     const meta=document.createElement('div'); meta.className='rowMeta'; meta.textContent=`${index+1}. ${candidate.current_l1} -> ${candidate.suggested_l1} - ${candidate.uncertainty.toFixed(3)}`;
-    row.append(title,meta); row.addEventListener('click',()=>{show(candidate.key); setQueueOpen(false);}); els.list.appendChild(row);
+    row.append(title,meta); row.addEventListener('click',()=>{show(candidate.key); if(isMobile())setQueueOpen(false);}); els.list.appendChild(row);
   });
 }
 async function show(key){
@@ -482,6 +483,7 @@ document.getElementById('hideQueue').addEventListener('click',()=>setQueueOpen(f
 document.getElementById('acceptBtn').addEventListener('click',()=>act('accept'));
 document.getElementById('rejectBtn').addEventListener('click',()=>act('reject'));
 document.getElementById('adjustBtn').addEventListener('click',()=>act('adjust'));
+if(isMobile())setQueueOpen(false);
 load().catch(e=>text(els.status,e.message||String(e)));
 </script></body></html>"""
 
