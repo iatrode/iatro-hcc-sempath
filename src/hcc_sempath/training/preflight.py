@@ -198,6 +198,7 @@ def main() -> None:
                 consensus_weight=float(cfg["loss"].get("consensus_weight", 0.4)),
                 anchor_weight=float(cfg["loss"].get("anchor_weight", 0.4)),
                 zhcc_response_weight=float(cfg["loss"].get("zhcc_response_weight", 0.2)),
+                filter_strength=float(cfg["loss"].get("prototype_filter_weight", 0.0)),
             )
         else:
             teacher_sample_weights = None
@@ -210,6 +211,7 @@ def main() -> None:
             semantic_temperature=float(cfg["loss"]["semantic_temperature"]),
             teacher_weights=cfg["loss"].get("teacher_weights"),
             teacher_sample_weights=teacher_sample_weights,
+            scale_relation_by_alpha=bool(cfg["loss"].get("scale_relation_by_alpha", False)),
         )
 
     print(

@@ -59,8 +59,9 @@ def test_multi_teacher_distillation_loss_aggregates_named_heads() -> None:
     )
 
     assert loss.ndim == 0
-    assert set(parts) == {"feature", "relation", "semantic", "reliability"}
+    assert set(parts) == {"feature", "relation", "semantic", "reliability", "relation_scale"}
     assert float(parts["reliability"]) == 1.0
+    assert float(parts["relation_scale"]) == 1.0
     loss.backward()
     assert student_by_teacher["teacher_a"].grad is not None
     assert student_by_teacher["teacher_b"].grad is not None
@@ -80,7 +81,63 @@ def test_multi_teacher_distillation_loss_accepts_per_sample_teacher_weights() ->
         teacher_sample_weights={"teacher": torch.tensor([1.0, 0.25])},
     )
 
-    assert abs(parts["feature"].item() - 0.125) < 1e-6
+    assert abs(parts["feature"].item() - 0.2) < 1e-6
     assert abs(parts["reliability"].item() - 0.625) < 1e-6
+    assert abs(parts["relation_scale"].item() - 1.0) < 1e-6
     loss.backward()
     assert student_by_teacher["teacher"].grad is not None
+
+
+def test_teacher_sample_weights_are_normalized_not_loss_scale() -> None:
+    student_by_teacher = {"teacher": torch.tensor([[1.0, 0.0], [0.0, 1.0]])}
+    teacher_by_name = {"teacher": torch.tensor([[1.0, 0.0], [1.0, 0.0]])}
+
+    _, parts_a = multi_teacher_distillation_loss(
+        student_by_teacher=student_by_teacher,
+        teacher_by_name=teacher_by_name,
+        prototypes_by_teacher=None,
+        relation_weight=0.0,
+        semantic_weight=0.0,
+        semantic_temperature=1.0,
+        teacher_sample_weights={"teacher": torch.tensor([1.0, 0.25])},
+    )
+    _, parts_b = multi_teacher_distillation_loss(
+        student_by_teacher=student_by_teacher,
+        teacher_by_name=teacher_by_name,
+        prototypes_by_teacher=None,
+        relation_weight=0.0,
+        semantic_weight=0.0,
+        semantic_temperature=1.0,
+        teacher_sample_weights={"teacher": torch.tensor([0.5, 0.125])},
+    )
+
+    assert abs(parts_a["feature"].item() - parts_b["feature"].item()) < 1e-6
+
+
+def test_relation_scaling_by_alpha_is_opt_in() -> None:
+    student_by_teacher = {"teacher": torch.randn(4, 3)}
+    teacher_by_name = {"teacher": torch.randn(4, 3)}
+    weights = {"teacher": torch.tensor([1.0, 0.5, 0.5, 0.25])}
+
+    _, default_parts = multi_teacher_distillation_loss(
+        student_by_teacher=student_by_teacher,
+        teacher_by_name=teacher_by_name,
+        prototypes_by_teacher=None,
+        relation_weight=0.25,
+        semantic_weight=0.0,
+        semantic_temperature=1.0,
+        teacher_sample_weights=weights,
+    )
+    _, scaled_parts = multi_teacher_distillation_loss(
+        student_by_teacher=student_by_teacher,
+        teacher_by_name=teacher_by_name,
+        prototypes_by_teacher=None,
+        relation_weight=0.25,
+        semantic_weight=0.0,
+        semantic_temperature=1.0,
+        teacher_sample_weights=weights,
+        scale_relation_by_alpha=True,
+    )
+
+    assert default_parts["relation_scale"].item() == 1.0
+    assert abs(scaled_parts["relation_scale"].item() - weights["teacher"].mean().item()) < 1e-6

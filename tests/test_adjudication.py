@@ -66,3 +66,52 @@ def test_prototype_adjudication_aligns_prototype_names_not_tensor_order() -> Non
     )
 
     assert alpha["teacher"].item() > 0.75
+
+
+def test_filter_strength_interpolates_raw_alpha() -> None:
+    registry = _registry(torch.eye(3))
+    kwargs = {
+        "teacher_by_name": {"teacher": torch.tensor([[0.0, 5.0, 0.0]])},
+        "prototypes_by_teacher": {"teacher": registry},
+        "zhcc_embedding_norm": torch.tensor([[5.0, 0.0, 5.0]]),
+        "zhcc_prototypes": registry,
+        "prototype_mask": torch.tensor([False]),
+        "prototype_level1": torch.tensor([-1]),
+        "prototype_level2": torch.tensor([[0.0]]),
+        "alpha_min": 0.25,
+        "consensus_weight": 0.0,
+        "anchor_weight": 0.0,
+        "zhcc_response_weight": 1.0,
+    }
+
+    alpha_off, diag_off = prototype_adjudicated_teacher_weights(**kwargs, filter_strength=0.0)
+    alpha_half, _ = prototype_adjudicated_teacher_weights(**kwargs, filter_strength=0.5)
+    alpha_full, diag_full = prototype_adjudicated_teacher_weights(**kwargs, filter_strength=1.0)
+
+    assert alpha_off["teacher"].item() == 1.0
+    assert alpha_full["teacher"].item() == diag_full["alpha_raw_mean/teacher"].item()
+    assert alpha_full["teacher"].item() < alpha_half["teacher"].item() < alpha_off["teacher"].item()
+    assert diag_off["alpha_effective_mean/teacher"].item() == 1.0
+
+
+def test_anchor_weight_only_changes_anchor_tiles() -> None:
+    registry = _registry(torch.eye(3))
+    common = {
+        "teacher_by_name": {"teacher": torch.tensor([[5.0, 0.0, 5.0], [5.0, 0.0, 5.0]])},
+        "prototypes_by_teacher": {"teacher": registry},
+        "zhcc_embedding_norm": torch.tensor([[5.0, 0.0, 5.0], [5.0, 0.0, 5.0]]),
+        "zhcc_prototypes": registry,
+        "prototype_mask": torch.tensor([True, False]),
+        "prototype_level1": torch.tensor([1, -1]),
+        "prototype_level2": torch.tensor([[0.0], [0.0]]),
+        "alpha_min": 0.25,
+        "consensus_weight": 0.5,
+        "zhcc_response_weight": 0.5,
+        "filter_strength": 1.0,
+    }
+
+    no_anchor, _ = prototype_adjudicated_teacher_weights(**common, anchor_weight=0.0)
+    with_anchor, _ = prototype_adjudicated_teacher_weights(**common, anchor_weight=0.8)
+
+    assert with_anchor["teacher"][0] < no_anchor["teacher"][0]
+    assert abs(with_anchor["teacher"][1].item() - no_anchor["teacher"][1].item()) < 1e-6

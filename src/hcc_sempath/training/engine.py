@@ -76,7 +76,12 @@ def scheduled_loss_config(cfg: dict, epoch: int) -> dict[str, float | dict]:
         "zhcc_level2_weight": float(loss_cfg.get("zhcc_level2_weight", 0.5)),
         "consensus_weight": float(loss_cfg.get("consensus_weight", 0.4)),
         "anchor_weight": float(loss_cfg.get("anchor_weight", 0.4)),
-        "zhcc_response_weight": float(loss_cfg.get("zhcc_response_weight", 0.2)),
+        "zhcc_response_weight": _linear_warmup(
+            float(loss_cfg.get("zhcc_response_weight", 0.2)),
+            epoch,
+            int(loss_cfg.get("zhcc_response_warmup_epochs", loss_cfg.get("zhcc_proto_warmup_epochs", 0))),
+        ),
+        "scale_relation_by_alpha": bool(loss_cfg.get("scale_relation_by_alpha", False)),
     }
 
 
@@ -144,6 +149,7 @@ def run_epoch(
         "relation": 0.0,
         "semantic": 0.0,
         "reliability": 0.0,
+        "relation_scale": 0.0,
         "zhcc_proto": 0.0,
         "zhcc_l1": 0.0,
         "zhcc_l2": 0.0,
@@ -194,6 +200,7 @@ def run_epoch(
                         consensus_weight=float(loss_cfg["consensus_weight"]),
                         anchor_weight=float(loss_cfg["anchor_weight"]),
                         zhcc_response_weight=float(loss_cfg["zhcc_response_weight"]),
+                        filter_strength=float(loss_cfg["prototype_filter_weight"]),
                     )
                 else:
                     alpha_by_teacher = None
@@ -210,6 +217,7 @@ def run_epoch(
                     feature_loss_type=str(loss_cfg["feature_loss_type"]),
                     primary_temperature=float(loss_cfg["primary_temperature"]),
                     attribute_temperature=float(loss_cfg["attribute_temperature"]),
+                    scale_relation_by_alpha=bool(loss_cfg["scale_relation_by_alpha"]),
                 )
                 zhcc_loss, zhcc_parts = zhcc_prototype_loss(
                     embedding_norm=outputs["embedding_norm"],
@@ -235,7 +243,7 @@ def run_epoch(
                 if scheduler is not None:
                     scheduler.step()
         totals["loss"] += float(loss.detach().cpu())
-        for key in ("feature", "relation", "semantic", "reliability"):
+        for key in ("feature", "relation", "semantic", "reliability", "relation_scale"):
             totals[key] += float(parts[key].cpu())
         for key in ("zhcc_proto", "zhcc_l1", "zhcc_l2"):
             totals[key] += float(zhcc_parts[key].detach().cpu())
@@ -392,6 +400,7 @@ def fit(
             "scheduled_semantic_weight": float(loss_cfg["semantic_weight"]),
             "scheduled_prototype_filter_weight": float(loss_cfg["prototype_filter_weight"]),
             "scheduled_zhcc_proto_weight": float(loss_cfg["zhcc_proto_weight"]),
+            "scheduled_zhcc_response_weight": float(loss_cfg["zhcc_response_weight"]),
             **{f"train_{k}": v for k, v in train_metrics.items()},
             **{f"val_{k}": v for k, v in val_metrics.items()},
             **embedding_metrics,
