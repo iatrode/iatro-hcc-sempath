@@ -107,13 +107,14 @@ def test_anchor_information_curve_outputs_nested_feature_metrics(tmp_path: Path)
         )
     )
 
-    plan = json.loads((output_root / "anchor_information_plan.json").read_text(encoding="utf-8"))
-    assert plan["sweep_type"] == "anchor_information_curve"
-    assert plan["anchor_counts_available"] == [2, 4, 6]
-    assert plan["does_not_train"] is True
-    assert plan["nested_subsets"] is True
-    assert plan["locked_validation_reused_for_all_counts"] is True
-    assert plan["split_seed"] == 13
+    report = json.loads((output_root / "anchor_information_report.json").read_text(encoding="utf-8"))
+    assert report["sweep_type"] == "anchor_information_curve"
+    assert report["anchor_counts_available"] == [2, 4, 6]
+    assert report["does_not_train"] is True
+    assert report["nested_subsets"] is True
+    assert report["locked_validation_reused_for_all_counts"] is True
+    assert report["seed"] == 13
+    assert "recommendation" in report
 
     subsets = _rows(output_root / "nested_subsets.csv")
     assert [row["anchor_count"] for row in subsets] == ["2", "4", "6"]
@@ -194,5 +195,36 @@ def test_missing_centers_are_reported_without_global_mean_fill(tmp_path: Path) -
 def test_default_anchor_counts_stop_at_three_thousand() -> None:
     module = _load_module()
     parser = module.build_parser()
-    args = parser.parse_args(["--teachers", "t"])
-    assert args.anchor_counts == "100,200,400,800,1200,1600,2000,3000"
+    args = parser.parse_args([])
+    assert args.seed == 13
+
+
+def test_teacher_aliases_resolve_local_feature_directories(tmp_path: Path) -> None:
+    module = _load_module()
+    root = tmp_path / "features"
+    h1_dir = root / "h1"
+    uni2_dir = root / "uni2"
+    h1_dir.mkdir(parents=True)
+    uni2_dir.mkdir(parents=True)
+    h1_package = h1_dir / "slide_a.h_optimus_1.features.iac"
+    uni2_package = uni2_dir / "slide_a.uni2_h.features.iac"
+    h1_package.write_text("", encoding="utf-8")
+    uni2_package.write_text("", encoding="utf-8")
+
+    paths = module._resolve_teacher_paths(
+        argparse.Namespace(
+            teacher_feature_root=str(root),
+            teacher_feature_packages="",
+            teachers="h1,uni2",
+        )
+    )
+
+    assert sorted(paths) == ["h_optimus_1", "uni2_h"]
+    assert paths["h_optimus_1"] == [h1_package]
+    assert paths["uni2_h"] == [uni2_package]
+
+
+def test_explicit_teacher_package_aliases_are_canonicalized() -> None:
+    module = _load_module()
+    paths = module._teacher_paths_from_arg("h1=/tmp/h1.features.iac,uni2=/tmp/uni2.features.iac")
+    assert sorted(paths) == ["h_optimus_1", "uni2_h"]

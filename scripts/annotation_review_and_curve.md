@@ -1,0 +1,141 @@
+# Annotation Review and Anchor Information Curve
+
+This note documents two standalone research utilities under `scripts/`.
+They are intentionally not wired into the main `hcc-sempath` CLI.
+
+## Annotation review UI
+
+Script:
+
+```bash
+scripts/annotation_review_ui.py
+```
+
+Purpose:
+
+- Review existing tile annotations with the tile image visible.
+- Save review state into JSON and a companion `.review.csv`.
+- Skip entries already marked with `reviewed: true`.
+- Resume from `--output-json` when that file already exists.
+
+### L1 review
+
+Use this when reviewing unstable L1 labels across all classes.
+With teacher features, the UI shows a feature-center suggestion, but the user still makes the final decision.
+
+```bash
+python scripts/annotation_review_ui.py \
+  --annotation-json annotations/hcc_prototype_review.json \
+  --output-json annotations/hcc_prototype_review.l1_review.json \
+  --mode l1 \
+  --teachers gigapath,uni2_h,virchow2 \
+  --teacher-feature-root <LOCAL_DATA_VOLUME>/temp-wsi-iac/Features
+```
+
+Useful options:
+
+```text
+--unstable-l1 Indeterminate-region,Artifact-non-tissue,Degenerative-material
+--no-open
+--host 127.0.0.1
+--port 0
+```
+
+### Pair review
+
+Use this when only two L1 classes should be shown and each tile is assigned to one of them.
+The two classes are arbitrary.
+
+```bash
+python scripts/annotation_review_ui.py \
+  --annotation-json annotations/hcc_prototype_review.json \
+  --output-json annotations/hcc_prototype_review.pair_review.json \
+  --mode binary \
+  --class-a Artifact-non-tissue \
+  --class-b Degenerative-material
+```
+
+Change `--class-a` and `--class-b` for other two-class reviews.
+
+### UI behavior
+
+- Desktop: the tile list is open by default and stays open when selecting a tile.
+- Mobile: the tile list is folded by default; the screen is split into tile image and controls.
+- After a decision, the UI advances to the next remaining tile.
+- During save, controls are disabled to avoid duplicate clicks.
+- L1 mode actions are three-way: accept suggested, keep current, or use selected.
+- Pair mode actions are the two class buttons.
+
+## Anchor information curve
+
+Script:
+
+```bash
+scripts/anchor_information_curve.py
+```
+
+Purpose:
+
+- Estimate whether additional annotated anchors still improve prototype information.
+- Use cached teacher features; it does not train a model.
+- Reuse one locked validation split for all anchor counts.
+- Produce summary CSVs and plots for the annotation-count curve.
+
+Typical command:
+
+```bash
+python scripts/anchor_information_curve.py \
+  --annotation-json annotations/hcc_prototype_review.json \
+  --prototype-contract annotations/hcc_prototype_review.json \
+  --teacher-feature-root <LOCAL_DATA_VOLUME>/temp-wsi-iac/Features \
+  --output-root outputs/anchor_information_curve_real_iac_smoke \
+  --seed 13
+```
+
+Help:
+
+```bash
+python scripts/anchor_information_curve.py --help
+```
+
+Main outputs:
+
+```text
+anchor_information_report.json
+anchor_information_summary.csv
+anchor_information_by_teacher.csv
+anchor_information_by_prototype.csv
+figures/anchor_information_summary.png
+figures/anchor_information_level1_prototypes.png
+figures/anchor_information_level2_prototypes.png
+figures/anchor_information_level1_prototype_audit.png
+figures/anchor_information_level2_prototype_audit.png
+figures/anchor_information_teacher_audit.png
+figures/anchor_information_teacher_coverage.png
+figures/anchor_information_teacher_delta_ci.png
+```
+
+Key defaults:
+
+```text
+anchor counts 100,200,400,800,1200,1600,2000,3000
+seed 13
+locked validation fraction 0.2
+anchor group key tile_id
+bootstrap iterations 500
+plot formats png,pdf
+```
+
+Interpretation:
+
+- `recommendation.recommended_anchor_count` in `anchor_information_report.json` is the selected count.
+- `anchor_counts_requested` records requested counts.
+- `anchor_counts_available` records counts that could actually be evaluated from available train anchors.
+- If 3000 is requested but unavailable after locked validation is held out, it will not appear in `anchor_counts_available`.
+
+Boundary:
+
+- This script only computes the information curve from cached features.
+- It does not modify annotation JSON.
+- It does not train.
+- It does not change prototype definitions.
