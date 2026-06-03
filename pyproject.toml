@@ -13,6 +13,7 @@ dependencies = [
   "timm",
   "PyYAML",
   "numpy",
+  "matplotlib",
   "Pillow",
   "tqdm",
   "imagecodecs",
