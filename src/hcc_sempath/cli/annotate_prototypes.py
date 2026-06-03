@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import hmac
 import io
 import json
 import logging
+import os
 import random
+import secrets
 import socket
 import tempfile
 import threading
@@ -69,8 +72,59 @@ def _find_free_port(host: str, preferred: int) -> int:
         return int(sock.getsockname()[1])
 
 
+def _auth_ok(provided: str, expected: str) -> bool:
+    return bool(provided) and hmac.compare_digest(provided, expected)
+
+
+def _request_auth_token(query: dict[str, list[str]]) -> str:
+    for key in ("token", "auth_token", "access_token"):
+        value = query.get(key, [""])[0]
+        if value:
+            return value
+    return ""
+
+
+def _auth_token_path(state_path: str | Path) -> Path:
+    return Path(state_path).with_suffix(".auth-token")
+
+
+def _load_or_create_auth_token(state_path: str | Path, provided: str = "") -> str:
+    if provided:
+        return provided
+    token_path = _auth_token_path(state_path)
+    if token_path.exists():
+        token = token_path.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    token = secrets.token_urlsafe(24)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(f"{token}\n", encoding="utf-8")
+    token_path.chmod(0o600)
+    return token
+
+
 def _candidate_iac_paths(root: Path) -> list[Path]:
-    return [root] if root.is_file() and root.suffix == ".iac" else sorted(root.rglob("*.iac"))
+    if root.is_file():
+        return [root] if root.suffix == ".iac" else []
+
+    paths = []
+    visited_dirs: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        real_dir = os.path.realpath(dirpath)
+        if real_dir in visited_dirs:
+            dirnames[:] = []
+            continue
+        visited_dirs.add(real_dir)
+
+        dirnames[:] = sorted(
+            dirname
+            for dirname in dirnames
+            if os.path.realpath(Path(dirpath) / dirname) not in visited_dirs
+        )
+        for filename in sorted(filenames):
+            if filename.endswith(".iac"):
+                paths.append(Path(dirpath) / filename)
+    return paths
 
 
 def _package_from_path(root: Path, path: Path) -> AnnotationPackage | None:
@@ -109,17 +163,70 @@ def _annotation_key(package: AnnotationPackage, record: IacRecord) -> str:
     return f"{package.rel_path}::{record.tile_id}::{record.display_x},{record.display_y}"
 
 
+def _is_counted_annotation(item: dict) -> bool:
+    if bool(item.get("skipped")) or bool(item.get("skip")):
+        return False
+    skip_values = {"skip", "skipped"}
+    decision = str(item.get("decision") or "").strip().lower()
+    review_decision = str(item.get("review_decision") or "").strip().lower()
+    if decision in skip_values or review_decision in skip_values:
+        return False
+    return bool(str(item.get("l1") or item.get("level1_label") or "").strip())
+
+
+def _ordered_unique(values) -> list[str]:
+    result = []
+    seen = set()
+    for value in values:
+        item = str(value).strip()
+        if not item or item in seen:
+            continue
+        result.append(item)
+        seen.add(item)
+    return result
+
+
+def _state_prototypes(payload: dict, key: str, fallback: list[str], annotation_field: str) -> list[str]:
+    values = list(payload.get(key) or fallback)
+    for item in payload.get("annotations", {}).values():
+        observed = item.get(annotation_field)
+        if isinstance(observed, list):
+            values.extend(observed)
+        else:
+            values.append(observed)
+    return _ordered_unique(values)
+
+
 class AnnotationState:
     def __init__(self, state_path: str | Path, input_path: str | Path) -> None:
         self.state_path = Path(state_path)
         self.input_path = str(Path(input_path).resolve())
         self.annotations: dict[str, dict] = {}
+        self.skipped: set[str] = set()
+        self.extra_payload: dict = {}
+        self.last_iac = ""
+        self.l1_prototypes = list(L1_PROTOTYPES)
+        self.l2_prototypes = list(L2_PROTOTYPES)
         self.revision = 0
         if self.state_path.exists():
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
             self.input_path = str(Path(payload.get("input_path", self.input_path)).resolve())
             self.annotations = dict(payload.get("annotations", {}))
-            LOG.info("state_load path=%s annotations=%d input=%s", self.state_path, len(self.annotations), self.input_path)
+            self.skipped = set(str(item) for item in payload.get("skipped", []))
+            self.last_iac = str(payload.get("last_iac") or "")
+            self.l1_prototypes = _state_prototypes(payload, "l1_prototypes", L1_PROTOTYPES, "l1")
+            self.l2_prototypes = _state_prototypes(payload, "l2_prototypes", L2_PROTOTYPES, "l2")
+            known_keys = {"version", "input_path", "l1_prototypes", "l2_prototypes", "annotations", "skipped", "last_iac"}
+            self.extra_payload = {key: value for key, value in payload.items() if key not in known_keys}
+            LOG.info(
+                "state_load path=%s annotations=%d skipped=%d l1=%d l2=%d input=%s",
+                self.state_path,
+                len(self.annotations),
+                len(self.skipped),
+                len(self.l1_prototypes),
+                len(self.l2_prototypes),
+                self.input_path,
+            )
         else:
             LOG.info("state_new path=%s input=%s", self.state_path, self.input_path)
 
@@ -128,24 +235,39 @@ class AnnotationState:
         return self.state_path.with_suffix(".csv")
 
     def is_annotated(self, package: AnnotationPackage, record: IacRecord) -> bool:
-        return _annotation_key(package, record) in self.annotations
+        key = _annotation_key(package, record)
+        return key in self.annotations or key in self.skipped
 
     def counts_for_package(self, package: AnnotationPackage, records: list[IacRecord]) -> dict:
-        annotated = sum(1 for record in records if self.is_annotated(package, record))
-        return {"annotated": annotated, "total": len(records), "remaining": max(0, len(records) - annotated)}
+        annotated = sum(1 for record in records if self.is_counted_record(package, record))
+        skipped = sum(1 for record in records if _annotation_key(package, record) in self.skipped)
+        return {"annotated": annotated, "total": len(records), "remaining": max(0, len(records) - annotated - skipped), "skipped": skipped}
 
     def annotations_for_package(self, package: AnnotationPackage) -> list[dict]:
         prefix = f"{package.rel_path}::"
         return [value for key, value in self.annotations.items() if key.startswith(prefix)]
 
+    def counted_annotations_for_package(self, package: AnnotationPackage) -> list[dict]:
+        prefix = f"{package.rel_path}::"
+        return [item for key, item in self.annotations.items() if key.startswith(prefix) and key not in self.skipped and _is_counted_annotation(item)]
+
+    def skipped_for_package(self, package: AnnotationPackage) -> set[str]:
+        prefix = f"{package.rel_path}::"
+        return {key for key in self.skipped if key.startswith(prefix)}
+
+    def is_counted_record(self, package: AnnotationPackage, record: IacRecord) -> bool:
+        key = _annotation_key(package, record)
+        return key not in self.skipped and _is_counted_annotation(self.annotations.get(key, {}))
+
     def lightweight_counts_for_package(self, package: AnnotationPackage) -> dict:
-        annotated = len(self.annotations_for_package(package))
-        return {"annotated": annotated, "total": package.total, "remaining": max(0, package.total - annotated)}
+        annotated = len(self.counted_annotations_for_package(package))
+        skipped = len(self.skipped_for_package(package))
+        return {"annotated": annotated, "total": package.total, "remaining": max(0, package.total - annotated - skipped), "skipped": skipped}
 
     def save_annotation(self, package: AnnotationPackage, record: IacRecord, l1: str, l2: list[str]) -> None:
-        if l1 not in L1_PROTOTYPES:
+        if l1 not in self.l1_prototypes:
             raise ValueError(f"unknown L1 prototype: {l1}")
-        unknown_l2 = sorted(set(l2) - set(L2_PROTOTYPES))
+        unknown_l2 = sorted(set(l2) - set(self.l2_prototypes))
         if unknown_l2:
             raise ValueError(f"unknown L2 prototype(s): {unknown_l2}")
         payload = {
@@ -160,7 +282,10 @@ class AnnotationState:
             "l1": l1,
             "l2": list(l2),
         }
-        self.annotations[_annotation_key(package, record)] = payload
+        key = _annotation_key(package, record)
+        self.annotations[key] = payload
+        self.skipped.discard(key)
+        self.last_iac = package.rel_path
         self.revision += 1
         self.flush()
         LOG.info(
@@ -177,13 +302,16 @@ class AnnotationState:
 
     def flush(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
+        payload = dict(self.extra_payload)
+        payload.update({
             "version": 1,
             "input_path": self.input_path,
-            "l1_prototypes": L1_PROTOTYPES,
-            "l2_prototypes": L2_PROTOTYPES,
+            "l1_prototypes": self.l1_prototypes,
+            "l2_prototypes": self.l2_prototypes,
+            "last_iac": self.last_iac,
             "annotations": self.annotations,
-        }
+            "skipped": sorted(self.skipped),
+        })
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=self.state_path.parent) as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
             tmp_path = Path(handle.name)
@@ -192,15 +320,22 @@ class AnnotationState:
         LOG.info("state_flush json=%s csv=%s annotations=%d", self.state_path, self.csv_path, len(self.annotations))
 
     def _write_csv(self) -> None:
+        base_fields = ["dataset", "iac", "iac_path", "tile_id", "row", "slide", "x", "y", "l1", "l2"]
+        extra_fields = sorted(
+            {
+                key
+                for item in self.annotations.values()
+                for key in item.keys()
+                if key not in set(base_fields)
+            }
+        )
+        fieldnames = base_fields + extra_fields
         with self.csv_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=["dataset", "iac", "iac_path", "tile_id", "row", "slide", "x", "y", "l1", "l2"],
-            )
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             for item in sorted(self.annotations.values(), key=lambda value: (value["iac"], value["row"])):
                 row = dict(item)
-                row["l2"] = ";".join(row["l2"])
+                row["l2"] = ";".join(row.get("l2", []))
                 writer.writerow(row)
 
 
@@ -251,7 +386,7 @@ class AnnotationData:
 
     def scan_status(self) -> dict:
         with self._lock:
-            return {"done": self._scan_done, "error": self._scan_error, "packages": len(self.packages)}
+            return {"done": self._scan_done, "error": self._scan_error, "packages": len(self.packages), "last_iac": self.state.last_iac}
 
     def package(self, index: int) -> AnnotationPackage:
         with self._lock:
@@ -323,23 +458,44 @@ class AnnotationData:
 
     def progress(self, index: int) -> dict:
         with self._lock:
+            packages = list(self.packages)
             package = self.packages[index]
         viewer = self.viewer(index)
         counts = self.state.counts_for_package(package, viewer.records)
-        l1_counts = {name: 0 for name in L1_PROTOTYPES}
-        l2_counts = {name: 0 for name in L2_PROTOTYPES}
-        for item in self.state.annotations_for_package(package):
-            l1_counts[item["l1"]] = l1_counts.get(item["l1"], 0) + 1
+        overall = {
+            "annotated": sum(len(self.state.counted_annotations_for_package(item)) for item in packages),
+            "total": sum(item.total for item in packages),
+            "skipped": sum(
+                1
+                for item in packages
+                for key in self.state.skipped
+                if key.startswith(f"{item.rel_path}::")
+            ),
+        }
+        overall["remaining"] = max(0, overall["total"] - overall["annotated"] - overall["skipped"])
+        l1_counts = {name: 0 for name in self.state.l1_prototypes}
+        l2_counts = {name: 0 for name in self.state.l2_prototypes}
+        for counted_package in packages:
+            for item in self.state.counted_annotations_for_package(counted_package):
+                l1_counts[item["l1"]] = l1_counts.get(item["l1"], 0) + 1
+                for label in item["l2"]:
+                    l2_counts[label] = l2_counts.get(label, 0) + 1
+        package_l1_counts = {name: 0 for name in self.state.l1_prototypes}
+        package_l2_counts = {name: 0 for name in self.state.l2_prototypes}
+        for item in self.state.counted_annotations_for_package(package):
+            package_l1_counts[item["l1"]] = package_l1_counts.get(item["l1"], 0) + 1
             for label in item["l2"]:
-                l2_counts[label] = l2_counts.get(label, 0) + 1
+                package_l2_counts[label] = package_l2_counts.get(label, 0) + 1
         LOG.info(
-            "progress_read iac=%s annotated=%d total=%d remaining=%d",
+            "progress_read iac=%s annotated=%d total=%d remaining=%d overall_annotated=%d overall_total=%d",
             package.rel_path,
             counts["annotated"],
             counts["total"],
             counts["remaining"],
+            overall["annotated"],
+            overall["total"],
         )
-        return {"package": counts, "l1": l1_counts, "l2": l2_counts}
+        return {"package": counts, "overall": overall, "l1": l1_counts, "l2": l2_counts, "package_l1": package_l1_counts, "package_l2": package_l2_counts}
 
     def random_record(self, index: int) -> dict:
         with self._lock:
@@ -369,7 +525,7 @@ class AnnotationData:
         viewer = self.viewer(index)
         return {record.row for record in viewer.records if self.state.is_annotated(package, record)}
 
-    def thumbnail_jpg(self, index: int, token: str | None = None) -> bytes:
+    def thumbnail_jpg(self, index: int, token: str | None = None, selected_row: int | None = None) -> bytes:
         if token:
             self.activate_thumbnail_token(token)
         with self._lock:
@@ -377,7 +533,7 @@ class AnnotationData:
         cache_path = self.overview_cache_path(package)
         if cache_path.exists():
             LOG.info("overview_cache_hit iac=%s path=%s", package.rel_path, cache_path)
-            return self._overview_with_annotations(index, cache_path)
+            return self._overview_with_annotations(index, cache_path, selected_row=selected_row)
 
         viewer = self.viewer(index)
         start = perf_counter()
@@ -450,9 +606,9 @@ class AnnotationData:
             cache_path,
             perf_counter() - start,
         )
-        return self._overview_with_annotations(index, cache_path)
+        return self._overview_with_annotations(index, cache_path, selected_row=selected_row)
 
-    def _overview_with_annotations(self, index: int, cache_path: Path) -> bytes:
+    def _overview_with_annotations(self, index: int, cache_path: Path, selected_row: int | None = None) -> bytes:
         package = self.package(index)
         viewer = self.viewer(index)
         records = viewer.records
@@ -468,9 +624,53 @@ class AnnotationData:
             x = (row.grid_x - min_grid_x) * OVERVIEW_CELL_PX
             y = (row.grid_y - min_grid_y) * OVERVIEW_CELL_PX
             draw.rectangle([x, y, x + OVERVIEW_CELL_PX, y + OVERVIEW_CELL_PX], outline=(0, 140, 80, 220), width=1)
+        if selected_row is not None and selected_row in viewer._by_row:
+            row = viewer._by_row[selected_row]
+            x = (row.grid_x - min_grid_x) * OVERVIEW_CELL_PX
+            y = (row.grid_y - min_grid_y) * OVERVIEW_CELL_PX
+            cx = x + OVERVIEW_CELL_PX // 2
+            cy = y + OVERVIEW_CELL_PX // 2
+            span = max(12, OVERVIEW_CELL_PX * 3)
+            draw.line([cx - span, cy, cx + span, cy], fill=(220, 20, 20, 255), width=2)
+            draw.line([cx, cy - span, cx, cy + span], fill=(220, 20, 20, 255), width=2)
+            draw.rectangle([x, y, x + OVERVIEW_CELL_PX, y + OVERVIEW_CELL_PX], outline=(220, 20, 20, 255), width=2)
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=90)
         LOG.info("overview_return iac=%s path=%s annotated=%d bytes=%d", package.rel_path, cache_path, len(annotated), buffer.tell())
+        return buffer.getvalue()
+
+    def context_jpg(self, index: int, row: int) -> bytes:
+        viewer = self.viewer(index)
+        center = viewer._by_row[row]
+        tile_w = max(1, int(viewer.header.get("tile_width", viewer.stride_x))) // 2
+        tile_h = max(1, int(viewer.header.get("tile_height", viewer.stride_y))) // 2
+        tile_w = max(1, tile_w)
+        tile_h = max(1, tile_h)
+        canvas = Image.new("RGB", (tile_w * 5, tile_h * 5), (245, 247, 249))
+        draw = ImageDraw.Draw(canvas)
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                record = viewer._image_lookup.get((center.slide_key, center.grid_x + dx, center.grid_y + dy))
+                x = (dx + 2) * tile_w
+                y = (dy + 2) * tile_h
+                if record is None:
+                    draw.rectangle([x, y, x + tile_w - 1, y + tile_h - 1], outline=(210, 215, 220))
+                    continue
+                try:
+                    image = Image.open(io.BytesIO(viewer.read_tile_png(record.row))).convert("RGB")
+                    image = image.resize((tile_w, tile_h), Image.Resampling.BILINEAR)
+                    canvas.paste(image, (x, y))
+                except Exception:
+                    LOG.exception("context_tile_decode_failed row=%d", record.row)
+                    draw.rectangle([x, y, x + tile_w - 1, y + tile_h - 1], outline=(210, 80, 80))
+        center_x = 2 * tile_w
+        center_y = 2 * tile_h
+        draw.rectangle([center_x, center_y, center_x + tile_w - 1, center_y + tile_h - 1], outline=(220, 20, 20), width=4)
+        draw.line([center_x, center_y + tile_h // 2, center_x + tile_w, center_y + tile_h // 2], fill=(220, 20, 20), width=2)
+        draw.line([center_x + tile_w // 2, center_y, center_x + tile_w // 2, center_y + tile_h], fill=(220, 20, 20), width=2)
+        buffer = io.BytesIO()
+        canvas.save(buffer, format="JPEG", quality=90)
+        LOG.info("context_render index=%d row=%d bytes=%d", index, row, buffer.tell())
         return buffer.getvalue()
 
 
@@ -481,39 +681,77 @@ HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HCC-SemPath Prototype Annotation</title>
 <style>
-body{margin:0;font:14px system-ui,-apple-system,Segoe UI,sans-serif;color:#202124;background:#f6f7f8}
-.layout{display:grid;grid-template-columns:300px 1fr 320px;height:100vh}
-aside,.right{overflow:auto;background:#fff;border-right:1px solid #d8dadd;padding:12px}.right{border-left:1px solid #d8dadd;border-right:0}
-main{overflow:auto;padding:12px}.pkg{position:relative;padding:8px;border:1px solid #d8dadd;margin-bottom:6px;cursor:pointer;background:#fff;overflow:hidden}.pkg.active{border-color:#1a73e8;background:#eaf2ff}
+:root{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--line:#d7dce2;--text:#202124;--muted:#687381;--blue:#1a73e8;--blue-soft:#e8f0fe;--green-soft:#dff3eb;--danger:#b42318}
+*{box-sizing:border-box}body{margin:0;font:14px system-ui,-apple-system,Segoe UI,sans-serif;color:var(--text);background:var(--bg);height:100svh;overflow:hidden}
+button,input{font:inherit}button{min-height:40px;border:1px solid var(--line);background:var(--panel);color:var(--text);cursor:pointer}button.primary{background:var(--blue);border-color:var(--blue);color:#fff}button.ghost{background:transparent}button:disabled{opacity:.55;cursor:default}
+.layout{display:grid;grid-template-columns:300px minmax(0,1fr) 320px;height:100svh}.layout.queue-collapsed{grid-template-columns:0 minmax(0,1fr) 320px}.layout.labels-collapsed{grid-template-columns:300px minmax(0,1fr) 0}.layout.queue-collapsed.labels-collapsed{grid-template-columns:0 minmax(0,1fr) 0}
+aside,.right{overflow:hidden;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column}.right{border-left:1px solid var(--line);border-right:0}.layout.queue-collapsed aside,.layout.labels-collapsed .right{border:0}.layout.queue-collapsed aside>*,.layout.labels-collapsed .right>*{display:none}
+.panelHead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px;border-bottom:1px solid var(--line)}.panelTitle{font-weight:650}.panelBody{overflow:auto;padding:12px}.labelBody{min-height:0;flex:1}.labelActions{border-top:1px solid var(--line);padding:10px 12px;background:var(--panel)}
+main{min-width:0;display:grid;grid-template-rows:auto minmax(0,1fr);height:100svh}.topbar{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--panel)}.topbarTitle{min-width:0;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.workspace{min-height:0;overflow:auto;padding:12px}.pkg{position:relative;padding:8px;border:1px solid var(--line);margin-bottom:6px;cursor:pointer;background:#fff;overflow:hidden}.pkg.active{border-color:var(--blue);background:var(--blue-soft)}
 .pkg>*{position:relative;z-index:1}.pkg::before{content:"";position:absolute;inset:0 auto 0 0;width:var(--pct,0%);background:#dff3eb;z-index:0}
-.muted{color:#6b7280;font-size:12px}.thumbWrap{min-height:220px;border:1px solid #c7cbd1;background:white;overflow:auto}
+.muted{color:var(--muted);font-size:12px}.thumbWrap{min-height:220px;border:1px solid #c7cbd1;background:white;overflow:auto}
 .thumb{display:block;width:auto;height:auto;max-width:none;background:white;cursor:crosshair}.loading{padding:18px;color:#6b7280;font-size:12px}
 .tile{width:224px;height:224px;object-fit:contain;border:1px solid #c7cbd1;background:#fff}.chips{display:grid;grid-template-columns:1fr;gap:6px;margin:8px 0 16px}
+.panzoom{touch-action:none;transform-origin:0 0;will-change:transform;cursor:grab}.panzoom.dragging{cursor:grabbing}
 button.chip{position:relative;text-align:left;border:1px solid #c7cbd1;background:#fff;padding:8px;cursor:pointer;overflow:hidden}button.chip::before{content:"";position:absolute;inset:0 auto 0 0;width:var(--pct,0%);background:#eef4ff;z-index:0}button.chip.selected{background:#1a73e8;color:white;border-color:#1a73e8}button.chip.selected::before{background:rgba(255,255,255,.18)}button.chip span{position:relative;z-index:1}.chipRow{display:flex;justify-content:space-between;gap:8px}.chipCount{font-variant-numeric:tabular-nums;color:#374151}button.chip.selected .chipCount{color:white}
-.actions button{padding:8px 10px;margin-right:6px}.bar{height:8px;background:#e5e7eb;margin:6px 0 10px}.bar>div{height:8px;background:#18865b}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.actions button{padding:8px 10px}.bar{height:8px;background:#e5e7eb;margin:6px 0 10px}.bar>div{height:8px;background:#18865b}
 pre{white-space:pre-wrap;font-size:12px;background:#f1f3f4;padding:8px}
+.authGate{position:fixed;inset:0;background:rgba(244,246,248,.96);z-index:10;display:none;align-items:center;justify-content:center;padding:18px}.authBox{width:min(420px,100%);background:#fff;border:1px solid var(--line);padding:16px;box-shadow:0 14px 40px rgba(15,23,42,.18)}.authBox h3{margin:0 0 10px}.authBox input{width:100%;min-height:42px;border:1px solid var(--line);padding:0 10px;margin-bottom:10px}.authBox .status{min-height:18px;color:var(--danger);font-size:12px}
+.contextOverlay{position:fixed;inset:0;background:rgba(15,23,42,.86);z-index:9;display:flex;flex-direction:column}.contextBar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;background:#fff}.contextStage{min-height:0;flex:1;overflow:hidden;display:flex;align-items:center;justify-content:center}.contextStage img{max-width:none;max-height:none;background:#fff;border:1px solid rgba(255,255,255,.5)}
+.hidden{display:none!important}
+@media(max-width:760px){
+  body{height:100svh;overflow:hidden}.layout,.layout.queue-collapsed,.layout.labels-collapsed,.layout.queue-collapsed.labels-collapsed{display:block;height:100svh}
+  aside{position:fixed;inset:0 0 auto 0;z-index:5;max-height:45svh;border-right:0;border-bottom:1px solid var(--line);box-shadow:0 8px 24px rgba(15,23,42,.16)}.layout.queue-collapsed aside{display:none}
+  .right{position:fixed;inset:auto 0 0 0;z-index:4;max-height:48svh;border-left:0;border-top:1px solid var(--line);box-shadow:0 -8px 24px rgba(15,23,42,.12)}.layout.labels-collapsed .right{display:none}
+  main{height:100svh;grid-template-rows:auto minmax(0,1fr)}.topbar{position:sticky;top:0;z-index:3}.workspace{padding:8px}.tile{width:192px;height:192px}.thumbWrap{max-height:calc(100svh - 310px);min-height:160px}.actions{grid-template-columns:1fr 1fr}.panelBody{padding:10px}.labelActions{padding:8px 10px}.chips{gap:6px;margin-bottom:10px}button.chip{min-height:38px;padding:7px}
+}
 </style>
 </head>
-<body><div class="layout"><aside><h3>IAC packages</h3><div id="packageSummary" class="muted"></div><div id="packages"></div></aside>
-<main><h3 id="title">Prototype annotation</h3><div class="muted" id="recordMeta"></div>
-<p><img id="tile" class="tile"></p><h3>Location overview</h3><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb"></div></main>
-<section class="right"><h3>Progress</h3><div id="progress"></div><h3>L1 primary</h3><div id="l1" class="chips"></div>
-<h3>L2 attributes</h3><div id="l2" class="chips"></div><div class="actions"><button onclick="save()">Save + next</button><button onclick="nextRandom()">Skip / random</button></div><pre id="status"></pre></section>
+<body><div id="authGate" class="authGate"><div class="authBox"><h3>Annotation token</h3><input id="authInput" autocomplete="off"><button id="authSubmit" class="primary" type="button">Open</button><div id="authStatus" class="status"></div></div></div>
+<div id="layout" class="layout"><aside><div class="panelHead"><div><div class="panelTitle">IAC packages</div><div id="packageSummary" class="muted"></div></div><button id="hideQueue" class="ghost" type="button">Hide</button></div><div id="packages" class="panelBody"></div></aside>
+<main><div class="topbar"><button id="toggleQueue" type="button">Tiles</button><button id="toggleLabels" type="button">Labels</button><button id="contextBtn" type="button">Context</button><div id="title" class="topbarTitle">Prototype annotation</div></div><section class="workspace"><div class="muted" id="recordMeta"></div>
+<p><img id="tile" class="tile panzoom"></p><h3>Location overview</h3><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom"></div></section></main>
+<section class="right"><div class="panelHead"><div class="panelTitle">Labels</div><button id="hideLabels" class="ghost" type="button">Hide</button></div><div class="panelBody labelBody"><h3>Progress</h3><div id="progress"></div><h3>L1 primary</h3><div id="l1" class="chips"></div>
+<h3>L2 attributes</h3><div id="l2" class="chips"></div></div><div class="labelActions"><div class="actions"><button onclick="save()" class="primary">Save + next</button><button onclick="nextRandom()">Skip / random</button></div><pre id="status"></pre></div></section>
 </div>
+<div id="contextOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>5x5 context</b><div id="contextMeta" class="muted"></div></div><button id="contextClose" type="button">Close</button></div><div class="contextStage"><img id="contextImg" class="panzoom"></div></div>
 <script>
-let packages=[], pkg=0, current=null, l1="", l2=new Set(), l1Counts={}, l2Counts={};
-async function api(path, opts){const r=await fetch(path, opts); if(!r.ok) throw new Error(await r.text()); return r.headers.get('content-type')?.includes('json')?r.json():r.blob();}
+let packages=[], pkg=0, current=null, l1="", l2=new Set(), l1Counts={}, l2Counts={}, restoredLastIac=false;
+const TOKEN_KEYS=['token','auth_token','access_token'];
+let AUTH_TOKEN='';
+function tokenFromUrl(){const params=new URLSearchParams(location.search); for(const key of TOKEN_KEYS){const value=params.get(key); if(value)return value;} return '';}
+function setAuthToken(token){AUTH_TOKEN=token||''; if(AUTH_TOKEN)localStorage.setItem('hcc_sempath_annotation_token',AUTH_TOKEN);}
+function authed(path){return path+(path.includes('?')?'&':'?')+'token='+encodeURIComponent(AUTH_TOKEN);}
+async function api(path, opts){const r=await fetch(authed(path), opts); if(!r.ok) throw new Error(await r.text()); return r.headers.get('content-type')?.includes('json')?r.json():r.blob();}
+function setQueueOpen(open){document.getElementById('layout').classList.toggle('queue-collapsed',!open);}
+function setLabelsOpen(open){document.getElementById('layout').classList.toggle('labels-collapsed',!open);}
+function isMobile(){return window.matchMedia('(max-width:760px)').matches;}
+async function ensureAuth(){setAuthToken(tokenFromUrl()||localStorage.getItem('hcc_sempath_annotation_token')||''); if(!AUTH_TOKEN){document.getElementById('authGate').style.display='flex'; throw new Error('');}}
+async function submitAuth(){setAuthToken(document.getElementById('authInput').value.trim()); try{await api('/api/scan-status'); document.getElementById('authGate').style.display='none'; refreshPackage().catch(e=>document.getElementById('status').textContent=e.message||String(e));}catch(e){document.getElementById('authStatus').textContent='Invalid token.';}}
+function setupPanZoom(el,onClick){let scale=1,tx=0,ty=0,drag=false,sx=0,sy=0,stx=0,sty=0,moved=0; const apply=()=>{el.style.transform=`translate(${tx}px,${ty}px) scale(${scale})`;}; el.addEventListener('wheel',ev=>{ev.preventDefault(); const next=Math.min(12,Math.max(.25,scale*(ev.deltaY<0?1.15:.87))); scale=next; apply();},{passive:false}); el.addEventListener('pointerdown',ev=>{drag=true;moved=0;sx=ev.clientX;sy=ev.clientY;stx=tx;sty=ty;el.classList.add('dragging');el.setPointerCapture(ev.pointerId);}); el.addEventListener('pointermove',ev=>{if(!drag)return; const dx=ev.clientX-sx,dy=ev.clientY-sy; moved=Math.max(moved,Math.abs(dx)+Math.abs(dy)); tx=stx+dx; ty=sty+dy; apply();}); el.addEventListener('pointerup',ev=>{if(!drag)return; drag=false; el.classList.remove('dragging'); if(moved<6&&onClick)onClick(ev);}); el.addEventListener('dblclick',ev=>{ev.preventDefault(); scale=1;tx=0;ty=0;apply();}); el.resetPanZoom=()=>{scale=1;tx=0;ty=0;apply();};}
 function prototypeButton(name, selected, count, maxCount, onClick){const b=document.createElement('button'); const pct=maxCount?Math.round(count/maxCount*100):0; b.className='chip'+(selected?' selected':''); b.style.setProperty('--pct',pct+'%'); b.innerHTML=`<span class=chipRow><span>${name}</span><span class=chipCount>${count}</span></span>`; b.onclick=onClick; return b;}
 function renderLabels(){const a=document.getElementById('l1'); a.innerHTML=''; const l1Max=Math.max(1,...Object.values(l1Counts)); L1.forEach(x=>a.appendChild(prototypeButton(x,l1===x,l1Counts[x]||0,l1Max,()=>{l1=x;renderLabels()}))); const b=document.getElementById('l2'); b.innerHTML=''; const l2Max=Math.max(1,...Object.values(l2Counts)); L2.forEach(x=>b.appendChild(prototypeButton(x,l2.has(x),l2Counts[x]||0,l2Max,()=>{l2.has(x)?l2.delete(x):l2.add(x);renderLabels()})));}
-function setThumbnailSrc(){const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); const token=`${Date.now()}-${pkg}`; img.dataset.token=String(token); loading.style.display='block'; loading.textContent='Building overview...'; img.style.display='none'; img.onload=()=>{if(img.dataset.token!==String(token)) return; loading.style.display='none'; img.style.display='block';}; img.onerror=()=>{if(img.dataset.token===String(token)) loading.textContent='Overview failed to load.';}; img.src=`/api/thumbnail?package=${pkg}&token=${encodeURIComponent(token)}&t=${Date.now()}`;}
-async function loadPackages(){packages=await api('/api/packages'); const scan=await api('/api/scan-status'); document.getElementById('packageSummary').textContent=`${packages.length} IAC package${packages.length===1?'':'s'}${scan.done?'':' · scanning...'}`; if(scan.error){document.getElementById('status').textContent=scan.error;} const box=document.getElementById('packages'); box.innerHTML=''; packages.forEach(p=>{const pct=p.total?Math.round(p.annotated/p.total*100):0; const d=document.createElement('div'); d.className='pkg'+(p.index===pkg?' active':''); d.style.setProperty('--pct',pct+'%'); d.innerHTML=`<b>${p.name}</b><div class=muted>${p.dataset||'no dataset'} · ${p.annotated}/${p.total} · ${pct}%</div>`; d.onclick=()=>{pkg=p.index; refreshPackage();}; box.appendChild(d)}); return scan;}
+function setThumbnailSrc(){const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); const token=`${Date.now()}-${pkg}`; const row=current?`&row=${current.row}`:''; img.dataset.token=String(token); loading.style.display='block'; loading.textContent='Building overview...'; img.style.display='none'; img.onload=()=>{if(img.dataset.token!==String(token)) return; loading.style.display='none'; img.style.display='block'; if(img.resetPanZoom)img.resetPanZoom();}; img.onerror=()=>{if(img.dataset.token===String(token)) loading.textContent='Overview failed to load.';}; img.src=authed(`/api/thumbnail?package=${pkg}${row}&thumb_token=${encodeURIComponent(token)}&t=${Date.now()}`);}
+async function loadPackages(){packages=await api('/api/packages'); const scan=await api('/api/scan-status'); if(!restoredLastIac&&scan.last_iac){const found=packages.find(p=>p.rel_path===scan.last_iac); if(found)pkg=found.index; restoredLastIac=true;} document.getElementById('packageSummary').textContent=`${packages.length} IAC package${packages.length===1?'':'s'}${scan.done?'':' · scanning...'}`; if(scan.error){document.getElementById('status').textContent=scan.error;} const box=document.getElementById('packages'); box.innerHTML=''; packages.forEach(p=>{const pct=p.total?Math.round(p.annotated/p.total*100):0; const d=document.createElement('div'); d.className='pkg'+(p.index===pkg?' active':''); d.style.setProperty('--pct',pct+'%'); d.innerHTML=`<b>${p.name}</b><div class=muted>${p.dataset||'no dataset'} · ${p.annotated}/${p.total} · ${pct}%</div>`; d.onclick=()=>{pkg=p.index; restoredLastIac=true; if(isMobile())setQueueOpen(false); refreshPackage();}; box.appendChild(d)}); return scan;}
 async function refreshPackage(){const scan=await loadPackages(); if(!packages.length){document.getElementById('recordMeta').textContent=scan.done?'No image-tile IAC packages found.':'Scanning IAC packages...'; setTimeout(refreshPackage,1000); return;} if(pkg>=packages.length) pkg=0; setThumbnailSrc(); await progress(); await nextRandom();}
-async function progress(){const p=await api('/api/progress?package='+pkg); l1Counts=p.l1; l2Counts=p.l2; renderLabels(); const pct=p.package.total?Math.round(p.package.annotated/p.package.total*100):0; document.getElementById('progress').innerHTML=`<div>${p.package.annotated}/${p.package.total} (${pct}%)</div><div class=bar><div style="width:${pct}%"></div></div>`;}
-async function showRecord(rec){current=rec; l1=""; l2=new Set(); renderLabels(); if(!rec){document.getElementById('recordMeta').textContent='All tiles in this IAC are annotated.'; document.getElementById('tile').removeAttribute('src'); return;} document.getElementById('recordMeta').textContent=`${packages[pkg].rel_path} · ${rec.tile_id} · x=${rec.x} y=${rec.y} row=${rec.row}`; document.getElementById('tile').src=`/api/tile?package=${pkg}&row=${rec.row}`;}
+async function progress(){const p=await api('/api/progress?package='+pkg); l1Counts=p.l1; l2Counts=p.l2; renderLabels(); const overallPct=p.overall.total?Math.round(p.overall.annotated/p.overall.total*100):0; const pkgPct=p.package.total?Math.round(p.package.annotated/p.package.total*100):0; document.getElementById('progress').innerHTML=`<div><b>${p.overall.annotated}/${p.overall.total}</b> tiles marked (${overallPct}%)</div><div class=bar><div style="width:${overallPct}%"></div></div><div class="muted">Skipped: ${p.overall.skipped} · Remaining: ${p.overall.remaining}</div><div class="muted">Current IAC: ${p.package.annotated}/${p.package.total} (${pkgPct}%) · skipped ${p.package.skipped}</div>`;}
+async function showRecord(rec){current=rec; l1=""; l2=new Set(); renderLabels(); if(!rec){document.getElementById('recordMeta').textContent='All tiles in this IAC are annotated.'; document.getElementById('tile').removeAttribute('src'); return;} document.getElementById('recordMeta').textContent=`${packages[pkg].rel_path} · ${rec.tile_id} · x=${rec.x} y=${rec.y} row=${rec.row}`; const tile=document.getElementById('tile'); tile.onload=()=>{if(tile.resetPanZoom)tile.resetPanZoom();}; tile.src=authed(`/api/tile?package=${pkg}&row=${rec.row}`); setThumbnailSrc();}
 async function nextRandom(){const r=await api('/api/random?package='+pkg); await showRecord(r.record);}
 async function save(){if(!current){await nextRandom(); return;} if(!l1){document.getElementById('status').textContent='Select one L1 primary prototype first.'; return;} await api('/api/annotation',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({package:pkg,row:current.row,l1,l2:[...l2]})}); document.getElementById('status').textContent='Saved.'; setThumbnailSrc(); await progress(); await loadPackages(); await nextRandom();}
-document.getElementById('thumb').onclick=async ev=>{const img=ev.target, r=img.getBoundingClientRect(); const x=(ev.clientX-r.left)/r.width, y=(ev.clientY-r.top)/r.height; const rec=await api(`/api/nearest?package=${pkg}&rx=${x}&ry=${y}`); await showRecord(rec.record);}
-const L1=%L1_JSON%; const L2=%L2_JSON%; renderLabels(); refreshPackage().catch(e=>document.getElementById('status').textContent=e);
+async function openContext(){if(!current){document.getElementById('status').textContent='No tile selected.'; return;} const overlay=document.getElementById('contextOverlay'); const img=document.getElementById('contextImg'); document.getElementById('contextMeta').textContent=`${packages[pkg].rel_path} · ${current.tile_id}`; overlay.classList.remove('hidden'); img.onload=()=>{if(img.resetPanZoom)img.resetPanZoom();}; img.src=authed(`/api/context?package=${pkg}&row=${current.row}&t=${Date.now()}`);}
+setupPanZoom(document.getElementById('tile'));
+setupPanZoom(document.getElementById('contextImg'));
+setupPanZoom(document.getElementById('thumb'),async ev=>{const img=ev.target, r=img.getBoundingClientRect(); const x=(ev.clientX-r.left)/r.width, y=(ev.clientY-r.top)/r.height; const rec=await api(`/api/nearest?package=${pkg}&rx=${x}&ry=${y}`); await showRecord(rec.record);});
+document.getElementById('toggleQueue').addEventListener('click',()=>setQueueOpen(document.getElementById('layout').classList.contains('queue-collapsed')));
+document.getElementById('hideQueue').addEventListener('click',()=>setQueueOpen(false));
+document.getElementById('toggleLabels').addEventListener('click',()=>setLabelsOpen(document.getElementById('layout').classList.contains('labels-collapsed')));
+document.getElementById('hideLabels').addEventListener('click',()=>setLabelsOpen(false));
+document.getElementById('contextBtn').addEventListener('click',openContext);
+document.getElementById('contextClose').addEventListener('click',()=>document.getElementById('contextOverlay').classList.add('hidden'));
+document.getElementById('authSubmit').addEventListener('click',submitAuth);
+document.getElementById('authInput').addEventListener('keydown',ev=>{if(ev.key==='Enter')submitAuth();});
+const L1=%L1_JSON%; const L2=%L2_JSON%; renderLabels(); if(isMobile()){setQueueOpen(false); setLabelsOpen(false);} ensureAuth().then(()=>refreshPackage()).catch(e=>{if(e.message)document.getElementById('status').textContent=e.message||String(e);});
 </script></body></html>
 """
 
@@ -527,7 +765,7 @@ def _json_response(handler: BaseHTTPRequestHandler, payload: dict | list) -> Non
     handler.wfile.write(body)
 
 
-def make_handler(data: AnnotationData):
+def make_handler(data: AnnotationData, auth_token: str):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):  # noqa: A003
             return
@@ -538,13 +776,16 @@ def make_handler(data: AnnotationData):
             try:
                 if parsed.path == "/":
                     LOG.info("ui_open path=/")
-                    html = HTML.replace("%L1_JSON%", json.dumps(L1_PROTOTYPES)).replace("%L2_JSON%", json.dumps(L2_PROTOTYPES))
+                    html = HTML.replace("%L1_JSON%", json.dumps(data.state.l1_prototypes)).replace("%L2_JSON%", json.dumps(data.state.l2_prototypes))
                     body = html.encode("utf-8")
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                    return
+                if not _auth_ok(_request_auth_token(qs), auth_token):
+                    self.send_error(HTTPStatus.FORBIDDEN, "invalid annotation token")
                     return
                 if parsed.path == "/api/packages":
                     _json_response(self, data.package_json())
@@ -569,8 +810,18 @@ def make_handler(data: AnnotationData):
                     _json_response(self, data.select_nearest(index, x, y))
                     return
                 if parsed.path == "/api/thumbnail":
-                    token = qs.get("token", [""])[0]
-                    body = data.thumbnail_jpg(index, token=token)
+                    token = qs.get("thumb_token", [""])[0]
+                    selected_row = int(qs["row"][0]) if "row" in qs else None
+                    body = data.thumbnail_jpg(index, token=token, selected_row=selected_row)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if parsed.path == "/api/context":
+                    row = int(qs["row"][0])
+                    body = data.context_jpg(index, row)
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "image/jpeg")
                     self.send_header("Content-Length", str(len(body)))
@@ -595,6 +846,10 @@ def make_handler(data: AnnotationData):
 
         def do_POST(self):  # noqa: N802
             parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+            if not _auth_ok(_request_auth_token(qs), auth_token):
+                self.send_error(HTTPStatus.FORBIDDEN, "invalid annotation token")
+                return
             if parsed.path != "/api/annotation":
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -622,14 +877,17 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="IAC file or directory containing image-tile IAC packages.")
     parser.add_argument("--state", required=True, help="JSON annotation state file; CSV is exported next to it.")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--port", type=int, default=8765, help="Use 0 to pick a free port.")
+    parser.add_argument("--token", default="", help="Annotation UI auth token; overrides the persisted state .auth-token when set.")
     parser.add_argument("--no-open", action="store_true")
     args = parser.parse_args()
-    data = AnnotationData(args.input, args.state, async_scan=True)
+    data = AnnotationData(args.input, args.state)
+    auth_token = _load_or_create_auth_token(args.state, args.token)
     port = _find_free_port(args.host, args.port)
-    server = ThreadingHTTPServer((args.host, port), make_handler(data))
-    url = f"http://{args.host}:{port}/"
-    LOG.info("server_start url=%s state=%s csv=%s", url, args.state, data.state.csv_path)
+    server = ThreadingHTTPServer((args.host, port), make_handler(data, auth_token))
+    base_url = f"http://{args.host}:{port}/"
+    url = f"{base_url}?token={auth_token}"
+    LOG.info("server_start url=%s state=%s csv=%s", base_url, args.state, data.state.csv_path)
     print(f"annotation_ui url={url} state={args.state} csv={data.state.csv_path}", flush=True)
     if not args.no_open:
         LOG.info("browser_open url=%s", url)
