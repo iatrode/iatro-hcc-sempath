@@ -7,7 +7,6 @@ import time
 
 import numpy as np
 import torch
-from torchvision.transforms import functional as TVF
 
 from .adjudication import prototype_adjudicated_teacher_weights
 from .losses import multi_teacher_distillation_loss
@@ -24,56 +23,11 @@ def _move_teachers(batch: dict, device: torch.device) -> dict[str, torch.Tensor]
     }
 
 
-def _jitter_factor(amount: float, device: torch.device) -> torch.Tensor | float:
-    if amount <= 0:
-        return 1.0
-    return 1.0 + (torch.rand((), device=device) * 2.0 - 1.0) * amount
-
-
-def _apply_gpu_image_augmentation(images: torch.Tensor, cfg: dict, *, train: bool) -> torch.Tensor:
-    aug = cfg.get("augmentation") or {}
-    if not train or not bool(aug.get("enabled", False)):
-        return images
-    batch_size = int(images.shape[0])
-    if bool(aug.get("horizontal_flip", False)):
-        mask = torch.rand((batch_size, 1, 1, 1), device=images.device) < 0.5
-        images = torch.where(mask, images.flip(-1), images)
-    if bool(aug.get("vertical_flip", False)):
-        mask = torch.rand((batch_size, 1, 1, 1), device=images.device) < 0.5
-        images = torch.where(mask, images.flip(-2), images)
-    if bool(aug.get("random_rotation_90", False)):
-        rotations = torch.randint(0, 4, (batch_size,), device=images.device)
-        for k in (1, 2, 3):
-            idx = torch.nonzero(rotations == k, as_tuple=True)[0]
-            if len(idx) > 0:
-                images[idx] = torch.rot90(images[idx], k=k, dims=(-2, -1))
-    color_jitter = aug.get("color_jitter") or {}
-    if color_jitter:
-        brightness = float(color_jitter.get("brightness", 0.0))
-        contrast = float(color_jitter.get("contrast", 0.0))
-        saturation = float(color_jitter.get("saturation", 0.0))
-        hue = float(color_jitter.get("hue", 0.0))
-        if brightness > 0:
-            images = images * _jitter_factor(brightness, images.device)
-        if contrast > 0:
-            mean = images.mean(dim=(-2, -1), keepdim=True)
-            images = (images - mean) * _jitter_factor(contrast, images.device) + mean
-        if saturation > 0:
-            gray = images[:, 0:1] * 0.2989 + images[:, 1:2] * 0.5870 + images[:, 2:3] * 0.1140
-            images = (images - gray) * _jitter_factor(saturation, images.device) + gray
-        images = images.clamp_(0.0, 1.0)
-        if hue > 0:
-            hue_factor = float((torch.rand((), device=images.device) * 2.0 - 1.0).detach().cpu()) * hue
-            images = TVF.adjust_hue(images, hue_factor)
-    return images
-
-
-def _prepare_images(batch: dict, cfg: dict, device: torch.device, *, train: bool) -> torch.Tensor:
+def _prepare_images(batch: dict, cfg: dict, device: torch.device) -> torch.Tensor:
     images = batch["images"].to(device, non_blocking=device.type == "cuda")
     if not bool(batch.get("images_uint8", False)):
         return images
     images = images.to(torch.float32).div_(255.0)
-    images = _apply_gpu_image_augmentation(images, cfg, train=train)
     mean = torch.tensor(cfg["data"].get("mean", [0.0, 0.0, 0.0]), dtype=torch.float32, device=device).view(1, 3, 1, 1)
     std = torch.tensor(cfg["data"].get("std", [1.0, 1.0, 1.0]), dtype=torch.float32, device=device).view(1, 3, 1, 1)
     return images.sub_(mean).div_(std)
@@ -463,7 +417,7 @@ def run_epoch(
             )
             batch_start = time.perf_counter()
             image_prepare_start = time.perf_counter()
-            images = _prepare_images(batch, cfg, device, train=train)
+            images = _prepare_images(batch, cfg, device)
             if will_log and device.type == "cuda":
                 torch.cuda.synchronize(device)
             image_prepare = time.perf_counter() - image_prepare_start
@@ -654,7 +608,7 @@ def collect_embeddings(
         if max_batches is not None and batch_idx >= max_batches:
             break
         if cfg is not None:
-            images = _prepare_images(batch, cfg, device, train=False)
+            images = _prepare_images(batch, cfg, device)
         else:
             images = batch["images"].to(device, non_blocking=device.type == "cuda")
             if bool(batch.get("images_uint8", False)):

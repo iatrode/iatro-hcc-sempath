@@ -296,8 +296,6 @@ def main() -> None:
             max_records=int(cfg["data"].get("max_train_records", 0)),
             seed=int(cfg["runtime"]["seed"]),
             expected_dims=dims,
-            train=True,
-            augmentation=cfg.get("augmentation"),
             prototype_labels=train_prototype_labels,
         )
         val_ds = PackageSampledDistillationDataset(
@@ -307,8 +305,6 @@ def main() -> None:
             max_records=int(cfg["data"].get("max_val_records", 0)),
             seed=int(cfg["runtime"]["seed"]) + 1,
             expected_dims=dims,
-            train=False,
-            augmentation=cfg.get("augmentation"),
             prototype_labels=val_prototype_labels,
         )
     elif manifest_path or explicit_split_packages:
@@ -340,16 +336,12 @@ def main() -> None:
             train_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=train_teacher_packages,
-            train=True,
-            augmentation=cfg.get("augmentation"),
             prototype_labels=train_prototype_labels,
         )
         val_ds = DistillationTileDataset(
             val_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=val_teacher_packages,
-            train=False,
-            augmentation=cfg.get("augmentation"),
             prototype_labels=val_prototype_labels,
         )
     else:
@@ -387,16 +379,12 @@ def main() -> None:
             train_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=train_teacher_packages,
-            train=True,
-            augmentation=cfg.get("augmentation"),
             prototype_labels=train_prototype_labels,
         )
         val_ds = DistillationTileDataset(
             val_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=val_teacher_packages,
-            train=False,
-            augmentation=cfg.get("augmentation"),
             prototype_labels=val_prototype_labels,
         )
     num_workers = int(cfg["data"]["num_workers"])
