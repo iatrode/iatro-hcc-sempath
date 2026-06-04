@@ -49,7 +49,8 @@ def main() -> None:
         dims,
         cfg["model"]["pretrained"],
     ).to(device).eval()
-    model.load_state_dict(torch.load(args.checkpoint, map_location=device)["model"])
+    payload = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    model.load_state_dict(payload["model"])
     batch = torch.randn(cfg["train"]["batch_size"], 3, image_height, image_width, device=device)
     with torch.no_grad():
         for _ in range(3):
