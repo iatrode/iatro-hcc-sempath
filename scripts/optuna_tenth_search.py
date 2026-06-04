@@ -68,6 +68,70 @@ def require_prototype_inputs(cfg: dict[str, Any]) -> None:
         )
 
 
+def has_prototype_inputs(cfg: dict[str, Any]) -> bool:
+    try:
+        require_prototype_inputs(cfg)
+    except ValueError:
+        return False
+    return True
+
+
+def inject_prototype_assets(cfg: dict[str, Any], asset_dir: Path) -> dict[str, Any]:
+    cfg = deep_merge({}, cfg)
+    cfg.setdefault("data", {})
+    cfg["data"]["prototype_paths"] = {
+        "gigapath": str(asset_dir / "gigapath_hcc_semantic_prototypes.pt"),
+        "h_optimus_1": str(asset_dir / "h_optimus_1_hcc_semantic_prototypes.pt"),
+        "uni2_h": str(asset_dir / "uni2_h_hcc_semantic_prototypes.pt"),
+        "virchow2": str(asset_dir / "virchow2_hcc_semantic_prototypes.pt"),
+    }
+    cfg["data"]["zhcc_prototype_path"] = str(asset_dir / "zhcc_hcc_semantic_prototypes.pt")
+    cfg["data"]["prototype_supervision_manifest_path"] = str(asset_dir / "hcc_prototype_supervision_manifest.csv")
+    cfg["data"]["prototype_supervision_train_splits"] = ["train"]
+    cfg["data"]["prototype_supervision_val_splits"] = ["val"]
+    return cfg
+
+
+def maybe_build_prototype_assets(
+    *,
+    cfg: dict[str, Any],
+    annotation_json: str,
+    asset_dir: Path,
+    python_bin: str,
+    repo: Path,
+) -> dict[str, Any]:
+    if has_prototype_inputs(cfg):
+        return cfg
+    if not annotation_json:
+        require_prototype_inputs(cfg)
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = asset_dir / "prototype_assets_summary.json"
+    if not summary_path.exists():
+        manifest_path = Path(str(cfg["data"].get("train_manifest_path", "")))
+        if not manifest_path.is_absolute():
+            manifest_path = repo / manifest_path
+        command = [
+            python_bin,
+            str(repo / "scripts" / "build_prototype_assets_from_annotations.py"),
+            "--annotation-json",
+            annotation_json,
+            "--training-manifest",
+            str(manifest_path),
+            "--output-dir",
+            str(asset_dir),
+            "--embedding-dim",
+            str(int(cfg.get("model", {}).get("embedding_dim", 1536))),
+            "--source-split",
+            "train",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(repo / "src")
+        subprocess.run(command, cwd=repo, env=env, check=True)
+    built = inject_prototype_assets(cfg, asset_dir)
+    require_prototype_inputs(built)
+    return built
+
+
 def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path, epochs: int) -> dict[str, Any]:
     cfg = deep_merge({}, base_cfg)
     cfg.setdefault("runtime", {})
@@ -261,6 +325,8 @@ def main() -> None:
     parser.add_argument("--study-name", default="hcc_sempath_tenth_pamtd")
     parser.add_argument("--storage", default="sqlite:///runtime/runtime/optuna/hcc_sempath_tenth_pamtd.db")
     parser.add_argument("--output-root", default="runtime/runtime/optuna_runs")
+    parser.add_argument("--annotation-json", default="")
+    parser.add_argument("--prototype-asset-dir", default="runtime/prototypes/hcc_annotation_final_3000")
     parser.add_argument("--python", default="python")
     parser.add_argument("--n-trials", type=int, default=24)
     parser.add_argument("--epochs", type=int, default=12)
@@ -275,7 +341,13 @@ def main() -> None:
     if not base_config_path.is_absolute():
         base_config_path = repo / base_config_path
     base_cfg = load_yaml(base_config_path)
-    require_prototype_inputs(base_cfg)
+    base_cfg = maybe_build_prototype_assets(
+        cfg=base_cfg,
+        annotation_json=str(args.annotation_json),
+        asset_dir=Path(args.prototype_asset_dir),
+        python_bin=str(args.python),
+        repo=repo,
+    )
 
     storage_dir = Path(args.storage.removeprefix("sqlite:///")).parent if args.storage.startswith("sqlite:///") else None
     if storage_dir is not None:
