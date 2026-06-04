@@ -24,7 +24,7 @@ if SRC_ROOT.exists() and str(SRC_ROOT) not in sys.path:
 
 
 @dataclass(frozen=True)
-class Anchor:
+class PrototypeSample:
     tile_id: str
     level1_label: str
     level2_labels: tuple[str, ...]
@@ -54,10 +54,10 @@ CANONICAL_TEACHER_BY_ALIAS = {
     for alias in aliases
 }
 
-DEFAULT_ANCHOR_COUNTS = "100,200,400,800,1200,1600,2000,3000"
+DEFAULT_PROTOTYPE_SAMPLE_COUNTS = "100,200,400,800,1200,1600,2000,3000"
 DEFAULT_PLOT_FORMATS = "png,pdf"
 DEFAULT_SEED = 13
-DEFAULT_ANCHOR_GROUP_KEY = "tile_id"
+DEFAULT_PROTOTYPE_SAMPLE_GROUP_KEY = "tile_id"
 DEFAULT_INFOSPACE_TOPK = 5
 DEFAULT_BOOTSTRAP_ITERATIONS = 500
 DEFAULT_PLATEAU_NOVELTY_THRESHOLD = 0.02
@@ -90,9 +90,9 @@ def _teacher_aliases(name: str) -> tuple[str, ...]:
 def _parse_int_list(value: str) -> list[int]:
     counts = [int(item.strip()) for item in str(value).split(",") if item.strip()]
     if not counts:
-        raise ValueError("expected at least one anchor count")
+        raise ValueError("expected at least one prototype_sample count")
     if any(count <= 0 for count in counts):
-        raise ValueError(f"anchor counts must be positive: {counts}")
+        raise ValueError(f"prototype_sample counts must be positive: {counts}")
     return sorted(dict.fromkeys(counts))
 
 
@@ -134,17 +134,17 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _normalize_anchor(row: dict[str, Any]) -> Anchor:
+def _normalize_prototype_sample(row: dict[str, Any]) -> PrototypeSample:
     tile_id = str(row.get("tile_id", "")).strip()
     if not tile_id:
-        raise ValueError("anchor row missing tile_id")
+        raise ValueError("prototype_sample row missing tile_id")
 
     level1 = str(row.get("level1_label") or row.get("l1") or "").strip()
     if not level1:
-        raise ValueError(f"anchor row missing level1 label: tile_id={tile_id}")
+        raise ValueError(f"prototype_sample row missing level1 label: tile_id={tile_id}")
 
     slide_id = str(row.get("slide_id") or row.get("slide") or tile_id).strip()
-    return Anchor(
+    return PrototypeSample(
         tile_id=tile_id,
         level1_label=level1,
         level2_labels=_split_labels(str(row.get("level2_labels") or row.get("l2") or "")),
@@ -154,13 +154,13 @@ def _normalize_anchor(row: dict[str, Any]) -> Anchor:
     )
 
 
-def _anchors_from_annotation_json(path: Path) -> list[Anchor]:
+def _prototype_samples_from_annotation_json(path: Path) -> list[PrototypeSample]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     annotations = payload.get("annotations")
     if not isinstance(annotations, dict):
         raise ValueError(f"annotation JSON missing annotations object: {path}")
 
-    anchors: list[Anchor] = []
+    prototype_samples: list[PrototypeSample] = []
     for item in annotations.values():
         tile_id = str(item.get("tile_id", "")).strip()
         level1 = str(item.get("l1") or item.get("level1_label") or "").strip()
@@ -173,8 +173,8 @@ def _anchors_from_annotation_json(path: Path) -> list[Anchor]:
             l2 = _split_labels(l2_raw)
         else:
             l2 = tuple(str(label).strip() for label in l2_raw if str(label).strip())
-        anchors.append(
-            Anchor(
+        prototype_samples.append(
+            PrototypeSample(
                 tile_id=tile_id,
                 level1_label=level1,
                 level2_labels=l2,
@@ -184,44 +184,44 @@ def _anchors_from_annotation_json(path: Path) -> list[Anchor]:
             )
         )
 
-    if not anchors:
-        raise ValueError(f"annotation JSON has no usable anchors: {path}")
-    return anchors
+    if not prototype_samples:
+        raise ValueError(f"annotation JSON has no usable prototype_samples: {path}")
+    return prototype_samples
 
 
-def _load_anchors_from_manifest(path: Path) -> list[Anchor]:
-    anchors = [_normalize_anchor(row) for row in _read_csv(path)]
-    if not anchors:
-        raise ValueError(f"anchor manifest has no usable anchors: {path}")
-    return anchors
+def _load_prototype_samples_from_manifest(path: Path) -> list[PrototypeSample]:
+    prototype_samples = [_normalize_prototype_sample(row) for row in _read_csv(path)]
+    if not prototype_samples:
+        raise ValueError(f"prototype_sample manifest has no usable prototype_samples: {path}")
+    return prototype_samples
 
 
-def _write_anchor_manifest(path: Path, anchors: list[Anchor]) -> None:
+def _write_prototype_sample_manifest(path: Path, prototype_samples: list[PrototypeSample]) -> None:
     _write_csv(
         path,
         [
             {
-                "tile_id": anchor.tile_id,
-                "level1_label": anchor.level1_label,
-                "level2_labels": ";".join(anchor.level2_labels),
-                "slide_id": anchor.slide_id,
-                "patient_id": anchor.patient_id,
-                "center": anchor.center,
-                "source": "anchor_pool",
+                "tile_id": prototype_sample.tile_id,
+                "level1_label": prototype_sample.level1_label,
+                "level2_labels": ";".join(prototype_sample.level2_labels),
+                "slide_id": prototype_sample.slide_id,
+                "patient_id": prototype_sample.patient_id,
+                "center": prototype_sample.center,
+                "source": "prototype_sample_pool",
             }
-            for anchor in anchors
+            for prototype_sample in prototype_samples
         ],
     )
 
 
-def _load_contract(path: Path | None, anchors: list[Anchor]) -> tuple[list[str], list[str]]:
+def _load_contract(path: Path | None, prototype_samples: list[PrototypeSample]) -> tuple[list[str], list[str]]:
     if path is None:
         level1: list[str] = []
         level2: list[str] = []
-        for anchor in anchors:
-            if anchor.level1_label not in level1:
-                level1.append(anchor.level1_label)
-            for label in anchor.level2_labels:
+        for prototype_sample in prototype_samples:
+            if prototype_sample.level1_label not in level1:
+                level1.append(prototype_sample.level1_label)
+            for label in prototype_sample.level2_labels:
                 if label not in level2:
                     level2.append(label)
         return level1, level2
@@ -235,29 +235,29 @@ def _load_contract(path: Path | None, anchors: list[Anchor]) -> tuple[list[str],
 
 
 def _nested_subsets(
-    anchors: list[Anchor],
+    prototype_samples: list[PrototypeSample],
     counts: list[int],
     seed: int,
     group_key: str,
-) -> tuple[dict[int, list[Anchor]], list[int]]:
-    available_counts = [count for count in counts if count <= len(anchors)]
-    skipped_counts = [count for count in counts if count > len(anchors)]
+) -> tuple[dict[int, list[PrototypeSample]], list[int]]:
+    available_counts = [count for count in counts if count <= len(prototype_samples)]
+    skipped_counts = [count for count in counts if count > len(prototype_samples)]
     if not available_counts:
-        raise ValueError(f"all requested counts exceed available anchors={len(anchors)}")
+        raise ValueError(f"all requested counts exceed available prototype_samples={len(prototype_samples)}")
 
     rng = random.Random(seed)
-    groups: dict[str, list[Anchor]] = {}
-    for anchor in anchors:
+    groups: dict[str, list[PrototypeSample]] = {}
+    for prototype_sample in prototype_samples:
         if group_key in {"tile_id", "slide_id", "patient_id", "center"}:
-            key = str(getattr(anchor, group_key) or anchor.tile_id)
+            key = str(getattr(prototype_sample, group_key) or prototype_sample.tile_id)
         else:
-            key = anchor.tile_id
-        groups.setdefault(key, []).append(anchor)
+            key = prototype_sample.tile_id
+        groups.setdefault(key, []).append(prototype_sample)
 
     group_keys = sorted(groups)
     rng.shuffle(group_keys)
 
-    ordered: list[Anchor] = []
+    ordered: list[PrototypeSample] = []
     for key in group_keys:
         items = list(groups[key])
         rng.shuffle(items)
@@ -540,7 +540,7 @@ def _feature_map(store: FeatureStore, teacher: str, tile_ids: list[str], *, verb
 
 
 def _centers(
-    anchors: list[Anchor],
+    prototype_samples: list[PrototypeSample],
     features: dict[str, np.ndarray],
     level1_names: list[str],
     level2_names: list[str],
@@ -548,11 +548,11 @@ def _centers(
     level1: dict[str, list[np.ndarray]] = {name: [] for name in level1_names}
     level2: dict[str, list[np.ndarray]] = {name: [] for name in level2_names}
 
-    for anchor in anchors:
-        feature = features[anchor.tile_id]
-        if anchor.level1_label in level1:
-            level1[anchor.level1_label].append(feature)
-        for label in anchor.level2_labels:
+    for prototype_sample in prototype_samples:
+        feature = features[prototype_sample.tile_id]
+        if prototype_sample.level1_label in level1:
+            level1[prototype_sample.level1_label].append(feature)
+        for label in prototype_sample.level2_labels:
             if label in level2:
                 level2[label].append(feature)
 
@@ -586,10 +586,10 @@ def _prototype_drift_values(current: Centers, previous: Centers | None) -> np.nd
     return np.asarray(values, dtype=np.float32)
 
 
-def _anchor_has_prototype(anchor: Anchor, level: int, name: str) -> bool:
+def _prototype_sample_has_prototype(prototype_sample: PrototypeSample, level: int, name: str) -> bool:
     if level == 1:
-        return anchor.level1_label == name
-    return name in anchor.level2_labels
+        return prototype_sample.level1_label == name
+    return name in prototype_sample.level2_labels
 
 
 def _metric_summary(values: np.ndarray, prefix: str, rng: np.random.Generator, iterations: int) -> dict[str, Any]:
@@ -607,9 +607,9 @@ def _metric_summary(values: np.ndarray, prefix: str, rng: np.random.Generator, i
 def _prototype_rows(
     *,
     teacher: str,
-    anchor_count: int,
-    anchors: list[Anchor],
-    previous_anchors: list[Anchor] | None,
+    prototype_sample_count: int,
+    prototype_samples: list[PrototypeSample],
+    previous_prototype_samples: list[PrototypeSample] | None,
     features: dict[str, np.ndarray],
     centers: Centers,
     previous_centers: Centers | None,
@@ -618,17 +618,17 @@ def _prototype_rows(
     topk: int,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    previous_anchors = previous_anchors or []
+    previous_prototype_samples = previous_prototype_samples or []
 
     for level, names in [(1, level1_names), (2, level2_names)]:
         for name in names:
-            selected = [anchor for anchor in anchors if _anchor_has_prototype(anchor, level, name)]
-            previous_selected = [anchor for anchor in previous_anchors if _anchor_has_prototype(anchor, level, name)]
+            selected = [prototype_sample for prototype_sample in prototype_samples if _prototype_sample_has_prototype(prototype_sample, level, name)]
+            previous_selected = [prototype_sample for prototype_sample in previous_prototype_samples if _prototype_sample_has_prototype(prototype_sample, level, name)]
             new_selected = selected[len(previous_selected) :]
 
-            new_features = [features[anchor.tile_id] for anchor in new_selected]
-            previous_global_features = [features[anchor.tile_id] for anchor in previous_anchors]
-            previous_local_features = [features[anchor.tile_id] for anchor in previous_selected]
+            new_features = [features[prototype_sample.tile_id] for prototype_sample in new_selected]
+            previous_global_features = [features[prototype_sample.tile_id] for prototype_sample in previous_prototype_samples]
+            previous_local_features = [features[prototype_sample.tile_id] for prototype_sample in previous_selected]
 
             global_novelty = _novelty_values(new_features, previous_global_features, k=topk)
             local_novelty = _novelty_values(new_features, previous_local_features, k=topk)
@@ -644,13 +644,13 @@ def _prototype_rows(
             )
 
             row: dict[str, Any] = {
-                "anchor_count": anchor_count,
+                "prototype_sample_count": prototype_sample_count,
                 "teacher": teacher,
                 "level": level,
                 "prototype": name,
                 "prototype_tile_count": len(selected),
                 "new_prototype_tile_count": len(new_selected),
-                "prototype_tile_fraction": _format_float(len(selected) / len(anchors) if anchors else math.nan),
+                "prototype_tile_fraction": _format_float(len(selected) / len(prototype_samples) if prototype_samples else math.nan),
                 "center_available": str(current_center is not None).lower(),
                 "prototype_drift": _format_float(drift),
                 "global_infospace_novelty": _format_float(float(global_novelty.mean()) if global_novelty.size else math.nan),
@@ -668,7 +668,7 @@ def _prototype_rows(
 def _teacher_curve(
     *,
     teacher: str,
-    subsets: dict[int, list[Anchor]],
+    subsets: dict[int, list[PrototypeSample]],
     features: dict[str, np.ndarray],
     level1_names: list[str],
     level2_names: list[str],
@@ -684,19 +684,19 @@ def _teacher_curve(
 
     for count in sorted(subsets):
         _log(f"teacher={teacher}: compute infospace metrics at N={count}", enabled=verbose)
-        anchors = subsets[count]
-        centers = _centers(anchors, features, level1_names, level2_names)
+        prototype_samples = subsets[count]
+        centers = _centers(prototype_samples, features, level1_names, level2_names)
 
         if previous is None:
-            new_anchors = anchors
-            previous_anchors: list[Anchor] = []
+            new_prototype_samples = prototype_samples
+            previous_prototype_samples: list[PrototypeSample] = []
             novelty = np.asarray([], dtype=np.float32)
             redundancy = np.asarray([], dtype=np.float32)
         else:
-            previous_anchors = previous["anchors"]
-            new_anchors = anchors[len(previous_anchors) :]
-            new_features = [features[anchor.tile_id] for anchor in new_anchors]
-            previous_features = [features[anchor.tile_id] for anchor in previous_anchors]
+            previous_prototype_samples = previous["prototype_samples"]
+            new_prototype_samples = prototype_samples[len(previous_prototype_samples) :]
+            new_features = [features[prototype_sample.tile_id] for prototype_sample in new_prototype_samples]
+            previous_features = [features[prototype_sample.tile_id] for prototype_sample in previous_prototype_samples]
             novelty = _novelty_values(new_features, previous_features, k=topk)
             redundancy = _redundancy_values(new_features, previous_features, k=topk)
 
@@ -705,10 +705,10 @@ def _teacher_curve(
         missing_l2 = [name for name in level2_names if name not in centers.level2]
 
         row: dict[str, Any] = {
-            "anchor_count": count,
+            "prototype_sample_count": count,
             "teacher": teacher,
-            "new_tile_count": len(new_anchors),
-            "previous_tile_count": len(previous_anchors),
+            "new_tile_count": len(new_prototype_samples),
+            "previous_tile_count": len(previous_prototype_samples),
             "infospace_topk": topk,
             "prototype_drift": _format_float(float(drift_values.mean()) if drift_values.size else math.nan),
             "available_l1_centers": len(centers.level1),
@@ -723,9 +723,9 @@ def _teacher_curve(
         prototype_rows.extend(
             _prototype_rows(
                 teacher=teacher,
-                anchor_count=count,
-                anchors=anchors,
-                previous_anchors=previous_anchors,
+                prototype_sample_count=count,
+                prototype_samples=prototype_samples,
+                previous_prototype_samples=previous_prototype_samples,
                 features=features,
                 centers=centers,
                 previous_centers=previous["centers"] if previous else None,
@@ -736,7 +736,7 @@ def _teacher_curve(
         )
 
         previous = {
-            "anchors": anchors,
+            "prototype_samples": prototype_samples,
             "centers": centers,
         }
 
@@ -751,13 +751,13 @@ def _aggregate_rows(
     plateau_redundancy_threshold: float,
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    counts = sorted({int(row["anchor_count"]) for row in teacher_rows})
+    counts = sorted({int(row["prototype_sample_count"]) for row in teacher_rows})
     consecutive_plateau = 0
 
     quantile_suffixes = ["q05", "q25", "q50", "q75", "q95"]
 
     for count in counts:
-        rows = [row for row in teacher_rows if int(row["anchor_count"]) == count]
+        rows = [row for row in teacher_rows if int(row["prototype_sample_count"]) == count]
         novelty = _mean([_as_float(row, "infospace_novelty") for row in rows])
         novelty_ci_low = _mean([_as_float(row, "infospace_novelty_ci_low") for row in rows])
         novelty_ci_high = _mean([_as_float(row, "infospace_novelty_ci_high") for row in rows])
@@ -773,7 +773,7 @@ def _aggregate_rows(
         consecutive_plateau = consecutive_plateau + 1 if interval_plateau else 0
 
         aggregate: dict[str, Any] = {
-            "anchor_count": count,
+            "prototype_sample_count": count,
             "teacher_count": len(rows),
             "new_tile_count_mean": _format_float(_mean([_as_float(row, "new_tile_count") for row in rows])),
             "previous_tile_count_mean": _format_float(_mean([_as_float(row, "previous_tile_count") for row in rows])),
@@ -807,19 +807,19 @@ def _annotate_marginal_utility(aggregate_rows: list[dict[str, Any]]) -> None:
     previous: dict[str, Any] | None = None
 
     for row in aggregate_rows:
-        count = int(row["anchor_count"])
+        count = int(row["prototype_sample_count"])
         novelty = _as_float(row, "infospace_novelty_mean")
         drift = _as_float(row, "prototype_drift_mean")
 
         if previous is None:
-            row["marginal_anchor_count_delta"] = ""
+            row["marginal_prototype_sample_count_delta"] = ""
             row["marginal_novelty_drop"] = ""
             row["marginal_novelty_drop_per_100_tiles"] = ""
             row["marginal_drift_drop"] = ""
             previous = row
             continue
 
-        previous_count = int(previous["anchor_count"])
+        previous_count = int(previous["prototype_sample_count"])
         previous_novelty = _as_float(previous, "infospace_novelty_mean")
         previous_drift = _as_float(previous, "prototype_drift_mean")
         delta = count - previous_count
@@ -827,7 +827,7 @@ def _annotate_marginal_utility(aggregate_rows: list[dict[str, Any]]) -> None:
         drop_per_100 = novelty_drop / delta * 100.0 if delta > 0 and math.isfinite(novelty_drop) else math.nan
         drift_drop = previous_drift - drift if math.isfinite(previous_drift) and math.isfinite(drift) else math.nan
 
-        row["marginal_anchor_count_delta"] = delta
+        row["marginal_prototype_sample_count_delta"] = delta
         row["marginal_novelty_drop"] = _format_float(novelty_drop)
         row["marginal_novelty_drop_per_100_tiles"] = _format_float(drop_per_100)
         row["marginal_drift_drop"] = _format_float(drift_drop)
@@ -851,18 +851,18 @@ def _recommendation(aggregate_rows: list[dict[str, Any]]) -> dict[str, Any]:
     elbow_rows = [row for row in aggregate_rows if str(row.get("elbow_candidate", "")).lower() == "true"]
     if elbow_rows:
         onset = elbow_rows[0]
-        onset_count = int(onset["anchor_count"])
-        counts = [int(row["anchor_count"]) for row in aggregate_rows]
+        onset_count = int(onset["prototype_sample_count"])
+        counts = [int(row["prototype_sample_count"]) for row in aggregate_rows]
         onset_index = counts.index(onset_count)
         confirmation_count = counts[min(onset_index + 1, len(counts) - 1)]
         conservative_index = min(onset_index + 2, len(counts) - 1)
         conservative_count = counts[conservative_index]
         return {
-            "recommended_anchor_count": confirmation_count,
+            "recommended_prototype_sample_count": confirmation_count,
             "elbow_onset_count": onset_count,
-            "conservative_anchor_count": conservative_count,
+            "conservative_prototype_sample_count": conservative_count,
             "reason": (
-                "marginal utility elbow: novelty drop per 100 anchors falls below "
+                "marginal utility elbow: novelty drop per 100 prototype_samples falls below "
                 f"{DEFAULT_ELBOW_MARGINAL_RATIO:.0%} of the best observed marginal gain while prototype drift is low"
             ),
             "marginal_utility_ratio_threshold": DEFAULT_ELBOW_MARGINAL_RATIO,
@@ -870,16 +870,16 @@ def _recommendation(aggregate_rows: list[dict[str, Any]]) -> dict[str, Any]:
             "prototype_drift_at_elbow": _format_float(_as_float(onset, "prototype_drift_mean")),
         }
 
-    plateau_counts = [int(row["anchor_count"]) for row in aggregate_rows if row["plateau_consensus"] == "true"]
-    available_counts = [int(row["anchor_count"]) for row in aggregate_rows]
+    plateau_counts = [int(row["prototype_sample_count"]) for row in aggregate_rows if row["plateau_consensus"] == "true"]
+    available_counts = [int(row["prototype_sample_count"]) for row in aggregate_rows]
     if plateau_counts:
         return {
-            "recommended_anchor_count": plateau_counts[0],
+            "recommended_prototype_sample_count": plateau_counts[0],
             "reason": "strict novelty plateau; this is stronger than the marginal utility elbow criterion",
         }
     return {
-        "recommended_anchor_count": available_counts[-1] if available_counts else None,
-        "reason": "no marginal utility elbow detected within available anchors",
+        "recommended_prototype_sample_count": available_counts[-1] if available_counts else None,
+        "reason": "no marginal utility elbow detected within available prototype_samples",
     }
 
 
@@ -995,19 +995,19 @@ def _l1_distribution_ellipses(coords: np.ndarray, labels: list[str]) -> dict[str
     return result
 
 
-def _anchor_labels(anchor: Anchor, level: str) -> tuple[str, ...]:
+def _prototype_sample_labels(prototype_sample: PrototypeSample, level: str) -> tuple[str, ...]:
     if level == "l1":
-        return (anchor.level1_label,)
-    labels = tuple(label for label in anchor.level2_labels if label)
+        return (prototype_sample.level1_label,)
+    labels = tuple(label for label in prototype_sample.level2_labels if label)
     return labels if labels else ("none",)
 
 
-def _compress_multilabels(labels_by_anchor: list[tuple[str, ...]], max_categories: int) -> list[tuple[str, ...]]:
+def _compress_multilabels(labels_by_prototype_sample: list[tuple[str, ...]], max_categories: int) -> list[tuple[str, ...]]:
     if max_categories <= 0:
-        return labels_by_anchor
+        return labels_by_prototype_sample
 
     counts: dict[str, int] = {}
-    for labels in labels_by_anchor:
+    for labels in labels_by_prototype_sample:
         for label in labels:
             counts[label] = counts.get(label, 0) + 1
 
@@ -1017,7 +1017,7 @@ def _compress_multilabels(labels_by_anchor: list[tuple[str, ...]], max_categorie
     }
 
     compressed: list[tuple[str, ...]] = []
-    for labels in labels_by_anchor:
+    for labels in labels_by_prototype_sample:
         mapped: list[str] = []
         for label in labels:
             mapped.append(label if label in keep else "OTHER")
@@ -1029,14 +1029,14 @@ def _compress_multilabels(labels_by_anchor: list[tuple[str, ...]], max_categorie
 def _scatter_by_multilabel(
     ax: Any,
     coords: np.ndarray,
-    labels_by_anchor: list[tuple[str, ...]],
+    labels_by_prototype_sample: list[tuple[str, ...]],
     *,
     point_size: float = 12.0,
     alpha: float = 0.58,
 ) -> None:
-    unique_labels = sorted({label for labels in labels_by_anchor for label in labels})
+    unique_labels = sorted({label for labels in labels_by_prototype_sample for label in labels})
     for label in unique_labels:
-        idx = [i for i, labels in enumerate(labels_by_anchor) if label in labels]
+        idx = [i for i, labels in enumerate(labels_by_prototype_sample) if label in labels]
         if not idx:
             continue
         ax.scatter(coords[idx, 0], coords[idx, 1], s=point_size, alpha=alpha, label=label)
@@ -1049,7 +1049,7 @@ def _plot_pca_qc(
     *,
     plt: Any,
     figure_dir: Path,
-    anchors: list[Anchor],
+    prototype_samples: list[PrototypeSample],
     pca_features_by_teacher: dict[str, dict[str, np.ndarray]],
     label_levels: list[str],
     max_categories: int,
@@ -1057,21 +1057,21 @@ def _plot_pca_qc(
     written: list[str],
     verbose: bool,
 ) -> None:
-    if not anchors or not pca_features_by_teacher:
+    if not prototype_samples or not pca_features_by_teacher:
         return
 
     teacher_names = sorted(pca_features_by_teacher)
     common_tile_ids = [
-        anchor.tile_id
-        for anchor in anchors
-        if all(anchor.tile_id in pca_features_by_teacher[teacher] for teacher in teacher_names)
+        prototype_sample.tile_id
+        for prototype_sample in prototype_samples
+        if all(prototype_sample.tile_id in pca_features_by_teacher[teacher] for teacher in teacher_names)
     ]
     if len(common_tile_ids) < 3:
         _log("PCA QC skipped: fewer than 3 common tiles across teachers", enabled=verbose)
         return
 
-    anchors_by_id = {anchor.tile_id: anchor for anchor in anchors}
-    common_anchors = [anchors_by_id[tile_id] for tile_id in common_tile_ids]
+    prototype_samples_by_id = {prototype_sample.tile_id: prototype_sample for prototype_sample in prototype_samples}
+    common_prototype_samples = [prototype_samples_by_id[tile_id] for tile_id in common_tile_ids]
 
     teacher_coords: dict[str, np.ndarray] = {}
     for teacher in teacher_names:
@@ -1096,15 +1096,15 @@ def _plot_pca_qc(
     for level in label_levels:
         if level not in {"l1", "l2"}:
             continue
-        raw_labels = [_anchor_labels(anchor, level) for anchor in common_anchors]
-        labels_by_anchor = _compress_multilabels(raw_labels, max_categories)
+        raw_labels = [_prototype_sample_labels(prototype_sample, level) for prototype_sample in common_prototype_samples]
+        labels_by_prototype_sample = _compress_multilabels(raw_labels, max_categories)
         level_name = "L1" if level == "l1" else "L2"
         label_note = "single-label" if level == "l1" else "multi-label expanded; one tile may appear under multiple labels"
 
-        _log(f"plot PCA QC: teacher-averaged {level_name}, tiles={len(common_anchors)}", enabled=verbose)
+        _log(f"plot PCA QC: teacher-averaged {level_name}, tiles={len(common_prototype_samples)}", enabled=verbose)
         fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
-        _scatter_by_multilabel(ax, average_coords, labels_by_anchor)
-        ax.set_title(f"{level_name} QC PCA at max N={len(anchors)}: teacher-averaged ({label_note})")
+        _scatter_by_multilabel(ax, average_coords, labels_by_prototype_sample)
+        ax.set_title(f"{level_name} QC PCA at max N={len(prototype_samples)}: teacher-averaged ({label_note})")
         ax.set_xlabel("Averaged PCA-1")
         ax.set_ylabel("Averaged PCA-2")
         ax.legend(fontsize=7, markerscale=1.5, ncols=2)
@@ -1118,7 +1118,7 @@ def _plot_pca_qc(
         fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows), constrained_layout=True)
         axes_arr = np.asarray(axes).reshape(-1)
         for ax, teacher in zip(axes_arr, teacher_names):
-            _scatter_by_multilabel(ax, teacher_coords[teacher], labels_by_anchor, point_size=10.0, alpha=0.52)
+            _scatter_by_multilabel(ax, teacher_coords[teacher], labels_by_prototype_sample, point_size=10.0, alpha=0.52)
             ax.set_title(f"{teacher}")
             ax.set_xlabel("PCA-1")
             ax.set_ylabel("PCA-2")
@@ -1127,7 +1127,7 @@ def _plot_pca_qc(
         handles, legend_labels = axes_arr[0].get_legend_handles_labels()
         if handles:
             fig.legend(handles, legend_labels, loc="outside lower center", ncols=min(4, max(1, len(legend_labels))), fontsize=7)
-        fig.suptitle(f"{level_name} QC PCA at max N={len(anchors)}: individual teachers ({label_note})", y=1.02)
+        fig.suptitle(f"{level_name} QC PCA at max N={len(prototype_samples)}: individual teachers ({label_note})", y=1.02)
         for fmt in formats:
             path = figure_dir / f"infospace_pca_qc_{level}_by_teacher.{fmt}"
             fig.savefig(path, dpi=220)
@@ -1139,33 +1139,33 @@ def _plot_browser_matched_l1_umap_qc(
     *,
     plt: Any,
     figure_dir: Path,
-    anchors: list[Anchor],
+    prototype_samples: list[PrototypeSample],
     pca_features_by_teacher: dict[str, dict[str, np.ndarray]],
     formats: list[str],
     written: list[str],
     verbose: bool,
 ) -> None:
-    if not anchors or not pca_features_by_teacher:
+    if not prototype_samples or not pca_features_by_teacher:
         return
 
     teacher_names = sorted(pca_features_by_teacher)
     common_tile_ids = [
-        anchor.tile_id
-        for anchor in anchors
-        if all(anchor.tile_id in pca_features_by_teacher[teacher] for teacher in teacher_names)
+        prototype_sample.tile_id
+        for prototype_sample in prototype_samples
+        if all(prototype_sample.tile_id in pca_features_by_teacher[teacher] for teacher in teacher_names)
     ]
     if len(common_tile_ids) < 3:
         _log("browser-matched L1 UMAP QC skipped: fewer than 3 common tiles across teachers", enabled=verbose)
         return
 
-    anchors_by_id = {anchor.tile_id: anchor for anchor in anchors}
-    common_anchors = [anchors_by_id[tile_id] for tile_id in common_tile_ids]
-    labels = [anchor.level1_label for anchor in common_anchors]
+    prototype_samples_by_id = {prototype_sample.tile_id: prototype_sample for prototype_sample in prototype_samples}
+    common_prototype_samples = [prototype_samples_by_id[tile_id] for tile_id in common_tile_ids]
+    labels = [prototype_sample.level1_label for prototype_sample in common_prototype_samples]
     label_names = sorted(set(labels))
 
     _log(
         "plot browser-matched L1 UMAP QC: "
-        f"tiles={len(common_anchors)} n_neighbors={DEFAULT_BROWSER_UMAP_NEIGHBORS} "
+        f"tiles={len(common_prototype_samples)} n_neighbors={DEFAULT_BROWSER_UMAP_NEIGHBORS} "
         f"min_dist={DEFAULT_BROWSER_UMAP_MIN_DIST} random_state={DEFAULT_BROWSER_UMAP_RANDOM_STATE}",
         enabled=verbose,
     )
@@ -1212,7 +1212,7 @@ def _plot_browser_matched_l1_umap_qc(
 
     ax.set_title(
         "L1 QC UMAP at max N="
-        f"{len(anchors)}: browser-matched fused teacher features\n"
+        f"{len(prototype_samples)}: browser-matched fused teacher features\n"
         f"UMAP cosine, n_neighbors={DEFAULT_BROWSER_UMAP_NEIGHBORS}, "
         f"min_dist={DEFAULT_BROWSER_UMAP_MIN_DIST}, random_state={DEFAULT_BROWSER_UMAP_RANDOM_STATE}"
     )
@@ -1238,7 +1238,7 @@ def _plot_infospace_distribution(
     formats: list[str],
     written: list[str],
 ) -> None:
-    counts = [int(row["anchor_count"]) for row in aggregate_rows]
+    counts = [int(row["prototype_sample_count"]) for row in aggregate_rows]
     q05 = [_as_float(row, "infospace_novelty_q05_mean") for row in aggregate_rows]
     q25 = [_as_float(row, "infospace_novelty_q25_mean") for row in aggregate_rows]
     q50 = [_as_float(row, "infospace_novelty_q50_mean") for row in aggregate_rows]
@@ -1273,7 +1273,7 @@ def _plot_prototype_curves(
     rows = [row for row in prototype_rows if int(row["level"]) == level]
     if not rows:
         return
-    counts = sorted({int(row["anchor_count"]) for row in rows})
+    counts = sorted({int(row["prototype_sample_count"]) for row in rows})
     prototypes = sorted({str(row["prototype"]) for row in rows})
     if not counts or not prototypes:
         return
@@ -1282,7 +1282,7 @@ def _plot_prototype_curves(
         return _mean([
             _as_float(row, key)
             for row in rows
-            if int(row["anchor_count"]) == count and str(row["prototype"]) == prototype
+            if int(row["prototype_sample_count"]) == count and str(row["prototype"]) == prototype
         ])
 
     fig, axes = plt.subplots(3, 1, figsize=(11, max(8, 0.34 * len(prototypes) + 6)), constrained_layout=True)
@@ -1317,8 +1317,8 @@ def _plot_prototype_audit(
     rows = [row for row in prototype_rows if int(row["level"]) == level]
     if not rows:
         return
-    final_count = max(int(row["anchor_count"]) for row in rows)
-    final_rows = [row for row in rows if int(row["anchor_count"]) == final_count]
+    final_count = max(int(row["prototype_sample_count"]) for row in rows)
+    final_rows = [row for row in rows if int(row["prototype_sample_count"]) == final_count]
     prototypes = sorted({str(row["prototype"]) for row in final_rows})
     if not prototypes:
         return
@@ -1389,7 +1389,7 @@ def _plot_curves(
     teacher_rows: list[dict[str, Any]],
     aggregate_rows: list[dict[str, Any]],
     prototype_rows: list[dict[str, Any]],
-    max_subset: list[Anchor],
+    max_subset: list[PrototypeSample],
     pca_features_by_teacher: dict[str, dict[str, np.ndarray]],
     pca_label_levels: list[str],
     max_pca_categories: int,
@@ -1407,9 +1407,9 @@ def _plot_curves(
     figure_dir.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
 
-    counts = [int(row["anchor_count"]) for row in aggregate_rows]
-    elbow_counts = [int(row["anchor_count"]) for row in aggregate_rows if str(row.get("elbow_candidate", "")).lower() == "true"]
-    plateau_counts = [int(row["anchor_count"]) for row in aggregate_rows if row["plateau_consensus"] == "true"]
+    counts = [int(row["prototype_sample_count"]) for row in aggregate_rows]
+    elbow_counts = [int(row["prototype_sample_count"]) for row in aggregate_rows if str(row.get("elbow_candidate", "")).lower() == "true"]
+    plateau_counts = [int(row["prototype_sample_count"]) for row in aggregate_rows if row["plateau_consensus"] == "true"]
     decision_count = elbow_counts[0] if elbow_counts else (plateau_counts[0] if plateau_counts else None)
 
     def save(fig: Any, stem: str) -> None:
@@ -1469,7 +1469,7 @@ def _plot_curves(
             for teacher in teacher_names:
                 rows = [row for row in teacher_rows if row["teacher"] == teacher]
                 ax.plot(
-                    [int(row["anchor_count"]) for row in rows],
+                    [int(row["prototype_sample_count"]) for row in rows],
                     [_as_float(row, key) for row in rows],
                     marker="o",
                     linewidth=1.4,
@@ -1507,7 +1507,7 @@ def _plot_curves(
         _plot_pca_qc(
             plt=plt,
             figure_dir=figure_dir,
-            anchors=max_subset,
+            prototype_samples=max_subset,
             pca_features_by_teacher=pca_features_by_teacher,
             label_levels=pca_label_levels,
             max_categories=max_pca_categories,
@@ -1518,7 +1518,7 @@ def _plot_curves(
         _plot_browser_matched_l1_umap_qc(
             plt=plt,
             figure_dir=figure_dir,
-            anchors=max_subset,
+            prototype_samples=max_subset,
             pca_features_by_teacher=pca_features_by_teacher,
             formats=formats,
             written=written,
@@ -1540,7 +1540,7 @@ def _process_teacher_worker(
     teacher: str,
     teacher_paths: list[Path],
     needed_tile_ids: list[str],
-    subsets: dict[int, list[Anchor]],
+    subsets: dict[int, list[PrototypeSample]],
     level1_names: list[str],
     level2_names: list[str],
     bootstrap_iterations: int,
@@ -1579,36 +1579,43 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _require_plot_backend(args)
 
     seed = int(args.seed)
-    anchor_counts = _parse_int_list(args.anchor_counts)
-    plot_formats = _parse_str_list(args.plot_formats) or _parse_str_list(DEFAULT_PLOT_FORMATS)
-    pca_label_levels = [value.lower() for value in _parse_str_list(args.pca_label_levels)]
+    prototype_sample_counts = _parse_int_list(args.prototype_sample_counts)
+    plot_formats = _parse_str_list(getattr(args, "plot_formats", DEFAULT_PLOT_FORMATS)) or _parse_str_list(DEFAULT_PLOT_FORMATS)
+    pca_label_levels = [value.lower() for value in _parse_str_list(getattr(args, "pca_label_levels", DEFAULT_PCA_LABEL_LEVELS))]
+    infospace_topk = int(getattr(args, "infospace_topk", DEFAULT_INFOSPACE_TOPK))
+    prototype_sample_group_key = getattr(args, "prototype_sample_group_key", DEFAULT_PROTOTYPE_SAMPLE_GROUP_KEY)
+    workers = int(getattr(args, "workers", DEFAULT_WORKERS))
+    bootstrap_iterations = int(getattr(args, "bootstrap_iterations", DEFAULT_BOOTSTRAP_ITERATIONS))
+    plateau_novelty_threshold = float(getattr(args, "plateau_novelty_threshold", DEFAULT_PLATEAU_NOVELTY_THRESHOLD))
+    plateau_drift_threshold = float(getattr(args, "plateau_drift_threshold", DEFAULT_PLATEAU_DRIFT_THRESHOLD))
+    plateau_redundancy_threshold = float(getattr(args, "plateau_redundancy_threshold", DEFAULT_PLATEAU_REDUNDANCY_THRESHOLD))
 
-    _log("load anchors", enabled=verbose)
+    _log("load prototype_samples", enabled=verbose)
     generated_manifest_info: dict[str, Any] = {}
     if args.annotation_json:
-        anchors = _anchors_from_annotation_json(Path(args.annotation_json))
+        prototype_samples = _prototype_samples_from_annotation_json(Path(args.annotation_json))
         input_dir = output_root / "inputs"
-        anchor_manifest = input_dir / "anchor_pool.csv"
-        _write_anchor_manifest(anchor_manifest, anchors)
+        prototype_sample_manifest = input_dir / "prototype_sample_pool.csv"
+        _write_prototype_sample_manifest(prototype_sample_manifest, prototype_samples)
         generated_manifest_info = {
             "annotation_json": str(args.annotation_json),
-            "generated_anchor_manifest": str(anchor_manifest),
-            "anchor_count": len(anchors),
+            "generated_prototype_sample_manifest": str(prototype_sample_manifest),
+            "prototype_sample_count": len(prototype_samples),
             "seed": seed,
         }
     else:
-        if not args.anchor_manifest:
-            raise ValueError("--anchor-manifest is required unless --annotation-json is used")
-        anchor_manifest = Path(args.anchor_manifest)
-        anchors = _load_anchors_from_manifest(anchor_manifest)
+        if not args.prototype_sample_manifest:
+            raise ValueError("--prototype-sample-manifest is required unless --annotation-json is used")
+        prototype_sample_manifest = Path(args.prototype_sample_manifest)
+        prototype_samples = _load_prototype_samples_from_manifest(prototype_sample_manifest)
 
-    _log(f"anchor pool loaded: n={len(anchors)}", enabled=verbose)
-    subsets, skipped_counts = _nested_subsets(anchors, anchor_counts, seed, args.anchor_group_key)
+    _log(f"prototype_sample pool loaded: n={len(prototype_samples)}", enabled=verbose)
+    subsets, skipped_counts = _nested_subsets(prototype_samples, prototype_sample_counts, seed, prototype_sample_group_key)
     if skipped_counts:
-        _log(f"skip requested counts > anchor_pool_count: {skipped_counts}", enabled=verbose)
-    _log(f"available anchor counts: {sorted(subsets)}", enabled=verbose)
+        _log(f"skip requested counts > prototype_sample_pool_count: {skipped_counts}", enabled=verbose)
+    _log(f"available prototype_sample counts: {sorted(subsets)}", enabled=verbose)
 
-    level1_names, level2_names = _load_contract(Path(args.prototype_contract) if args.prototype_contract else None, anchors)
+    level1_names, level2_names = _load_contract(Path(args.prototype_contract) if args.prototype_contract else None, prototype_samples)
     _log(f"prototype labels: L1={len(level1_names)} L2={len(level2_names)}", enabled=verbose)
 
     teacher_paths = _resolve_teacher_paths(args)
@@ -1616,26 +1623,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     max_count = max(subsets)
     max_subset = subsets[max_count]
-    needed_tile_ids = [anchor.tile_id for anchor in max_subset]
+    needed_tile_ids = [prototype_sample.tile_id for prototype_sample in max_subset]
 
     report = {
         "sweep_type": "infospace_information_curve",
         "objective": "estimate decay of newly added tile novelty in teacher-feature infospace before main-model training",
-        "anchor_manifest": str(anchor_manifest),
+        "prototype_sample_manifest": str(prototype_sample_manifest),
         "prototype_contract": str(args.prototype_contract or ""),
-        "anchor_counts_requested": anchor_counts,
-        "anchor_counts_available": sorted(subsets),
-        "anchor_counts_skipped": skipped_counts,
+        "prototype_sample_counts_requested": prototype_sample_counts,
+        "prototype_sample_counts_available": sorted(subsets),
+        "prototype_sample_counts_skipped": skipped_counts,
         "nested_subsets": True,
         "validation_split_used": False,
         "coverage_metric_used": False,
         "does_not_train": True,
         "seed": seed,
-        "anchor_group_key": args.anchor_group_key,
-        "anchor_pool_count": len(anchors),
+        "prototype_sample_group_key": prototype_sample_group_key,
+        "prototype_sample_pool_count": len(prototype_samples),
         "max_subset_count": len(max_subset),
-        "infospace_topk": int(args.infospace_topk),
-        "workers_requested": int(args.workers),
+        "infospace_topk": infospace_topk,
+        "workers_requested": workers,
         "teachers": list(teacher_paths),
         "teacher_feature_packages": {teacher: [str(path) for path in paths] for teacher, paths in teacher_paths.items()},
         "level1_prototypes": level1_names,
@@ -1646,29 +1653,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _log("write nested subset manifests", enabled=verbose)
     subset_rows = []
     for count, subset in sorted(subsets.items()):
-        subset_path = output_root / f"N{count}" / "anchors.csv"
+        subset_path = output_root / f"N{count}" / "prototype_samples.csv"
         _write_csv(
             subset_path,
             [
                 {
-                    "tile_id": anchor.tile_id,
-                    "level1_label": anchor.level1_label,
-                    "level2_labels": ";".join(anchor.level2_labels),
-                    "slide_id": anchor.slide_id,
-                    "patient_id": anchor.patient_id,
-                    "center": anchor.center,
+                    "tile_id": prototype_sample.tile_id,
+                    "level1_label": prototype_sample.level1_label,
+                    "level2_labels": ";".join(prototype_sample.level2_labels),
+                    "slide_id": prototype_sample.slide_id,
+                    "patient_id": prototype_sample.patient_id,
+                    "center": prototype_sample.center,
                 }
-                for anchor in subset
+                for prototype_sample in subset
             ],
         )
-        subset_rows.append({"anchor_count": count, "anchor_count_actual": len(subset), "path": str(subset_path)})
+        subset_rows.append({"prototype_sample_count": count, "prototype_sample_count_actual": len(subset), "path": str(subset_path)})
     _write_csv(output_root / "nested_subsets.csv", subset_rows)
 
     teacher_rows: list[dict[str, Any]] = []
     prototype_rows: list[dict[str, Any]] = []
     pca_features_by_teacher: dict[str, dict[str, np.ndarray]] = {}
 
-    requested_workers = int(args.workers)
+    requested_workers = workers
     if requested_workers <= 0:
         worker_count = min(len(teacher_paths), os.cpu_count() or 1)
     else:
@@ -1684,9 +1691,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "subsets": subsets,
             "level1_names": level1_names,
             "level2_names": level2_names,
-            "bootstrap_iterations": int(args.bootstrap_iterations),
+            "bootstrap_iterations": bootstrap_iterations,
             "seed": seed,
-            "topk": int(args.infospace_topk),
+            "topk": infospace_topk,
             "verbose": verbose,
         }
         for teacher, paths in teacher_paths.items()
@@ -1710,9 +1717,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _log("aggregate teacher metrics", enabled=verbose)
     aggregate_rows = _aggregate_rows(
         teacher_rows,
-        plateau_novelty_threshold=float(args.plateau_novelty_threshold),
-        plateau_drift_threshold=float(args.plateau_drift_threshold),
-        plateau_redundancy_threshold=float(args.plateau_redundancy_threshold),
+        plateau_novelty_threshold=plateau_novelty_threshold,
+        plateau_drift_threshold=plateau_drift_threshold,
+        plateau_redundancy_threshold=plateau_redundancy_threshold,
     )
     recommendation = _recommendation(aggregate_rows)
 
@@ -1722,7 +1729,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _write_csv(output_root / "infospace_information_summary.csv", aggregate_rows)
 
     figure_paths: list[str] = []
-    if not bool(args.no_plots):
+    if not bool(getattr(args, "no_plots", False)):
         _log("render figures", enabled=verbose)
         figure_paths = _plot_curves(
             output_root=output_root,
@@ -1732,9 +1739,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             max_subset=max_subset,
             pca_features_by_teacher=pca_features_by_teacher,
             pca_label_levels=pca_label_levels,
-            max_pca_categories=int(args.max_pca_categories),
+            max_pca_categories=int(getattr(args, "max_pca_categories", DEFAULT_MAX_PCA_CATEGORIES)),
             formats=plot_formats,
-            no_pca=bool(args.no_pca),
+            no_pca=bool(getattr(args, "no_pca", False)),
             verbose=verbose,
         )
 
@@ -1744,7 +1751,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _log(
         "done "
         f"output_root={output_root} teachers={len(teacher_paths)} counts={len(subsets)} "
-        f"recommended_anchor_count={recommendation['recommended_anchor_count']} figures={len(figure_paths)}",
+        f"recommended_prototype_sample_count={recommendation['recommended_prototype_sample_count']} figures={len(figure_paths)}",
         enabled=verbose,
     )
     return {"teacher": teacher_rows, "prototype": prototype_rows, "summary": aggregate_rows, "recommendation": recommendation}
@@ -1761,12 +1768,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher-feature-packages", default="")
     parser.add_argument("--teachers", default="")
     parser.add_argument("--annotation-json", default="")
-    parser.add_argument("--anchor-manifest", default="")
+    parser.add_argument("--prototype-sample-manifest", default="")
     parser.add_argument("--prototype-contract", default="")
     parser.add_argument("--output-root", default="outputs/infospace_information_curve")
-    parser.add_argument("--anchor-counts", default=DEFAULT_ANCHOR_COUNTS)
+    parser.add_argument("--prototype-sample-counts", default=DEFAULT_PROTOTYPE_SAMPLE_COUNTS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--anchor-group-key", default=DEFAULT_ANCHOR_GROUP_KEY)
+    parser.add_argument("--prototype-sample-group-key", default=DEFAULT_PROTOTYPE_SAMPLE_GROUP_KEY)
     parser.add_argument("--infospace-topk", type=int, default=DEFAULT_INFOSPACE_TOPK)
     parser.add_argument("--bootstrap-iterations", type=int, default=DEFAULT_BOOTSTRAP_ITERATIONS)
     parser.add_argument("--plateau-novelty-threshold", type=float, default=DEFAULT_PLATEAU_NOVELTY_THRESHOLD)

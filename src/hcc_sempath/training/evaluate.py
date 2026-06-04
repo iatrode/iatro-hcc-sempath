@@ -136,6 +136,7 @@ def main() -> None:
         model,
         loader,
         device,
+        cfg=cfg,
         max_batches=cfg["train"].get("max_eval_batches", cfg["train"].get("max_val_batches")),
     )
     prototypes = _load_prototype_map(cfg, dims)

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
 from PIL import Image
 import torch
+import yaml
 
 from hcc_sempath.io.feature_cache import build_teacher_feature_package_from_feature_map
 from hcc_sempath.io.manifests import write_tile_manifest
@@ -23,6 +25,8 @@ from hcc_sempath.training.datasets import (
 )
 from hcc_sempath.training.manifest import build_training_manifest
 from hcc_sempath.training.manifest import validate_manifest_artifacts
+from hcc_sempath.training.engine import _prepare_images
+from hcc_sempath.training.preflight import main as preflight_main
 from hcc_sempath.training.train import _PackageShuffleBatchLoader
 from hcc_sempath.training.prototype_labels import PrototypeLabel
 
@@ -182,6 +186,29 @@ def test_manifest_data_paths_resolve_teacher_features_by_convention(tmp_path: Pa
     assert feature_packages == {"toy": [str(expected_feature_path)]}
 
 
+def test_preflight_accepts_explicit_train_val_package_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    train_tile, train_feature = _write_package(tmp_path, "train_slide", 10)
+    val_tile, val_feature = _write_package(tmp_path, "val_slide", 20)
+    config_path = tmp_path / "config.yaml"
+    config = {
+        "runtime": {"device": "cpu", "seed": 13},
+        "data": {
+            "train_image_tile_package_paths": [str(train_tile)],
+            "val_image_tile_package_paths": [str(val_tile)],
+            "train_teacher_feature_package_paths": {"toy": [str(train_feature)]},
+            "val_teacher_feature_package_paths": {"toy": [str(val_feature)]},
+        },
+        "model": {"teacher_dims": {"toy": 4}, "embedding_dim": 4},
+        "loss": {"semantic_weight": 0.0, "prototype_filter_weight": 0.0, "zhcc_proto_weight": 0.0},
+        "train": {"batch_size": 2},
+    }
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    monkeypatch.setattr(sys, "argv", ["preflight", "--config", str(config_path), "--skip-model"])
+
+    preflight_main()
+
+
 def test_validate_manifest_artifacts_checks_teacher_feature_packages(tmp_path: Path) -> None:
     tile_root = tmp_path / "tiles"
     feature_root = tmp_path / "features"
@@ -207,6 +234,16 @@ def test_validate_manifest_artifacts_checks_teacher_feature_packages(tmp_path: P
     assert result["missing_tile_packages"] == []
     assert result["missing_feature_packages"] == []
     assert tile_path.exists()
+
+
+def test_package_pair_validation_accepts_feature_source_alias_suffix(tmp_path: Path) -> None:
+    tile_a, feature_a = _write_package(tmp_path, "slide_a", 10, count=3)
+    alias_feature = tmp_path / "slide_a.teacher-source-alias.features.iac"
+    feature_a.replace(alias_feature)
+
+    counts = validate_teacher_feature_package_pairs([tile_a], {"toy": [alias_feature]}, expected_dims={"toy": 4})
+
+    assert counts == [3]
 
 
 def test_package_pair_validation_rejects_wrong_feature_stem(tmp_path: Path) -> None:
@@ -268,3 +305,38 @@ def test_package_shuffle_loader_mixes_packages_single_thread(tmp_path: Path) -> 
     first_batch = next(iter(loader))
 
     assert len({sample["_package_idx"] for sample in first_batch}) > 1
+
+
+def test_package_sampled_tensor_collate_defers_image_preprocess_to_device(tmp_path: Path) -> None:
+    tile_path, feature_path = _write_package(tmp_path, "slide_a", 10, count=4)
+    dataset = PackageSampledDistillationDataset(
+        [tile_path],
+        {"toy": [feature_path]},
+        image_size=(32, 32),
+        max_records=4,
+        seed=13,
+        mean=[0.5, 0.5, 0.5],
+        std=[0.5, 0.5, 0.5],
+        expected_dims={"toy": 4},
+        train=True,
+        augmentation={"enabled": True, "horizontal_flip": True, "vertical_flip": True, "random_rotation_90": True},
+        tensor_collate=True,
+    )
+    batch = dataset.collate([dataset[index] for index in range(4)])
+
+    assert batch["images"].dtype == torch.uint8
+    assert batch["images"].shape == (4, 3, 32, 32)
+    assert batch["images_uint8"] is True
+
+    images = _prepare_images(
+        batch,
+        {
+            "data": {"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]},
+            "augmentation": {"enabled": True, "horizontal_flip": True, "vertical_flip": True, "random_rotation_90": True},
+        },
+        torch.device("cpu"),
+        train=True,
+    )
+
+    assert images.dtype == torch.float32
+    assert images.shape == (4, 3, 32, 32)

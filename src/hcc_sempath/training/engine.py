@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
+from numbers import Number
 import random
 import time
 
 import numpy as np
 import torch
+from torchvision.transforms import functional as TVF
 
 from .adjudication import prototype_adjudicated_teacher_weights
 from .losses import multi_teacher_distillation_loss
@@ -16,7 +18,64 @@ from .zhcc_metrics import evaluate_zhcc_prototypes
 
 
 def _move_teachers(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
-    return {name: value.to(device) for name, value in batch["teacher_features"].items()}
+    return {
+        name: value.to(device, non_blocking=device.type == "cuda")
+        for name, value in batch["teacher_features"].items()
+    }
+
+
+def _jitter_factor(amount: float, device: torch.device) -> torch.Tensor | float:
+    if amount <= 0:
+        return 1.0
+    return 1.0 + (torch.rand((), device=device) * 2.0 - 1.0) * amount
+
+
+def _apply_gpu_image_augmentation(images: torch.Tensor, cfg: dict, *, train: bool) -> torch.Tensor:
+    aug = cfg.get("augmentation") or {}
+    if not train or not bool(aug.get("enabled", False)):
+        return images
+    batch_size = int(images.shape[0])
+    if bool(aug.get("horizontal_flip", False)):
+        mask = torch.rand((batch_size, 1, 1, 1), device=images.device) < 0.5
+        images = torch.where(mask, images.flip(-1), images)
+    if bool(aug.get("vertical_flip", False)):
+        mask = torch.rand((batch_size, 1, 1, 1), device=images.device) < 0.5
+        images = torch.where(mask, images.flip(-2), images)
+    if bool(aug.get("random_rotation_90", False)):
+        rotations = torch.randint(0, 4, (batch_size,), device=images.device)
+        for k in (1, 2, 3):
+            idx = torch.nonzero(rotations == k, as_tuple=True)[0]
+            if len(idx) > 0:
+                images[idx] = torch.rot90(images[idx], k=k, dims=(-2, -1))
+    color_jitter = aug.get("color_jitter") or {}
+    if color_jitter:
+        brightness = float(color_jitter.get("brightness", 0.0))
+        contrast = float(color_jitter.get("contrast", 0.0))
+        saturation = float(color_jitter.get("saturation", 0.0))
+        hue = float(color_jitter.get("hue", 0.0))
+        if brightness > 0:
+            images = images * _jitter_factor(brightness, images.device)
+        if contrast > 0:
+            mean = images.mean(dim=(-2, -1), keepdim=True)
+            images = (images - mean) * _jitter_factor(contrast, images.device) + mean
+        if saturation > 0:
+            gray = images[:, 0:1] * 0.2989 + images[:, 1:2] * 0.5870 + images[:, 2:3] * 0.1140
+            images = (images - gray) * _jitter_factor(saturation, images.device) + gray
+        images = images.clamp_(0.0, 1.0)
+        if hue > 0:
+            images = TVF.adjust_hue(images, (random.random() * 2.0 - 1.0) * hue)
+    return images
+
+
+def _prepare_images(batch: dict, cfg: dict, device: torch.device, *, train: bool) -> torch.Tensor:
+    images = batch["images"].to(device, non_blocking=device.type == "cuda")
+    if not bool(batch.get("images_uint8", False)):
+        return images
+    images = images.to(torch.float32).div_(255.0)
+    images = _apply_gpu_image_augmentation(images, cfg, train=train)
+    mean = torch.tensor(cfg["data"].get("mean", [0.0, 0.0, 0.0]), dtype=torch.float32, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(cfg["data"].get("std", [1.0, 1.0, 1.0]), dtype=torch.float32, device=device).view(1, 3, 1, 1)
+    return images.sub_(mean).div_(std)
 
 
 def _move_prototype_batch(batch: dict, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -156,6 +215,80 @@ def _cuda_memory_mb(device: torch.device) -> float:
     return float(torch.cuda.memory_allocated(device) / (1024 * 1024))
 
 
+def _build_summary_writer(cfg: dict, output_dir):
+    if not bool(cfg["train"].get("tensorboard", False)):
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        _log("tensorboard_unavailable reason=torch.utils.tensorboard import failed")
+        return None
+    log_dir = cfg["train"].get("tensorboard_log_dir") or str(output_dir / "tensorboard")
+    writer = SummaryWriter(log_dir=log_dir)
+    _log(f"tensorboard_log_dir={log_dir}")
+    return writer
+
+
+def _build_progress_bar(cfg: dict, *, phase: str, epoch: int, total: int):
+    progress = str(cfg["train"].get("progress", "none")).lower()
+    if progress not in {"1", "true", "yes", "tqdm"}:
+        return None
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        _log("tqdm_unavailable reason=tqdm import failed")
+        return None
+    return tqdm(
+        total=total,
+        desc=f"{phase} epoch {epoch}",
+        unit="batch",
+        dynamic_ncols=True,
+        leave=True,
+        mininterval=float(cfg["train"].get("progress_interval_sec", 5.0)),
+    )
+
+
+def _write_tensorboard_scalars(writer, row: dict, epoch: int) -> None:
+    if writer is None:
+        return
+    for key, value in row.items():
+        if isinstance(value, bool) or not isinstance(value, Number):
+            continue
+        scalar = float(value)
+        if not math.isfinite(scalar):
+            continue
+        if key.startswith("train_"):
+            tag = "train/" + key.removeprefix("train_")
+        elif key.startswith("val_"):
+            tag = "val/" + key.removeprefix("val_")
+        elif key in {"lr", "global_step"}:
+            tag = "train/" + key
+        elif key.startswith("scheduled_"):
+            tag = "schedule/" + key.removeprefix("scheduled_")
+        else:
+            tag = "metrics/" + key
+        writer.add_scalar(tag, scalar, epoch)
+    writer.flush()
+
+
+def _write_tensorboard_batch(
+    writer,
+    *,
+    phase: str,
+    global_step: int,
+    loss: torch.Tensor,
+    parts: dict[str, torch.Tensor],
+    lr: float,
+) -> None:
+    if writer is None:
+        return
+    writer.add_scalar(f"{phase}_batch/loss", float(loss.detach().cpu()), global_step)
+    for key in ("feature", "relation", "semantic"):
+        if key in parts:
+            writer.add_scalar(f"{phase}_batch/{key}", float(parts[key].detach().cpu()), global_step)
+    writer.add_scalar("train/lr_step", float(lr), global_step)
+
+
 def scheduled_loss_config(
     cfg: dict,
     *,
@@ -203,7 +336,7 @@ def scheduled_loss_config(
         "zhcc_proto_weight": zhcc_proto_weight,
         "zhcc_level2_weight": float(loss_cfg.get("zhcc_level2_weight", 0.5)),
         "consensus_weight": float(loss_cfg.get("consensus_weight", 0.4)),
-        "anchor_weight": float(loss_cfg.get("anchor_weight", 0.4)),
+        "prototype_label_weight": float(loss_cfg.get("prototype_label_weight", 0.4)),
         "zhcc_response_weight": zhcc_response_weight,
         "scale_relation_by_alpha": bool(loss_cfg.get("scale_relation_by_alpha", False)),
         "prototype_start_step": prototype_start,
@@ -273,6 +406,7 @@ def run_epoch(
     epoch: int = 1,
     global_step: int = 0,
     schedule_state: dict | None = None,
+    summary_writer=None,
 ) -> dict[str, float]:
     model.train(train)
     schedule_state = _ensure_schedule_state(schedule_state)
@@ -294,6 +428,7 @@ def run_epoch(
     interval_tiles = 0
     phase = "train" if train else "val"
     log_interval = int(cfg["train"].get("log_interval", 0) or 0)
+    tensorboard_batch_interval = int(cfg["train"].get("tensorboard_batch_interval", 0) or 0)
     last_loss_cfg = scheduled_loss_config(
         cfg,
         epoch=epoch,
@@ -301,129 +436,172 @@ def run_epoch(
         schedule_state=schedule_state,
     )
     iterator = iter(loader)
-    while True:
-        data_wait_start = time.perf_counter()
-        try:
-            batch = next(iterator)
-        except StopIteration:
-            break
-        data_wait = time.perf_counter() - data_wait_start
-        if max_batches is not None and n_batches >= max_batches:
-            break
-        batch_start = time.perf_counter()
-        images = batch["images"].to(device)
-        n_tiles += int(images.shape[0])
-        interval_tiles += int(images.shape[0])
-        teachers = _move_teachers(batch, device)
-        prototype_mask, prototype_level1, prototype_level2 = _move_prototype_batch(batch, device)
-        with torch.set_grad_enabled(train):
-            with torch.autocast(device_type=device.type, enabled=_amp_enabled(device, cfg, train)):
-                loss_cfg = scheduled_loss_config(
-                    cfg,
-                    epoch=epoch,
-                    global_step=global_step,
-                    schedule_state=schedule_state,
-                )
-                last_loss_cfg = loss_cfg
-                outputs = model(images)
-                student_by_teacher = outputs["teacher_outputs"]
-                if float(loss_cfg["prototype_filter_weight"]) > 0:
-                    if prototypes is None or zhcc_prototypes is None:
-                        raise ValueError(
-                            "prototype adjudication requires data.prototype_paths and data.zhcc_prototype_path"
+    progress_total = len(loader)
+    if max_batches is not None:
+        progress_total = min(progress_total, int(max_batches))
+    progress_bar = _build_progress_bar(cfg, phase=phase, epoch=epoch, total=progress_total)
+    try:
+        while True:
+            data_wait_start = time.perf_counter()
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
+            data_wait = time.perf_counter() - data_wait_start
+            if max_batches is not None and n_batches >= max_batches:
+                break
+            will_log = (
+                progress_bar is None
+                and log_interval > 0
+                and (n_batches + 1 == 1 or (n_batches + 1) % log_interval == 0)
+            )
+            batch_start = time.perf_counter()
+            image_prepare_start = time.perf_counter()
+            images = _prepare_images(batch, cfg, device, train=train)
+            if will_log and device.type == "cuda":
+                torch.cuda.synchronize(device)
+            image_prepare = time.perf_counter() - image_prepare_start
+            n_tiles += int(images.shape[0])
+            interval_tiles += int(images.shape[0])
+            teachers = _move_teachers(batch, device)
+            prototype_mask, prototype_level1, prototype_level2 = _move_prototype_batch(batch, device)
+            with torch.set_grad_enabled(train):
+                with torch.autocast(device_type=device.type, enabled=_amp_enabled(device, cfg, train)):
+                    loss_cfg = scheduled_loss_config(
+                        cfg,
+                        epoch=epoch,
+                        global_step=global_step,
+                        schedule_state=schedule_state,
+                    )
+                    last_loss_cfg = loss_cfg
+                    outputs = model(images)
+                    student_by_teacher = outputs["teacher_outputs"]
+                    if float(loss_cfg["prototype_filter_weight"]) > 0:
+                        if prototypes is None or zhcc_prototypes is None:
+                            raise ValueError(
+                                "prototype adjudication requires data.prototype_paths and data.zhcc_prototype_path"
+                            )
+                        alpha_by_teacher, alpha_diag = prototype_adjudicated_teacher_weights(
+                            teacher_by_name=teachers,
+                            prototypes_by_teacher=prototypes,
+                            zhcc_embedding_norm=outputs["embedding_norm"].detach(),
+                            zhcc_prototypes=zhcc_prototypes,
+                            prototype_mask=prototype_mask,
+                            prototype_level1=prototype_level1,
+                            prototype_level2=prototype_level2,
+                            alpha_min=float(loss_cfg["prototype_filter_alpha_min"]),
+                            consensus_weight=float(loss_cfg["consensus_weight"]),
+                            prototype_label_weight=float(loss_cfg["prototype_label_weight"]),
+                            zhcc_response_weight=float(loss_cfg["zhcc_response_weight"]),
+                            filter_strength=float(loss_cfg["prototype_filter_weight"]),
                         )
-                    alpha_by_teacher, alpha_diag = prototype_adjudicated_teacher_weights(
+                    else:
+                        alpha_by_teacher = None
+                        alpha_diag = {}
+                    loss, parts = multi_teacher_distillation_loss(
+                        student_by_teacher=student_by_teacher,
                         teacher_by_name=teachers,
                         prototypes_by_teacher=prototypes,
-                        zhcc_embedding_norm=outputs["embedding_norm"].detach(),
-                        zhcc_prototypes=zhcc_prototypes,
+                        relation_weight=float(loss_cfg["relation_weight"]),
+                        semantic_weight=float(loss_cfg["semantic_weight"]),
+                        semantic_temperature=float(loss_cfg["semantic_temperature"]),
+                        teacher_weights=loss_cfg.get("teacher_weights"),
+                        teacher_sample_weights=alpha_by_teacher,
+                        feature_loss_type=str(loss_cfg["feature_loss_type"]),
+                        primary_temperature=float(loss_cfg["primary_temperature"]),
+                        attribute_temperature=float(loss_cfg["attribute_temperature"]),
+                        scale_relation_by_alpha=bool(loss_cfg["scale_relation_by_alpha"]),
+                    )
+                    zhcc_loss, zhcc_parts = zhcc_prototype_loss(
+                        embedding_norm=outputs["embedding_norm"],
                         prototype_mask=prototype_mask,
                         prototype_level1=prototype_level1,
                         prototype_level2=prototype_level2,
-                        alpha_min=float(loss_cfg["prototype_filter_alpha_min"]),
-                        consensus_weight=float(loss_cfg["consensus_weight"]),
-                        anchor_weight=float(loss_cfg["anchor_weight"]),
-                        zhcc_response_weight=float(loss_cfg["zhcc_response_weight"]),
-                        filter_strength=float(loss_cfg["prototype_filter_weight"]),
+                        prototypes=zhcc_prototypes,
+                        level2_weight=float(loss_cfg["zhcc_level2_weight"]),
+                    ) if zhcc_prototypes is not None and float(loss_cfg["zhcc_proto_weight"]) > 0 else (
+                        loss.new_zeros(()),
+                        {"zhcc_proto": loss.new_zeros(()), "zhcc_l1": loss.new_zeros(()), "zhcc_l2": loss.new_zeros(())},
                     )
-                else:
-                    alpha_by_teacher = None
-                    alpha_diag = {}
-                loss, parts = multi_teacher_distillation_loss(
-                    student_by_teacher=student_by_teacher,
-                    teacher_by_name=teachers,
-                    prototypes_by_teacher=prototypes,
-                    relation_weight=float(loss_cfg["relation_weight"]),
-                    semantic_weight=float(loss_cfg["semantic_weight"]),
-                    semantic_temperature=float(loss_cfg["semantic_temperature"]),
-                    teacher_weights=loss_cfg.get("teacher_weights"),
-                    teacher_sample_weights=alpha_by_teacher,
-                    feature_loss_type=str(loss_cfg["feature_loss_type"]),
-                    primary_temperature=float(loss_cfg["primary_temperature"]),
-                    attribute_temperature=float(loss_cfg["attribute_temperature"]),
-                    scale_relation_by_alpha=bool(loss_cfg["scale_relation_by_alpha"]),
-                )
-                zhcc_loss, zhcc_parts = zhcc_prototype_loss(
-                    embedding_norm=outputs["embedding_norm"],
-                    prototype_mask=prototype_mask,
-                    prototype_level1=prototype_level1,
-                    prototype_level2=prototype_level2,
-                    prototypes=zhcc_prototypes,
-                    level2_weight=float(loss_cfg["zhcc_level2_weight"]),
-                ) if zhcc_prototypes is not None and float(loss_cfg["zhcc_proto_weight"]) > 0 else (
-                    loss.new_zeros(()),
-                    {"zhcc_proto": loss.new_zeros(()), "zhcc_l1": loss.new_zeros(()), "zhcc_l2": loss.new_zeros(())},
-                )
-                loss = loss + float(loss_cfg["zhcc_proto_weight"]) * zhcc_loss
-            if train:
-                optimizer.zero_grad(set_to_none=True)
-                if scaler is not None and scaler.is_enabled():
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
-                global_step += 1
-                teacher_prior_loss = float(parts["feature"].detach().cpu()) + float(loss_cfg["relation_weight"]) * float(
-                    parts["relation"].detach().cpu()
-                )
-                update_plateau_schedule_state(
-                    cfg,
-                    schedule_state,
+                    loss = loss + float(loss_cfg["zhcc_proto_weight"]) * zhcc_loss
+                if train:
+                    optimizer.zero_grad(set_to_none=True)
+                    if scaler is not None and scaler.is_enabled():
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                    global_step += 1
+                    teacher_prior_loss = float(parts["feature"].detach().cpu()) + float(loss_cfg["relation_weight"]) * float(
+                        parts["relation"].detach().cpu()
+                    )
+                    update_plateau_schedule_state(
+                        cfg,
+                        schedule_state,
+                        global_step=global_step,
+                        teacher_prior_loss=teacher_prior_loss,
+                    )
+            totals["loss"] += float(loss.detach().cpu())
+            for key in ("feature", "relation", "semantic", "reliability", "relation_scale"):
+                totals[key] += float(parts[key].cpu())
+            for key in ("zhcc_proto", "zhcc_l1", "zhcc_l2"):
+                totals[key] += float(zhcc_parts[key].detach().cpu())
+            for key, value in alpha_diag.items():
+                totals.setdefault(key, 0.0)
+                totals[key] += float(value.detach().cpu())
+            n_batches += 1
+            if (
+                summary_writer is not None
+                and tensorboard_batch_interval > 0
+                and train
+                and n_batches % tensorboard_batch_interval == 0
+            ):
+                _write_tensorboard_batch(
+                    summary_writer,
+                    phase=phase,
                     global_step=global_step,
-                    teacher_prior_loss=teacher_prior_loss,
+                    loss=loss,
+                    parts=parts,
+                    lr=float(optimizer.param_groups[0]["lr"]),
                 )
-        totals["loss"] += float(loss.detach().cpu())
-        for key in ("feature", "relation", "semantic", "reliability", "relation_scale"):
-            totals[key] += float(parts[key].cpu())
-        for key in ("zhcc_proto", "zhcc_l1", "zhcc_l2"):
-            totals[key] += float(zhcc_parts[key].detach().cpu())
-        for key, value in alpha_diag.items():
-            totals.setdefault(key, 0.0)
-            totals[key] += float(value.detach().cpu())
-        n_batches += 1
-        if log_interval > 0 and (n_batches == 1 or n_batches % log_interval == 0):
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            now = time.perf_counter()
-            interval_elapsed = max(now - interval_start, 1e-9)
-            total_elapsed = max(now - start, 1e-9)
-            batch_elapsed = max(now - batch_start, 1e-9)
-            _log(
-                f"{phase}_progress "
-                f"batch={n_batches} tiles={n_tiles} "
-                f"interval_tiles_per_sec={interval_tiles / interval_elapsed:.2f} "
-                f"total_tiles_per_sec={n_tiles / total_elapsed:.2f} "
-                f"last_data_wait_sec={data_wait:.3f} "
-                f"last_batch_sec={batch_elapsed:.3f} "
-                f"loss={float(loss.detach().cpu()):.6f} "
-                f"cuda_mem_mb={_cuda_memory_mb(device):.1f}"
-            )
-            interval_start = now
-            interval_tiles = 0
+            if progress_bar is not None:
+                elapsed = max(time.perf_counter() - start, 1e-9)
+                progress_bar.set_postfix(
+                    loss=f"{float(loss.detach().cpu()):.4f}",
+                    tiles_s=f"{n_tiles / elapsed:.0f}",
+                    data=f"{data_wait:.2f}s",
+                    prep=f"{image_prepare:.2f}s",
+                    mem=f"{_cuda_memory_mb(device):.0f}MB",
+                )
+                progress_bar.update(1)
+            if will_log:
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                now = time.perf_counter()
+                interval_elapsed = max(now - interval_start, 1e-9)
+                total_elapsed = max(now - start, 1e-9)
+                batch_elapsed = max(now - batch_start, 1e-9)
+                _log(
+                    f"{phase}_progress "
+                    f"batch={n_batches} tiles={n_tiles} "
+                    f"interval_tiles_per_sec={interval_tiles / interval_elapsed:.2f} "
+                    f"total_tiles_per_sec={n_tiles / total_elapsed:.2f} "
+                    f"last_data_wait_sec={data_wait:.3f} "
+                    f"last_image_prepare_sec={image_prepare:.3f} "
+                    f"last_batch_sec={batch_elapsed:.3f} "
+                    f"image_path={'uint8_device_prepare' if batch.get('images_uint8', False) else 'preprocessed_cpu'} "
+                    f"loss={float(loss.detach().cpu()):.6f} "
+                    f"cuda_mem_mb={_cuda_memory_mb(device):.1f}"
+                )
+                interval_start = now
+                interval_tiles = 0
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
     elapsed = max(time.perf_counter() - start, 1e-9)
     result = {key: value / max(1, n_batches) for key, value in totals.items()}
     result["lr"] = float(optimizer.param_groups[0]["lr"])
@@ -447,6 +625,7 @@ def collect_embeddings(
     model,
     loader,
     device,
+    cfg: dict | None = None,
     max_batches: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     model.eval()
@@ -459,7 +638,12 @@ def collect_embeddings(
     for batch_idx, batch in enumerate(loader):
         if max_batches is not None and batch_idx >= max_batches:
             break
-        images = batch["images"].to(device)
+        if cfg is not None:
+            images = _prepare_images(batch, cfg, device, train=False)
+        else:
+            images = batch["images"].to(device, non_blocking=device.type == "cuda")
+            if bool(batch.get("images_uint8", False)):
+                images = images.to(torch.float32).div_(255.0)
         outputs = model(images)
         embeddings.append(outputs["embedding_norm"].cpu())
         prototype_masks.append(batch.get("prototype_mask", torch.zeros(len(batch["tile_id"]), dtype=torch.bool)).cpu())
@@ -506,115 +690,124 @@ def fit(
     if resume_state and "scaler" in resume_state:
         scaler.load_state_dict(resume_state["scaler"])
     _restore_rng_state((resume_state or {}).get("rng_state"))
-    for epoch in range(start_epoch, int(cfg["train"]["epochs"]) + 1):
-        train_metrics = run_epoch(
-            model,
-            train_loader,
-            prototypes,
-            optimizer,
-            device,
-            cfg,
-            train=True,
-            scaler=scaler,
-            scheduler=scheduler,
-            max_batches=cfg["train"].get("max_train_batches"),
-            zhcc_prototypes=zhcc_prototypes,
-            epoch=epoch,
-            global_step=global_step,
-            schedule_state=schedule_state,
-        )
-        global_step = int(train_metrics["global_step_end"])
-        val_metrics = run_epoch(
-            model,
-            val_loader,
-            prototypes,
-            optimizer,
-            device,
-            cfg,
-            train=False,
-            max_batches=cfg["train"].get("max_val_batches"),
-            zhcc_prototypes=zhcc_prototypes,
-            epoch=epoch,
-            global_step=global_step,
-            schedule_state=schedule_state,
-        )
-        embeddings, student_by_teacher, teacher_by_name, prototype_labels = collect_embeddings(
-            model,
-            val_loader,
-            device,
-            max_batches=cfg["train"].get("max_eval_batches", cfg["train"].get("max_val_batches")),
-        )
-        cpu_prototypes = {name: registry.to("cpu") for name, registry in prototypes.items()} if prototypes else None
-        embedding_metrics = evaluate_teacher_outputs(
-            student_by_teacher,
-            teacher_by_name,
-            cpu_prototypes,
-            int(cfg["train"]["topk"]),
-        )
-        zhcc_metrics = evaluate_zhcc_prototypes(
-            embeddings,
-            prototype_labels["prototype_mask"],
-            prototype_labels["prototype_level1"],
-            prototype_labels["prototype_level2"],
-            zhcc_prototypes.to("cpu") if zhcc_prototypes is not None else None,
-            topk=int(cfg["train"]["topk"]),
-        )
-        loss_cfg = scheduled_loss_config(
-            cfg,
-            epoch=epoch,
-            global_step=global_step,
-            schedule_state=schedule_state,
-        )
-        row = {
-            "epoch": epoch,
-            "global_step": global_step,
-            "feature_loss_type": str(loss_cfg["feature_loss_type"]),
-            "lr": float(optimizer.param_groups[0]["lr"]),
-            "scheduled_semantic_weight": float(loss_cfg["semantic_weight"]),
-            "scheduled_prototype_filter_weight": float(loss_cfg["prototype_filter_weight"]),
-            "scheduled_zhcc_proto_weight": float(loss_cfg["zhcc_proto_weight"]),
-            "scheduled_zhcc_response_weight": float(loss_cfg["zhcc_response_weight"]),
-            "prototype_start_step": -1 if loss_cfg["prototype_start_step"] is None else int(loss_cfg["prototype_start_step"]),
-            "filter_start_step": -1 if loss_cfg["filter_start_step"] is None else int(loss_cfg["filter_start_step"]),
-            "teacher_prior_loss_ema": 0.0
-            if loss_cfg["teacher_prior_loss_ema"] is None
-            else float(loss_cfg["teacher_prior_loss_ema"]),
-            "teacher_prior_relative_improvement": 0.0
-            if loss_cfg["teacher_prior_relative_improvement"] is None
-            else float(loss_cfg["teacher_prior_relative_improvement"]),
-            "teacher_prior_plateau_count": int(loss_cfg["teacher_prior_plateau_count"]),
-            "intervention_stage": str(loss_cfg["intervention_stage"]),
-            **{f"train_{k}": v for k, v in train_metrics.items()},
-            **{f"val_{k}": v for k, v in val_metrics.items()},
-            **embedding_metrics,
-            **zhcc_metrics,
-        }
-        append_csv(output_dir / "metrics.csv", row)
-        checkpoint = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict() if scheduler is not None else None,
-            "scaler": scaler.state_dict(),
-            "epoch": epoch,
-            "global_step": global_step,
-            "best_loss": best_loss,
-            "best_metrics": best_metrics,
-            "rng_state": _rng_state(),
-            "schedule_state": schedule_state,
-            "config": cfg,
-        }
-        torch.save(
-            checkpoint,
-            checkpoints / "last.pt",
-        )
-        if val_metrics["loss"] < best_loss:
-            best_loss = val_metrics["loss"]
-            best_metrics = row
-            checkpoint["best_loss"] = best_loss
-            checkpoint["best_metrics"] = best_metrics
+    writer = _build_summary_writer(cfg, output_dir)
+    try:
+        for epoch in range(start_epoch, int(cfg["train"]["epochs"]) + 1):
+            train_metrics = run_epoch(
+                model,
+                train_loader,
+                prototypes,
+                optimizer,
+                device,
+                cfg,
+                train=True,
+                scaler=scaler,
+                scheduler=scheduler,
+                max_batches=cfg["train"].get("max_train_batches"),
+                zhcc_prototypes=zhcc_prototypes,
+                epoch=epoch,
+                global_step=global_step,
+                schedule_state=schedule_state,
+                summary_writer=writer,
+            )
+            global_step = int(train_metrics["global_step_end"])
+            val_metrics = run_epoch(
+                model,
+                val_loader,
+                prototypes,
+                optimizer,
+                device,
+                cfg,
+                train=False,
+                max_batches=cfg["train"].get("max_val_batches"),
+                zhcc_prototypes=zhcc_prototypes,
+                epoch=epoch,
+                global_step=global_step,
+                schedule_state=schedule_state,
+                summary_writer=writer,
+            )
+            embeddings, student_by_teacher, teacher_by_name, prototype_labels = collect_embeddings(
+                model,
+                val_loader,
+                device,
+                cfg=cfg,
+                max_batches=cfg["train"].get("max_eval_batches", cfg["train"].get("max_val_batches")),
+            )
+            cpu_prototypes = {name: registry.to("cpu") for name, registry in prototypes.items()} if prototypes else None
+            embedding_metrics = evaluate_teacher_outputs(
+                student_by_teacher,
+                teacher_by_name,
+                cpu_prototypes,
+                int(cfg["train"]["topk"]),
+            )
+            zhcc_metrics = evaluate_zhcc_prototypes(
+                embeddings,
+                prototype_labels["prototype_mask"],
+                prototype_labels["prototype_level1"],
+                prototype_labels["prototype_level2"],
+                zhcc_prototypes.to("cpu") if zhcc_prototypes is not None else None,
+                topk=int(cfg["train"]["topk"]),
+            )
+            loss_cfg = scheduled_loss_config(
+                cfg,
+                epoch=epoch,
+                global_step=global_step,
+                schedule_state=schedule_state,
+            )
+            row = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "feature_loss_type": str(loss_cfg["feature_loss_type"]),
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                "scheduled_semantic_weight": float(loss_cfg["semantic_weight"]),
+                "scheduled_prototype_filter_weight": float(loss_cfg["prototype_filter_weight"]),
+                "scheduled_zhcc_proto_weight": float(loss_cfg["zhcc_proto_weight"]),
+                "scheduled_zhcc_response_weight": float(loss_cfg["zhcc_response_weight"]),
+                "prototype_start_step": -1 if loss_cfg["prototype_start_step"] is None else int(loss_cfg["prototype_start_step"]),
+                "filter_start_step": -1 if loss_cfg["filter_start_step"] is None else int(loss_cfg["filter_start_step"]),
+                "teacher_prior_loss_ema": 0.0
+                if loss_cfg["teacher_prior_loss_ema"] is None
+                else float(loss_cfg["teacher_prior_loss_ema"]),
+                "teacher_prior_relative_improvement": 0.0
+                if loss_cfg["teacher_prior_relative_improvement"] is None
+                else float(loss_cfg["teacher_prior_relative_improvement"]),
+                "teacher_prior_plateau_count": int(loss_cfg["teacher_prior_plateau_count"]),
+                "intervention_stage": str(loss_cfg["intervention_stage"]),
+                **{f"train_{k}": v for k, v in train_metrics.items()},
+                **{f"val_{k}": v for k, v in val_metrics.items()},
+                **embedding_metrics,
+                **zhcc_metrics,
+            }
+            append_csv(output_dir / "metrics.csv", row)
+            _write_tensorboard_scalars(writer, row, epoch)
+            checkpoint = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                "scaler": scaler.state_dict(),
+                "epoch": epoch,
+                "global_step": global_step,
+                "best_loss": best_loss,
+                "best_metrics": best_metrics,
+                "rng_state": _rng_state(),
+                "schedule_state": schedule_state,
+                "config": cfg,
+            }
             torch.save(
                 checkpoint,
-                checkpoints / "best.pt",
+                checkpoints / "last.pt",
             )
+            if val_metrics["loss"] < best_loss:
+                best_loss = val_metrics["loss"]
+                best_metrics = row
+                checkpoint["best_loss"] = best_loss
+                checkpoint["best_metrics"] = best_metrics
+                torch.save(
+                    checkpoint,
+                    checkpoints / "best.pt",
+                )
+    finally:
+        if writer is not None:
+            writer.close()
     write_json(output_dir / "summary.json", best_metrics)
     return best_metrics

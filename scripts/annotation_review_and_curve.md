@@ -1,4 +1,4 @@
-# Annotation Review and Anchor Information Curve
+# Annotation Review and Prototype Information Curve
 
 This note documents two standalone research utilities under `scripts/`.
 They are intentionally not wired into the main `hcc-sempath` CLI.
@@ -66,36 +66,36 @@ Change `--class-a` and `--class-b` for other two-class reviews.
 - L1 mode actions are three-way: accept suggested, keep current, or use selected.
 - Pair mode actions are the two class buttons.
 
-## Anchor information curve
+## PrototypeSample information curve
 
 Script:
 
 ```bash
-scripts/anchor_information_curve.py
+scripts/prototype_information_curve.py
 ```
 
 Purpose:
 
-- Estimate whether additional annotated anchors still improve prototype information.
+- Estimate whether additional annotated prototype_samples still improve prototype information.
 - Use cached teacher features; it does not train a model.
-- Reuse one locked validation split for all anchor counts.
+- Reuse one locked validation split for all prototype_sample counts.
 - Produce summary CSVs and plots for the annotation-count curve.
 
 Typical command:
 
 ```bash
-python scripts/anchor_information_curve.py \
+python scripts/prototype_information_curve.py \
   --annotation-json annotations/hcc_prototype_review.json \
   --prototype-contract annotations/hcc_prototype_review.json \
   --teacher-feature-root /path/to/teacher/features \
-  --output-root outputs/anchor_information_curve_real_iac_smoke \
+  --output-root outputs/prototype_information_curve_real_iac_smoke \
   --seed 13
 ```
 
 Help:
 
 ```bash
-python scripts/anchor_information_curve.py --help
+python scripts/prototype_information_curve.py --help
 ```
 
 Main outputs:
@@ -122,21 +122,21 @@ figures/infospace_umap_qc_l1_browser_matched.png
 Key defaults:
 
 ```text
-anchor counts 100,200,400,800,1200,1600,2000,3000
+prototype_sample counts 100,200,400,800,1200,1600,2000,3000
 seed 13
 locked validation fraction 0.2
-anchor group key tile_id
+prototype_sample group key tile_id
 bootstrap iterations 500
 plot formats png,pdf
 ```
 
 Interpretation:
 
-- `recommendation.recommended_anchor_count` in `infospace_information_report.json` is the selected count.
-- Selection uses the first marginal-utility elbow, not complete feature exhaustion: the first low-drift count where novelty gain per 100 added anchors falls below 35% of the best observed marginal gain is treated as elbow onset, and the next count is used as the recommendation.
-- `anchor_counts_requested` records requested counts.
-- `anchor_counts_available` records counts that could actually be evaluated from available train anchors.
-- If 3000 is requested but unavailable after locked validation is held out, it will not appear in `anchor_counts_available`.
+- `recommendation.recommended_prototype_sample_count` in `infospace_information_report.json` is the selected count.
+- Selection uses the first marginal-utility elbow, not complete feature exhaustion: the first low-drift count where novelty gain per 100 added prototype_samples falls below 35% of the best observed marginal gain is treated as elbow onset, and the next count is used as the recommendation.
+- `prototype_sample_counts_requested` records requested counts.
+- `prototype_sample_counts_available` records counts that could actually be evaluated from available train prototype_samples.
+- If 3000 is requested but unavailable after locked validation is held out, it will not appear in `prototype_sample_counts_available`.
 
 Boundary:
 
