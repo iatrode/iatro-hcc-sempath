@@ -15,7 +15,7 @@ data:
   prototype_supervision_manifest_path: data/prototypes/hcc_prototype_supervision_manifest.csv
   prototype_supervision_train_splits: [train]
   prototype_supervision_val_splits: [val]
-  zhcc_prototype_path: data/prototypes/zhcc_hcc_semantic_prototypes.pt
+  zhcc_prototype_image_path: data/prototypes/zhcc_hcc_prototype_images.pt
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
   num_workers: 8

@@ -12,6 +12,7 @@ import torch
 import yaml
 
 from hcc_sempath.io.feature_cache import FeatureCacheReader
+from hcc_sempath.io.tile_package import TilePackageReader
 
 
 TILE_SUFFIX = ".tiles.iac"
@@ -89,12 +90,43 @@ def _feature_path(manifest: dict[str, Any], item: dict[str, Any], teacher: str) 
     return matches[0]
 
 
+def _tile_path(manifest: dict[str, Any], item: dict[str, Any]) -> Path:
+    datasets_payload = manifest.get("datasets")
+    if not isinstance(datasets_payload, dict):
+        raise ValueError("manifest missing datasets")
+    datasets = {str(key): value for key, value in datasets_payload.items()}
+    dataset = str(item.get("dataset") or "").strip()
+    if not dataset:
+        iac = str(item.get("iac") or "")
+        dataset = Path(iac).parent.name
+    if dataset not in datasets or not isinstance(datasets[dataset], dict):
+        raise ValueError(f"manifest datasets missing dataset={dataset}")
+    tile_root = datasets[dataset].get("tile_root")
+    if not tile_root:
+        raise ValueError(f"manifest dataset missing tile_root: {dataset}")
+    iac_name = Path(str(item.get("iac") or "")).name
+    if not iac_name:
+        raise ValueError(f"annotation row missing iac name: tile_id={item.get('tile_id')}")
+    return Path(tile_root) / iac_name
+
+
 def _read_feature(path: Path, row: int) -> np.ndarray:
     reader = FeatureCacheReader(path)
     try:
         return reader.read_feature_at(int(row)).astype(np.float32, copy=False).reshape(-1)
     finally:
         reader.close()
+
+
+def _read_tile_array(path: Path, row: int) -> np.ndarray:
+    reader = TilePackageReader(path)
+    try:
+        image = reader.read_array_at(int(row))
+    finally:
+        reader.close()
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(f"tile image must have shape (H, W, 3): path={path} row={row} shape={image.shape}")
+    return np.asarray(image, dtype=np.uint8)
 
 
 def _write_registry(
@@ -124,6 +156,59 @@ def _write_registry(
     )
 
 
+def _write_image_bank(
+    path: Path,
+    *,
+    manifest: dict[str, Any],
+    rows: list[dict[str, Any]],
+    l1_names: list[str],
+    l2_names: list[str],
+    names: list[str],
+    levels: list[int],
+    exclusive: list[bool],
+    source: dict[str, Any],
+) -> None:
+    primary_index = {name: idx for idx, name in enumerate(l1_names)}
+    attribute_index = {name: idx for idx, name in enumerate(l2_names)}
+    images = []
+    tile_ids = []
+    level1 = []
+    level2 = []
+    for item in rows:
+        images.append(_read_tile_array(_tile_path(manifest, item), int(item["row"])).transpose(2, 0, 1))
+        tile_id = str(item["tile_id"]).strip()
+        tile_ids.append(tile_id)
+        l1 = str(item["l1"]).strip()
+        if l1 not in primary_index:
+            raise ValueError(f"unknown level-1 label in annotation JSON: {l1}")
+        level1.append(primary_index[l1])
+        attributes = torch.zeros(len(l2_names), dtype=torch.float32)
+        for label in item.get("l2") or item.get("level2_labels") or []:
+            label = str(label).strip()
+            if not label:
+                continue
+            if label not in attribute_index:
+                raise ValueError(f"unknown level-2 label in annotation JSON: {label}")
+            attributes[attribute_index[label]] = 1.0
+        level2.append(attributes)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "version": 1,
+            "images": torch.from_numpy(np.stack(images, axis=0)),
+            "tile_ids": tile_ids,
+            "level1": torch.tensor(level1, dtype=torch.long),
+            "level2": torch.stack(level2),
+            "names": names,
+            "groups": ["primary_state" if level == 1 else "attribute_presence" for level in levels],
+            "levels": levels,
+            "exclusive": exclusive,
+            "source": source,
+        },
+        path,
+    )
+
+
 def _write_supervision_csv(path: Path, rows: list[dict[str, Any]], source_split: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     seen: set[str] = set()
@@ -140,6 +225,9 @@ def _write_supervision_csv(path: Path, rows: list[dict[str, Any]], source_split:
                 "expert_a",
                 "expert_b",
                 "adjudicated",
+                "dataset",
+                "iac",
+                "row",
             ],
         )
         writer.writeheader()
@@ -165,6 +253,9 @@ def _write_supervision_csv(path: Path, rows: list[dict[str, Any]], source_split:
                     "expert_a": "adjudicated",
                     "expert_b": "adjudicated",
                     "adjudicated": "true",
+                    "dataset": str(item.get("dataset") or Path(str(item.get("iac") or "")).parent.name).strip(),
+                    "iac": str(item.get("iac") or "").strip(),
+                    "row": str(item.get("row")),
                 }
             )
 
@@ -231,11 +322,9 @@ def main() -> None:
     levels = [1] * len(l1_names) + [2] * len(l2_names)
     exclusive = [True] * len(l1_names) + [False] * len(l2_names)
 
-    teacher_features: dict[str, list[np.ndarray]] = {}
     teacher_dims: dict[str, int] = {}
     for teacher in TEACHERS:
         features, dim = _collect_teacher_features(manifest, rows, teacher)
-        teacher_features[teacher] = features
         teacher_dims[teacher] = dim
         prototypes, counts = _build_label_prototypes(rows, features, l1_names, l2_names)
         _write_registry(
@@ -253,27 +342,21 @@ def main() -> None:
             },
         )
 
-    compatible_teachers = [teacher for teacher, dim in teacher_dims.items() if dim == int(args.embedding_dim)]
-    if not compatible_teachers:
-        raise ValueError(f"no teacher feature dimension matches embedding_dim={args.embedding_dim}: {teacher_dims}")
-    zhcc_features = []
-    for row_idx in range(len(rows)):
-        stacked = _normalize_rows(np.stack([teacher_features[teacher][row_idx] for teacher in compatible_teachers], axis=0))
-        zhcc_features.append(_normalize_vector(stacked.mean(axis=0)))
-    zhcc_prototypes, zhcc_counts = _build_label_prototypes(rows, zhcc_features, l1_names, l2_names)
-    _write_registry(
-        output_dir / "zhcc_hcc_semantic_prototypes.pt",
-        prototypes=zhcc_prototypes,
+    image_bank_path = output_dir / "zhcc_hcc_prototype_images.pt"
+    _write_image_bank(
+        image_bank_path,
+        manifest=manifest,
+        rows=rows,
+        l1_names=l1_names,
+        l2_names=l2_names,
         names=names,
         levels=levels,
         exclusive=exclusive,
-        counts=zhcc_counts,
         source={
             "annotation_json": str(annotation_path),
             "training_manifest": str(manifest_path),
-            "compatible_teachers": compatible_teachers,
-            "embedding_dim": int(args.embedding_dim),
             "builder": "build_prototype_assets_from_annotations.py",
+            "kind": "student_prototype_image_bank",
         },
     )
     supervision_path = output_dir / "hcc_prototype_supervision_manifest.csv"
@@ -286,14 +369,14 @@ def main() -> None:
         "l1_prototypes": l1_names,
         "l2_prototypes": l2_names,
         "teacher_dims": teacher_dims,
-        "zhcc_compatible_teachers": compatible_teachers,
+        "zhcc_prototype_image_path": str(image_bank_path),
         "supervision_manifest": str(supervision_path),
     }
     (output_dir / "prototype_assets_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(
         "prototype_assets_ok "
         f"annotations={len(rows)} output_dir={output_dir} "
-        f"zhcc_teachers={','.join(compatible_teachers)}"
+        f"zhcc_image_bank={image_bank_path}"
     )
 
 

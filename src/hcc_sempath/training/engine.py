@@ -8,9 +8,15 @@ import time
 import numpy as np
 import torch
 
+from ..modeling.prototypes import PrototypeRegistry
 from .adjudication import prototype_adjudicated_teacher_weights
 from .losses import multi_teacher_distillation_loss
 from .metrics import evaluate_teacher_outputs
+from .prototype_images import (
+    PrototypeImageBank,
+    build_student_prototype_registry,
+    collect_student_prototype_image_embeddings,
+)
 from .utils import append_csv, ensure_dir, write_json
 from .zhcc_losses import zhcc_prototype_loss
 from .zhcc_metrics import evaluate_zhcc_prototypes
@@ -244,6 +250,44 @@ def _write_tensorboard_batch(
     writer.add_scalar("train/lr_step", float(lr), global_step)
 
 
+def _maybe_refresh_dynamic_prototypes(
+    *,
+    model,
+    cfg: dict,
+    device: torch.device,
+    zhcc_image_bank: PrototypeImageBank | None,
+    prototype_state: dict | None,
+    global_step: int,
+    needed: bool,
+) -> PrototypeRegistry | None:
+    if prototype_state is None:
+        return None
+    current = prototype_state.get("zhcc")
+    if zhcc_image_bank is None:
+        return current
+    interval = int(cfg["train"].get("dynamic_prototype_refresh_steps", 500))
+    last_step = prototype_state.get("last_refresh_step")
+    should_refresh = current is None or (needed and (last_step is None or int(global_step) - int(last_step) >= interval))
+    if not should_refresh:
+        return current
+    batch_size = int(cfg["train"].get("dynamic_prototype_batch_size", cfg["train"].get("batch_size", 512)))
+    refreshed = build_student_prototype_registry(
+        model=model,
+        image_bank=zhcc_image_bank,
+        cfg=cfg,
+        device=device,
+        batch_size=batch_size,
+    )
+    prototype_state["zhcc"] = refreshed
+    prototype_state["last_refresh_step"] = int(global_step)
+    _log(
+        "dynamic_prototypes_refreshed "
+        f"global_step={global_step} image_count={zhcc_image_bank.count} "
+        f"batch_size={batch_size} prototypes={refreshed.count}"
+    )
+    return refreshed
+
+
 def scheduled_loss_config(
     cfg: dict,
     *,
@@ -362,6 +406,8 @@ def run_epoch(
     scheduler=None,
     max_batches: int | None = None,
     zhcc_prototypes=None,
+    zhcc_image_bank: PrototypeImageBank | None = None,
+    zhcc_prototype_state: dict | None = None,
     epoch: int = 1,
     global_step: int = 0,
     schedule_state: dict | None = None,
@@ -395,6 +441,10 @@ def run_epoch(
         global_step=global_step,
         schedule_state=schedule_state,
     )
+    if zhcc_prototype_state is None:
+        zhcc_prototype_state = {"zhcc": zhcc_prototypes, "last_refresh_step": None}
+    elif "zhcc" not in zhcc_prototype_state:
+        zhcc_prototype_state["zhcc"] = zhcc_prototypes
     iterator = iter(loader)
     progress_total = len(loader)
     if max_batches is not None:
@@ -426,26 +476,42 @@ def run_epoch(
             teachers = _move_teachers(batch, device)
             prototype_mask, prototype_level1, prototype_level2 = _move_prototype_batch(batch, device)
             with torch.set_grad_enabled(train):
+                loss_cfg = scheduled_loss_config(
+                    cfg,
+                    epoch=epoch,
+                    global_step=global_step,
+                    schedule_state=schedule_state,
+                )
+                last_loss_cfg = loss_cfg
+                active_zhcc_prototypes = _maybe_refresh_dynamic_prototypes(
+                    model=model,
+                    cfg=cfg,
+                    device=device,
+                    zhcc_image_bank=zhcc_image_bank,
+                    prototype_state=zhcc_prototype_state,
+                    global_step=global_step,
+                    needed=bool(
+                        train
+                        and (
+                            float(loss_cfg["zhcc_proto_weight"]) > 0
+                            or float(loss_cfg["prototype_filter_weight"]) > 0
+                            or float(loss_cfg["zhcc_response_weight"]) > 0
+                        )
+                    ),
+                )
                 with torch.autocast(device_type=device.type, enabled=_amp_enabled(device, cfg, train)):
-                    loss_cfg = scheduled_loss_config(
-                        cfg,
-                        epoch=epoch,
-                        global_step=global_step,
-                        schedule_state=schedule_state,
-                    )
-                    last_loss_cfg = loss_cfg
                     outputs = model(images)
                     student_by_teacher = outputs["teacher_outputs"]
                     if float(loss_cfg["prototype_filter_weight"]) > 0:
-                        if prototypes is None or zhcc_prototypes is None:
+                        if prototypes is None:
                             raise ValueError(
-                                "prototype adjudication requires data.prototype_paths and data.zhcc_prototype_path"
+                                "prototype adjudication requires data.prototype_paths"
                             )
                         alpha_by_teacher, alpha_diag = prototype_adjudicated_teacher_weights(
                             teacher_by_name=teachers,
                             prototypes_by_teacher=prototypes,
                             zhcc_embedding_norm=outputs["embedding_norm"].detach(),
-                            zhcc_prototypes=zhcc_prototypes,
+                            zhcc_prototypes=active_zhcc_prototypes,
                             prototype_mask=prototype_mask,
                             prototype_level1=prototype_level1,
                             prototype_level2=prototype_level2,
@@ -479,11 +545,11 @@ def run_epoch(
                         prototype_mask=prototype_mask,
                         prototype_level1=prototype_level1,
                         prototype_level2=prototype_level2,
-                        prototypes=zhcc_prototypes,
+                        prototypes=active_zhcc_prototypes,
                         level2_weight=float(loss_cfg["zhcc_level2_weight"]),
                         primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
                         attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
-                    ) if zhcc_prototypes is not None and float(loss_cfg["zhcc_proto_weight"]) > 0 else (
+                    ) if active_zhcc_prototypes is not None and float(loss_cfg["zhcc_proto_weight"]) > 0 else (
                         loss.new_zeros(()),
                         {"zhcc_proto": loss.new_zeros(()), "zhcc_l1": loss.new_zeros(()), "zhcc_l2": loss.new_zeros(())},
                     )
@@ -645,6 +711,7 @@ def fit(
     *,
     scheduler=None,
     zhcc_prototypes=None,
+    zhcc_image_bank: PrototypeImageBank | None = None,
     resume_state: dict | None = None,
 ) -> dict:
     output_dir = ensure_dir(cfg["runtime"]["output_dir"])
@@ -661,6 +728,10 @@ def fit(
         scaler.load_state_dict(resume_state["scaler"])
     _restore_rng_state((resume_state or {}).get("rng_state"))
     writer = _build_summary_writer(cfg, output_dir)
+    zhcc_prototype_state = {
+        "zhcc": zhcc_prototypes,
+        "last_refresh_step": (resume_state or {}).get("zhcc_dynamic_prototype_step"),
+    }
     try:
         for epoch in range(start_epoch, int(cfg["train"]["epochs"]) + 1):
             train_metrics = run_epoch(
@@ -675,12 +746,23 @@ def fit(
                 scheduler=scheduler,
                 max_batches=cfg["train"].get("max_train_batches"),
                 zhcc_prototypes=zhcc_prototypes,
+                zhcc_image_bank=zhcc_image_bank,
+                zhcc_prototype_state=zhcc_prototype_state,
                 epoch=epoch,
                 global_step=global_step,
                 schedule_state=schedule_state,
                 summary_writer=writer,
             )
             global_step = int(train_metrics["global_step_end"])
+            _maybe_refresh_dynamic_prototypes(
+                model=model,
+                cfg=cfg,
+                device=device,
+                zhcc_image_bank=zhcc_image_bank,
+                prototype_state=zhcc_prototype_state,
+                global_step=global_step,
+                needed=zhcc_image_bank is not None,
+            )
             val_metrics = run_epoch(
                 model,
                 val_loader,
@@ -690,12 +772,15 @@ def fit(
                 cfg,
                 train=False,
                 max_batches=cfg["train"].get("max_val_batches"),
-                zhcc_prototypes=zhcc_prototypes,
+                zhcc_prototypes=zhcc_prototype_state.get("zhcc", zhcc_prototypes),
+                zhcc_image_bank=zhcc_image_bank,
+                zhcc_prototype_state=zhcc_prototype_state,
                 epoch=epoch,
                 global_step=global_step,
                 schedule_state=schedule_state,
                 summary_writer=writer,
             )
+            current_zhcc_prototypes = zhcc_prototype_state.get("zhcc", zhcc_prototypes)
             embeddings, student_by_teacher, teacher_by_name, prototype_labels = collect_embeddings(
                 model,
                 val_loader,
@@ -715,9 +800,28 @@ def fit(
                 prototype_labels["prototype_mask"],
                 prototype_labels["prototype_level1"],
                 prototype_labels["prototype_level2"],
-                zhcc_prototypes.to("cpu") if zhcc_prototypes is not None else None,
+                current_zhcc_prototypes.to("cpu") if current_zhcc_prototypes is not None else None,
                 topk=int(cfg["train"]["topk"]),
             )
+            prototype_bank_metrics = {}
+            if zhcc_image_bank is not None and current_zhcc_prototypes is not None:
+                bank_batch_size = int(cfg["train"].get("dynamic_prototype_batch_size", cfg["train"].get("batch_size", 512)))
+                bank_embeddings = collect_student_prototype_image_embeddings(
+                    model=model,
+                    image_bank=zhcc_image_bank,
+                    cfg=cfg,
+                    device=device,
+                    batch_size=bank_batch_size,
+                ).cpu()
+                bank_metrics = evaluate_zhcc_prototypes(
+                    bank_embeddings,
+                    torch.ones(zhcc_image_bank.count, dtype=torch.bool),
+                    zhcc_image_bank.level1,
+                    zhcc_image_bank.level2,
+                    current_zhcc_prototypes.to("cpu"),
+                    topk=int(cfg["train"]["topk"]),
+                )
+                prototype_bank_metrics = {f"prototype_bank_{key}": value for key, value in bank_metrics.items()}
             teacher_alignment_values = [
                 float(value) for key, value in embedding_metrics.items() if key.endswith("_feature_cosine")
             ]
@@ -756,6 +860,7 @@ def fit(
                 "teacher_alignment_score": 0.0 if not math.isfinite(teacher_alignment) else teacher_alignment,
                 **embedding_metrics,
                 **zhcc_metrics,
+                **prototype_bank_metrics,
             }
             append_csv(output_dir / "metrics.csv", row)
             _write_tensorboard_scalars(writer, row, epoch)
@@ -771,6 +876,7 @@ def fit(
                 "best_metrics": best_metrics,
                 "rng_state": _rng_state(),
                 "schedule_state": schedule_state,
+                "zhcc_dynamic_prototype_step": zhcc_prototype_state.get("last_refresh_step"),
                 "config": cfg,
             }
             torch.save(
