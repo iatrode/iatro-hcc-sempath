@@ -1,12 +1,13 @@
 # HCC-SemPath
 
-HCC-SemPath is a lightweight vertical pathology representation repository for
-hepatocellular carcinoma. The project target is a reusable HCC semantic
-embedding space, not a general-purpose pathology foundation model and not a
-single downstream diagnostic, prognostic, or report-generation model.
+HCC-SemPath is an HCC-centered vertical pathology foundation representation
+repository. The project target is a reusable HCC histomorphology embedding space,
+not a general-purpose pathology foundation model and not a single downstream
+diagnostic, prognostic, or report-generation model.
 
-HCC-SemPath 是面向肝细胞癌（HCC）的轻量级垂直病理表征仓库。项目目标是构建可复用的
-HCC 语义 embedding 空间，而不是通用病理基础模型，也不是单一下游诊断、预后或报告生成模型。
+HCC-SemPath 是面向肝细胞癌（HCC）的垂直病理 foundation representation 仓库。项目目标
+是构建可复用的 HCC 组织形态 embedding 空间，而不是通用病理 foundation model，也不是
+单一下游诊断、预后或报告生成模型。
 
 ## Current Direction
 
@@ -20,13 +21,14 @@ teacher heads are training-time adapters.
 projection head 对接不同病理基座模型；推理和下游任务默认使用归一化学生 embedding
 （`embedding_norm`），teacher head 只是训练阶段的适配层。
 
-HCC prototype supervision is expected to further shape the embedding space
-around domain-specific morphology and tissue semantics, such as tumor architecture,
-cholangiocytic components, liver lobule context, necrosis, fibrosis, and immune
-microenvironment patterns.
+HCC prototype supervision further shapes the embedding space around
+domain-specific morphology and tissue context, including tumor, background
+liver, inflammatory/stromal, degenerative, hepatocellular, necrotic,
+hemorrhagic, bile-pigment, fibrous, vascular, and ductular/portal patterns.
 
-HCC 原型监督用于进一步把 embedding 空间塑造成专病语义空间，覆盖肿瘤结构、胆管样成分、
-肝小叶背景、坏死、纤维化和免疫微环境等 HCC 相关形态语义。
+HCC prototype supervision 用于进一步把 embedding 空间塑造成专病语义空间，覆盖肿瘤、
+背景肝、炎症/间质、退变物、肝细胞性实质、坏死、出血、胆色素、纤维间质、血管结构和
+胆管/汇管区等 HCC 相关形态语义。
 
 The current method configuration is PAMT-D, Prototype-Adjudicated Multi-Teacher
 Distillation. Two-level HCC prototypes compute per-tile, per-teacher reliability
@@ -37,10 +39,10 @@ current shared `z_hcc` prototype response.
 共识、专家 anchor 一致性，以及与当前共享 `z_hcc` prototype response 的一致性，计算
 每个 tile / teacher 的软可靠性权重。
 
-The guiding public research direction is maintained in
-[`docs/PROJECT_DIRECTION.md`](docs/PROJECT_DIRECTION.md).
+The public scientific design is maintained in
+[`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md).
 
-公开研究方向以 [`docs/PROJECT_DIRECTION.md`](docs/PROJECT_DIRECTION.md) 为准。
+公开科学设计以 [`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md) 为准。
 
 ## Repository Scope
 
@@ -48,16 +50,15 @@ This repository contains:
 
 - data contracts and package readers/writers for offline tile and feature caches;
 - student model, loss, training, and evaluation scaffolding;
-- public project direction for a lightweight vertical HCC representation model;
-- public-safe documentation of the HCC-SemPath model plan;
+- public scientific design for an HCC-centered vertical foundation
+  representation model;
 - smoke-test utilities based on synthetic data.
 
 本仓库包含：
 
 - 离线 tile 与 feature cache 的数据合同和读写实现；
 - 学生模型、loss、训练和评估脚手架；
-- 轻量级 HCC 垂直表征模型的公开项目方向；
-- 面向公开发布的 HCC-SemPath 模型规划文档；
+- 面向 HCC 垂直 foundation representation model 的公开科学设计；
 - 基于合成数据的 smoke-test 工具。
 
 This repository should not contain private WSIs, production tile packages,
@@ -66,17 +67,6 @@ machine paths.
 
 本仓库不应包含私有 WSI、生产级 tile package、teacher feature package、checkpoint、
 可识别患者身份的 manifest 或本机路径。
-
-## Source Layout
-
-```text
-src/hcc_sempath/
-  io/        offline cache readers/writers, manifests, QC
-  teacher/   teacher model loading and offline feature-cache construction
-  modeling/  student models and semantic prototypes
-  training/  datasets, losses, metrics, engine, train/evaluate/benchmark CLIs
-  cli/       installed command-line entry points
-```
 
 ## Environment
 
@@ -98,24 +88,19 @@ python -m pip install --no-deps -e .
 ## Data Flow
 
 ```text
-WSI or raster image
-  -> 224 px tiling
-  -> image-tile package
-  -> teacher feature package
-  -> multi-teacher student training
-  -> HCC semantic embedding
-  -> downstream evaluation
+HCC WSIs
+  -> tile-level morphology corpus
+  -> multi-teacher morphology priors
+  -> HCC prototype-shaped student embedding
+  -> blinded result-level morphology retrieval evaluation
 ```
 
-IatroCache (`.iac`) is the repository-internal engineering cache contract used
-for offline tile caches and teacher feature caches. It is an implementation
-detail for training data preparation, not the scientific contribution and not a
-general-purpose pathology format. The compact format note lives in
-[`docs/IATROCACHE_FORMAT.md`](docs/IATROCACHE_FORMAT.md).
+IatroCache (`.iac`) is an internal cache format for tile and teacher-feature
+artifacts. It is an implementation detail, not the scientific contribution and
+not a general-purpose pathology data format.
 
 IatroCache（`.iac`）是本仓库内部用于离线 tile cache 与 teacher feature cache 的工程合同，
 属于训练数据准备实现细节，不是论文或模型工作的科学贡献，也不是通用病理格式。
-格式说明见 [`docs/IATROCACHE_FORMAT.md`](docs/IATROCACHE_FORMAT.md)。
 
 ## Training Data Baseline
 
@@ -138,189 +123,20 @@ conda activate hcc-sempath
 bash scripts/run_contract_smoke.sh
 ```
 
-## Core Commands
+## Scientific Prototype Design
 
-Build an image-tile cache from one WSI:
+The current prototype design is part of the scientific method and is documented
+in [`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md). It uses four
+mutually exclusive Level-1 tissue states and ten non-exclusive Level-2 morphology
+attributes. Prototypes are training-side semantic anchors; the manuscript-grade
+primary evaluation is not prototype reconstruction.
 
-```bash
-hcc-sempath build-tile-cache \
-  --input slide.svs \
-  --output data/packages/slide.tiles.iac \
-  --target-mpp 0.5 \
-  --tile-size 224 \
-  --distance 1.0 \
-  --workers 8 \
-  --qc
-```
+当前 prototype 设计属于科学方法本身，见
+[`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md)。它包含 4 个互斥 Level-1
+tissue states 和 10 个非互斥 Level-2 morphology attributes。Prototype 是训练侧语义
+锚点；论文级主评价不是 prototype reconstruction。
 
-Build image-tile caches from a WSI directory:
-
-```bash
-hcc-sempath build-tile-cache \
-  --input /path/to/wsi-root \
-  --output /path/to/output-iac-root \
-  --target-mpp 0.5 \
-  --tile-size 224 \
-  --min-tissue-fraction 0.3 \
-  --distance 1.0 \
-  --workers 8
-```
-
-`build-tile-cache` is the WSI ingestion command used to prepare image-tile
-caches for training. It writes the internal cache package directly; PNG tile
-directories and standalone CSV tile manifests are kept out of the training
-workflow. Directory input scans only the specified directory's top-level WSI
-files because MRXS slides use a file plus companion data directory layout.
-Tissue filtering excludes both white background and near-black empty regions
-(`--black-threshold`, default `8`) so MRXS skipped regions do not become
-retained tiles.
-
-Validate a package:
-
-```bash
-hcc-sempath validate-package \
-  --input data/packages/tiles.iac
-```
-
-Validate all tile and teacher-feature IAC packages under a directory:
-
-```bash
-hcc-sempath validate-package \
-  --input data/packages \
-  --max-decode 8 \
-  --max-crc 0
-```
-
-Directory validation recursively scans `*.iac` files, shows a package progress
-bar, validates both image-tile packages and teacher-feature packages, and prints
-a final ok/failed summary.
-
-Inspect an internal cache package in a local browser:
-
-```bash
-hcc-sempath view-iac \
-  --package data/packages/tiles.iac
-```
-
-Image-tile packages show a spatial coordinate map and a clickable 5x5 tile
-window centered on the clicked coordinate.
-Teacher feature packages show a coordinate heatmap without decoding feature
-payloads.
-
-Annotate L1/L2 semantic prototypes from image-tile packages:
-
-```bash
-hcc-sempath annotate-prototypes \
-  --input data/packages \
-  --state annotations/hcc_prototype_review.json
-```
-
-The annotation UI recursively discovers image-tile `.iac` packages. It supports
-both direct package directories and `dataset_name/*.iac` layouts, shows package
-progress, renders a downsampled tile thumbnail for spatial navigation, and saves
-resume state as JSON with a CSV export next to it. See
-[`docs/PROTOTYPE_ANNOTATION.md`](docs/PROTOTYPE_ANNOTATION.md).
-
-Build teacher features:
-
-```bash
-hcc-sempath build-teacher-cache \
-  --input data/packages \
-  --output data/features/gigapath \
-  --teacher gigapath \
-  --batch-size 512 \
-  --precision bf16 \
-  --feature-dtype auto \
-  --compile \
-  --num-workers 8 \
-  --prefetch-factor 2 \
-  --continue-on-error \
-  --device cuda
-```
-
-Teacher output packages use the suffix pattern `<teacher-name>.features.iac`.
-The input image-tile package naming remains unchanged.
-Tile size is read from the input `.iac` header. Feature payloads are stored as
-a package-level losslessly compressed matrix, with tile order defined by the
-record table. Directory inputs are allowed; all discovered image-tile packages
-must have the same tile dimensions.
-For directory inputs, existing valid outputs are skipped unless `--overwrite`
-is passed. Each generated or skipped package is header-checked and recorded in
-`teacher_cache_progress.csv` plus a JSON summary under the output directory.
-Use `--continue-on-error` for large remote batches so one failed package is
-recorded without stopping the whole teacher-cache run.
-Use `--validate-output` only when a full output IAC matrix validation is needed;
-it decompresses each feature matrix and is intentionally off by default for
-large directory runs.
-Directory runs use bounded batch prefetch through `--prefetch-factor`.
-Package-level prefetch is not part of the public teacher-cache interface.
-The training teacher queue is `gigapath`, `h_optimus_1`, `uni2_h`, and
-`virchow2`. Local model directories and custom timm / `hf_hub:*` names remain
-available for controlled experiments, but the documented path should use the
-supported presets.
-Teacher-cache defaults are tuned for the development workflow: batch size 512,
-bf16 CUDA inference, `torch.compile`, and `--feature-dtype auto`, which writes
-float16 feature matrices for fp16/bf16 inference to keep IAC caches compact.
-Training casts teacher features back to float32 before computing losses.
-
-Some teacher presets, including `h_optimus_1`, `uni2_h`, and `virchow2`, may
-require gated Hugging Face access. Request access with an institutional account,
-accept the model terms, and run `hf auth login` in the feature-cache environment
-before building caches. Local snapshots can also be loaded directly with
-`--teacher weights/teachers/<teacher>`; the `weights/` tree is git-ignored.
-
-Build semantic prototypes:
-
-```bash
-hcc-sempath build-prototypes \
-  --primary-dir data/prototype_concepts/primary \
-  --attribute-dir data/prototype_concepts/attributes \
-  --output data/prototypes/hcc_semantic_prototypes.pt
-```
-
-Prototype packages are runtime data with metadata, not hard-coded model classes.
-See `docs/PROTOTYPE_FORMAT.md` for the public package contract and
-`docs/PROTOTYPE_TAXONOMY.md` for the current L1/L2 classification rules.
-The current curated annotation set uses four L1 labels (`HCC-tumor`,
-`Background-liver`, `Inflammatory-stromal`, `Degenerative-material`) and ten L2
-labels (`hepatocellular-parenchyma-present`, `necrosis-present`,
-`hemorrhage-present`, `bile-pigment-present`, `inflammatory-cell-present`,
-`fibrous-stroma-present`, `steatosis-vacuolation-present`,
-`hyaline-change-present`, `vascular-structure-present`,
-`ductular-portal-present`).
-
-Prototype supervision is provided through a dynamic CSV manifest rather than a
-fixed code-level label set:
-
-```csv
-tile_id,level1_label,level2_labels,source_split,expert_a,expert_b,adjudicated
-```
-
-`level1_label` and `level2_labels` are resolved by name against the configured
-`data.zhcc_prototype_path`, so future prototype packages can add or revise
-prototype names without changing dataset code. Training supervision uses only
-the configured `data.prototype_supervision_train_splits`; validation and
-external validation use their own configured supervision splits.
-
-Build a training manifest:
-
-```bash
-hcc-sempath build-train-manifest \
-  --dev-source internal=/data/hcc_tiles/internal \
-  --public-source tcga=/data/hcc_tiles/tcga \
-  --public-exval-n 50 \
-  --val-frac 0.15 \
-  --split-key patient_id \
-  --teacher gigapath \
-  --teacher h_optimus_1 \
-  --teacher uni2_h \
-  --teacher virchow2 \
-  --feature-root /data/hcc_features \
-  --check-artifacts \
-  --output data/manifests/hcc_train.yaml
-```
-
-See `docs/TRAINING_MANIFEST.md` for the cohort manifest contract.
+## Reproducibility Commands
 
 Run a preflight check before a long training job:
 
@@ -363,15 +179,14 @@ hcc-sempath evaluate \
   --split val
 ```
 
-Evaluation writes `eval_<split>.json` and reports teacher-imitation metrics
-plus direct `z_hcc` prototype metrics computed from `embedding_norm`, including
-Level-1 accuracy, Level-2 macro F1/AUC, prototype top-k precision, and
-neighborhood purity.
+The training `evaluate` command writes `eval_<split>.json` and reports
+teacher-imitation QC plus direct `z_hcc` prototype diagnostics from
+`embedding_norm`, including Level-1 accuracy, Level-2 macro F1/AUC, prototype
+top-k precision, and neighborhood purity. The manuscript-grade primary
+evaluation is the blinded result-level morphology retrieval protocol described
+in `docs/HCC_SEMPATH_DESIGN.md`; it is not dense exval tile annotation and not a
+clinical endpoint benchmark.
 
 ## Documentation
 
-- `docs/model_plan.md`: public bilingual model direction.
-- `docs/CURRENT_STATUS.md`: current engineering and training status.
-- `docs/TECHNICAL_FRAMEWORK.md`: public technical framework.
-- `docs/IATROCACHE_FORMAT.md`: internal cache contract used by data preparation.
-- `docs/remote_cache_workflow.md`: teacher-cache workflow.
+- `docs/HCC_SEMPATH_DESIGN.md`: single public scientific design and evaluation protocol.
