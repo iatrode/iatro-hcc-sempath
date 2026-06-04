@@ -226,6 +226,8 @@ def main() -> None:
                 alpha_min=float(cfg["loss"].get("prototype_filter_alpha_min", 0.25)),
                 consensus_weight=float(cfg["loss"].get("consensus_weight", 0.4)),
                 prototype_label_weight=float(cfg["loss"].get("prototype_label_weight", 0.4)),
+                l1_agreement_weight=float(cfg["loss"].get("prototype_l1_agreement_weight", 0.5)),
+                l2_agreement_weight=float(cfg["loss"].get("prototype_l2_agreement_weight", 0.5)),
                 zhcc_response_weight=float(cfg["loss"].get("zhcc_response_weight", 0.2)),
                 filter_strength=float(cfg["loss"].get("prototype_filter_weight", 0.0)),
             )

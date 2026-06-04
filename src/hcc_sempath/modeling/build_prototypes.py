@@ -7,6 +7,26 @@ import numpy as np
 import torch
 
 
+def _load_feature_matrix(paths: list[Path], concept: str) -> np.ndarray:
+    features = [np.load(path).astype(np.float32).reshape(-1) for path in paths]
+    if not features:
+        raise ValueError(f"no feature arrays found for concept={concept}")
+    dims = {feature.shape[0] for feature in features}
+    if len(dims) != 1:
+        raise ValueError(f"feature dimension mismatch for concept={concept}: dims={sorted(dims)}")
+    matrix = np.stack(features)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    return matrix / np.clip(norms, 1e-12, None)
+
+
+def _mean_unit_prototype(matrix: np.ndarray) -> np.ndarray:
+    prototype = matrix.mean(axis=0).astype(np.float32)
+    norm = float(np.linalg.norm(prototype))
+    if norm <= 1e-12:
+        raise ValueError("prototype mean has near-zero norm")
+    return prototype / norm
+
+
 def _append_concepts(
     concept_dir: Path,
     level: int,
@@ -19,16 +39,16 @@ def _append_concepts(
     counts: list[int],
 ) -> None:
     for subdir in sorted(path for path in concept_dir.iterdir() if path.is_dir()):
-        features = [np.load(path).astype(np.float32).reshape(-1) for path in sorted(subdir.glob("*.npy"))]
-        if not features:
+        paths = sorted(subdir.glob("*.npy"))
+        if not paths:
             continue
-        matrix = np.stack(features)
+        matrix = _load_feature_matrix(paths, subdir.name)
         names.append(subdir.name)
         groups.append(group)
         levels.append(level)
         exclusive.append(level == 1)
-        prototypes.append(matrix.mean(axis=0))
-        counts.append(len(features))
+        prototypes.append(_mean_unit_prototype(matrix))
+        counts.append(len(paths))
 
 
 def main() -> None:

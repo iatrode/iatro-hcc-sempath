@@ -114,9 +114,17 @@ def test_teacher_sample_weights_are_normalized_not_loss_scale() -> None:
     assert abs(parts_a["feature"].item() - parts_b["feature"].item()) < 1e-6
 
 
-def test_relation_scaling_by_alpha_is_opt_in() -> None:
-    student_by_teacher = {"teacher": torch.randn(4, 3)}
-    teacher_by_name = {"teacher": torch.randn(4, 3)}
+def test_relation_pair_weighting_by_alpha_is_opt_in() -> None:
+    student_by_teacher = {
+        "teacher": torch.tensor(
+            [[1.0, 0.0, 0.0], [0.8, 0.2, 0.0], [0.0, 1.0, 0.0], [0.0, 0.2, 0.8]]
+        )
+    }
+    teacher_by_name = {
+        "teacher": torch.tensor(
+            [[1.0, 0.0, 0.0], [0.9, 0.1, 0.0], [0.0, 1.0, 0.0], [0.7, 0.1, 0.0]]
+        )
+    }
     weights = {"teacher": torch.tensor([1.0, 0.5, 0.5, 0.25])}
 
     _, default_parts = multi_teacher_distillation_loss(
@@ -140,4 +148,5 @@ def test_relation_scaling_by_alpha_is_opt_in() -> None:
     )
 
     assert default_parts["relation_scale"].item() == 1.0
-    assert abs(scaled_parts["relation_scale"].item() - weights["teacher"].mean().item()) < 1e-6
+    assert scaled_parts["relation_scale"].item() == 1.0
+    assert scaled_parts["relation"].item() != default_parts["relation"].item()

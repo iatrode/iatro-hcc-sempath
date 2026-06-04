@@ -45,6 +45,7 @@ class _PackageShuffleBatchLoader:
         seed: int = 13,
         chunk_size: int | None = None,
         buffer_batches: int = 1,
+        reshuffle_each_epoch: bool = True,
     ) -> None:
         self.dataset = dataset
         self.batch_size = int(batch_size)
@@ -52,6 +53,8 @@ class _PackageShuffleBatchLoader:
         self.prefetch_batches = max(0, int(prefetch_batches))
         self.collate_fn = collate_fn
         self.seed = int(seed)
+        self.reshuffle_each_epoch = bool(reshuffle_each_epoch)
+        self._epoch = 0
         self.chunk_size = max(1, int(chunk_size or self.batch_size))
         self.buffer_target = max(self.batch_size, self.batch_size * max(1, int(buffer_batches)))
 
@@ -69,8 +72,11 @@ class _PackageShuffleBatchLoader:
             yield self.collate_fn(self._draw_batch(buffer, rng))
 
     def __iter__(self):
-        rng = np.random.default_rng(self.seed)
-        chunks = iter(self.dataset.iter_package_row_chunks(self.chunk_size, self.seed))
+        epoch_seed = self.seed + self._epoch if self.reshuffle_each_epoch else self.seed
+        if self.reshuffle_each_epoch:
+            self._epoch += 1
+        rng = np.random.default_rng(epoch_seed)
+        chunks = iter(self.dataset.iter_package_row_chunks(self.chunk_size, epoch_seed))
         buffer: list[dict] = []
         if self.num_workers <= 0:
             for package_idx, rows in chunks:
@@ -406,7 +412,7 @@ def main() -> None:
         prefetch_batches = int(cfg["data"].get("prefetch_factor", 2))
         default_chunk_size = max(1, int(cfg["train"]["batch_size"]) // max(1, num_workers))
         package_chunk_size = int(cfg["data"].get("package_chunk_size", default_chunk_size))
-        package_buffer_batches = int(cfg["data"].get("package_buffer_batches", 1))
+        package_buffer_batches = int(cfg["data"].get("package_buffer_batches", 4))
         train_loader = _PackageShuffleBatchLoader(
             train_ds,
             batch_size=int(cfg["train"]["batch_size"]),
@@ -416,6 +422,7 @@ def main() -> None:
             seed=int(cfg["runtime"]["seed"]),
             chunk_size=package_chunk_size,
             buffer_batches=package_buffer_batches,
+            reshuffle_each_epoch=True,
         )
         val_loader = _PackageShuffleBatchLoader(
             val_ds,
@@ -426,6 +433,7 @@ def main() -> None:
             seed=int(cfg["runtime"]["seed"]) + 1,
             chunk_size=package_chunk_size,
             buffer_batches=package_buffer_batches,
+            reshuffle_each_epoch=False,
         )
     else:
         train_loader = DataLoader(

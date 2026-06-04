@@ -15,7 +15,9 @@ def _macro_auc(logits: torch.Tensor, targets: torch.Tensor) -> float:
         neg = logits[~y, idx]
         if pos.numel() == 0 or neg.numel() == 0:
             continue
-        aucs.append(float((pos[:, None] > neg[None, :]).float().mean().cpu()))
+        greater = (pos[:, None] > neg[None, :]).float()
+        ties = (pos[:, None] == neg[None, :]).float()
+        aucs.append(float((greater + 0.5 * ties).mean().cpu()))
     return float(sum(aucs) / len(aucs)) if aucs else 0.0
 
 

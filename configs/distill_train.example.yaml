@@ -22,6 +22,7 @@ data:
   prefetch_factor: 2
   persistent_workers: true
   dynamic_package_sampling: true
+  package_buffer_batches: 4
 
 augmentation:
   enabled: true
@@ -55,12 +56,14 @@ loss:
     virchow2: 1.0
   feature_loss_type: cosine
   relation_weight: 0.05
-  scale_relation_by_alpha: false
+  scale_relation_by_alpha: true
   semantic_weight: 0.0
   semantic_warmup_epochs: 0
   semantic_temperature: 1.0
   primary_temperature: 1.0
   attribute_temperature: 1.0
+  zhcc_primary_temperature: 0.1
+  zhcc_attribute_temperature: 0.1
   zhcc_proto_weight: 0.2
   prototype_ramp_steps: 1000
   zhcc_level2_weight: 0.5
@@ -69,6 +72,8 @@ loss:
   prototype_filter_alpha_min: 0.25
   consensus_weight: 0.4
   prototype_label_weight: 0.4
+  prototype_l1_agreement_weight: 0.5
+  prototype_l2_agreement_weight: 0.5
   zhcc_response_weight: 0.0
   teacher_prior_plateau_window_steps: 1000
   teacher_prior_plateau_threshold: 0.01
@@ -86,6 +91,7 @@ train:
   warmup_epochs: 3
   min_lr: 0.000001
   weight_decay: 0.01
+  max_grad_norm: 1.0
   amp: true
   topk: 10
   max_val_batches: 512

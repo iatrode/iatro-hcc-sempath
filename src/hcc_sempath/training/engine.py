@@ -63,7 +63,8 @@ def _apply_gpu_image_augmentation(images: torch.Tensor, cfg: dict, *, train: boo
             images = (images - gray) * _jitter_factor(saturation, images.device) + gray
         images = images.clamp_(0.0, 1.0)
         if hue > 0:
-            images = TVF.adjust_hue(images, (random.random() * 2.0 - 1.0) * hue)
+            hue_factor = float((torch.rand((), device=images.device) * 2.0 - 1.0).detach().cpu()) * hue
+            images = TVF.adjust_hue(images, hue_factor)
     return images
 
 
@@ -335,8 +336,12 @@ def scheduled_loss_config(
         "feature_loss_type": str(loss_cfg.get("feature_loss_type", "cosine")),
         "zhcc_proto_weight": zhcc_proto_weight,
         "zhcc_level2_weight": float(loss_cfg.get("zhcc_level2_weight", 0.5)),
+        "zhcc_primary_temperature": float(loss_cfg.get("zhcc_primary_temperature", 0.1)),
+        "zhcc_attribute_temperature": float(loss_cfg.get("zhcc_attribute_temperature", 0.1)),
         "consensus_weight": float(loss_cfg.get("consensus_weight", 0.4)),
         "prototype_label_weight": float(loss_cfg.get("prototype_label_weight", 0.4)),
+        "prototype_l1_agreement_weight": float(loss_cfg.get("prototype_l1_agreement_weight", 0.5)),
+        "prototype_l2_agreement_weight": float(loss_cfg.get("prototype_l2_agreement_weight", 0.5)),
         "zhcc_response_weight": zhcc_response_weight,
         "scale_relation_by_alpha": bool(loss_cfg.get("scale_relation_by_alpha", False)),
         "prototype_start_step": prototype_start,
@@ -429,6 +434,7 @@ def run_epoch(
     phase = "train" if train else "val"
     log_interval = int(cfg["train"].get("log_interval", 0) or 0)
     tensorboard_batch_interval = int(cfg["train"].get("tensorboard_batch_interval", 0) or 0)
+    max_grad_norm = float(cfg["train"].get("max_grad_norm", 0.0) or 0.0)
     last_loss_cfg = scheduled_loss_config(
         cfg,
         epoch=epoch,
@@ -492,6 +498,8 @@ def run_epoch(
                             alpha_min=float(loss_cfg["prototype_filter_alpha_min"]),
                             consensus_weight=float(loss_cfg["consensus_weight"]),
                             prototype_label_weight=float(loss_cfg["prototype_label_weight"]),
+                            l1_agreement_weight=float(loss_cfg["prototype_l1_agreement_weight"]),
+                            l2_agreement_weight=float(loss_cfg["prototype_l2_agreement_weight"]),
                             zhcc_response_weight=float(loss_cfg["zhcc_response_weight"]),
                             filter_strength=float(loss_cfg["prototype_filter_weight"]),
                         )
@@ -519,6 +527,8 @@ def run_epoch(
                         prototype_level2=prototype_level2,
                         prototypes=zhcc_prototypes,
                         level2_weight=float(loss_cfg["zhcc_level2_weight"]),
+                        primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
+                        attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
                     ) if zhcc_prototypes is not None and float(loss_cfg["zhcc_proto_weight"]) > 0 else (
                         loss.new_zeros(()),
                         {"zhcc_proto": loss.new_zeros(()), "zhcc_l1": loss.new_zeros(()), "zhcc_l2": loss.new_zeros(())},
@@ -528,10 +538,15 @@ def run_epoch(
                     optimizer.zero_grad(set_to_none=True)
                     if scaler is not None and scaler.is_enabled():
                         scaler.scale(loss).backward()
+                        if max_grad_norm > 0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         loss.backward()
+                        if max_grad_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                         optimizer.step()
                     if scheduler is not None:
                         scheduler.step()
@@ -682,6 +697,7 @@ def fit(
     checkpoints = ensure_dir(output_dir / "checkpoints")
     write_json(output_dir / "resolved_config.json", cfg)
     best_loss = float((resume_state or {}).get("best_loss", float("inf")))
+    best_teacher_alignment = float((resume_state or {}).get("best_teacher_alignment", float("-inf")))
     best_metrics = dict((resume_state or {}).get("best_metrics", {}))
     start_epoch = int((resume_state or {}).get("epoch", 0)) + 1
     global_step = int((resume_state or {}).get("global_step", 0))
@@ -748,6 +764,14 @@ def fit(
                 zhcc_prototypes.to("cpu") if zhcc_prototypes is not None else None,
                 topk=int(cfg["train"]["topk"]),
             )
+            teacher_alignment_values = [
+                float(value) for key, value in embedding_metrics.items() if key.endswith("_feature_cosine")
+            ]
+            teacher_alignment = (
+                float(sum(teacher_alignment_values) / len(teacher_alignment_values))
+                if teacher_alignment_values
+                else float("-inf")
+            )
             loss_cfg = scheduled_loss_config(
                 cfg,
                 epoch=epoch,
@@ -775,6 +799,7 @@ def fit(
                 "intervention_stage": str(loss_cfg["intervention_stage"]),
                 **{f"train_{k}": v for k, v in train_metrics.items()},
                 **{f"val_{k}": v for k, v in val_metrics.items()},
+                "teacher_alignment_score": 0.0 if not math.isfinite(teacher_alignment) else teacher_alignment,
                 **embedding_metrics,
                 **zhcc_metrics,
             }
@@ -788,6 +813,7 @@ def fit(
                 "epoch": epoch,
                 "global_step": global_step,
                 "best_loss": best_loss,
+                "best_teacher_alignment": best_teacher_alignment,
                 "best_metrics": best_metrics,
                 "rng_state": _rng_state(),
                 "schedule_state": schedule_state,
@@ -805,6 +831,13 @@ def fit(
                 torch.save(
                     checkpoint,
                     checkpoints / "best.pt",
+                )
+            if teacher_alignment > best_teacher_alignment:
+                best_teacher_alignment = teacher_alignment
+                checkpoint["best_teacher_alignment"] = best_teacher_alignment
+                torch.save(
+                    checkpoint,
+                    checkpoints / "best_teacher_alignment.pt",
                 )
     finally:
         if writer is not None:

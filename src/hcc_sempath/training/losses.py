@@ -43,12 +43,23 @@ def _weighted_mean(loss_per_sample: torch.Tensor, weight: torch.Tensor | None) -
     return (weight * loss_per_sample).sum() / weight.sum().clamp_min(1e-6)
 
 
-def relation_distillation_loss(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
+def relation_distillation_loss(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    sample_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
     student_norm = F.normalize(student, dim=-1)
     teacher_norm = F.normalize(teacher, dim=-1)
     student_rel = student_norm @ student_norm.transpose(0, 1)
     teacher_rel = teacher_norm @ teacher_norm.transpose(0, 1)
-    return F.mse_loss(student_rel, teacher_rel)
+    relation_error = (student_rel - teacher_rel).square()
+    if sample_weight is None:
+        return relation_error.mean()
+    weight = sample_weight.to(device=student.device, dtype=student.dtype)
+    if weight.shape != (student.shape[0],):
+        raise ValueError(f"sample_weight must have shape=({student.shape[0]},), got {tuple(weight.shape)}")
+    pair_weight = weight[:, None] * weight[None, :]
+    return (relation_error * pair_weight).sum() / pair_weight.sum().clamp_min(1e-6)
 
 
 def semantic_distillation_loss(
@@ -94,7 +105,7 @@ def attribute_prototype_bce_loss(
     student_logits = normalized_prototype_logits(student, attributes) / temperature
     with torch.no_grad():
         teacher_targets = torch.sigmoid(normalized_prototype_logits(teacher, attributes) / temperature)
-    return F.binary_cross_entropy_with_logits(student_logits, teacher_targets)
+    return F.binary_cross_entropy_with_logits(student_logits, teacher_targets) * (temperature**2)
 
 
 def total_distillation_loss(
@@ -119,7 +130,7 @@ def total_distillation_loss(
         )
     feature_per_sample = feature_distillation_loss_per_sample(student, teacher, loss_type=feature_loss_type)
     feature = _weighted_mean(feature_per_sample, reliability)
-    relation = relation_distillation_loss(student, teacher)
+    relation = relation_distillation_loss(student, teacher, reliability if scale_relation_by_alpha else None)
     if prototypes is None or semantic_weight == 0:
         semantic = feature.new_zeros(())
     else:
@@ -131,8 +142,8 @@ def total_distillation_loss(
             attribute_temperature=semantic_temperature if attribute_temperature is None else attribute_temperature,
         )
     reliability_mean = reliability.mean() if reliability is not None else relation.new_ones(())
-    relation_scale = reliability_mean if reliability is not None and scale_relation_by_alpha else relation.new_ones(())
-    total = feature + relation_weight * relation_scale * relation + semantic_weight * semantic
+    relation_scale = relation.new_ones(())
+    total = feature + relation_weight * relation + semantic_weight * semantic
     return total, {
         "feature": feature.detach(),
         "relation": relation.detach(),

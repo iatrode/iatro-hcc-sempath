@@ -15,7 +15,13 @@ def zhcc_prototype_loss(
     prototypes: PrototypeRegistry,
     *,
     level2_weight: float = 0.5,
+    primary_temperature: float = 0.1,
+    attribute_temperature: float = 0.1,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if primary_temperature <= 0:
+        raise ValueError(f"primary_temperature must be positive, got {primary_temperature}")
+    if attribute_temperature <= 0:
+        raise ValueError(f"attribute_temperature must be positive, got {attribute_temperature}")
     if not bool(prototype_mask.any()):
         zero = embedding_norm.new_zeros(())
         return zero, {"zhcc_proto": zero.detach(), "zhcc_l1": zero.detach(), "zhcc_l2": zero.detach()}
@@ -36,10 +42,10 @@ def zhcc_prototype_loss(
         raise ValueError(
             f"prototype_level2 width mismatch: labels={l2_targets.shape[1]} attributes={num_attributes}"
         )
-    primary_logits = normalized_prototype_logits(supervised_embedding, prototypes.primary_prototypes)
+    primary_logits = normalized_prototype_logits(supervised_embedding, prototypes.primary_prototypes) / float(primary_temperature)
     l1 = F.cross_entropy(primary_logits, l1_targets)
     if num_attributes > 0:
-        attribute_logits = normalized_prototype_logits(supervised_embedding, prototypes.attribute_prototypes)
+        attribute_logits = normalized_prototype_logits(supervised_embedding, prototypes.attribute_prototypes) / float(attribute_temperature)
         l2 = F.binary_cross_entropy_with_logits(attribute_logits, l2_targets)
     else:
         l2 = embedding_norm.new_zeros(())
