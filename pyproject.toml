@@ -28,6 +28,9 @@ dependencies = [
 dev = [
   "pytest",
 ]
+search = [
+  "optuna",
+]
 
 [project.scripts]
 hcc-sempath = "hcc_sempath.cli.main:main"
