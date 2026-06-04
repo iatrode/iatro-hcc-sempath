@@ -29,6 +29,7 @@ from .datasets import (
 )
 from .engine import build_lr_scheduler, fit
 from .manifest import load_training_manifest
+from .prototype_images import PrototypeImageBank, load_prototype_image_bank
 from .prototype_labels import load_prototype_labels
 from .utils import seed_everything
 
@@ -202,13 +203,39 @@ def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -
 def _load_zhcc_prototypes(cfg: dict, device: torch.device) -> PrototypeRegistry | None:
     prototype_path = cfg["data"].get("zhcc_prototype_path")
     if prototype_path is None:
-        if float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0 or float(cfg["loss"].get("prototype_filter_weight", 0.0)) > 0:
+        if float(cfg["loss"].get("zhcc_response_weight", 0.0)) > 0:
             raise ValueError(
-                "data.zhcc_prototype_path is required when zhcc prototype supervision "
-                "or prototype adjudication is enabled"
+                "data.zhcc_prototype_path is required only when loss.zhcc_response_weight > 0"
             )
         return None
     return load_prototype_registry(prototype_path, expected_dim=embedding_dim(cfg)).to(device)
+
+
+def _load_zhcc_image_bank(cfg: dict) -> PrototypeImageBank | None:
+    image_path = cfg["data"].get("zhcc_prototype_image_path")
+    if image_path is None:
+        if float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0:
+            raise ValueError(
+                "data.zhcc_prototype_image_path is required when loss.zhcc_proto_weight > 0"
+            )
+        return None
+    return load_prototype_image_bank(image_path)
+
+
+def _label_contract_registry(
+    *,
+    cfg: dict,
+    prototypes: dict[str, PrototypeRegistry] | None,
+    zhcc_prototypes: PrototypeRegistry | None,
+    zhcc_image_bank: PrototypeImageBank | None,
+) -> PrototypeRegistry | None:
+    if zhcc_prototypes is not None:
+        return zhcc_prototypes.to("cpu")
+    if zhcc_image_bank is not None:
+        return zhcc_image_bank.label_contract(embedding_dim(cfg))
+    if prototypes:
+        return next(iter(prototypes.values())).to("cpu")
+    return None
 
 
 def _prototype_source_splits(cfg: dict, key: str, default: list[str]) -> set[str] | None:
@@ -251,7 +278,15 @@ def main() -> None:
         names = list(teacher_packages)
     validate_training_config(cfg, names)
     dims = teacher_dims(cfg, names)
+    prototypes = _load_prototype_map(cfg, dims, device)
     zhcc_prototypes = _load_zhcc_prototypes(cfg, device)
+    zhcc_image_bank = _load_zhcc_image_bank(cfg)
+    label_contract = _label_contract_registry(
+        cfg=cfg,
+        prototypes=prototypes,
+        zhcc_prototypes=zhcc_prototypes,
+        zhcc_image_bank=zhcc_image_bank,
+    )
     prototype_manifest_path = cfg["data"].get("prototype_supervision_manifest_path")
     prototype_label_required = (
         float(cfg["loss"].get("prototype_filter_weight", 0.0)) > 0
@@ -264,12 +299,12 @@ def main() -> None:
         )
     train_prototype_labels = load_prototype_labels(
         prototype_manifest_path,
-        zhcc_prototypes.to("cpu") if zhcc_prototypes is not None else None,
+        label_contract,
         allowed_source_splits=_prototype_source_splits(cfg, "prototype_supervision_train_splits", ["train"]),
     )
     val_prototype_labels = load_prototype_labels(
         prototype_manifest_path,
-        zhcc_prototypes.to("cpu") if zhcc_prototypes is not None else None,
+        label_contract,
         allowed_source_splits=_prototype_source_splits(cfg, "prototype_supervision_val_splits", ["val"]),
     )
     all_tile_packages = sorted(set(train_tile_packages + val_tile_packages))
@@ -436,7 +471,6 @@ def main() -> None:
             collate_fn=collate_distillation,
             **loader_kwargs,
         )
-    prototypes = _load_prototype_map(cfg, dims, device)
     model = HCCSemPathModel(
         backbone_name=cfg["model"]["backbone_name"],
         embedding_dim=embedding_dim(cfg),
@@ -466,6 +500,7 @@ def main() -> None:
         cfg,
         scheduler=scheduler,
         zhcc_prototypes=zhcc_prototypes,
+        zhcc_image_bank=zhcc_image_bank,
         resume_state=resume_state,
     )
     print("train_ok " + " ".join(f"{k}={v}" for k, v in metrics.items()))

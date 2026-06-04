@@ -181,8 +181,8 @@ def prototype_adjudicated_teacher_weights(
     *,
     teacher_by_name: dict[str, torch.Tensor],
     prototypes_by_teacher: dict[str, PrototypeRegistry],
-    zhcc_embedding_norm: torch.Tensor,
-    zhcc_prototypes: PrototypeRegistry,
+    zhcc_embedding_norm: torch.Tensor | None = None,
+    zhcc_prototypes: PrototypeRegistry | None = None,
     prototype_mask: torch.Tensor,
     prototype_level1: torch.Tensor,
     prototype_level2: torch.Tensor,
@@ -207,15 +207,23 @@ def prototype_adjudicated_teacher_weights(
     if not 0.0 <= filter_strength_value <= 1.0:
         raise ValueError(f"filter_strength must be in [0, 1], got {filter_strength}")
 
-    primary_names = _prototype_names(zhcc_prototypes, zhcc_prototypes.primary_indices)
-    attribute_names = _prototype_names(zhcc_prototypes, zhcc_prototypes.attribute_indices)
-    zhcc_primary, zhcc_attributes = _teacher_response(
-        zhcc_embedding_norm,
-        zhcc_prototypes,
-        primary_names=primary_names,
-        attribute_names=attribute_names,
-        label="zhcc",
-    )
+    label_registry = zhcc_prototypes if zhcc_prototypes is not None else next(iter(prototypes_by_teacher.values()))
+    primary_names = _prototype_names(label_registry, label_registry.primary_indices)
+    attribute_names = _prototype_names(label_registry, label_registry.attribute_indices)
+    if float(zhcc_response_weight) > 0:
+        if zhcc_embedding_norm is None or zhcc_prototypes is None:
+            raise ValueError("zhcc_response_weight > 0 requires zhcc_embedding_norm and zhcc_prototypes")
+        zhcc_primary, zhcc_attributes = _teacher_response(
+            zhcc_embedding_norm,
+            zhcc_prototypes,
+            primary_names=primary_names,
+            attribute_names=attribute_names,
+            label="zhcc",
+        )
+    else:
+        first_teacher = next(iter(teacher_by_name.values()))
+        zhcc_primary = first_teacher.new_zeros((first_teacher.shape[0], len(primary_names)))
+        zhcc_attributes = first_teacher.new_zeros((first_teacher.shape[0], len(attribute_names)))
 
     responses = {
         name: _teacher_response(
@@ -259,14 +267,17 @@ def prototype_adjudicated_teacher_weights(
             l1_weight=l1_agreement_weight,
             l2_weight=l2_agreement_weight,
         )
-        zhcc = _agreement(
-            primary,
-            attributes,
-            zhcc_primary,
-            zhcc_attributes,
-            l1_weight=l1_agreement_weight,
-            l2_weight=l2_agreement_weight,
-        )
+        if float(zhcc_response_weight) > 0:
+            zhcc = _agreement(
+                primary,
+                attributes,
+                zhcc_primary,
+                zhcc_attributes,
+                l1_weight=l1_agreement_weight,
+                l2_weight=l2_agreement_weight,
+            )
+        else:
+            zhcc = consensus.new_zeros(consensus.shape)
         reliability = _combine_reliability(
             consensus=consensus,
             prototype_label=prototype_label,

@@ -59,7 +59,7 @@ def require_prototype_inputs(cfg: dict[str, Any]) -> None:
         missing.append("data.prototype_paths")
     else:
         missing.extend(f"data.prototype_paths.{teacher}" for teacher in TEACHERS if teacher not in prototype_paths)
-    for key in ("zhcc_prototype_path", "prototype_supervision_manifest_path"):
+    for key in ("zhcc_prototype_image_path", "prototype_supervision_manifest_path"):
         if not data.get(key):
             missing.append(f"data.{key}")
     if missing:
@@ -85,7 +85,7 @@ def inject_prototype_assets(cfg: dict[str, Any], asset_dir: Path) -> dict[str, A
         "uni2_h": str(asset_dir / "uni2_h_hcc_semantic_prototypes.pt"),
         "virchow2": str(asset_dir / "virchow2_hcc_semantic_prototypes.pt"),
     }
-    cfg["data"]["zhcc_prototype_path"] = str(asset_dir / "zhcc_hcc_semantic_prototypes.pt")
+    cfg["data"]["zhcc_prototype_image_path"] = str(asset_dir / "zhcc_hcc_prototype_images.pt")
     cfg["data"]["prototype_supervision_manifest_path"] = str(asset_dir / "hcc_prototype_supervision_manifest.csv")
     cfg["data"]["prototype_supervision_train_splits"] = ["train"]
     cfg["data"]["prototype_supervision_val_splits"] = ["val"]
@@ -105,8 +105,15 @@ def maybe_build_prototype_assets(
     if not annotation_json:
         require_prototype_inputs(cfg)
     asset_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = asset_dir / "prototype_assets_summary.json"
-    if not summary_path.exists():
+    required_assets = [
+        asset_dir / "gigapath_hcc_semantic_prototypes.pt",
+        asset_dir / "h_optimus_1_hcc_semantic_prototypes.pt",
+        asset_dir / "uni2_h_hcc_semantic_prototypes.pt",
+        asset_dir / "virchow2_hcc_semantic_prototypes.pt",
+        asset_dir / "zhcc_hcc_prototype_images.pt",
+        asset_dir / "hcc_prototype_supervision_manifest.csv",
+    ]
+    if any(not path.exists() for path in required_assets):
         manifest_path = Path(str(cfg["data"].get("train_manifest_path", "")))
         if not manifest_path.is_absolute():
             manifest_path = repo / manifest_path
@@ -192,9 +199,9 @@ def score_row(row: dict[str, str], objective: str) -> float:
             return 0.0
 
     teacher_alignment = value("teacher_alignment_score")
-    prototype_topk = value("zhcc_prototype_topk_precision")
-    l1_acc = value("zhcc_level1_accuracy")
-    l2_auc = value("zhcc_level2_macro_auc")
+    prototype_topk = value("prototype_bank_zhcc_prototype_topk_precision") or value("zhcc_prototype_topk_precision")
+    l1_acc = value("prototype_bank_zhcc_level1_accuracy") or value("zhcc_level1_accuracy")
+    l2_auc = value("prototype_bank_zhcc_level2_macro_auc") or value("zhcc_level2_macro_auc")
     if objective == "teacher_alignment":
         return teacher_alignment
     if objective == "prototype_qc":
