@@ -116,8 +116,6 @@ def main() -> None:
         mean=cfg["data"].get("mean"),
         std=cfg["data"].get("std"),
         teacher_cache_package_paths=teacher_packages,
-        train=False,
-        augmentation=cfg.get("augmentation"),
         prototype_labels=prototype_labels,
     )
     loader = DataLoader(dataset, batch_size=cfg["train"]["batch_size"], shuffle=False, num_workers=cfg["data"]["num_workers"], collate_fn=collate_distillation)

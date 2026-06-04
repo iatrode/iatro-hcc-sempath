@@ -24,17 +24,6 @@ data:
   dynamic_package_sampling: true
   package_buffer_batches: 4
 
-augmentation:
-  enabled: true
-  horizontal_flip: true
-  vertical_flip: true
-  random_rotation_90: true
-  color_jitter:
-    brightness: 0.10
-    contrast: 0.10
-    saturation: 0.05
-    hue: 0.02
-
 model:
   backbone_name: vit_small_patch14_reg4_dinov2.lvd142m
   embedding_dim: 1536

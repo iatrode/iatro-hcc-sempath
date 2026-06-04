@@ -30,41 +30,12 @@ def _build_image_transform(
     mean: list[float] | tuple[float, ...] | None,
     std: list[float] | tuple[float, ...] | None,
     *,
-    train: bool = False,
-    augmentation: dict | None = None,
     resize: bool = True,
 ) -> transforms.Compose:
     resize_size = (image_size, image_size) if isinstance(image_size, int) else image_size
     transform_steps = []
     if resize:
         transform_steps.append(transforms.Resize(resize_size))
-    aug = augmentation or {}
-    if train and aug.get("enabled", False):
-        if aug.get("horizontal_flip", False):
-            transform_steps.append(transforms.RandomHorizontalFlip())
-        if aug.get("vertical_flip", False):
-            transform_steps.append(transforms.RandomVerticalFlip())
-        if aug.get("random_rotation_90", False):
-            transform_steps.append(
-                transforms.RandomChoice(
-                    [
-                        transforms.RandomRotation((0, 0)),
-                        transforms.RandomRotation((90, 90)),
-                        transforms.RandomRotation((180, 180)),
-                        transforms.RandomRotation((270, 270)),
-                    ]
-                )
-            )
-        color_jitter = aug.get("color_jitter") or {}
-        if color_jitter:
-            transform_steps.append(
-                transforms.ColorJitter(
-                    brightness=float(color_jitter.get("brightness", 0.0)),
-                    contrast=float(color_jitter.get("contrast", 0.0)),
-                    saturation=float(color_jitter.get("saturation", 0.0)),
-                    hue=float(color_jitter.get("hue", 0.0)),
-                )
-            )
     transform_steps.append(transforms.ToTensor())
     if mean is not None and std is not None:
         transform_steps.append(transforms.Normalize(mean=mean, std=std))
@@ -314,8 +285,6 @@ class DistillationTileDataset(Dataset):
             | tuple[str | Path, ...]
             | None
         ) = None,
-        train: bool = False,
-        augmentation: dict | None = None,
         prototype_labels: dict[str, PrototypeLabel] | None = None,
     ) -> None:
         self.records = records
@@ -333,8 +302,6 @@ class DistillationTileDataset(Dataset):
             image_size,
             mean,
             std,
-            train=train,
-            augmentation=augmentation,
             resize=True,
         )
         self.prototype_labels = prototype_labels or {}
@@ -413,8 +380,6 @@ class PackageSampledDistillationDataset(Dataset):
         mean: list[float] | tuple[float, ...] | None = None,
         std: list[float] | tuple[float, ...] | None = None,
         expected_dims: dict[str, int] | None = None,
-        train: bool = False,
-        augmentation: dict | None = None,
         prototype_labels: dict[str, PrototypeLabel] | None = None,
         tensor_collate: bool = False,
     ) -> None:
@@ -452,8 +417,6 @@ class PackageSampledDistillationDataset(Dataset):
             image_size,
             mean,
             std,
-            train=train,
-            augmentation=augmentation,
             resize=False,
         )
         self.prototype_labels = prototype_labels or {}

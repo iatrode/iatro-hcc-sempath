@@ -318,8 +318,6 @@ def test_package_sampled_tensor_collate_defers_image_preprocess_to_device(tmp_pa
         mean=[0.5, 0.5, 0.5],
         std=[0.5, 0.5, 0.5],
         expected_dims={"toy": 4},
-        train=True,
-        augmentation={"enabled": True, "horizontal_flip": True, "vertical_flip": True, "random_rotation_90": True},
         tensor_collate=True,
     )
     batch = dataset.collate([dataset[index] for index in range(4)])
@@ -332,10 +330,8 @@ def test_package_sampled_tensor_collate_defers_image_preprocess_to_device(tmp_pa
         batch,
         {
             "data": {"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]},
-            "augmentation": {"enabled": True, "horizontal_flip": True, "vertical_flip": True, "random_rotation_90": True},
         },
         torch.device("cpu"),
-        train=True,
     )
 
     assert images.dtype == torch.float32
