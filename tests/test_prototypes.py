@@ -190,6 +190,7 @@ def test_build_prototypes_writes_two_level_package(tmp_path: Path, monkeypatch: 
     assert registry.names == ["primary_non_tumor", "primary_tumor", "lymphocyte_rich"]
     assert registry.levels == [1, 1, 2]
     assert registry.exclusive == [True, True, False]
+    assert torch.linalg.norm(registry.prototypes, dim=1).tolist() == pytest.approx([1.0, 1.0, 1.0])
 
 
 def test_hcc_taxonomy_package_loads_with_expected_levels(tmp_path: Path) -> None:

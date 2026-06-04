@@ -6,7 +6,7 @@ data:
 loss:
   feature_loss_type: cosine
   relation_weight: 0.05
-  scale_relation_by_alpha: false
+  scale_relation_by_alpha: true
   semantic_weight: 0.0
   zhcc_proto_weight: 0.2
   zhcc_level2_weight: 0.5

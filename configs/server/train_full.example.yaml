@@ -14,7 +14,7 @@ data:
   dynamic_package_sampling: true
   tensor_collate: true
   package_chunk_size: 64
-  package_buffer_batches: 1
+  package_buffer_batches: 4
 
 augmentation:
   enabled: true
@@ -53,12 +53,16 @@ loss:
   semantic_temperature: 1.0
   primary_temperature: 1.0
   attribute_temperature: 1.0
+  zhcc_primary_temperature: 0.1
+  zhcc_attribute_temperature: 0.1
   zhcc_proto_weight: 0.0
   zhcc_level2_weight: 0.5
   prototype_filter_weight: 0.0
   prototype_filter_alpha_min: 0.25
   consensus_weight: 0.4
   prototype_label_weight: 0.4
+  prototype_l1_agreement_weight: 0.5
+  prototype_l2_agreement_weight: 0.5
   zhcc_response_weight: 0.0
   teacher_prior_plateau_window_steps: 1000
   teacher_prior_plateau_threshold: 0.01
@@ -78,6 +82,7 @@ train:
   warmup_epochs: 3
   min_lr: 0.000001
   weight_decay: 0.01
+  max_grad_norm: 1.0
   amp: true
   topk: 10
   max_val_batches: 512

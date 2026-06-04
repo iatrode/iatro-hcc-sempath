@@ -63,12 +63,18 @@ def _agreement(
     left_attributes: torch.Tensor,
     right_primary: torch.Tensor,
     right_attributes: torch.Tensor,
+    *,
+    l1_weight: float = 0.5,
+    l2_weight: float = 0.5,
 ) -> torch.Tensor:
     primary_agreement = (left_primary * right_primary).sum(dim=-1).clamp(0.0, 1.0)
     if left_attributes.shape[1] == 0:
         return primary_agreement
     attribute_agreement = 1.0 - (left_attributes - right_attributes).abs().mean(dim=-1)
-    return (0.5 * primary_agreement + 0.5 * attribute_agreement.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+    denom = max(float(l1_weight) + float(l2_weight), 1e-6)
+    return (
+        (float(l1_weight) * primary_agreement + float(l2_weight) * attribute_agreement.clamp(0.0, 1.0)) / denom
+    ).clamp(0.0, 1.0)
 
 
 def _prototype_label_agreement(
@@ -78,6 +84,8 @@ def _prototype_label_agreement(
     prototype_mask: torch.Tensor,
     prototype_level1: torch.Tensor,
     prototype_level2: torch.Tensor,
+    l1_weight: float = 0.5,
+    l2_weight: float = 0.5,
 ) -> torch.Tensor:
     mask = prototype_mask.to(device=primary_response.device, dtype=torch.bool)
     prototype_agreement = primary_response.new_zeros(primary_response.shape[0])
@@ -101,7 +109,10 @@ def _prototype_label_agreement(
         )
     level2_targets = prototype_level2[mask].to(attribute_response.dtype)
     attribute_agreement = 1.0 - (attribute_response[mask] - level2_targets).abs().mean(dim=-1)
-    prototype_agreement[mask] = (0.5 * primary_agreement + 0.5 * attribute_agreement.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+    denom = max(float(l1_weight) + float(l2_weight), 1e-6)
+    prototype_agreement[mask] = (
+        (float(l1_weight) * primary_agreement + float(l2_weight) * attribute_agreement.clamp(0.0, 1.0)) / denom
+    ).clamp(0.0, 1.0)
     return prototype_agreement
 
 
@@ -178,6 +189,8 @@ def prototype_adjudicated_teacher_weights(
     alpha_min: float = 0.25,
     consensus_weight: float = 0.4,
     prototype_label_weight: float = 0.4,
+    l1_agreement_weight: float = 0.5,
+    l2_agreement_weight: float = 0.5,
     zhcc_response_weight: float = 0.2,
     filter_strength: float = 1.0,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -229,15 +242,31 @@ def prototype_adjudicated_teacher_weights(
         else:
             mean_other_primary = (primary_stack.sum(dim=0) - primary_stack[idx]) / float(len(names) - 1)
             mean_other_attributes = (attribute_stack.sum(dim=0) - attribute_stack[idx]) / float(len(names) - 1)
-            consensus = _agreement(primary, attributes, mean_other_primary, mean_other_attributes)
+            consensus = _agreement(
+                primary,
+                attributes,
+                mean_other_primary,
+                mean_other_attributes,
+                l1_weight=l1_agreement_weight,
+                l2_weight=l2_agreement_weight,
+            )
         prototype_label = _prototype_label_agreement(
             primary_response=primary,
             attribute_response=attributes,
             prototype_mask=prototype_mask.to(primary.device),
             prototype_level1=prototype_level1.to(primary.device),
             prototype_level2=prototype_level2.to(primary.device),
+            l1_weight=l1_agreement_weight,
+            l2_weight=l2_agreement_weight,
         )
-        zhcc = _agreement(primary, attributes, zhcc_primary, zhcc_attributes)
+        zhcc = _agreement(
+            primary,
+            attributes,
+            zhcc_primary,
+            zhcc_attributes,
+            l1_weight=l1_agreement_weight,
+            l2_weight=l2_agreement_weight,
+        )
         reliability = _combine_reliability(
             consensus=consensus,
             prototype_label=prototype_label,

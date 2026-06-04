@@ -186,6 +186,14 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
 
     semantic_weight = float(cfg.get("loss", {}).get("semantic_weight", 0.0))
     prototype_filter_weight = float(cfg.get("loss", {}).get("prototype_filter_weight", 0.0))
+    loss_cfg = cfg.get("loss", {})
+    for key in ("zhcc_primary_temperature", "zhcc_attribute_temperature", "primary_temperature", "attribute_temperature"):
+        if key in loss_cfg and float(loss_cfg[key]) <= 0:
+            raise ValueError(f"loss.{key} must be positive")
+    l1_weight = float(loss_cfg.get("prototype_l1_agreement_weight", 0.5))
+    l2_weight = float(loss_cfg.get("prototype_l2_agreement_weight", 0.5))
+    if l1_weight < 0 or l2_weight < 0 or (l1_weight + l2_weight) <= 0:
+        raise ValueError("prototype L1/L2 agreement weights must be non-negative and not both zero")
     prototype_paths = cfg.get("data", {}).get("prototype_paths")
     if isinstance(prototype_paths, dict):
         _unexpected_keys(prototype_paths, expected, "data.prototype_paths")
