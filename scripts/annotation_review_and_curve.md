@@ -20,7 +20,7 @@ Purpose:
 
 ### L1 review
 
-Use this when reviewing unstable L1 labels across all classes.
+Use this when reviewing unstable L1 labels across all current classes.
 With teacher features, the UI shows a feature-center suggestion, but the user still makes the final decision.
 
 ```bash
@@ -29,13 +29,13 @@ python scripts/annotation_review_ui.py \
   --output-json annotations/hcc_prototype_review.l1_review.json \
   --mode l1 \
   --teachers gigapath,uni2_h,virchow2 \
-  --teacher-feature-root /Volumes/MacDataHD/temp-wsi-iac/Features
+  --teacher-feature-root /path/to/teacher/features
 ```
 
 Useful options:
 
 ```text
---unstable-l1 Indeterminate-region,Artifact-non-tissue,Degenerative-material
+--unstable-l1 Degenerative-material
 --no-open
 --host 127.0.0.1
 --port 0
@@ -51,8 +51,8 @@ python scripts/annotation_review_ui.py \
   --annotation-json annotations/hcc_prototype_review.json \
   --output-json annotations/hcc_prototype_review.pair_review.json \
   --mode binary \
-  --class-a Artifact-non-tissue \
-  --class-b Degenerative-material
+  --class-a HCC-tumor \
+  --class-b Inflammatory-stromal
 ```
 
 Change `--class-a` and `--class-b` for other two-class reviews.
@@ -87,7 +87,7 @@ Typical command:
 python scripts/anchor_information_curve.py \
   --annotation-json annotations/hcc_prototype_review.json \
   --prototype-contract annotations/hcc_prototype_review.json \
-  --teacher-feature-root /Volumes/MacDataHD/temp-wsi-iac/Features \
+  --teacher-feature-root /path/to/teacher/features \
   --output-root outputs/anchor_information_curve_real_iac_smoke \
   --seed 13
 ```
@@ -101,18 +101,22 @@ python scripts/anchor_information_curve.py --help
 Main outputs:
 
 ```text
-anchor_information_report.json
-anchor_information_summary.csv
-anchor_information_by_teacher.csv
-anchor_information_by_prototype.csv
-figures/anchor_information_summary.png
-figures/anchor_information_level1_prototypes.png
-figures/anchor_information_level2_prototypes.png
-figures/anchor_information_level1_prototype_audit.png
-figures/anchor_information_level2_prototype_audit.png
-figures/anchor_information_teacher_audit.png
-figures/anchor_information_teacher_coverage.png
-figures/anchor_information_teacher_delta_ci.png
+infospace_information_report.json
+infospace_information_summary.csv
+infospace_information_by_teacher.csv
+infospace_information_by_prototype.csv
+figures/infospace_information_summary.png
+figures/infospace_information_teacher_audit.png
+figures/infospace_novelty_distribution.png
+figures/infospace_level1_prototype_curves.png
+figures/infospace_level2_prototype_curves.png
+figures/infospace_level1_prototype_audit.png
+figures/infospace_level2_prototype_audit.png
+figures/infospace_pca_qc_l1_teacher_average.png
+figures/infospace_pca_qc_l1_by_teacher.png
+figures/infospace_pca_qc_l2_teacher_average.png
+figures/infospace_pca_qc_l2_by_teacher.png
+figures/infospace_umap_qc_l1_browser_matched.png
 ```
 
 Key defaults:
@@ -128,7 +132,8 @@ plot formats png,pdf
 
 Interpretation:
 
-- `recommendation.recommended_anchor_count` in `anchor_information_report.json` is the selected count.
+- `recommendation.recommended_anchor_count` in `infospace_information_report.json` is the selected count.
+- Selection uses the first marginal-utility elbow, not complete feature exhaustion: the first low-drift count where novelty gain per 100 added anchors falls below 35% of the best observed marginal gain is treated as elbow onset, and the next count is used as the recommendation.
 - `anchor_counts_requested` records requested counts.
 - `anchor_counts_available` records counts that could actually be evaluated from available train anchors.
 - If 3000 is requested but unavailable after locked validation is held out, it will not appear in `anchor_counts_available`.

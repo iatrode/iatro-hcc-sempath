@@ -281,6 +281,13 @@ hcc-sempath build-prototypes \
 Prototype packages are runtime data with metadata, not hard-coded model classes.
 See `docs/PROTOTYPE_FORMAT.md` for the public package contract and
 `docs/PROTOTYPE_TAXONOMY.md` for the current L1/L2 classification rules.
+The current curated annotation set uses four L1 labels (`HCC-tumor`,
+`Background-liver`, `Inflammatory-stromal`, `Degenerative-material`) and ten L2
+labels (`hepatocellular-parenchyma-present`, `necrosis-present`,
+`hemorrhage-present`, `bile-pigment-present`, `inflammatory-cell-present`,
+`fibrous-stroma-present`, `steatosis-vacuolation-present`,
+`hyaline-change-present`, `vascular-structure-present`,
+`ductular-portal-present`).
 
 Prototype supervision is provided through a dynamic CSV manifest rather than a
 fixed code-level label set:

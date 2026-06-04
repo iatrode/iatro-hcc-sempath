@@ -34,25 +34,23 @@ OVERVIEW_CELL_PX = 4
 OVERVIEW_WORKERS = 8
 
 L1_PROTOTYPES = [
-    "HCC-trabecular",
-    "HCC-solid",
-    "HCC-pseudoglandular",
-    "HCC-mixed-pattern",
+    "HCC-tumor",
     "Background-liver",
-    "Fibrous-stromal",
+    "Inflammatory-stromal",
     "Degenerative-material",
-    "Indeterminate-region",
-    "Artifact-non-tissue",
 ]
 
 L2_PROTOTYPES = [
-    "necrotic",
-    "hemorrhagic-blood-rich",
-    "bile-pigment-rich",
-    "inflammatory-rich",
-    "fibrotic",
-    "steatotic-vacuolated",
-    "interface-capsule",
+    "hepatocellular-parenchyma-present",
+    "necrosis-present",
+    "hemorrhage-present",
+    "bile-pigment-present",
+    "inflammatory-cell-present",
+    "fibrous-stroma-present",
+    "steatosis-vacuolation-present",
+    "hyaline-change-present",
+    "vascular-structure-present",
+    "ductular-portal-present",
 ]
 
 

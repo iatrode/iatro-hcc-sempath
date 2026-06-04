@@ -194,22 +194,20 @@ def test_build_prototypes_writes_two_level_package(tmp_path: Path, monkeypatch: 
 
 def test_hcc_taxonomy_package_loads_with_expected_levels(tmp_path: Path) -> None:
     names = [
-        "HCC-trabecular",
-        "HCC-solid",
-        "HCC-pseudoglandular",
-        "HCC-mixed-pattern",
+        "HCC-tumor",
         "Background-liver",
-        "Fibrous-stromal",
+        "Inflammatory-stromal",
         "Degenerative-material",
-        "Indeterminate-region",
-        "Artifact-non-tissue",
-        "necrotic",
-        "hemorrhagic-blood-rich",
-        "bile-pigment-rich",
-        "inflammatory-rich",
-        "fibrotic",
-        "steatotic-vacuolated",
-        "interface-capsule",
+        "hepatocellular-parenchyma-present",
+        "necrosis-present",
+        "hemorrhage-present",
+        "bile-pigment-present",
+        "inflammatory-cell-present",
+        "fibrous-stroma-present",
+        "steatosis-vacuolation-present",
+        "hyaline-change-present",
+        "vascular-structure-present",
+        "ductular-portal-present",
     ]
     package_path = tmp_path / "taxonomy.pt"
     torch.save(
@@ -218,35 +216,33 @@ def test_hcc_taxonomy_package_loads_with_expected_levels(tmp_path: Path) -> None
             "prototypes": torch.randn(len(names), 8),
             "names": names,
             "groups": [
-                "hcc_architecture",
-                "hcc_architecture",
-                "hcc_architecture",
-                "hcc_architecture",
+                "hcc_tumor",
                 "background_liver",
-                "stroma",
+                "inflammatory_stroma",
                 "degenerative_material",
-                "indeterminate",
-                "artifact",
-                "degeneration",
+                "hepatocellular_parenchyma",
+                "necrosis",
                 "hemorrhage",
                 "pigment",
                 "inflammation",
-                "fibrosis",
-                "cellular_change",
-                "interface",
+                "fibrous_stroma",
+                "steatosis_vacuolation",
+                "hyaline_change",
+                "vascular_structure",
+                "ductular_portal",
             ],
-            "levels": [1] * 9 + [2] * 7,
-            "exclusive": [True] * 9 + [False] * 7,
+            "levels": [1] * 4 + [2] * 10,
+            "exclusive": [True] * 4 + [False] * 10,
         },
         package_path,
     )
 
     registry = load_prototype_registry(package_path, expected_dim=8)
 
-    assert registry.primary_indices == list(range(9))
-    assert registry.attribute_indices == list(range(9, 16))
-    assert registry.names[0] == "HCC-trabecular"
-    assert registry.names[-1] == "interface-capsule"
+    assert registry.primary_indices == list(range(4))
+    assert registry.attribute_indices == list(range(4, 14))
+    assert registry.names[0] == "HCC-tumor"
+    assert registry.names[-1] == "ductular-portal-present"
 
 
 def test_prototype_supervision_manifest_is_resolved_by_registry_names(tmp_path: Path) -> None:

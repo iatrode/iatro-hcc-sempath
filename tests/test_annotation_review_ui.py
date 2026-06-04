@@ -17,27 +17,27 @@ def _load_module():
     return module
 
 
-def test_l1_review_candidates_prioritize_unstable_without_label_guessing() -> None:
+def test_l1_review_candidates_prioritize_degenerative_without_label_guessing() -> None:
     module = _load_module()
     payload = {
         "annotations": {
             "stable": {"tile_id": "a", "l1": "HCC-tumor", "l2": []},
-            "indeterminate": {
+            "degenerative": {
                 "tile_id": "b",
-                "l1": "Indeterminate-region",
-                "l2": ["fibrous-stroma-present"],
+                "l1": "Degenerative-material",
+                "l2": ["necrosis-present"],
             },
-            "fibrous": {"tile_id": "c", "l1": "Fibrous-stromal", "l2": ["fibrous-stroma-present"]},
+            "stromal": {"tile_id": "c", "l1": "Inflammatory-stromal", "l2": ["fibrous-stroma-present"]},
         }
     }
 
     candidates = module.build_candidates(payload)
 
-    assert candidates[0].key == "indeterminate"
-    assert candidates[0].suggested_l1 == "Indeterminate-region"
+    assert candidates[0].key == "degenerative"
+    assert candidates[0].suggested_l1 == "Degenerative-material"
     assert candidates[0].uncertainty > candidates[1].uncertainty
-    fibrous = next(candidate for candidate in candidates if candidate.key == "fibrous")
-    assert fibrous.suggested_l1 == "Fibrous-stromal"
+    stromal = next(candidate for candidate in candidates if candidate.key == "stromal")
+    assert stromal.suggested_l1 == "Inflammatory-stromal"
 
 
 def test_review_state_accept_and_adjust_write_review_fields(tmp_path: Path) -> None:
@@ -54,12 +54,12 @@ def test_review_state_accept_and_adjust_write_review_fields(tmp_path: Path) -> N
                         "l1": "HCC-tumor",
                         "l2": ["hepatocellular-parenchyma-present"],
                     },
-                    "artifact": {
+                    "stromal": {
                         "tile_id": "a",
                         "row": 1,
                         "iac_path": "missing.iac",
-                        "l1": "Artifact-non-tissue",
-                        "l2": [],
+                        "l1": "Inflammatory-stromal",
+                        "l2": ["fibrous-stroma-present"],
                     },
                 }
             }
@@ -67,10 +67,10 @@ def test_review_state_accept_and_adjust_write_review_fields(tmp_path: Path) -> N
         encoding="utf-8",
     )
     output_json = tmp_path / "reviewed.json"
-    state = module.ReviewState(annotation_json, output_json, mode="l1", binary_a="Artifact-non-tissue", binary_b="Degenerative-material")
+    state = module.ReviewState(annotation_json, output_json, mode="l1", binary_a="HCC-tumor", binary_b="Degenerative-material")
 
     accepted = state.review("tumor", "accept")
-    adjusted = state.review("artifact", "adjust", "Degenerative-material")
+    adjusted = state.review("stromal", "adjust", "Degenerative-material")
 
     assert accepted["reviewed"] is True
     assert accepted["l1"] == "HCC-tumor"
@@ -89,18 +89,18 @@ def test_review_state_resumes_existing_output_and_updates_candidate_cache(tmp_pa
     source_payload = {
         "annotations": {
             "done": {"tile_id": "done", "l1": "HCC-tumor"},
-            "todo": {"tile_id": "todo", "l1": "Fibrous-stromal"},
+            "todo": {"tile_id": "todo", "l1": "Inflammatory-stromal"},
         }
     }
     resumed_payload = {
         "annotations": {
             "done": {"tile_id": "done", "l1": "HCC-tumor", "reviewed": True},
-            "todo": {"tile_id": "todo", "l1": "Fibrous-stromal"},
+            "todo": {"tile_id": "todo", "l1": "Inflammatory-stromal"},
         }
     }
     annotation_json.write_text(json.dumps(source_payload), encoding="utf-8")
     output_json.write_text(json.dumps(resumed_payload), encoding="utf-8")
-    state = module.ReviewState(annotation_json, output_json, mode="l1", binary_a="HCC-tumor", binary_b="Fibrous-stromal")
+    state = module.ReviewState(annotation_json, output_json, mode="l1", binary_a="HCC-tumor", binary_b="Inflammatory-stromal")
 
     assert [candidate.key for candidate in state.candidates()] == ["todo"]
 
@@ -115,12 +115,12 @@ def test_binary_mode_filters_to_requested_classes() -> None:
     module = _load_module()
     payload = {
         "annotations": {
-            "artifact": {"tile_id": "a", "l1": "Artifact-non-tissue", "l2": []},
-            "fibrous": {"tile_id": "f", "l1": "Fibrous-stromal", "l2": []},
+            "background": {"tile_id": "a", "l1": "Background-liver", "l2": []},
+            "stromal": {"tile_id": "f", "l1": "Inflammatory-stromal", "l2": []},
             "tumor": {"tile_id": "t", "l1": "HCC-tumor", "l2": []},
         }
     }
 
-    candidates = module.build_candidates(payload, mode="binary", binary_a="HCC-tumor", binary_b="Fibrous-stromal")
+    candidates = module.build_candidates(payload, mode="binary", binary_a="HCC-tumor", binary_b="Inflammatory-stromal")
 
-    assert {candidate.key for candidate in candidates} == {"fibrous", "tumor"}
+    assert {candidate.key for candidate in candidates} == {"stromal", "tumor"}

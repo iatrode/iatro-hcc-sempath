@@ -45,8 +45,8 @@ The JSON state file stores:
 {
   "version": 1,
   "input_path": "/absolute/path/to/input",
-  "l1_prototypes": ["HCC-trabecular"],
-  "l2_prototypes": ["necrotic"],
+  "l1_prototypes": ["HCC-tumor"],
+  "l2_prototypes": ["necrosis-present"],
   "annotations": {
     "dataset/slide.iac::tile_id::123,456": {
       "dataset": "dataset",
@@ -57,8 +57,8 @@ The JSON state file stores:
       "slide": "slide_id",
       "x": 123,
       "y": 456,
-      "l1": "HCC-trabecular",
-      "l2": ["necrotic"]
+      "l1": "HCC-tumor",
+      "l2": ["necrosis-present"]
     }
   }
 }

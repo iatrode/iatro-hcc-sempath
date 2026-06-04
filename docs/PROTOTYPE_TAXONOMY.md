@@ -35,27 +35,25 @@ L2 非互斥，表示可在同一 tile 内共存、也可跨 L1 类型出现的�
 
 | Prototype | Definition / 定义 |
 | --- | --- |
-| `HCC-trabecular` | HCC dominated by trabecular, plate-like, or cord-like architecture. / 以梁索状、板状或条索状排列为主的 HCC。 |
-| `HCC-solid` | HCC dominated by compact solid, nested, or weakly structured growth. / 以致密实性、巢状或结构感弱的生长方式为主的 HCC。 |
-| `HCC-pseudoglandular` | HCC dominated by pseudoglandular, acinar-like, or lumen-like architecture. / 以假腺样、腺泡样或腔样结构为主的 HCC。 |
-| `HCC-mixed-pattern` | Definite HCC with mixed structural patterns that cannot be stably assigned to one HCC architecture. Use only when the tile is confidently HCC but the dominant architecture is mixed or unstable across L1 HCC architecture classes. / 明确为 HCC，但结构模式混合，不能稳定归入单一 HCC 结构型；仅用于 HCC 置信度明确但主导结构在多个 HCC architecture 类别之间混合或不稳定的 tile。 |
+| `HCC-tumor` | HCC tumor-dominant tile, regardless of local architecture subtype. / 以 HCC 肿瘤成分为主的 tile，不再细分局部结构亚型。 |
 | `Background-liver` | Non-neoplastic background liver parenchyma. / 非肿瘤性背景肝实质。 |
-| `Fibrous-stromal` | Fibrous septa, capsule, collagen, or stromal tissue-dominant tile. / 以纤维隔、包膜、胶原或间质组织为主的 tile。 |
+| `Inflammatory-stromal` | Stromal, portal, fibrous, or interface-rich tile with inflammatory/stromal context as the dominant state. / 以间质、汇管区、纤维成分或界面区域为主，并带炎症/间质背景的 tile。 |
 | `Degenerative-material` | Necrosis, hemorrhage, clot, bile lake, debris, or treatment-related degenerative material-dominant tile. / 以坏死、出血、血凝块、胆汁湖、碎屑或治疗后退变物为主的 tile。 |
-| `Indeterminate-region` | Tissue-containing region with insufficient confidence for stable tissue or lesion assignment. This is not artifact; tissue information is present but category confidence is insufficient. / 有组织信息，但区域归属或病变判读置信度不足；不同于 artifact，该类应包含可见组织信息，只是类别归属不稳定。 |
-| `Artifact-non-tissue` | Blank area, severe artifact, severe out-of-focus region, contamination, or non-tissue area. / 空白、严重伪影、严重失焦、污染或非组织区域。 |
 
 ## L2: Non-Exclusive Attribute Prototypes / 非互斥属性 Prototype
 
 | Prototype | Definition / 定义 |
 | --- | --- |
-| `necrotic` | Obvious necrotic component. / 坏死成分明显。 |
-| `hemorrhagic-blood-rich` | Hemorrhage, blood pool, clot, or erythrocyte-rich area. / 出血、血池、血凝块或红细胞丰富。 |
-| `bile-pigment-rich` | Obvious bile, bile pigment, or pigment deposition. / 胆汁、胆色素或色素沉积明显。 |
-| `inflammatory-rich` | Inflammatory-cell-rich area; can coexist with HCC, background liver, or stromal L1 classes. / 炎症细胞丰富；可与 HCC、背景肝或纤维间质等 L1 类别同时存在。 |
-| `fibrotic` | Obvious fibrosis, collagen, or scar-like component. / 纤维化、胶原或瘢痕样成分明显。 |
-| `steatotic-vacuolated` | Steatosis, vacuolated change, or optically clear cytoplasmic change. / 脂肪变、空泡样改变或胞质空亮改变。 |
-| `interface-capsule` | Capsule, boundary, or tumor-non-tumor interface area. / 包膜、边界或肿瘤-非肿瘤交界区域。 |
+| `hepatocellular-parenchyma-present` | Hepatocellular parenchyma or hepatocyte-like tumor/background cells are present. / 可见肝细胞性实质或肝细胞样肿瘤/背景细胞。 |
+| `necrosis-present` | Necrotic component is present. / 可见坏死成分。 |
+| `hemorrhage-present` | Hemorrhage, blood pool, clot, or erythrocyte-rich area is present. / 可见出血、血池、血凝块或红细胞丰富区域。 |
+| `bile-pigment-present` | Bile, bile pigment, or pigment deposition is present. / 可见胆汁、胆色素或色素沉积。 |
+| `inflammatory-cell-present` | Inflammatory cells are present. / 可见炎症细胞。 |
+| `fibrous-stroma-present` | Fibrous stroma, collagen, scar-like matrix, septa, or capsule-like stroma is present. / 可见纤维间质、胶原、瘢痕样基质、纤维隔或包膜样间质。 |
+| `steatosis-vacuolation-present` | Steatosis, vacuolated change, or optically clear cytoplasmic change is present. / 可见脂肪变、空泡样改变或胞质空亮改变。 |
+| `hyaline-change-present` | Hyaline or glassy degenerative material is present. / 可见透明变或玻璃样退变物。 |
+| `vascular-structure-present` | Vascular structure, sinusoid-like space, or blood vessel context is present. / 可见血管结构、窦样腔隙或血管相关背景。 |
+| `ductular-portal-present` | Ductular reaction, bile duct/ductule, or portal tract context is present. / 可见胆管/小胆管、胆管反应或汇管区背景。 |
 
 ## Package Encoding / Package 编码
 
@@ -63,46 +61,42 @@ The taxonomy is encoded in the prototype package metadata:
 
 ```python
 names = [
-    "HCC-trabecular",
-    "HCC-solid",
-    "HCC-pseudoglandular",
-    "HCC-mixed-pattern",
+    "HCC-tumor",
     "Background-liver",
-    "Fibrous-stromal",
+    "Inflammatory-stromal",
     "Degenerative-material",
-    "Indeterminate-region",
-    "Artifact-non-tissue",
-    "necrotic",
-    "hemorrhagic-blood-rich",
-    "bile-pigment-rich",
-    "inflammatory-rich",
-    "fibrotic",
-    "steatotic-vacuolated",
-    "interface-capsule",
+    "hepatocellular-parenchyma-present",
+    "necrosis-present",
+    "hemorrhage-present",
+    "bile-pigment-present",
+    "inflammatory-cell-present",
+    "fibrous-stroma-present",
+    "steatosis-vacuolation-present",
+    "hyaline-change-present",
+    "vascular-structure-present",
+    "ductular-portal-present",
 ]
-levels = [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2]
-exclusive = [True, True, True, True, True, True, True, True, True, False, False, False, False, False, False, False]
+levels = [1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+exclusive = [True, True, True, True, False, False, False, False, False, False, False, False, False, False]
 ```
 
 Recommended groups:
 
 ```python
 groups = [
-    "hcc_architecture",
-    "hcc_architecture",
-    "hcc_architecture",
-    "hcc_architecture",
+    "hcc_tumor",
     "background_liver",
-    "stroma",
+    "inflammatory_stroma",
     "degenerative_material",
-    "indeterminate",
-    "artifact",
-    "degeneration",
+    "hepatocellular_parenchyma",
+    "necrosis",
     "hemorrhage",
     "pigment",
     "inflammation",
-    "fibrosis",
-    "cellular_change",
-    "interface",
+    "fibrous_stroma",
+    "steatosis_vacuolation",
+    "hyaline_change",
+    "vascular_structure",
+    "ductular_portal",
 ]
 ```
