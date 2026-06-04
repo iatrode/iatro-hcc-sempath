@@ -348,6 +348,9 @@ def main() -> None:
         python_bin=str(args.python),
         repo=repo,
     )
+    if int(args.n_trials) <= 0:
+        print("optuna_search_ready n_trials=0")
+        return
 
     storage_dir = Path(args.storage.removeprefix("sqlite:///")).parent if args.storage.startswith("sqlite:///") else None
     if storage_dir is not None:
