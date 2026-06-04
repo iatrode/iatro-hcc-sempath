@@ -31,17 +31,18 @@ Required fields:
 - `prototypes`: 2D float tensor.
 - `names`: unique prototype names.
 - `levels`: prototype semantic level. Level `1` is the primary mutually
-  exclusive state, such as the dominant HCC architecture, background liver,
-  stromal region, degenerative material, indeterminate tissue, or artifact /
-  non-tissue. Level `2` is a non-exclusive attribute, such as necrotic,
-  hemorrhagic-blood-rich, inflammatory-rich, fibrotic, or interface-capsule.
+  exclusive state, such as HCC tumor, background liver, inflammatory/stromal
+  tissue, or degenerative material. Level `2` is a non-exclusive attribute,
+  such as hepatocellular parenchyma, necrosis, hemorrhage, bile pigment,
+  inflammatory cells, fibrous stroma, steatosis/vacuolation, hyaline change,
+  vascular structure, or ductular/portal context.
 - `exclusive`: per-prototype exclusivity flag. Level-1 prototypes must be
   `True`; level-2 prototypes must be `False`.
 
 Optional fields:
 
-- `groups`: coarse prototype groups such as tumor morphology, background liver,
-  stromal context, or immune microenvironment.
+- `groups`: coarse prototype groups such as HCC tumor, background liver,
+  inflammatory stroma, degeneration, vascular context, or portal context.
 - `thresholds`: per-prototype confidence thresholds for weak-label or
   self-training workflows.
 - `counts`: number of curated examples used to initialize each prototype.

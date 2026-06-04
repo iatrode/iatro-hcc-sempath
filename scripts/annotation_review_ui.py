@@ -26,8 +26,6 @@ from hcc_sempath.cli.view_iac import IacViewerData
 
 
 DEFAULT_UNSTABLE_L1 = {
-    "Indeterminate-region",
-    "Artifact-non-tissue",
     "Degenerative-material",
 }
 
@@ -229,8 +227,8 @@ def build_candidates(
     payload: dict,
     *,
     mode: str = "l1",
-    binary_a: str = "Artifact-non-tissue",
-    binary_b: str = "Degenerative-material",
+    binary_a: str = "HCC-tumor",
+    binary_b: str = "Inflammatory-stromal",
     scorer: FeatureL1Scorer | None = None,
     unstable_l1: set[str] | None = None,
 ) -> list[ReviewCandidate]:
@@ -553,12 +551,12 @@ def main() -> None:
     parser.add_argument("--annotation-json", required=True)
     parser.add_argument("--output-json", default="")
     parser.add_argument("--mode", choices=["l1", "binary"], default="l1")
-    parser.add_argument("--class-a", "--binary-a", dest="binary_a", default="Artifact-non-tissue")
-    parser.add_argument("--class-b", "--binary-b", dest="binary_b", default="Degenerative-material")
+    parser.add_argument("--class-a", "--binary-a", dest="binary_a", default="HCC-tumor")
+    parser.add_argument("--class-b", "--binary-b", dest="binary_b", default="Inflammatory-stromal")
     parser.add_argument("--teachers", default="")
     parser.add_argument("--teacher-feature-root", default="")
     parser.add_argument("--teacher-feature-packages", default="")
-    parser.add_argument("--unstable-l1", default="Indeterminate-region,Artifact-non-tissue,Degenerative-material")
+    parser.add_argument("--unstable-l1", default="Degenerative-material")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--no-open", action="store_true")

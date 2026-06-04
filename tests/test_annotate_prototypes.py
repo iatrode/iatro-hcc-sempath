@@ -217,8 +217,8 @@ def test_annotation_state_writes_resume_json_and_csv(tmp_path: Path) -> None:
     assert len(reloaded.annotations) == 1
     assert reloaded.last_iac == "tiles.iac"
     csv_text = state_path.with_suffix(".csv").read_text(encoding="utf-8")
-    assert "HCC-trabecular" in csv_text
-    assert "necrotic;inflammatory-rich" in csv_text
+    assert "HCC-tumor" in csv_text
+    assert "hepatocellular-parenchyma-present;bile-pigment-present" in csv_text
 
 
 def test_annotation_state_uses_taxonomy_from_json_and_observed_labels(tmp_path: Path) -> None:
@@ -246,7 +246,7 @@ def test_annotation_state_uses_taxonomy_from_json_and_observed_labels(tmp_path: 
                             "slide": record.slide_label,
                             "x": record.display_x,
                             "y": record.display_y,
-                            "l1": "Inflammatory-immune",
+                            "l1": "Inflammatory-stromal",
                             "l2": ["ductular-portal-present"],
                         }
                     },
@@ -260,10 +260,10 @@ def test_annotation_state_uses_taxonomy_from_json_and_observed_labels(tmp_path: 
 
     data = AnnotationData(iac_path, state_path)
     try:
-        assert data.state.l1_prototypes == ["HCC-tumor", "Background-liver", "Inflammatory-immune"]
+        assert data.state.l1_prototypes == ["HCC-tumor", "Background-liver", "Inflammatory-stromal"]
         assert data.state.l2_prototypes == ["hepatocellular-parenchyma-present", "ductular-portal-present"]
         second = data.viewer(0).records[1]
-        data.state.save_annotation(package, second, "Inflammatory-immune", ["ductular-portal-present"])
+        data.state.save_annotation(package, second, "Inflammatory-stromal", ["ductular-portal-present"])
         payload = json.loads(state_path.read_text(encoding="utf-8"))
         assert payload["l1_prototypes"] == data.state.l1_prototypes
         assert payload["l2_prototypes"] == data.state.l2_prototypes

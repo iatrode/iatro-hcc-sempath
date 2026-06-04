@@ -66,6 +66,10 @@ DEFAULT_PLATEAU_REDUNDANCY_THRESHOLD = 0.98
 DEFAULT_PCA_LABEL_LEVELS = "l1,l2"
 DEFAULT_MAX_PCA_CATEGORIES = 24
 DEFAULT_WORKERS = 0
+DEFAULT_BROWSER_UMAP_NEIGHBORS = 150
+DEFAULT_BROWSER_UMAP_MIN_DIST = 0.7
+DEFAULT_BROWSER_UMAP_RANDOM_STATE = 0
+DEFAULT_ELBOW_MARGINAL_RATIO = 0.35
 
 
 def _log(message: str, *, enabled: bool = True) -> None:
@@ -794,20 +798,88 @@ def _aggregate_rows(
                 aggregate[f"{key}_mean"] = _format_float(_mean([_as_float(row, key) for row in rows]))
         result.append(aggregate)
 
+    _annotate_marginal_utility(result)
     return result
 
 
+def _annotate_marginal_utility(aggregate_rows: list[dict[str, Any]]) -> None:
+    positive_drop_per_100: list[float] = []
+    previous: dict[str, Any] | None = None
+
+    for row in aggregate_rows:
+        count = int(row["anchor_count"])
+        novelty = _as_float(row, "infospace_novelty_mean")
+        drift = _as_float(row, "prototype_drift_mean")
+
+        if previous is None:
+            row["marginal_anchor_count_delta"] = ""
+            row["marginal_novelty_drop"] = ""
+            row["marginal_novelty_drop_per_100_tiles"] = ""
+            row["marginal_drift_drop"] = ""
+            previous = row
+            continue
+
+        previous_count = int(previous["anchor_count"])
+        previous_novelty = _as_float(previous, "infospace_novelty_mean")
+        previous_drift = _as_float(previous, "prototype_drift_mean")
+        delta = count - previous_count
+        novelty_drop = previous_novelty - novelty if math.isfinite(previous_novelty) and math.isfinite(novelty) else math.nan
+        drop_per_100 = novelty_drop / delta * 100.0 if delta > 0 and math.isfinite(novelty_drop) else math.nan
+        drift_drop = previous_drift - drift if math.isfinite(previous_drift) and math.isfinite(drift) else math.nan
+
+        row["marginal_anchor_count_delta"] = delta
+        row["marginal_novelty_drop"] = _format_float(novelty_drop)
+        row["marginal_novelty_drop_per_100_tiles"] = _format_float(drop_per_100)
+        row["marginal_drift_drop"] = _format_float(drift_drop)
+        if math.isfinite(drop_per_100) and drop_per_100 > 0:
+            positive_drop_per_100.append(drop_per_100)
+        previous = row
+
+    best_drop = max(positive_drop_per_100) if positive_drop_per_100 else math.nan
+    for row in aggregate_rows:
+        drop_per_100 = _as_float(row, "marginal_novelty_drop_per_100_tiles")
+        ratio = drop_per_100 / best_drop if math.isfinite(drop_per_100) and math.isfinite(best_drop) and best_drop > 0 else math.nan
+        row["marginal_utility_ratio"] = _format_float(ratio)
+        row["elbow_candidate"] = str(
+            math.isfinite(ratio)
+            and ratio <= DEFAULT_ELBOW_MARGINAL_RATIO
+            and str(row.get("low_drift", "")).lower() == "true"
+        ).lower()
+
+
 def _recommendation(aggregate_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    elbow_rows = [row for row in aggregate_rows if str(row.get("elbow_candidate", "")).lower() == "true"]
+    if elbow_rows:
+        onset = elbow_rows[0]
+        onset_count = int(onset["anchor_count"])
+        counts = [int(row["anchor_count"]) for row in aggregate_rows]
+        onset_index = counts.index(onset_count)
+        confirmation_count = counts[min(onset_index + 1, len(counts) - 1)]
+        conservative_index = min(onset_index + 2, len(counts) - 1)
+        conservative_count = counts[conservative_index]
+        return {
+            "recommended_anchor_count": confirmation_count,
+            "elbow_onset_count": onset_count,
+            "conservative_anchor_count": conservative_count,
+            "reason": (
+                "marginal utility elbow: novelty drop per 100 anchors falls below "
+                f"{DEFAULT_ELBOW_MARGINAL_RATIO:.0%} of the best observed marginal gain while prototype drift is low"
+            ),
+            "marginal_utility_ratio_threshold": DEFAULT_ELBOW_MARGINAL_RATIO,
+            "novelty_drop_per_100_at_elbow": _format_float(_as_float(onset, "marginal_novelty_drop_per_100_tiles")),
+            "prototype_drift_at_elbow": _format_float(_as_float(onset, "prototype_drift_mean")),
+        }
+
     plateau_counts = [int(row["anchor_count"]) for row in aggregate_rows if row["plateau_consensus"] == "true"]
     available_counts = [int(row["anchor_count"]) for row in aggregate_rows]
     if plateau_counts:
         return {
             "recommended_anchor_count": plateau_counts[0],
-            "reason": "first consecutive infospace novelty plateau",
+            "reason": "strict novelty plateau; this is stronger than the marginal utility elbow criterion",
         }
     return {
         "recommended_anchor_count": available_counts[-1] if available_counts else None,
-        "reason": "no infospace novelty plateau detected within available anchors",
+        "reason": "no marginal utility elbow detected within available anchors",
     }
 
 
@@ -849,6 +921,78 @@ def _align_coords_to_reference(coords: np.ndarray, reference: np.ndarray) -> np.
         return _standardize_coords(coords @ rotation)
     except np.linalg.LinAlgError:
         return coords
+
+
+def _browser_matched_fused_features(
+    pca_features_by_teacher: dict[str, dict[str, np.ndarray]],
+    teacher_names: list[str],
+    common_tile_ids: list[str],
+) -> np.ndarray:
+    matrices = []
+    for teacher in teacher_names:
+        matrix = np.stack([pca_features_by_teacher[teacher][tile_id] for tile_id in common_tile_ids])
+        matrices.append(_normalize_rows(matrix))
+
+    dims = {matrix.shape[1] for matrix in matrices}
+    if len(dims) == 1:
+        return _normalize_rows(np.stack(matrices, axis=0).mean(axis=0))
+    return _normalize_rows(np.concatenate(matrices, axis=1))
+
+
+def _browser_matched_umap_2d(features: np.ndarray) -> np.ndarray:
+    os.environ.setdefault("NUMBA_CACHE_DIR", str(Path(os.getenv("TMPDIR", "/tmp")) / "numba_cache"))
+    try:
+        import umap  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("umap-learn is required for browser-matched L1 UMAP QC") from exc
+
+    x = _normalize_rows(features)
+    n = x.shape[0]
+    if n < 3:
+        return _standardize_coords(_pca_2d(x))
+
+    reducer = umap.UMAP(
+        n_components=2,
+        n_neighbors=max(2, min(DEFAULT_BROWSER_UMAP_NEIGHBORS, n - 1)),
+        min_dist=DEFAULT_BROWSER_UMAP_MIN_DIST,
+        metric="cosine",
+        random_state=DEFAULT_BROWSER_UMAP_RANDOM_STATE,
+        n_jobs=1,
+        low_memory=False,
+    )
+    return _standardize_coords(reducer.fit_transform(x))
+
+
+def _l1_distribution_ellipses(coords: np.ndarray, labels: list[str]) -> dict[str, dict[str, float]]:
+    # 95% covariance ellipse in 2D: chi-square(df=2, p=0.95) = 5.991464547.
+    chi2_95_2d = 5.991464547107979
+    result: dict[str, dict[str, float]] = {}
+    coords = np.asarray(coords, dtype=np.float32)
+
+    for label in sorted(set(labels)):
+        idx = [i for i, value in enumerate(labels) if value == label]
+        if len(idx) < 3:
+            continue
+        points = coords[idx]
+        center = points.mean(axis=0)
+        cov = np.cov(points.T)
+        cov = np.asarray(cov, dtype=np.float64)
+        if cov.shape != (2, 2) or not np.isfinite(cov).all():
+            continue
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        eigvals = np.maximum(eigvals, 1e-10)
+        order = np.argsort(eigvals)[::-1]
+        eigvals = eigvals[order]
+        eigvecs = eigvecs[:, order]
+        result[label] = {
+            "cx": float(center[0]),
+            "cy": float(center[1]),
+            "rx": float(math.sqrt(float(eigvals[0]) * chi2_95_2d)),
+            "ry": float(math.sqrt(float(eigvals[1]) * chi2_95_2d)),
+            "angle": float(math.degrees(math.atan2(float(eigvecs[1, 0]), float(eigvecs[0, 0])))),
+            "n": int(len(idx)),
+        }
+    return result
 
 
 def _anchor_labels(anchor: Anchor, level: str) -> tuple[str, ...]:
@@ -989,6 +1133,101 @@ def _plot_pca_qc(
             fig.savefig(path, dpi=220)
             written.append(str(path))
         plt.close(fig)
+
+
+def _plot_browser_matched_l1_umap_qc(
+    *,
+    plt: Any,
+    figure_dir: Path,
+    anchors: list[Anchor],
+    pca_features_by_teacher: dict[str, dict[str, np.ndarray]],
+    formats: list[str],
+    written: list[str],
+    verbose: bool,
+) -> None:
+    if not anchors or not pca_features_by_teacher:
+        return
+
+    teacher_names = sorted(pca_features_by_teacher)
+    common_tile_ids = [
+        anchor.tile_id
+        for anchor in anchors
+        if all(anchor.tile_id in pca_features_by_teacher[teacher] for teacher in teacher_names)
+    ]
+    if len(common_tile_ids) < 3:
+        _log("browser-matched L1 UMAP QC skipped: fewer than 3 common tiles across teachers", enabled=verbose)
+        return
+
+    anchors_by_id = {anchor.tile_id: anchor for anchor in anchors}
+    common_anchors = [anchors_by_id[tile_id] for tile_id in common_tile_ids]
+    labels = [anchor.level1_label for anchor in common_anchors]
+    label_names = sorted(set(labels))
+
+    _log(
+        "plot browser-matched L1 UMAP QC: "
+        f"tiles={len(common_anchors)} n_neighbors={DEFAULT_BROWSER_UMAP_NEIGHBORS} "
+        f"min_dist={DEFAULT_BROWSER_UMAP_MIN_DIST} random_state={DEFAULT_BROWSER_UMAP_RANDOM_STATE}",
+        enabled=verbose,
+    )
+    try:
+        fused = _browser_matched_fused_features(pca_features_by_teacher, teacher_names, common_tile_ids)
+        coords = _browser_matched_umap_2d(fused)
+    except RuntimeError as exc:
+        _log(f"browser-matched L1 UMAP QC skipped: {exc}", enabled=verbose)
+        return
+
+    palette = dict(zip(label_names, plt.rcParams["axes.prop_cycle"].by_key()["color"]))
+    ellipses = _l1_distribution_ellipses(coords, labels)
+
+    fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
+    for label in label_names:
+        idx = [i for i, value in enumerate(labels) if value == label]
+        ax.scatter(
+            coords[idx, 0],
+            coords[idx, 1],
+            s=12.0,
+            alpha=0.58,
+            label=label,
+            color=palette.get(label),
+            linewidths=0,
+        )
+
+    try:
+        from matplotlib.patches import Ellipse
+
+        for label, ellipse in ellipses.items():
+            patch = Ellipse(
+                (ellipse["cx"], ellipse["cy"]),
+                width=2.0 * ellipse["rx"],
+                height=2.0 * ellipse["ry"],
+                angle=ellipse["angle"],
+                facecolor="none",
+                edgecolor=palette.get(label, "#111827"),
+                linewidth=1.2,
+                alpha=0.75,
+            )
+            ax.add_patch(patch)
+    except Exception:
+        pass
+
+    ax.set_title(
+        "L1 QC UMAP at max N="
+        f"{len(anchors)}: browser-matched fused teacher features\n"
+        f"UMAP cosine, n_neighbors={DEFAULT_BROWSER_UMAP_NEIGHBORS}, "
+        f"min_dist={DEFAULT_BROWSER_UMAP_MIN_DIST}, random_state={DEFAULT_BROWSER_UMAP_RANDOM_STATE}"
+    )
+    ax.set_xlabel("UMAP-1")
+    ax.set_ylabel("UMAP-2")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(True, linewidth=0.4, alpha=0.25)
+    ax.legend(fontsize=8, markerscale=1.5, ncols=2)
+
+    for fmt in formats:
+        path = figure_dir / f"infospace_umap_qc_l1_browser_matched.{fmt}"
+        fig.savefig(path, dpi=220)
+        written.append(str(path))
+    plt.close(fig)
 
 
 def _plot_infospace_distribution(
@@ -1169,8 +1408,9 @@ def _plot_curves(
     written: list[str] = []
 
     counts = [int(row["anchor_count"]) for row in aggregate_rows]
+    elbow_counts = [int(row["anchor_count"]) for row in aggregate_rows if str(row.get("elbow_candidate", "")).lower() == "true"]
     plateau_counts = [int(row["anchor_count"]) for row in aggregate_rows if row["plateau_consensus"] == "true"]
-    plateau_count = plateau_counts[0] if plateau_counts else None
+    decision_count = elbow_counts[0] if elbow_counts else (plateau_counts[0] if plateau_counts else None)
 
     def save(fig: Any, stem: str) -> None:
         for fmt in formats:
@@ -1205,8 +1445,8 @@ def _plot_curves(
                 alpha=0.18,
                 linewidth=0,
             )
-        if plateau_count is not None:
-            ax.axvline(plateau_count, linestyle="--", linewidth=0.9, alpha=0.65)
+        if decision_count is not None:
+            ax.axvline(decision_count, linestyle="--", linewidth=0.9, alpha=0.65)
         ax.set_title(title)
         ax.set_xlabel("Prototype tile count N")
         ax.grid(True, linewidth=0.5, alpha=0.35)
@@ -1235,8 +1475,8 @@ def _plot_curves(
                     linewidth=1.4,
                     label=teacher,
                 )
-            if plateau_count is not None:
-                ax.axvline(plateau_count, linestyle="--", linewidth=0.9, alpha=0.65)
+            if decision_count is not None:
+                ax.axvline(decision_count, linestyle="--", linewidth=0.9, alpha=0.65)
             ax.set_title(title)
             ax.set_xlabel("Prototype tile count N")
             ax.grid(True, linewidth=0.5, alpha=0.35)
@@ -1271,6 +1511,15 @@ def _plot_curves(
             pca_features_by_teacher=pca_features_by_teacher,
             label_levels=pca_label_levels,
             max_categories=max_pca_categories,
+            formats=formats,
+            written=written,
+            verbose=verbose,
+        )
+        _plot_browser_matched_l1_umap_qc(
+            plt=plt,
+            figure_dir=figure_dir,
+            anchors=max_subset,
+            pca_features_by_teacher=pca_features_by_teacher,
             formats=formats,
             written=written,
             verbose=verbose,
