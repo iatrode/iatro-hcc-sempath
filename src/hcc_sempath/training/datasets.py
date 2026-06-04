@@ -229,6 +229,11 @@ def _strip_required_suffix(path: Path, suffix: str) -> str:
     return name[: -len(suffix)]
 
 
+def _feature_package_matches_tile_stem(feature_path: Path, tile_stem: str) -> bool:
+    feature_stem = _strip_required_suffix(feature_path, ".features.iac")
+    return feature_stem == tile_stem or feature_stem.startswith(f"{tile_stem}.")
+
+
 def validate_teacher_feature_package_pairs(
     image_tile_package_paths: list[str | Path],
     teacher_cache_package_paths: dict[str, list[str | Path]],
@@ -263,16 +268,10 @@ def validate_teacher_feature_package_pairs(
             feature_header = read_header(feature_path)
             if feature_header.get("payload_type") != "teacher_features":
                 raise ValueError(f"not a teacher feature package: teacher={teacher_name} path={feature_path}")
-            feature_stem = _strip_required_suffix(feature_path, f".{teacher_name}.features.iac")
-            if feature_stem != tile_stem:
+            if not _feature_package_matches_tile_stem(feature_path, tile_stem):
                 raise ValueError(
                     f"feature/tile package stem mismatch: teacher={teacher_name} "
                     f"tile={tile_path.name} feature={feature_path.name}"
-                )
-            header_teacher = str(feature_header.get("teacher") or "")
-            if header_teacher != teacher_name:
-                raise ValueError(
-                    f"teacher header mismatch: expected={teacher_name} got={header_teacher} path={feature_path}"
                 )
             feature_count = int(feature_header["num_records"])
             if feature_count != count:
@@ -417,6 +416,7 @@ class PackageSampledDistillationDataset(Dataset):
         train: bool = False,
         augmentation: dict | None = None,
         prototype_labels: dict[str, PrototypeLabel] | None = None,
+        tensor_collate: bool = False,
     ) -> None:
         self.tile_paths = [Path(path) for path in image_tile_package_paths]
         self.teacher_package_paths = {
@@ -457,6 +457,7 @@ class PackageSampledDistillationDataset(Dataset):
             resize=False,
         )
         self.prototype_labels = prototype_labels or {}
+        self.tensor_collate = bool(tensor_collate)
         self.mean_tensor = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1) if mean is not None else None
         self.std_tensor = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1) if std is not None else None
 
@@ -685,9 +686,14 @@ class PackageSampledDistillationDataset(Dataset):
 
     def collate(self, batch: list[dict]) -> dict:
         teacher_names = list(batch[0]["teacher_features"].keys())
+        if self.tensor_collate:
+            images = torch.from_numpy(np.stack([item["image"] for item in batch], axis=0)).permute(0, 3, 1, 2).contiguous()
+        else:
+            images = torch.stack([self.transform(Image.fromarray(item["image"]).convert("RGB")) for item in batch])
         return {
             "tile_id": [item["tile_id"] for item in batch],
-            "images": torch.stack([self.transform(Image.fromarray(item["image"]).convert("RGB")) for item in batch]),
+            "images": images,
+            "images_uint8": self.tensor_collate,
             "teacher_features": {
                 name: torch.from_numpy(
                     np.stack([item["teacher_features"][name] for item in batch], axis=0)

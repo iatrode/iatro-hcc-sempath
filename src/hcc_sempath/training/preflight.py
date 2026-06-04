@@ -32,6 +32,28 @@ from .prototype_labels import load_prototype_labels
 from .utils import seed_everything
 
 
+def _paths_from_data(cfg: dict, key: str) -> list[str]:
+    value = cfg["data"].get(key)
+    if value is None:
+        raise ValueError(f"data.{key} is required")
+    if isinstance(value, dict):
+        return [str(path) for path in value.values()]
+    return [str(path) for path in value]
+
+
+def _teacher_paths_from_data(cfg: dict, key: str) -> dict[str, list[str]]:
+    value = cfg["data"].get(key)
+    if not isinstance(value, dict):
+        raise ValueError(f"data.{key} must be a teacher->paths mapping")
+    result = {}
+    for name, paths in value.items():
+        if isinstance(paths, (list, tuple)):
+            result[str(name)] = [str(path) for path in paths]
+        else:
+            result[str(name)] = [str(paths)]
+    return result
+
+
 def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -> dict[str, PrototypeRegistry] | None:
     semantic_weight = float(cfg["loss"].get("semantic_weight", 0.0))
     prototype_filter_weight = float(cfg["loss"].get("prototype_filter_weight", 0.0))
@@ -101,7 +123,14 @@ def main() -> None:
         raise RuntimeError("runtime.device is cuda but CUDA is not available")
 
     manifest_path = cfg["data"].get("train_manifest_path")
-    if manifest_path:
+    explicit_split_packages = "train_image_tile_package_paths" in cfg["data"]
+    if explicit_split_packages:
+        train_tile_packages = _paths_from_data(cfg, "train_image_tile_package_paths")
+        val_tile_packages = _paths_from_data(cfg, "val_image_tile_package_paths")
+        train_teacher_packages = _teacher_paths_from_data(cfg, "train_teacher_feature_package_paths")
+        val_teacher_packages = _teacher_paths_from_data(cfg, "val_teacher_feature_package_paths")
+        names = list(train_teacher_packages)
+    elif manifest_path:
         manifest = load_training_manifest(manifest_path)
         train_tile_packages, train_teacher_packages = manifest_data_paths(cfg, manifest, "train")
         val_tile_packages, val_teacher_packages = manifest_data_paths(cfg, manifest, "val")
@@ -119,7 +148,7 @@ def main() -> None:
     dims = teacher_dims(cfg, names)
     image_size = _check_tile_package_sizes(sorted(set(train_tile_packages + val_tile_packages)))
 
-    if manifest_path:
+    if manifest_path or explicit_split_packages:
         train_records = read_packaged_tile_records(train_tile_packages)
         val_records = read_packaged_tile_records(val_tile_packages)
     else:
@@ -142,14 +171,14 @@ def main() -> None:
     prototypes = _load_prototype_map(cfg, dims, device)
     zhcc_prototypes = _load_zhcc_prototypes(cfg, device)
     prototype_manifest_path = cfg["data"].get("prototype_supervision_manifest_path")
-    anchor_required = (
+    prototype_label_required = (
         float(cfg["loss"].get("prototype_filter_weight", 0.0)) > 0
-        and float(cfg["loss"].get("anchor_weight", 0.4)) > 0
+        and float(cfg["loss"].get("prototype_label_weight", 0.4)) > 0
     )
-    if (float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0 or anchor_required) and prototype_manifest_path is None:
+    if (float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0 or prototype_label_required) and prototype_manifest_path is None:
         raise ValueError(
             "data.prototype_supervision_manifest_path is required when zhcc prototype supervision "
-            "or anchor adjudication is enabled"
+            "or prototype-label adjudication is enabled"
         )
     train_prototype_labels = load_prototype_labels(
         prototype_manifest_path,
@@ -196,7 +225,7 @@ def main() -> None:
                 prototype_level2=batch["prototype_level2"].to(device),
                 alpha_min=float(cfg["loss"].get("prototype_filter_alpha_min", 0.25)),
                 consensus_weight=float(cfg["loss"].get("consensus_weight", 0.4)),
-                anchor_weight=float(cfg["loss"].get("anchor_weight", 0.4)),
+                prototype_label_weight=float(cfg["loss"].get("prototype_label_weight", 0.4)),
                 zhcc_response_weight=float(cfg["loss"].get("zhcc_response_weight", 0.2)),
                 filter_strength=float(cfg["loss"].get("prototype_filter_weight", 0.0)),
             )

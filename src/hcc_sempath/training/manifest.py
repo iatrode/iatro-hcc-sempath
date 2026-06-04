@@ -34,6 +34,33 @@ def feature_package_path(
     return Path(feature_root) / teacher / f"{stem}{feature_suffix_template.format(teacher=teacher)}"
 
 
+def _feature_package_path_for_tile(
+    manifest: dict,
+    tile_path: Path,
+    teacher: str,
+    feature_root: str | Path | None,
+    feature_suffix_template: str = FEATURE_SUFFIX_TEMPLATE,
+) -> Path:
+    stem = package_stem(tile_path, str(manifest.get("tile_suffix", TILE_SUFFIX)))
+    feature_roots = manifest.get("feature_roots")
+    if isinstance(feature_roots, dict):
+        teacher_root = feature_roots.get(teacher)
+        if teacher_root is None:
+            raise ValueError(f"training manifest feature_roots missing teacher={teacher}")
+        feature_dir = Path(teacher_root) / tile_path.parent.name
+        matches = sorted(feature_dir.glob(f"{stem}.*.features.iac"))
+        if not matches:
+            raise FileNotFoundError(
+                f"missing feature package teacher={teacher} tile={tile_path} expected={feature_dir}/{stem}.*.features.iac"
+            )
+        if len(matches) > 1:
+            raise RuntimeError(f"ambiguous feature packages teacher={teacher} tile={tile_path} matches={matches}")
+        return matches[0]
+    if feature_root is None:
+        raise ValueError("feature_root is required when manifest.feature_roots is not configured")
+    return feature_package_path(feature_root, teacher, stem, feature_suffix_template)
+
+
 def _discover_tile_packages(root: str | Path, tile_suffix: str = TILE_SUFFIX) -> list[Path]:
     root = Path(root)
     return sorted(path for path in root.glob(f"*{tile_suffix}") if path.is_file())
@@ -177,11 +204,40 @@ def load_training_manifest(path: str | Path) -> dict:
     return manifest
 
 
+def _auto_split_payload(manifest: dict, split: str) -> dict:
+    auto_split = manifest.get("auto_split")
+    if not isinstance(auto_split, dict) or not bool(auto_split.get("enabled", False)):
+        return {}
+    tile_suffix = str(manifest.get("tile_suffix", TILE_SUFFIX))
+    split_key = str(auto_split.get("split_key", manifest.get("split_key", "stem")))
+    development_val_frac = float(auto_split.get("development_val_fraction", auto_split.get("val_fraction", 0.15)))
+    external_val_frac = float(auto_split.get("external_val_fraction", 0.50))
+    seed = int(auto_split.get("seed", manifest.get("seed", 13)))
+    payload = {"train": {}, "val": {}, "exval": {}}
+    for name, dataset in manifest["datasets"].items():
+        role = str(dataset.get("role", "development"))
+        root = dataset["tile_root"]
+        packages = _discover_tile_packages(root, tile_suffix)
+        if role == "development":
+            train_stems, val_stems = _split_development_packages(packages, split_key, development_val_frac, seed)
+            payload["train"][name] = train_stems
+            payload["val"][name] = val_stems
+        elif role == "validation_external":
+            exval_stems, val_stems = _split_development_packages(packages, split_key, external_val_frac, seed)
+            payload["val"][name] = val_stems
+            payload["exval"][f"{name}_heldout"] = {"source": name, "stems": exval_stems}
+        elif role == "external":
+            payload["exval"][f"{name}_heldout"] = {"source": name, "stems": [package_stem(path, tile_suffix) for path in packages]}
+    return payload.get(split, {})
+
+
 def manifest_tile_packages(manifest: dict, split: str) -> list[Path]:
     tile_suffix = str(manifest.get("tile_suffix", TILE_SUFFIX))
     datasets = manifest["datasets"]
     packages: list[Path] = []
     split_payload = manifest["splits"].get(split, {})
+    if not split_payload:
+        split_payload = _auto_split_payload(manifest, split)
     if split == "exval":
         for payload in split_payload.values():
             source = payload["source"]
@@ -201,13 +257,27 @@ def manifest_teacher_feature_packages(
     feature_root: str | Path,
     feature_suffix_template: str = FEATURE_SUFFIX_TEMPLATE,
 ) -> dict[str, list[Path]]:
-    tile_suffix = str(manifest.get("tile_suffix", TILE_SUFFIX))
     packages_by_teacher = {teacher: [] for teacher in teachers}
     for tile_path in manifest_tile_packages(manifest, split):
-        stem = package_stem(tile_path, tile_suffix)
         for teacher in teachers:
             packages_by_teacher[teacher].append(
-                feature_package_path(feature_root, teacher, stem, feature_suffix_template)
+                _feature_package_path_for_tile(manifest, tile_path, teacher, feature_root, feature_suffix_template)
+            )
+    return packages_by_teacher
+
+
+def manifest_teacher_feature_packages_for_tiles(
+    manifest: dict,
+    tile_paths: list[str | Path],
+    teachers: list[str],
+    feature_root: str | Path | None = None,
+    feature_suffix_template: str = FEATURE_SUFFIX_TEMPLATE,
+) -> dict[str, list[Path]]:
+    packages_by_teacher = {teacher: [] for teacher in teachers}
+    for tile_path in [Path(path) for path in tile_paths]:
+        for teacher in teachers:
+            packages_by_teacher[teacher].append(
+                _feature_package_path_for_tile(manifest, tile_path, teacher, feature_root, feature_suffix_template)
             )
     return packages_by_teacher
 

@@ -1,0 +1,36 @@
+version: 1
+tile_suffix: .tiles.iac
+split_key: stem
+seed: 13
+
+datasets:
+  internal_a:
+    role: development
+    tile_root: /path/to/tiles/internal_a
+  internal_b:
+    role: development
+    tile_root: /path/to/tiles/internal_b
+  internal_c:
+    role: development
+    tile_root: /path/to/tiles/internal_c
+  external_public:
+    role: validation_external
+    tile_root: /path/to/tiles/external_public
+
+feature_roots:
+  gigapath: /path/to/features/gigapath
+  h_optimus_1: /path/to/features/h_optimus_1
+  uni2_h: /path/to/features/uni2_h
+  virchow2: /path/to/features/virchow2
+
+auto_split:
+  enabled: true
+  development_val_fraction: 0.15
+  external_val_fraction: 0.50
+  split_key: stem
+  seed: 13
+
+splits:
+  train: {}
+  val: {}
+  exval: {}

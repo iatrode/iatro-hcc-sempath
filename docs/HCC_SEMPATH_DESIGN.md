@@ -91,18 +91,21 @@ HCC prototype semantics 冲突的 teacher signal 应被降权，而不是直接�
 
 ## 4. Prototype Design / Prototype 设计
 
-Prototypes are semantic anchors for training and interpretation. They are not the
-final evaluation judge. They should cover the HCC morphology space as well as the
-development data allows, and they are expected to come from the training side of
-the study design.
+Prototypes define the HCC-specific semantic axes used for representation
+shaping and interpretation. They are not the final evaluation judge. They should
+cover the HCC morphology space as well as the development data allows, and they
+are expected to come from the training side of the study design.
 
-Prototype 是训练与解释用的语义锚点，不是最终评价裁判。Prototype 应尽可能覆盖
-development data 中的 HCC morphology space，并且应来自研究设计中的训练侧数据。
+Prototype 定义用于 representation shaping 和解释的 HCC 专病语义轴，不是最终评价裁判。
+Prototype 应尽可能覆盖 development data 中的 HCC morphology space，并且应来自研究设计中的
+训练侧数据。
 
 Each reviewed tile receives one dominant Level-1 state and zero or more Level-2
-attributes.
+presence attributes. Level 1 and Level 2 are parallel prototype axes, not a
+parent-child hierarchy.
 
-每个审阅 tile 对应一个主导 Level-1 state，并可包含零个或多个 Level-2 attributes。
+每个审阅 tile 对应一个主导 Level-1 state，并可包含零个或多个 Level-2 presence
+attributes。Level 1 和 Level 2 是并行 prototype 语义轴，不是父子层级。
 
 ### Level 1: Primary Tissue State / Level 1：主组织状态
 
@@ -119,11 +122,13 @@ Level 1 互斥，表示 tile 的主导组织或病变状态。
 
 ### Level 2: Non-Exclusive Morphology Attributes / Level 2：非互斥形态属性
 
-Level 2 is multi-label and encodes morphology or tissue-context attributes that
-can coexist within one tile and can cross Level-1 states.
+Level 2 is multi-label and encodes morphology or tissue-context presence
+attributes that can coexist within one tile and can cross Level-1 states. Empty
+Level-2 labels do not imply a negative Level-1 state, and Level-1 states do not
+imply fixed Level-2 positives.
 
 Level 2 是 multi-label，表示可在同一 tile 内共存、并可跨 Level-1 state 出现的形态或组织
-背景属性。
+背景 presence attributes。L2 为空不表示 L1 阴性，L1 状态也不预设固定 L2 阳性。
 
 | Prototype | Scientific meaning |
 | --- | --- |

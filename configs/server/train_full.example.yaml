@@ -1,27 +1,20 @@
 runtime:
   device: cuda
   seed: 13
-  output_dir: outputs/hcc_sempath_v1
+  output_dir: outputs/server_full
 
 data:
-  train_manifest_path: data/manifests/hcc_train.yaml
-  feature_root: data/features
+  train_manifest_path: configs/server/manifest.example.yaml
   teachers: [gigapath, h_optimus_1, uni2_h, virchow2]
-  prototype_paths:
-    gigapath: data/prototypes/gigapath_hcc_semantic_prototypes.pt
-    h_optimus_1: data/prototypes/h_optimus_1_hcc_semantic_prototypes.pt
-    uni2_h: data/prototypes/uni2_h_hcc_semantic_prototypes.pt
-    virchow2: data/prototypes/virchow2_hcc_semantic_prototypes.pt
-  prototype_supervision_manifest_path: data/prototypes/hcc_prototype_supervision_manifest.csv
-  prototype_supervision_train_splits: [train]
-  prototype_supervision_val_splits: [val]
-  zhcc_prototype_path: data/prototypes/zhcc_hcc_semantic_prototypes.pt
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
   num_workers: 8
   prefetch_factor: 2
   persistent_workers: true
   dynamic_package_sampling: true
+  tensor_collate: true
+  package_chunk_size: 64
+  package_buffer_batches: 1
 
 augmentation:
   enabled: true
@@ -35,7 +28,7 @@ augmentation:
     hue: 0.02
 
 model:
-  backbone_name: vit_small_patch14_reg4_dinov2.lvd142m
+  backbone_name: vit_small_patch16_224
   embedding_dim: 1536
   projector_type: linear
   projector_hidden_dim: 2048
@@ -45,7 +38,7 @@ model:
     h_optimus_1: 1536
     uni2_h: 1536
     virchow2: 2560
-  pretrained: true
+  pretrained: false
 
 loss:
   teacher_weights:
@@ -57,15 +50,12 @@ loss:
   relation_weight: 0.05
   scale_relation_by_alpha: false
   semantic_weight: 0.0
-  semantic_warmup_epochs: 0
   semantic_temperature: 1.0
   primary_temperature: 1.0
   attribute_temperature: 1.0
-  zhcc_proto_weight: 0.2
-  prototype_ramp_steps: 1000
+  zhcc_proto_weight: 0.0
   zhcc_level2_weight: 0.5
-  prototype_filter_weight: 0.5
-  filter_ramp_steps: 1000
+  prototype_filter_weight: 0.0
   prototype_filter_alpha_min: 0.25
   consensus_weight: 0.4
   prototype_label_weight: 0.4
@@ -76,10 +66,12 @@ loss:
   teacher_prior_ema_beta: 0.9
   min_teacher_warmup_steps: 2000
   max_teacher_warmup_steps: 10000
+  prototype_ramp_steps: 1000
+  filter_ramp_steps: 1000
   proto_to_filter_delay_steps: 1000
 
 train:
-  batch_size: 256
+  batch_size: 512
   epochs: 100
   lr: 0.0001
   scheduler: cosine
@@ -90,3 +82,7 @@ train:
   topk: 10
   max_val_batches: 512
   max_eval_batches: 128
+  log_interval: 0
+  progress: tqdm
+  tensorboard: true
+  tensorboard_batch_interval: 20

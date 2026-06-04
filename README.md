@@ -32,11 +32,11 @@ HCC prototype supervision 用于进一步把 embedding 空间塑造成专病语�
 
 The current method configuration is PAMT-D, Prototype-Adjudicated Multi-Teacher
 Distillation. Two-level HCC prototypes compute per-tile, per-teacher reliability
-from cross-teacher consensus, expert anchor agreement, and agreement with the
-current shared `z_hcc` prototype response.
+from cross-teacher consensus, expert prototype-label agreement, and agreement
+with the current shared `z_hcc` prototype response.
 
 当前方法配置为 PAMT-D，即原型裁决的多教师蒸馏。两级 HCC prototype 通过跨 teacher
-共识、专家 anchor 一致性，以及与当前共享 `z_hcc` prototype response 的一致性，计算
+共识、专家 prototype label 一致性，以及与当前共享 `z_hcc` prototype response 的一致性，计算
 每个 tile / teacher 的软可靠性权重。
 
 The public scientific design is maintained in
@@ -128,13 +128,14 @@ bash scripts/run_contract_smoke.sh
 The current prototype design is part of the scientific method and is documented
 in [`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md). It uses four
 mutually exclusive Level-1 tissue states and ten non-exclusive Level-2 morphology
-attributes. Prototypes are training-side semantic anchors; the manuscript-grade
-primary evaluation is not prototype reconstruction.
+presence attributes. Level-1 and Level-2 are parallel prototype axes rather than
+a parent-child taxonomy; the manuscript-grade primary evaluation is not
+prototype reconstruction.
 
 当前 prototype 设计属于科学方法本身，见
 [`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md)。它包含 4 个互斥 Level-1
-tissue states 和 10 个非互斥 Level-2 morphology attributes。Prototype 是训练侧语义
-锚点；论文级主评价不是 prototype reconstruction。
+tissue states 和 10 个非互斥 Level-2 morphology presence attributes。Level-1 与
+Level-2 是并行 prototype 语义轴，不是父子层级；论文级主评价不是 prototype reconstruction。
 
 ## Reproducibility Commands
 

@@ -43,6 +43,8 @@ class _PackageShuffleBatchLoader:
         prefetch_batches: int,
         collate_fn,
         seed: int = 13,
+        chunk_size: int | None = None,
+        buffer_batches: int = 1,
     ) -> None:
         self.dataset = dataset
         self.batch_size = int(batch_size)
@@ -50,8 +52,8 @@ class _PackageShuffleBatchLoader:
         self.prefetch_batches = max(0, int(prefetch_batches))
         self.collate_fn = collate_fn
         self.seed = int(seed)
-        self.chunk_size = max(1, min(64, self.batch_size // 4))
-        self.buffer_target = max(self.batch_size, self.batch_size * (self.prefetch_batches + 1))
+        self.chunk_size = max(1, int(chunk_size or self.batch_size))
+        self.buffer_target = max(self.batch_size, self.batch_size * max(1, int(buffer_batches)))
 
     def _draw_batch(self, buffer: list[dict], rng: np.random.Generator) -> list[dict]:
         take = min(self.batch_size, len(buffer))
@@ -77,7 +79,7 @@ class _PackageShuffleBatchLoader:
             yield from self._ready_batches(buffer, rng, final=True)
             return
 
-        max_pending = max(1, self.num_workers * (self.prefetch_batches + 1))
+        max_pending = max(1, self.num_workers + self.prefetch_batches)
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             pending: set[Future] = set()
 
@@ -245,14 +247,14 @@ def main() -> None:
     dims = teacher_dims(cfg, names)
     zhcc_prototypes = _load_zhcc_prototypes(cfg, device)
     prototype_manifest_path = cfg["data"].get("prototype_supervision_manifest_path")
-    anchor_required = (
+    prototype_label_required = (
         float(cfg["loss"].get("prototype_filter_weight", 0.0)) > 0
-        and float(cfg["loss"].get("anchor_weight", 0.4)) > 0
+        and float(cfg["loss"].get("prototype_label_weight", 0.4)) > 0
     )
-    if (float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0 or anchor_required) and prototype_manifest_path is None:
+    if (float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0 or prototype_label_required) and prototype_manifest_path is None:
         raise ValueError(
             "data.prototype_supervision_manifest_path is required when zhcc prototype supervision "
-            "or anchor adjudication is enabled"
+            "or prototype-label adjudication is enabled"
         )
     train_prototype_labels = load_prototype_labels(
         prototype_manifest_path,
@@ -274,10 +276,12 @@ def main() -> None:
             raise ValueError(f"tile package size mismatch: {package_path} has {candidate_size}, expected {image_size}")
     dynamic_package_sampling = bool(cfg["data"].get("dynamic_package_sampling", False))
     if dynamic_package_sampling:
+        tensor_collate = bool(cfg["data"].get("tensor_collate", device.type == "cuda"))
         common_dataset_kwargs = {
             "image_size": image_size,
             "mean": cfg["data"].get("mean"),
             "std": cfg["data"].get("std"),
+            "tensor_collate": tensor_collate,
         }
         train_ds = PackageSampledDistillationDataset(
             train_tile_packages,
@@ -400,6 +404,9 @@ def main() -> None:
         loader_kwargs["persistent_workers"] = bool(cfg["data"].get("persistent_workers", True))
     if dynamic_package_sampling:
         prefetch_batches = int(cfg["data"].get("prefetch_factor", 2))
+        default_chunk_size = max(1, int(cfg["train"]["batch_size"]) // max(1, num_workers))
+        package_chunk_size = int(cfg["data"].get("package_chunk_size", default_chunk_size))
+        package_buffer_batches = int(cfg["data"].get("package_buffer_batches", 1))
         train_loader = _PackageShuffleBatchLoader(
             train_ds,
             batch_size=int(cfg["train"]["batch_size"]),
@@ -407,6 +414,8 @@ def main() -> None:
             prefetch_batches=prefetch_batches,
             collate_fn=train_ds.collate,
             seed=int(cfg["runtime"]["seed"]),
+            chunk_size=package_chunk_size,
+            buffer_batches=package_buffer_batches,
         )
         val_loader = _PackageShuffleBatchLoader(
             val_ds,
@@ -415,6 +424,8 @@ def main() -> None:
             prefetch_batches=prefetch_batches,
             collate_fn=val_ds.collate,
             seed=int(cfg["runtime"]["seed"]) + 1,
+            chunk_size=package_chunk_size,
+            buffer_batches=package_buffer_batches,
         )
     else:
         train_loader = DataLoader(

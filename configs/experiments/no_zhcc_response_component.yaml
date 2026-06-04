@@ -10,5 +10,5 @@ loss:
   prototype_filter_weight: 0.5
   prototype_filter_alpha_min: 0.25
   consensus_weight: 0.5
-  anchor_weight: 0.5
+  prototype_label_weight: 0.5
   zhcc_response_weight: 0.0

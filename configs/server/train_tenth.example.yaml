@@ -1,0 +1,14 @@
+inherits: train_full.example.yaml
+
+runtime:
+  output_dir: outputs/server_tenth
+
+data:
+  train_tile_fraction: 0.10
+  val_tile_fraction: 0.10
+
+train:
+  epochs: 20
+  warmup_epochs: 1
+  max_val_batches: 256
+  max_eval_batches: 64

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import random
 
 import yaml
 
 from ..io.feature_cache import FeatureCacheReader
-from .manifest import manifest_teacher_feature_packages, manifest_tile_packages
+from ..io.iatrocache import read_header
+from .manifest import manifest_teacher_feature_packages_for_tiles, manifest_tile_packages
 
 
 EXCLUDED_TEACHER_NAMES = {
@@ -147,6 +149,35 @@ def embedding_dim(cfg: dict) -> int:
     return int(cfg["model"].get("embedding_dim", cfg["model"].get("teacher_dim", 256)))
 
 
+def _package_record_count(path: Path) -> int:
+    return int(read_header(path)["num_records"])
+
+
+def _select_package_fraction(
+    packages: list[Path],
+    counts: dict[Path, int],
+    *,
+    fraction: float,
+    seed: int,
+) -> list[Path]:
+    if fraction >= 1.0:
+        return sorted(packages)
+    if fraction <= 0.0:
+        raise ValueError(f"tile fraction must be > 0: {fraction}")
+    target_tiles = max(1, round(sum(counts[path] for path in packages) * fraction))
+    rng = random.Random(seed)
+    shuffled = packages[:]
+    rng.shuffle(shuffled)
+    selected = []
+    selected_tiles = 0
+    for path in shuffled:
+        selected.append(path)
+        selected_tiles += counts[path]
+        if selected_tiles >= target_tiles:
+            break
+    return sorted(selected)
+
+
 def validate_training_config(cfg: dict, names: list[str]) -> None:
     validate_teacher_names(names)
     expected = set(names)
@@ -167,15 +198,24 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
 def manifest_data_paths(cfg: dict, manifest: dict, split: str) -> tuple[list[str], dict[str, list[str]]]:
     data = cfg["data"]
     feature_root = data.get("feature_root")
-    if feature_root is None:
-        raise ValueError("data.feature_root is required when data.train_manifest_path is used")
+    if feature_root is None and not isinstance(manifest.get("feature_roots"), dict):
+        raise ValueError("data.feature_root or manifest.feature_roots is required when data.train_manifest_path is used")
     teachers = teacher_names(cfg)
-    tile_packages = [str(path) for path in manifest_tile_packages(manifest, split)]
+    tile_paths = manifest_tile_packages(manifest, split)
+    fraction_key = "train_tile_fraction" if split == "train" else f"{split}_tile_fraction"
+    fraction = float(data.get(fraction_key, 1.0))
+    tile_paths = _select_package_fraction(
+        tile_paths,
+        {path: _package_record_count(path) for path in tile_paths},
+        fraction=fraction,
+        seed=int(cfg.get("runtime", {}).get("seed", 13)) + (0 if split == "train" else 1),
+    )
+    tile_packages = [str(path) for path in tile_paths]
     feature_packages = {
         name: [str(path) for path in paths]
-        for name, paths in manifest_teacher_feature_packages(
+        for name, paths in manifest_teacher_feature_packages_for_tiles(
             manifest=manifest,
-            split=split,
+            tile_paths=tile_paths,
             teachers=teachers,
             feature_root=feature_root,
             feature_suffix_template=data.get("feature_suffix_template", ".{teacher}.features.iac"),
