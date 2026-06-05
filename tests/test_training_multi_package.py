@@ -281,6 +281,34 @@ def test_package_shuffle_loader_mixes_packages_single_thread(tmp_path: Path) -> 
     assert len({sample["_package_idx"] for sample in first_batch}) > 1
 
 
+def test_package_shuffle_loader_mixes_packages_multi_thread(tmp_path: Path) -> None:
+    tile_paths = []
+    feature_paths = []
+    for idx in range(6):
+        tile_path, feature_path = _write_package(tmp_path, f"slide_{idx}", idx * 20, count=6)
+        tile_paths.append(tile_path)
+        feature_paths.append(feature_path)
+    dataset = PackageSampledDistillationDataset(
+        tile_paths,
+        {"toy": feature_paths},
+        image_size=(32, 32),
+        max_records=24,
+        seed=13,
+        expected_dims={"toy": 4},
+    )
+    loader = _PackageShuffleBatchLoader(
+        dataset,
+        batch_size=8,
+        num_workers=2,
+        prefetch_batches=2,
+        collate_fn=lambda batch: dataset.collate(batch),
+        seed=13,
+    )
+
+    first_batch = next(iter(loader))
+    assert len(first_batch["tile_id"]) == 8
+
+
 def test_package_sampled_tensor_collate_defers_image_preprocess_to_device(tmp_path: Path) -> None:
     tile_path, feature_path = _write_package(tmp_path, "slide_a", 10, count=4)
     dataset = PackageSampledDistillationDataset(

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from queue import Full, Queue
+from threading import Event, Thread
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
@@ -67,12 +69,9 @@ class _PackageShuffleBatchLoader:
             buffer.pop(index)
         return batch
 
-    def _ready_batches(self, buffer: list[dict], rng: np.random.Generator, *, final: bool = False):
-        threshold = self.batch_size if final else self.buffer_target
-        while len(buffer) >= threshold or (final and buffer):
-            yield self.collate_fn(self._draw_batch(buffer, rng))
-
     def __iter__(self):
+        import threading
+        import time
         epoch_seed = self.seed + self._epoch if self.reshuffle_each_epoch else self.seed
         if self.reshuffle_each_epoch:
             self._epoch += 1
@@ -82,30 +81,117 @@ class _PackageShuffleBatchLoader:
         if self.num_workers <= 0:
             for package_idx, rows in chunks:
                 buffer.extend(self.dataset.read_package_rows(package_idx, rows))
-                yield from self._ready_batches(buffer, rng)
-            yield from self._ready_batches(buffer, rng, final=True)
+                while len(buffer) >= self.batch_size:
+                    yield self.collate_fn(self._draw_batch(buffer, rng))
+            if buffer:
+                yield self.collate_fn(self._draw_batch(buffer, rng))
             return
 
         max_pending = max(1, self.num_workers + self.prefetch_batches)
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+        max_buffer_rows = self.batch_size * max(4, self.prefetch_batches * 2)
+        ready_queue: Queue = Queue(maxsize=max(1, self.prefetch_batches * 2))
+        stop_event = Event()
+        sentinel = object()
+        buffer_lock = threading.Lock()
+        exhausted_flag = [False]
+
+        def put_ready(item) -> bool:
+            while not stop_event.is_set():
+                try:
+                    ready_queue.put(item, timeout=0.1)
+                    return True
+                except Full:
+                    continue
+            return False
+
+        def reader_worker() -> None:
             pending: set[Future] = set()
+            chunks_exhausted = False
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                def fill_window() -> None:
+                    nonlocal chunks_exhausted
+                    with buffer_lock:
+                        buf_len = len(buffer)
+                    while not stop_event.is_set() and len(pending) < max_pending and buf_len < max_buffer_rows:
+                        try:
+                            package_idx, rows = next(chunks)
+                        except StopIteration:
+                            chunks_exhausted = True
+                            return
+                        pending.add(executor.submit(self.dataset.read_package_rows, package_idx, rows))
+                        buf_len += len(rows)
 
-            def fill_window() -> None:
-                while len(pending) < max_pending:
-                    try:
-                        package_idx, rows = next(chunks)
-                    except StopIteration:
-                        return
-                    pending.add(executor.submit(self.dataset.read_package_rows, package_idx, rows))
+                try:
+                    while not stop_event.is_set() and (pending or not chunks_exhausted):
+                        fill_window()
+                        ready_f = {f for f in pending if f.done()}
+                        if ready_f:
+                            pending -= ready_f
+                            for f in ready_f:
+                                res = f.result()
+                                with buffer_lock:
+                                    buffer.extend(res)
+                        if pending:
+                            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                            for f in done:
+                                res = f.result()
+                                with buffer_lock:
+                                    buffer.extend(res)
+                        else:
+                            time.sleep(0.01)
+                except BaseException as exc:
+                    put_ready(exc)
+                finally:
+                    exhausted_flag[0] = True
 
-            fill_window()
-            while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    buffer.extend(future.result())
-                fill_window()
-                yield from self._ready_batches(buffer, rng)
-            yield from self._ready_batches(buffer, rng, final=True)
+        def collation_worker() -> None:
+            try:
+                while not stop_event.is_set():
+                    with buffer_lock:
+                        buf_len = len(buffer)
+                    if buf_len >= self.batch_size or (exhausted_flag[0] and buf_len > 0):
+                        with buffer_lock:
+                            take = min(self.batch_size, len(buffer))
+                            chosen = rng.choice(len(buffer), size=take, replace=False)
+                            batch_rows = [buffer[index] for index in chosen]
+                            for index in sorted((int(i) for i in chosen), reverse=True):
+                                buffer.pop(index)
+                        batch = self.collate_fn(batch_rows)
+                        if torch.cuda.is_available():
+                            batch["images"] = batch["images"].pin_memory()
+                            batch["teacher_features"] = {
+                                name: feat.pin_memory()
+                                for name, feat in batch["teacher_features"].items()
+                            }
+                        if not put_ready(batch):
+                            return
+                    else:
+                        if exhausted_flag[0]:
+                            with buffer_lock:
+                                if len(buffer) == 0:
+                                    break
+                        time.sleep(0.01)
+            except BaseException as exc:
+                put_ready(exc)
+            finally:
+                put_ready(sentinel)
+
+        reader_thread = Thread(target=reader_worker, daemon=True)
+        collation_thread = Thread(target=collation_worker, daemon=True)
+        reader_thread.start()
+        collation_thread.start()
+        try:
+            while True:
+                item = ready_queue.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            stop_event.set()
+            reader_thread.join(timeout=1.0)
+            collation_thread.join(timeout=1.0)
 
     def __len__(self) -> int:
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
@@ -257,6 +343,10 @@ def main() -> None:
     cfg = load_config(args.config)
     seed_everything(int(cfg["runtime"]["seed"]))
     device = torch.device(cfg["runtime"]["device"])
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     manifest_path = cfg["data"].get("train_manifest_path")
     explicit_split_packages = "train_image_tile_package_paths" in cfg["data"]
     if explicit_split_packages:
@@ -481,16 +571,18 @@ def main() -> None:
         projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
         teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
-    scheduler = build_lr_scheduler(optimizer, cfg, len(train_loader))
     resume_state = None
     if args.resume:
         resume_state = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(resume_state["model"])
-        if "optimizer" in resume_state:
-            optimizer.load_state_dict(resume_state["optimizer"])
-        if scheduler is not None and resume_state.get("scheduler") is not None:
-            scheduler.load_state_dict(resume_state["scheduler"])
+    if bool(cfg["train"].get("compile", False)):
+        model = torch.compile(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
+    if resume_state and "optimizer" in resume_state:
+        optimizer.load_state_dict(resume_state["optimizer"])
+    scheduler = build_lr_scheduler(optimizer, cfg, len(train_loader))
+    if resume_state and scheduler is not None and resume_state.get("scheduler") is not None:
+        scheduler.load_state_dict(resume_state["scheduler"])
     metrics = fit(
         model,
         train_loader,
