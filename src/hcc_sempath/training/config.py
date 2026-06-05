@@ -186,6 +186,7 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
 
     semantic_weight = float(cfg.get("loss", {}).get("semantic_weight", 0.0))
     prototype_filter_weight = float(cfg.get("loss", {}).get("prototype_filter_weight", 0.0))
+    zhcc_proto_weight = float(cfg.get("loss", {}).get("zhcc_proto_weight", 0.0))
     loss_cfg = cfg.get("loss", {})
     for key in ("zhcc_primary_temperature", "zhcc_attribute_temperature", "primary_temperature", "attribute_temperature"):
         if key in loss_cfg and float(loss_cfg[key]) <= 0:
@@ -197,10 +198,16 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
     prototype_paths = cfg.get("data", {}).get("prototype_paths")
     if isinstance(prototype_paths, dict):
         _unexpected_keys(prototype_paths, expected, "data.prototype_paths")
-        if semantic_weight > 0 or prototype_filter_weight > 0:
+        if semantic_weight > 0 or prototype_filter_weight > 0 or zhcc_proto_weight > 0:
             missing = sorted(name for name in names if name not in prototype_paths)
             if missing:
                 raise ValueError(f"data.prototype_paths missing teacher entries: {missing}")
+    elif semantic_weight > 0 or prototype_filter_weight > 0 or zhcc_proto_weight > 0:
+        if cfg.get("data", {}).get("prototype_path") is None:
+            raise ValueError(
+                "data.prototype_path or data.prototype_paths is required when semantic_weight, "
+                "prototype_filter_weight, or zhcc_proto_weight > 0"
+            )
 
 
 def manifest_data_paths(cfg: dict, manifest: dict, split: str) -> tuple[list[str], dict[str, list[str]]]:

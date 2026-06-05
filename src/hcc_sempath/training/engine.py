@@ -18,7 +18,7 @@ from .prototype_images import (
     collect_student_prototype_image_embeddings,
 )
 from .utils import append_csv, ensure_dir, write_json
-from .zhcc_losses import zhcc_prototype_loss
+from .zhcc_losses import teacher_semantic_response_target, zhcc_response_distillation_loss
 from .zhcc_metrics import evaluate_zhcc_prototypes
 
 
@@ -176,6 +176,9 @@ def _cuda_memory_mb(device: torch.device) -> float:
     return float(torch.cuda.memory_allocated(device) / (1024 * 1024))
 
 
+
+
+
 def _build_summary_writer(cfg: dict, output_dir):
     if not bool(cfg["train"].get("tensorboard", False)):
         return None
@@ -244,7 +247,7 @@ def _write_tensorboard_batch(
     if writer is None:
         return
     writer.add_scalar(f"{phase}_batch/loss", float(loss.detach().cpu()), global_step)
-    for key in ("feature", "relation", "semantic"):
+    for key in ("feature", "relation", "semantic", "zhcc_proto", "zhcc_response"):
         if key in parts:
             writer.add_scalar(f"{phase}_batch/{key}", float(parts[key].detach().cpu()), global_step)
     writer.add_scalar("train/lr_step", float(lr), global_step)
@@ -263,11 +266,13 @@ def _maybe_refresh_dynamic_prototypes(
     if prototype_state is None:
         return None
     current = prototype_state.get("zhcc")
+    if not needed:
+        return current
     if zhcc_image_bank is None:
         return current
     interval = int(cfg["train"].get("dynamic_prototype_refresh_steps", 500))
     last_step = prototype_state.get("last_refresh_step")
-    should_refresh = current is None or (needed and (last_step is None or int(global_step) - int(last_step) >= interval))
+    should_refresh = current is None or last_step is None or int(global_step) - int(last_step) >= interval
     if not should_refresh:
         return current
     batch_size = int(cfg["train"].get("dynamic_prototype_batch_size", cfg["train"].get("batch_size", 512)))
@@ -423,11 +428,9 @@ def run_epoch(
         "reliability": 0.0,
         "relation_scale": 0.0,
         "zhcc_proto": 0.0,
+        "zhcc_response": 0.0,
         "zhcc_l1": 0.0,
         "zhcc_l2": 0.0,
-        "zhcc_bank_proto": 0.0,
-        "zhcc_bank_l1": 0.0,
-        "zhcc_bank_l2": 0.0,
     }
     n_batches = 0
     n_tiles = 0
@@ -525,6 +528,8 @@ def run_epoch(
                             l2_agreement_weight=float(loss_cfg["prototype_l2_agreement_weight"]),
                             zhcc_response_weight=float(loss_cfg["zhcc_response_weight"]),
                             filter_strength=float(loss_cfg["prototype_filter_weight"]),
+                            primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
+                            attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
                         )
                     else:
                         alpha_by_teacher = None
@@ -543,60 +548,36 @@ def run_epoch(
                         attribute_temperature=float(loss_cfg["attribute_temperature"]),
                         scale_relation_by_alpha=bool(loss_cfg["scale_relation_by_alpha"]),
                     )
-                    zhcc_loss, zhcc_parts = zhcc_prototype_loss(
-                        embedding_norm=outputs["embedding_norm"],
-                        prototype_mask=prototype_mask,
-                        prototype_level1=prototype_level1,
-                        prototype_level2=prototype_level2,
-                        prototypes=active_zhcc_prototypes,
-                        level2_weight=float(loss_cfg["zhcc_level2_weight"]),
-                        primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
-                        attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
-                    ) if active_zhcc_prototypes is not None and float(loss_cfg["zhcc_proto_weight"]) > 0 else (
-                        loss.new_zeros(()),
-                        {"zhcc_proto": loss.new_zeros(()), "zhcc_l1": loss.new_zeros(()), "zhcc_l2": loss.new_zeros(())},
-                    )
-                    bank_parts = {
-                        "zhcc_bank_proto": loss.new_zeros(()),
-                        "zhcc_bank_l1": loss.new_zeros(()),
-                        "zhcc_bank_l2": loss.new_zeros(()),
-                    }
-                    bank_loss = loss.new_zeros(())
-                    if (
-                        train
-                        and zhcc_image_bank is not None
-                        and active_zhcc_prototypes is not None
-                        and float(loss_cfg["zhcc_proto_weight"]) > 0
-                    ):
-                        bank_batch_size = int(cfg["train"].get("prototype_image_batch_size", cfg["train"].get("batch_size", 512)))
-                        bank_images, bank_level1, bank_level2 = zhcc_image_bank.sample_batch(
-                            batch_size=bank_batch_size,
-                            seed=int(cfg["runtime"].get("seed", 13)) + int(global_step),
+                    if active_zhcc_prototypes is not None and float(loss_cfg["zhcc_proto_weight"]) > 0:
+                        if prototypes is None:
+                            raise ValueError("zhcc response distillation requires data.prototype_paths")
+                        target_primary, target_attributes = teacher_semantic_response_target(
+                            teacher_by_name=teachers,
+                            prototypes_by_teacher=prototypes,
+                            target_registry=active_zhcc_prototypes,
+                            teacher_weights=loss_cfg.get("teacher_weights"),
+                            teacher_sample_weights=alpha_by_teacher,
+                            primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
+                            attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
                         )
-                        bank_outputs = model(
-                            _prepare_images(
-                                {"images": bank_images, "images_uint8": True},
-                                cfg,
-                                device,
-                            )
-                        )
-                        bank_mask = torch.ones(bank_images.shape[0], dtype=torch.bool, device=device)
-                        bank_loss, raw_bank_parts = zhcc_prototype_loss(
-                            embedding_norm=bank_outputs["embedding_norm"],
-                            prototype_mask=bank_mask,
-                            prototype_level1=bank_level1.to(device),
-                            prototype_level2=bank_level2.to(device),
+                        zhcc_loss, zhcc_parts = zhcc_response_distillation_loss(
+                            embedding_norm=outputs["embedding_norm"],
                             prototypes=active_zhcc_prototypes,
+                            target_primary=target_primary,
+                            target_attributes=target_attributes,
                             level2_weight=float(loss_cfg["zhcc_level2_weight"]),
                             primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
                             attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
                         )
-                        bank_parts = {
-                            "zhcc_bank_proto": raw_bank_parts["zhcc_proto"],
-                            "zhcc_bank_l1": raw_bank_parts["zhcc_l1"],
-                            "zhcc_bank_l2": raw_bank_parts["zhcc_l2"],
+                    else:
+                        zhcc_loss = loss.new_zeros(())
+                        zhcc_parts = {
+                            "zhcc_proto": loss.new_zeros(()),
+                            "zhcc_response": loss.new_zeros(()),
+                            "zhcc_l1": loss.new_zeros(()),
+                            "zhcc_l2": loss.new_zeros(()),
                         }
-                    loss = loss + float(loss_cfg["zhcc_proto_weight"]) * (zhcc_loss + bank_loss)
+                    loss = loss + float(loss_cfg["zhcc_proto_weight"]) * zhcc_loss
                 if train:
                     optimizer.zero_grad(set_to_none=True)
                     if scaler is not None and scaler.is_enabled():
@@ -623,16 +604,14 @@ def run_epoch(
                         global_step=global_step,
                         teacher_prior_loss=teacher_prior_loss,
                     )
-            totals["loss"] += float(loss.detach().cpu())
+            totals["loss"] = totals["loss"] + loss.detach()
             for key in ("feature", "relation", "semantic", "reliability", "relation_scale"):
-                totals[key] += float(parts[key].cpu())
-            for key in ("zhcc_proto", "zhcc_l1", "zhcc_l2"):
-                totals[key] += float(zhcc_parts[key].detach().cpu())
-            for key in ("zhcc_bank_proto", "zhcc_bank_l1", "zhcc_bank_l2"):
-                totals[key] += float(bank_parts[key].detach().cpu())
+                totals[key] = totals[key] + parts[key].detach()
+            for key in ("zhcc_proto", "zhcc_response", "zhcc_l1", "zhcc_l2"):
+                totals[key] = totals[key] + zhcc_parts[key].detach()
             for key, value in alpha_diag.items():
                 totals.setdefault(key, 0.0)
-                totals[key] += float(value.detach().cpu())
+                totals[key] = totals[key] + value.detach()
             n_batches += 1
             if (
                 summary_writer is not None
@@ -645,7 +624,7 @@ def run_epoch(
                     phase=phase,
                     global_step=global_step,
                     loss=loss,
-                    parts=parts,
+                    parts={**parts, **zhcc_parts},
                     lr=float(optimizer.param_groups[0]["lr"]),
                 )
             if progress_bar is not None:
@@ -683,7 +662,13 @@ def run_epoch(
         if progress_bar is not None:
             progress_bar.close()
     elapsed = max(time.perf_counter() - start, 1e-9)
-    result = {key: value / max(1, n_batches) for key, value in totals.items()}
+    result = {}
+    for key, value in totals.items():
+        mean_value = value / max(1, n_batches)
+        if isinstance(mean_value, torch.Tensor):
+            result[key] = float(mean_value.detach().cpu())
+        else:
+            result[key] = float(mean_value)
     result["lr"] = float(optimizer.param_groups[0]["lr"])
     result["tiles_per_sec"] = n_tiles / elapsed
     result["tiles"] = float(n_tiles)
@@ -764,6 +749,7 @@ def fit(
     write_json(output_dir / "resolved_config.json", cfg)
     best_loss = float((resume_state or {}).get("best_loss", float("inf")))
     best_teacher_alignment = float((resume_state or {}).get("best_teacher_alignment", float("-inf")))
+    best_scientific_score = float((resume_state or {}).get("best_scientific_score", float("-inf")))
     best_metrics = dict((resume_state or {}).get("best_metrics", {}))
     start_epoch = int((resume_state or {}).get("epoch", 0)) + 1
     global_step = int((resume_state or {}).get("global_step", 0))
@@ -875,6 +861,10 @@ def fit(
                 if teacher_alignment_values
                 else float("-inf")
             )
+            scientific_score = (
+                (0.0 if not math.isfinite(teacher_alignment) else teacher_alignment)
+                - float(cfg["train"].get("scientific_score_zhcc_response_weight", 0.25)) * float(val_metrics["zhcc_proto"])
+            )
             loss_cfg = scheduled_loss_config(
                 cfg,
                 epoch=epoch,
@@ -903,6 +893,7 @@ def fit(
                 **{f"train_{k}": v for k, v in train_metrics.items()},
                 **{f"val_{k}": v for k, v in val_metrics.items()},
                 "teacher_alignment_score": 0.0 if not math.isfinite(teacher_alignment) else teacher_alignment,
+                "scientific_score": scientific_score,
                 **embedding_metrics,
                 **zhcc_metrics,
                 **prototype_bank_metrics,
@@ -918,6 +909,7 @@ def fit(
                 "global_step": global_step,
                 "best_loss": best_loss,
                 "best_teacher_alignment": best_teacher_alignment,
+                "best_scientific_score": best_scientific_score,
                 "best_metrics": best_metrics,
                 "rng_state": _rng_state(),
                 "schedule_state": schedule_state,
@@ -930,9 +922,7 @@ def fit(
             )
             if val_metrics["loss"] < best_loss:
                 best_loss = val_metrics["loss"]
-                best_metrics = row
                 checkpoint["best_loss"] = best_loss
-                checkpoint["best_metrics"] = best_metrics
                 torch.save(
                     checkpoint,
                     checkpoints / "best.pt",
@@ -943,6 +933,15 @@ def fit(
                 torch.save(
                     checkpoint,
                     checkpoints / "best_teacher_alignment.pt",
+                )
+            if scientific_score > best_scientific_score:
+                best_scientific_score = scientific_score
+                best_metrics = row
+                checkpoint["best_scientific_score"] = best_scientific_score
+                checkpoint["best_metrics"] = best_metrics
+                torch.save(
+                    checkpoint,
+                    checkpoints / "best_scientific_score.pt",
                 )
     finally:
         if writer is not None:

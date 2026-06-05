@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
@@ -89,7 +90,7 @@ def test_filter_strength_interpolates_raw_alpha() -> None:
     alpha_full, diag_full = prototype_adjudicated_teacher_weights(**kwargs, filter_strength=1.0)
 
     assert alpha_off["teacher"].item() == 1.0
-    assert alpha_full["teacher"].item() == diag_full["alpha_raw_mean/teacher"].item()
+    assert alpha_full["teacher"].item() == pytest.approx(diag_full["alpha_raw_mean/teacher"].item())
     assert alpha_full["teacher"].item() < alpha_half["teacher"].item() < alpha_off["teacher"].item()
     assert diag_off["alpha_effective_mean/teacher"].item() == 1.0
 

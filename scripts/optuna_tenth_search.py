@@ -149,23 +149,25 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
 
     cfg["data"]["train_tile_fraction"] = 0.10
     cfg["data"]["val_tile_fraction"] = 0.10
-    cfg["data"]["dynamic_package_sampling"] = True
-    cfg["data"]["tensor_collate"] = True
-    cfg["data"]["package_buffer_batches"] = 4
-    cfg["data"]["package_chunk_size"] = 64
+    cfg["data"]["num_workers"] = int(cfg["data"].get("num_workers", 16))
+    cfg["data"]["prefetch_factor"] = int(cfg["data"].get("prefetch_factor", 3))
+    cfg["data"]["persistent_workers"] = bool(cfg["data"].get("persistent_workers", True))
+    cfg["data"]["dynamic_package_sampling"] = bool(cfg["data"].get("dynamic_package_sampling", True))
+    cfg["data"]["tensor_collate"] = bool(cfg["data"].get("tensor_collate", True))
+    cfg["data"]["package_chunk_size"] = int(cfg["data"].get("package_chunk_size", 64))
 
     cfg["loss"]["relation_weight"] = 0.05
     cfg["loss"]["scale_relation_by_alpha"] = True
-    cfg["loss"]["semantic_weight"] = trial.suggest_categorical("semantic_weight", [0.0, 0.02, 0.05])
+    cfg["loss"]["semantic_weight"] = trial.suggest_categorical("semantic_weight", [0.02, 0.05])
     cfg["loss"]["zhcc_proto_weight"] = trial.suggest_categorical("zhcc_proto_weight", [0.10, 0.20, 0.30])
     cfg["loss"]["zhcc_level2_weight"] = 0.50
-    cfg["loss"]["prototype_filter_weight"] = trial.suggest_categorical("prototype_filter_weight", [0.0, 0.30, 0.50])
+    cfg["loss"]["prototype_filter_weight"] = trial.suggest_categorical("prototype_filter_weight", [0.30, 0.50])
     cfg["loss"]["prototype_filter_alpha_min"] = 0.25
     cfg["loss"]["consensus_weight"] = 0.5
     cfg["loss"]["prototype_label_weight"] = 0.5
     cfg["loss"]["prototype_l1_agreement_weight"] = 0.5
     cfg["loss"]["prototype_l2_agreement_weight"] = 0.5
-    cfg["loss"]["zhcc_response_weight"] = trial.suggest_categorical("zhcc_response_weight", [0.0, 0.15, 0.30])
+    cfg["loss"]["zhcc_response_weight"] = trial.suggest_categorical("zhcc_response_weight", [0.15, 0.30])
     cfg["loss"]["zhcc_primary_temperature"] = 0.10
     cfg["loss"]["zhcc_attribute_temperature"] = 0.10
     cfg["loss"]["min_teacher_warmup_steps"] = 1000
@@ -183,11 +185,17 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     cfg["train"]["max_grad_norm"] = 1.0
     cfg["train"]["max_val_batches"] = 256
     cfg["train"]["max_eval_batches"] = 64
-    cfg["train"]["prototype_image_batch_size"] = 128
+    cfg["train"]["dynamic_prototype_batch_size"] = 512
     cfg["train"]["log_interval"] = 0
     cfg["train"]["progress"] = "tqdm"
-    cfg["train"]["tensorboard"] = True
-    cfg["train"]["tensorboard_batch_interval"] = 50
+    cfg["train"]["tensorboard"] = False
+    cfg["train"]["tensorboard_batch_interval"] = 0
+    cfg["train"]["pipeline_profile_interval"] = int(cfg["train"].get("pipeline_profile_interval", 25))
+    cfg["train"]["batch_timing_interval"] = int(cfg["train"].get("batch_timing_interval", 0))
+    cfg["train"]["system_profile_interval"] = int(cfg["train"].get("system_profile_interval", 1))
+    cfg["train"]["batch_profile_csv"] = bool(cfg["train"].get("batch_profile_csv", True))
+    cfg["train"]["batch_profile_csv_interval"] = int(cfg["train"].get("batch_profile_csv_interval", 1))
+    cfg["train"]["system_profile_paths"] = cfg["train"].get("system_profile_paths", ["runtime"])
     return cfg
 
 
@@ -198,20 +206,19 @@ def score_row(row: dict[str, str], objective: str) -> float:
         except ValueError:
             return 0.0
 
-    def preferred(primary_key: str, fallback_key: str) -> float:
-        if primary_key in row and str(row.get(primary_key, "")).strip() != "":
-            return value(primary_key)
-        return value(fallback_key)
-
     teacher_alignment = value("teacher_alignment_score")
-    prototype_topk = preferred("prototype_bank_zhcc_prototype_topk_precision", "zhcc_prototype_topk_precision")
-    l1_acc = preferred("prototype_bank_zhcc_level1_accuracy", "zhcc_level1_accuracy")
-    l2_auc = preferred("prototype_bank_zhcc_level2_macro_auc", "zhcc_level2_macro_auc")
+    response_loss = value("val_zhcc_proto")
+    prototype_topk = value("zhcc_prototype_topk_precision")
+    l1_acc = value("zhcc_level1_accuracy")
+    l2_auc = value("zhcc_level2_macro_auc")
+    train_tiles_per_sec = value("train_tiles_per_sec")
     if objective == "teacher_alignment":
         return teacher_alignment
-    if objective == "prototype_qc":
-        return 0.40 * prototype_topk + 0.30 * l1_acc + 0.30 * l2_auc
-    return 0.70 * teacher_alignment + 0.10 * prototype_topk + 0.10 * l1_acc + 0.10 * l2_auc
+    if objective == "speed":
+        return train_tiles_per_sec
+    if objective in {"prototype_qc", "response_alignment"}:
+        return -response_loss
+    return teacher_alignment - 0.25 * response_loss
 
 
 def read_metric_rows(metrics_path: Path) -> list[dict[str, str]]:
@@ -247,15 +254,6 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=30)
 
 
-def run_command(command: list[str], env: dict[str, str], log_path: Path) -> None:
-    with log_path.open("a", encoding="utf-8") as log:
-        log.write("$ " + " ".join(command) + "\n")
-        log.flush()
-        completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, env=env, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(f"command failed returncode={completed.returncode}: {' '.join(command)}")
-
-
 def train_with_pruning(
     *,
     trial: optuna.Trial,
@@ -265,27 +263,11 @@ def train_with_pruning(
     repo: Path,
     poll_sec: float,
     objective: str,
-    preflight: bool,
 ) -> float:
     log_path = output_dir / "trial.log"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(repo / "src")
     env["PYTHONNOUSERSITE"] = "1"
-    if preflight:
-        run_command(
-            [
-                python_bin,
-                "-m",
-                "hcc_sempath.cli.main",
-                "preflight",
-                "--config",
-                str(cfg_path),
-                "--max-records",
-                "2048",
-            ],
-            env,
-            log_path,
-        )
     command = [python_bin, "-m", "hcc_sempath.cli.main", "train", "--config", str(cfg_path)]
     process = subprocess.Popen(
         command,
@@ -312,6 +294,8 @@ def train_with_pruning(
             best_score = max(best_score, score)
             trial.report(score, step=epoch)
             trial.set_user_attr(f"epoch_{epoch}_score", score)
+            trial.set_user_attr(f"epoch_{epoch}_train_tiles_per_sec", row.get("train_tiles_per_sec"))
+            trial.set_user_attr(f"epoch_{epoch}_val_tiles_per_sec", row.get("val_tiles_per_sec"))
             if trial.should_prune():
                 terminate_process(process)
                 raise optuna.TrialPruned(f"pruned at epoch={epoch} score={score:.6f}")
@@ -327,6 +311,8 @@ def train_with_pruning(
     trial.set_user_attr("output_dir", str(output_dir))
     trial.set_user_attr("final_epoch", rows[-1].get("epoch"))
     trial.set_user_attr("final_score", final_score)
+    trial.set_user_attr("final_train_tiles_per_sec", rows[-1].get("train_tiles_per_sec"))
+    trial.set_user_attr("final_val_tiles_per_sec", rows[-1].get("val_tiles_per_sec"))
     trial.set_user_attr("best_observed_score", best_score)
     return best_score
 
@@ -335,16 +321,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Optuna 1/10 HCC-SemPath hyperparameter search.")
     parser.add_argument("--base-config", default="configs/local/server/train_tenth.yaml")
     parser.add_argument("--study-name", default="hcc_sempath_tenth_pamtd")
-    parser.add_argument("--storage", default="sqlite:///runtime/runtime/optuna/hcc_sempath_tenth_pamtd.db")
-    parser.add_argument("--output-root", default="runtime/runtime/optuna_runs")
+    parser.add_argument("--storage", default="sqlite:///runtime/optuna/hcc_sempath_tenth_pamtd_response.db")
+    parser.add_argument("--output-root", default="runtime/optuna_runs")
     parser.add_argument("--annotation-json", default="")
-    parser.add_argument("--prototype-asset-dir", default="runtime/prototypes/hcc_annotation_final_3000")
+    parser.add_argument("--prototype-asset-dir", default="artifacts/prototypes/hcc_annotation_final_3000")
     parser.add_argument("--python", default="python")
     parser.add_argument("--n-trials", type=int, default=24)
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--poll-sec", type=float, default=20.0)
-    parser.add_argument("--objective", choices=["combined", "teacher_alignment", "prototype_qc"], default="combined")
-    parser.add_argument("--no-preflight", action="store_true")
+    parser.add_argument(
+        "--objective",
+        choices=["combined", "teacher_alignment", "response_alignment", "prototype_qc", "speed"],
+        default="combined",
+    )
     parser.add_argument("--sampler-seed", type=int, default=13)
     args = parser.parse_args()
 
@@ -397,7 +386,6 @@ def main() -> None:
             repo=repo,
             poll_sec=float(args.poll_sec),
             objective=str(args.objective),
-            preflight=not bool(args.no_preflight),
         )
 
     study.optimize(objective, n_trials=int(args.n_trials), gc_after_trial=True)

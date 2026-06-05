@@ -7,6 +7,166 @@ from ..modeling.models import normalized_prototype_logits
 from ..modeling.prototypes import PrototypeRegistry
 
 
+def _prototype_names(registry: PrototypeRegistry, indices: list[int]) -> list[str]:
+    return [registry.names[idx] for idx in indices]
+
+
+def _positions_for_names(
+    *,
+    registry: PrototypeRegistry,
+    source_indices: list[int],
+    target_names: list[str],
+    label: str,
+    device: torch.device,
+) -> torch.Tensor:
+    source_names = _prototype_names(registry, source_indices)
+    positions = {name: idx for idx, name in enumerate(source_names)}
+    missing = [name for name in target_names if name not in positions]
+    if missing:
+        raise ValueError(f"{label} prototype package is missing required prototype names: {missing}")
+    return torch.tensor([positions[name] for name in target_names], dtype=torch.long, device=device)
+
+
+def prototype_response(
+    features: torch.Tensor,
+    registry: PrototypeRegistry,
+    *,
+    primary_names: list[str],
+    attribute_names: list[str],
+    label: str,
+    primary_temperature: float = 0.1,
+    attribute_temperature: float = 0.1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if primary_temperature <= 0:
+        raise ValueError(f"primary_temperature must be positive, got {primary_temperature}")
+    if attribute_temperature <= 0:
+        raise ValueError(f"attribute_temperature must be positive, got {attribute_temperature}")
+    primary_logits = normalized_prototype_logits(features, registry.primary_prototypes) / float(primary_temperature)
+    primary_positions = _positions_for_names(
+        registry=registry,
+        source_indices=registry.primary_indices,
+        target_names=primary_names,
+        label=label,
+        device=features.device,
+    )
+    primary = F.softmax(primary_logits, dim=-1).index_select(dim=1, index=primary_positions)
+    if not attribute_names:
+        return primary, features.new_zeros((features.shape[0], 0))
+    attribute_logits = normalized_prototype_logits(features, registry.attribute_prototypes) / float(attribute_temperature)
+    attribute_positions = _positions_for_names(
+        registry=registry,
+        source_indices=registry.attribute_indices,
+        target_names=attribute_names,
+        label=label,
+        device=features.device,
+    )
+    attributes = torch.sigmoid(attribute_logits).index_select(dim=1, index=attribute_positions)
+    return primary, attributes
+
+
+@torch.no_grad()
+def teacher_semantic_response_target(
+    *,
+    teacher_by_name: dict[str, torch.Tensor],
+    prototypes_by_teacher: dict[str, PrototypeRegistry],
+    target_registry: PrototypeRegistry,
+    teacher_weights: dict[str, float] | None = None,
+    teacher_sample_weights: dict[str, torch.Tensor] | None = None,
+    primary_temperature: float = 0.1,
+    attribute_temperature: float = 0.1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if set(teacher_by_name) != set(prototypes_by_teacher):
+        raise ValueError(
+            f"teacher/prototype names differ: teacher={sorted(teacher_by_name)} "
+            f"prototypes={sorted(prototypes_by_teacher)}"
+        )
+    if teacher_sample_weights is not None and set(teacher_sample_weights) != set(teacher_by_name):
+        raise ValueError(
+            f"teacher_sample_weights must match teachers: "
+            f"weights={sorted(teacher_sample_weights)} teachers={sorted(teacher_by_name)}"
+        )
+    primary_names = _prototype_names(target_registry, target_registry.primary_indices)
+    attribute_names = _prototype_names(target_registry, target_registry.attribute_indices)
+    primary_sum = None
+    attribute_sum = None
+    weight_sum = None
+    for name in sorted(teacher_by_name):
+        base_weight = float((teacher_weights or {}).get(name, 1.0))
+        if base_weight <= 0:
+            continue
+        primary, attributes = prototype_response(
+            teacher_by_name[name],
+            prototypes_by_teacher[name],
+            primary_names=primary_names,
+            attribute_names=attribute_names,
+            label=name,
+            primary_temperature=primary_temperature,
+            attribute_temperature=attribute_temperature,
+        )
+        sample_weight = teacher_sample_weights.get(name) if teacher_sample_weights is not None else None
+        if sample_weight is None:
+            weight = primary.new_full((primary.shape[0], 1), base_weight)
+        else:
+            weight = sample_weight.to(device=primary.device, dtype=primary.dtype).view(-1, 1) * base_weight
+        primary_sum = primary * weight if primary_sum is None else primary_sum + primary * weight
+        attribute_sum = attributes * weight if attribute_sum is None else attribute_sum + attributes * weight
+        weight_sum = weight if weight_sum is None else weight_sum + weight
+    if primary_sum is None or attribute_sum is None or weight_sum is None:
+        raise ValueError("at least one teacher must have a positive loss weight")
+    denom = weight_sum.clamp_min(1e-6)
+    primary_target = primary_sum / denom
+    primary_target = primary_target / primary_target.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    attribute_target = attribute_sum / denom
+    return primary_target, attribute_target.clamp(0.0, 1.0)
+
+
+def zhcc_response_distillation_loss(
+    *,
+    embedding_norm: torch.Tensor,
+    prototypes: PrototypeRegistry,
+    target_primary: torch.Tensor,
+    target_attributes: torch.Tensor,
+    primary_temperature: float = 0.1,
+    attribute_temperature: float = 0.1,
+    level2_weight: float = 0.5,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if primary_temperature <= 0:
+        raise ValueError(f"primary_temperature must be positive, got {primary_temperature}")
+    if attribute_temperature <= 0:
+        raise ValueError(f"attribute_temperature must be positive, got {attribute_temperature}")
+    primary_logits = normalized_prototype_logits(embedding_norm, prototypes.primary_prototypes) / float(primary_temperature)
+    if target_primary.shape != primary_logits.shape:
+        raise ValueError(f"target_primary shape mismatch: target={tuple(target_primary.shape)} logits={tuple(primary_logits.shape)}")
+    l1 = (
+        F.kl_div(
+            F.log_softmax(primary_logits, dim=-1),
+            target_primary.to(device=embedding_norm.device, dtype=embedding_norm.dtype),
+            reduction="batchmean",
+        )
+        * (float(primary_temperature) ** 2)
+    )
+    if prototypes.attribute_indices:
+        attribute_logits = normalized_prototype_logits(embedding_norm, prototypes.attribute_prototypes) / float(attribute_temperature)
+        if target_attributes.shape != attribute_logits.shape:
+            raise ValueError(
+                f"target_attributes shape mismatch: target={tuple(target_attributes.shape)} "
+                f"logits={tuple(attribute_logits.shape)}"
+            )
+        l2 = F.binary_cross_entropy_with_logits(
+            attribute_logits,
+            target_attributes.to(device=embedding_norm.device, dtype=embedding_norm.dtype),
+        ) * (float(attribute_temperature) ** 2)
+    else:
+        l2 = embedding_norm.new_zeros(())
+    total = l1 + float(level2_weight) * l2
+    return total, {
+        "zhcc_proto": total.detach(),
+        "zhcc_response": total.detach(),
+        "zhcc_l1": l1.detach(),
+        "zhcc_l2": l2.detach(),
+    }
+
+
 def zhcc_prototype_loss(
     embedding_norm: torch.Tensor,
     prototype_mask: torch.Tensor,
