@@ -198,8 +198,15 @@ class _PackageShuffleBatchLoader:
                 yield item
         finally:
             stop_event.set()
-            reader_thread.join(timeout=1.0)
-            collation_thread.join(timeout=1.0)
+            reader_thread.join()
+            collation_thread.join()
+            with buffer_lock:
+                buffer.clear()
+            while not ready_queue.empty():
+                try:
+                    ready_queue.get_nowait()
+                except Exception:
+                    break
 
     def __len__(self) -> int:
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
