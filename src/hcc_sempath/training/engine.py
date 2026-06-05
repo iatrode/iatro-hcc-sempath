@@ -440,6 +440,7 @@ def run_epoch(
     summary_writer=None,
     collect_embeddings: bool = False,
     max_eval_batches: int | None = None,
+    prefetched_iterator=None,
 ) -> dict[str, float] | tuple[dict[str, float], tuple]:
     model.train(train)
     schedule_state = _ensure_schedule_state(schedule_state)
@@ -484,21 +485,21 @@ def run_epoch(
             "students_by_teacher": {},
             "teachers_by_name": {},
         }
-    iterator = iter(loader)
+    iterator = prefetched_iterator if prefetched_iterator is not None else iter(loader)
     progress_total = len(loader)
     if max_batches is not None:
         progress_total = min(progress_total, int(max_batches))
     progress_bar = _build_progress_bar(cfg, phase=phase, epoch=epoch, total=progress_total)
     try:
         while True:
+            if max_batches is not None and n_batches >= int(max_batches):
+                break
             data_wait_start = time.perf_counter()
             try:
                 batch = next(iterator)
             except StopIteration:
                 break
             data_wait = time.perf_counter() - data_wait_start
-            if max_batches is not None and n_batches >= max_batches:
-                break
             will_log = (
                 progress_bar is None
                 and log_interval > 0
@@ -704,6 +705,9 @@ def run_epoch(
                 interval_start = now
                 interval_tiles = 0
     finally:
+        close_iterator = getattr(iterator, "close", None)
+        if callable(close_iterator):
+            close_iterator()
         if progress_bar is not None:
             progress_bar.close()
     elapsed = max(time.perf_counter() - start, 1e-9)
@@ -820,6 +824,7 @@ def fit(
         "zhcc": zhcc_prototypes,
         "last_refresh_step": (resume_state or {}).get("zhcc_dynamic_prototype_step"),
     }
+    prefetched_train_iterator = None
     try:
         for epoch in range(start_epoch, int(cfg["train"]["epochs"]) + 1):
             train_metrics = run_epoch(
@@ -840,36 +845,48 @@ def fit(
                 global_step=global_step,
                 schedule_state=schedule_state,
                 summary_writer=writer,
+                prefetched_iterator=prefetched_train_iterator,
             )
+            prefetched_train_iterator = None
             global_step = int(train_metrics["global_step_end"])
-            _maybe_refresh_dynamic_prototypes(
-                model=model,
-                cfg=cfg,
-                device=device,
-                zhcc_image_bank=zhcc_image_bank,
-                prototype_state=zhcc_prototype_state,
-                global_step=global_step,
-                needed=zhcc_image_bank is not None,
-            )
-            val_metrics, val_embeddings = run_epoch(
-                model,
-                val_loader,
-                prototypes,
-                optimizer,
-                device,
-                cfg,
-                train=False,
-                max_batches=cfg["train"].get("max_val_batches"),
-                zhcc_prototypes=zhcc_prototype_state.get("zhcc", zhcc_prototypes),
-                zhcc_image_bank=zhcc_image_bank,
-                zhcc_prototype_state=zhcc_prototype_state,
-                epoch=epoch,
-                global_step=global_step,
-                schedule_state=schedule_state,
-                summary_writer=writer,
-                collect_embeddings=True,
-                max_eval_batches=cfg["train"].get("max_eval_batches", cfg["train"].get("max_val_batches")),
-            )
+            val_iterator = iter(val_loader)
+            try:
+                _maybe_refresh_dynamic_prototypes(
+                    model=model,
+                    cfg=cfg,
+                    device=device,
+                    zhcc_image_bank=zhcc_image_bank,
+                    prototype_state=zhcc_prototype_state,
+                    global_step=global_step,
+                    needed=zhcc_image_bank is not None,
+                )
+                val_metrics, val_embeddings = run_epoch(
+                    model,
+                    val_loader,
+                    prototypes,
+                    optimizer,
+                    device,
+                    cfg,
+                    train=False,
+                    max_batches=cfg["train"].get("max_val_batches"),
+                    zhcc_prototypes=zhcc_prototype_state.get("zhcc", zhcc_prototypes),
+                    zhcc_image_bank=zhcc_image_bank,
+                    zhcc_prototype_state=zhcc_prototype_state,
+                    epoch=epoch,
+                    global_step=global_step,
+                    schedule_state=schedule_state,
+                    summary_writer=writer,
+                    collect_embeddings=True,
+                    max_eval_batches=cfg["train"].get("max_eval_batches", cfg["train"].get("max_val_batches")),
+                    prefetched_iterator=val_iterator,
+                )
+                val_iterator = None
+            finally:
+                close_val_iterator = getattr(val_iterator, "close", None)
+                if callable(close_val_iterator):
+                    close_val_iterator()
+            if epoch < int(cfg["train"]["epochs"]):
+                prefetched_train_iterator = iter(train_loader)
             current_zhcc_prototypes = zhcc_prototype_state.get("zhcc", zhcc_prototypes)
             embeddings, student_by_teacher, teacher_by_name, prototype_labels = val_embeddings
             cpu_prototypes = {name: registry.to("cpu") for name, registry in prototypes.items()} if prototypes else None
@@ -1004,6 +1021,9 @@ def fit(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
     finally:
+        close_prefetched_train = getattr(prefetched_train_iterator, "close", None)
+        if callable(close_prefetched_train):
+            close_prefetched_train()
         if writer is not None:
             writer.close()
     write_json(output_dir / "summary.json", best_metrics)
