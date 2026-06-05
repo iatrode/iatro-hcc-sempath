@@ -158,6 +158,7 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     l2_agreement_share = trial.suggest_categorical("prototype_l2_agreement_share", [0.4, 0.5, 0.6])
     cfg["loss"]["relation_weight"] = trial.suggest_categorical("relation_weight", [0.02, 0.05, 0.08])
     cfg["loss"]["scale_relation_by_alpha"] = True
+    cfg["loss"]["semantic_weight"] = trial.suggest_categorical("semantic_weight", [0.0, 0.02, 0.05, 0.10])
     cfg["loss"]["zhcc_proto_weight"] = trial.suggest_categorical("zhcc_proto_weight", [0.10, 0.20, 0.30])
     cfg["loss"]["zhcc_level2_weight"] = trial.suggest_categorical("zhcc_level2_weight", [0.35, 0.50, 0.65])
     cfg["loss"]["prototype_filter_weight"] = trial.suggest_categorical("prototype_filter_weight", [0.30, 0.50, 0.70])
@@ -166,7 +167,7 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     cfg["loss"]["prototype_label_weight"] = float(prototype_label_share)
     cfg["loss"]["prototype_l1_agreement_weight"] = round(1.0 - float(l2_agreement_share), 6)
     cfg["loss"]["prototype_l2_agreement_weight"] = float(l2_agreement_share)
-    cfg["loss"]["zhcc_response_weight"] = 0.0
+    cfg["loss"]["zhcc_response_weight"] = trial.suggest_categorical("zhcc_response_weight", [0.0, 0.15, 0.30])
     cfg["loss"]["zhcc_primary_temperature"] = trial.suggest_categorical("zhcc_primary_temperature", [0.07, 0.10, 0.15])
     cfg["loss"]["zhcc_attribute_temperature"] = trial.suggest_categorical("zhcc_attribute_temperature", [0.07, 0.10, 0.15])
     cfg["loss"]["min_teacher_warmup_steps"] = 1000
