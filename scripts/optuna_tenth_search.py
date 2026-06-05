@@ -151,25 +151,23 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     cfg["data"]["val_tile_fraction"] = 0.10
     cfg["data"]["dynamic_package_sampling"] = True
     cfg["data"]["tensor_collate"] = True
-    cfg["data"]["package_buffer_batches"] = trial.suggest_categorical("package_buffer_batches", [4, 6, 8])
-    cfg["data"]["package_chunk_size"] = trial.suggest_categorical("package_chunk_size", [32, 64, 96])
+    cfg["data"]["package_buffer_batches"] = 4
+    cfg["data"]["package_chunk_size"] = 64
 
-    prototype_label_share = trial.suggest_categorical("prototype_label_share", [0.35, 0.45, 0.55, 0.65])
-    l2_agreement_share = trial.suggest_categorical("prototype_l2_agreement_share", [0.4, 0.5, 0.6])
-    cfg["loss"]["relation_weight"] = trial.suggest_categorical("relation_weight", [0.02, 0.05, 0.08])
+    cfg["loss"]["relation_weight"] = 0.05
     cfg["loss"]["scale_relation_by_alpha"] = True
-    cfg["loss"]["semantic_weight"] = trial.suggest_categorical("semantic_weight", [0.0, 0.02, 0.05, 0.10])
+    cfg["loss"]["semantic_weight"] = trial.suggest_categorical("semantic_weight", [0.0, 0.02, 0.05])
     cfg["loss"]["zhcc_proto_weight"] = trial.suggest_categorical("zhcc_proto_weight", [0.10, 0.20, 0.30])
-    cfg["loss"]["zhcc_level2_weight"] = trial.suggest_categorical("zhcc_level2_weight", [0.35, 0.50, 0.65])
-    cfg["loss"]["prototype_filter_weight"] = trial.suggest_categorical("prototype_filter_weight", [0.30, 0.50, 0.70])
-    cfg["loss"]["prototype_filter_alpha_min"] = trial.suggest_categorical("prototype_filter_alpha_min", [0.15, 0.25, 0.35])
-    cfg["loss"]["consensus_weight"] = round(1.0 - float(prototype_label_share), 6)
-    cfg["loss"]["prototype_label_weight"] = float(prototype_label_share)
-    cfg["loss"]["prototype_l1_agreement_weight"] = round(1.0 - float(l2_agreement_share), 6)
-    cfg["loss"]["prototype_l2_agreement_weight"] = float(l2_agreement_share)
+    cfg["loss"]["zhcc_level2_weight"] = 0.50
+    cfg["loss"]["prototype_filter_weight"] = trial.suggest_categorical("prototype_filter_weight", [0.0, 0.30, 0.50])
+    cfg["loss"]["prototype_filter_alpha_min"] = 0.25
+    cfg["loss"]["consensus_weight"] = 0.5
+    cfg["loss"]["prototype_label_weight"] = 0.5
+    cfg["loss"]["prototype_l1_agreement_weight"] = 0.5
+    cfg["loss"]["prototype_l2_agreement_weight"] = 0.5
     cfg["loss"]["zhcc_response_weight"] = trial.suggest_categorical("zhcc_response_weight", [0.0, 0.15, 0.30])
-    cfg["loss"]["zhcc_primary_temperature"] = trial.suggest_categorical("zhcc_primary_temperature", [0.07, 0.10, 0.15])
-    cfg["loss"]["zhcc_attribute_temperature"] = trial.suggest_categorical("zhcc_attribute_temperature", [0.07, 0.10, 0.15])
+    cfg["loss"]["zhcc_primary_temperature"] = 0.10
+    cfg["loss"]["zhcc_attribute_temperature"] = 0.10
     cfg["loss"]["min_teacher_warmup_steps"] = 1000
     cfg["loss"]["max_teacher_warmup_steps"] = 4000
     cfg["loss"]["teacher_prior_plateau_window_steps"] = 500
@@ -180,11 +178,12 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     cfg["train"]["batch_size"] = int(cfg["train"].get("batch_size", 512))
     cfg["train"]["epochs"] = int(epochs)
     cfg["train"]["warmup_epochs"] = 1
-    cfg["train"]["lr"] = trial.suggest_categorical("lr", [5e-5, 1e-4, 2e-4])
-    cfg["train"]["weight_decay"] = trial.suggest_categorical("weight_decay", [0.005, 0.01, 0.02])
+    cfg["train"]["lr"] = 1e-4
+    cfg["train"]["weight_decay"] = 0.01
     cfg["train"]["max_grad_norm"] = 1.0
     cfg["train"]["max_val_batches"] = 256
     cfg["train"]["max_eval_batches"] = 64
+    cfg["train"]["prototype_image_batch_size"] = 128
     cfg["train"]["log_interval"] = 0
     cfg["train"]["progress"] = "tqdm"
     cfg["train"]["tensorboard"] = True
@@ -199,10 +198,15 @@ def score_row(row: dict[str, str], objective: str) -> float:
         except ValueError:
             return 0.0
 
+    def preferred(primary_key: str, fallback_key: str) -> float:
+        if primary_key in row and str(row.get(primary_key, "")).strip() != "":
+            return value(primary_key)
+        return value(fallback_key)
+
     teacher_alignment = value("teacher_alignment_score")
-    prototype_topk = value("prototype_bank_zhcc_prototype_topk_precision") or value("zhcc_prototype_topk_precision")
-    l1_acc = value("prototype_bank_zhcc_level1_accuracy") or value("zhcc_level1_accuracy")
-    l2_auc = value("prototype_bank_zhcc_level2_macro_auc") or value("zhcc_level2_macro_auc")
+    prototype_topk = preferred("prototype_bank_zhcc_prototype_topk_precision", "zhcc_prototype_topk_precision")
+    l1_acc = preferred("prototype_bank_zhcc_level1_accuracy", "zhcc_level1_accuracy")
+    l2_auc = preferred("prototype_bank_zhcc_level2_macro_auc", "zhcc_level2_macro_auc")
     if objective == "teacher_alignment":
         return teacher_alignment
     if objective == "prototype_qc":

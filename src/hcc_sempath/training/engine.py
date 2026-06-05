@@ -425,6 +425,9 @@ def run_epoch(
         "zhcc_proto": 0.0,
         "zhcc_l1": 0.0,
         "zhcc_l2": 0.0,
+        "zhcc_bank_proto": 0.0,
+        "zhcc_bank_l1": 0.0,
+        "zhcc_bank_l2": 0.0,
     }
     n_batches = 0
     n_tiles = 0
@@ -553,7 +556,47 @@ def run_epoch(
                         loss.new_zeros(()),
                         {"zhcc_proto": loss.new_zeros(()), "zhcc_l1": loss.new_zeros(()), "zhcc_l2": loss.new_zeros(())},
                     )
-                    loss = loss + float(loss_cfg["zhcc_proto_weight"]) * zhcc_loss
+                    bank_parts = {
+                        "zhcc_bank_proto": loss.new_zeros(()),
+                        "zhcc_bank_l1": loss.new_zeros(()),
+                        "zhcc_bank_l2": loss.new_zeros(()),
+                    }
+                    bank_loss = loss.new_zeros(())
+                    if (
+                        train
+                        and zhcc_image_bank is not None
+                        and active_zhcc_prototypes is not None
+                        and float(loss_cfg["zhcc_proto_weight"]) > 0
+                    ):
+                        bank_batch_size = int(cfg["train"].get("prototype_image_batch_size", cfg["train"].get("batch_size", 512)))
+                        bank_images, bank_level1, bank_level2 = zhcc_image_bank.sample_batch(
+                            batch_size=bank_batch_size,
+                            seed=int(cfg["runtime"].get("seed", 13)) + int(global_step),
+                        )
+                        bank_outputs = model(
+                            _prepare_images(
+                                {"images": bank_images, "images_uint8": True},
+                                cfg,
+                                device,
+                            )
+                        )
+                        bank_mask = torch.ones(bank_images.shape[0], dtype=torch.bool, device=device)
+                        bank_loss, raw_bank_parts = zhcc_prototype_loss(
+                            embedding_norm=bank_outputs["embedding_norm"],
+                            prototype_mask=bank_mask,
+                            prototype_level1=bank_level1.to(device),
+                            prototype_level2=bank_level2.to(device),
+                            prototypes=active_zhcc_prototypes,
+                            level2_weight=float(loss_cfg["zhcc_level2_weight"]),
+                            primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
+                            attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
+                        )
+                        bank_parts = {
+                            "zhcc_bank_proto": raw_bank_parts["zhcc_proto"],
+                            "zhcc_bank_l1": raw_bank_parts["zhcc_l1"],
+                            "zhcc_bank_l2": raw_bank_parts["zhcc_l2"],
+                        }
+                    loss = loss + float(loss_cfg["zhcc_proto_weight"]) * (zhcc_loss + bank_loss)
                 if train:
                     optimizer.zero_grad(set_to_none=True)
                     if scaler is not None and scaler.is_enabled():
@@ -585,6 +628,8 @@ def run_epoch(
                 totals[key] += float(parts[key].cpu())
             for key in ("zhcc_proto", "zhcc_l1", "zhcc_l2"):
                 totals[key] += float(zhcc_parts[key].detach().cpu())
+            for key in ("zhcc_bank_proto", "zhcc_bank_l1", "zhcc_bank_l2"):
+                totals[key] += float(bank_parts[key].detach().cpu())
             for key, value in alpha_diag.items():
                 totals.setdefault(key, 0.0)
                 totals[key] += float(value.detach().cpu())

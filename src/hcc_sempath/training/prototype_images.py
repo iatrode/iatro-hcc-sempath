@@ -45,6 +45,18 @@ class PrototypeImageBank:
             source={"kind": "prototype_image_label_contract", **dict(self.source or {})},
         )
 
+    def sample_batch(self, *, batch_size: int, seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        count = self.count
+        take = min(max(1, int(batch_size)), count)
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed))
+        indices = torch.randperm(count, generator=generator)[:take]
+        return (
+            self.images.index_select(0, indices),
+            self.level1.index_select(0, indices),
+            self.level2.index_select(0, indices),
+        )
+
 
 def load_prototype_image_bank(path: str | Path) -> PrototypeImageBank:
     payload = torch.load(Path(path), map_location="cpu")

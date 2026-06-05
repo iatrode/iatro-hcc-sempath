@@ -85,3 +85,4 @@ train:
   topk: 10
   max_val_batches: 512
   max_eval_batches: 128
+  prototype_image_batch_size: 256
