@@ -101,7 +101,7 @@ def update_plateau_schedule_state(
     schedule_state: dict,
     *,
     global_step: int,
-    teacher_prior_loss: float,
+    teacher_prior_loss: torch.Tensor | float,
 ) -> dict:
     loss_cfg = cfg["loss"]
     schedule_state = _ensure_schedule_state(schedule_state)
@@ -113,15 +113,28 @@ def update_plateau_schedule_state(
         _set_intervention_steps(cfg, schedule_state, global_step)
         return schedule_state
 
-    schedule_state["teacher_prior_window_loss_sum"] = (
-        float(schedule_state.get("teacher_prior_window_loss_sum") or 0.0) + float(teacher_prior_loss)
-    )
+    current_sum = schedule_state.get("teacher_prior_window_loss_sum")
+    if isinstance(teacher_prior_loss, torch.Tensor):
+        if current_sum is None or isinstance(current_sum, float):
+            current_sum = torch.zeros((), device=teacher_prior_loss.device)
+        elif current_sum.device != teacher_prior_loss.device:
+            current_sum = current_sum.to(teacher_prior_loss.device)
+        schedule_state["teacher_prior_window_loss_sum"] = current_sum + teacher_prior_loss.detach()
+    else:
+        schedule_state["teacher_prior_window_loss_sum"] = float(current_sum or 0.0) + float(teacher_prior_loss)
+
     schedule_state["teacher_prior_window_count"] = int(schedule_state.get("teacher_prior_window_count") or 0) + 1
     window_steps = max(1, int(loss_cfg.get("teacher_prior_plateau_window_steps", 1000)))
     if int(schedule_state["teacher_prior_window_count"]) < window_steps:
         return schedule_state
 
-    window_mean = float(schedule_state["teacher_prior_window_loss_sum"]) / float(schedule_state["teacher_prior_window_count"])
+    window_sum = schedule_state["teacher_prior_window_loss_sum"]
+    if isinstance(window_sum, torch.Tensor):
+        window_sum_val = float(window_sum.cpu())
+    else:
+        window_sum_val = float(window_sum)
+
+    window_mean = window_sum_val / float(schedule_state["teacher_prior_window_count"])
     beta = float(loss_cfg.get("teacher_prior_ema_beta", 0.9))
     current_ema = schedule_state.get("teacher_prior_loss_ema")
     if current_ema is None:
@@ -130,7 +143,11 @@ def update_plateau_schedule_state(
         current_ema = beta * float(current_ema) + (1.0 - beta) * window_mean
     prev_ema = schedule_state.get("teacher_prior_prev_window_ema")
     schedule_state["teacher_prior_loss_ema"] = float(current_ema)
-    schedule_state["teacher_prior_window_loss_sum"] = 0.0
+    
+    if isinstance(teacher_prior_loss, torch.Tensor):
+        schedule_state["teacher_prior_window_loss_sum"] = torch.zeros((), device=teacher_prior_loss.device)
+    else:
+        schedule_state["teacher_prior_window_loss_sum"] = 0.0
     schedule_state["teacher_prior_window_count"] = 0
 
     if prev_ema is not None:
@@ -167,7 +184,11 @@ def intervention_stage(cfg: dict, global_step: int, schedule_state: dict | None)
 
 
 def _log(message: str) -> None:
-    print(message, flush=True)
+    try:
+        from tqdm.auto import tqdm
+        tqdm.write(message)
+    except ImportError:
+        print(message, flush=True)
 
 
 def _cuda_memory_mb(device: torch.device) -> float:
@@ -595,9 +616,7 @@ def run_epoch(
                     if scheduler is not None:
                         scheduler.step()
                     global_step += 1
-                    teacher_prior_loss = float(parts["feature"].detach().cpu()) + float(loss_cfg["relation_weight"]) * float(
-                        parts["relation"].detach().cpu()
-                    )
+                    teacher_prior_loss = parts["feature"].detach() + float(loss_cfg["relation_weight"]) * parts["relation"].detach()
                     update_plateau_schedule_state(
                         cfg,
                         schedule_state,
@@ -628,14 +647,13 @@ def run_epoch(
                     lr=float(optimizer.param_groups[0]["lr"]),
                 )
             if progress_bar is not None:
-                elapsed = max(time.perf_counter() - start, 1e-9)
-                progress_bar.set_postfix(
-                    loss=f"{float(loss.detach().cpu()):.4f}",
-                    tiles_s=f"{n_tiles / elapsed:.0f}",
-                    data=f"{data_wait:.2f}s",
-                    prep=f"{image_prepare:.2f}s",
-                    mem=f"{_cuda_memory_mb(device):.0f}MB",
-                )
+                if n_batches % 10 == 0 or n_batches == progress_total:
+                    elapsed = max(time.perf_counter() - start, 1e-9)
+                    progress_bar.set_postfix(
+                        loss=f"{float(loss.detach().cpu()):.4f}",
+                        tiles_s=f"{n_tiles / elapsed:.0f}",
+                        refresh=False,
+                    )
                 progress_bar.update(1)
             if will_log:
                 if device.type == "cuda":
@@ -943,6 +961,8 @@ def fit(
                     checkpoint,
                     checkpoints / "best_scientific_score.pt",
                 )
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
     finally:
         if writer is not None:
             writer.close()

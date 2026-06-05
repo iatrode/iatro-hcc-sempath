@@ -5,6 +5,7 @@ from bisect import bisect_right
 from dataclasses import dataclass, replace
 from pathlib import Path
 from collections.abc import Iterator
+import threading
 
 import torch
 import numpy as np
@@ -305,15 +306,16 @@ class DistillationTileDataset(Dataset):
             resize=True,
         )
         self.prototype_labels = prototype_labels or {}
+        self._thread_local = threading.local()
 
     def _packaged_reader(self, package_path: Path) -> TilePackageReader:
-        if self.active_package_path != package_path:
-            if self.active_package_reader is not None:
-                self.active_package_reader.close()
-            self.active_package_path = package_path
-            self.active_package_reader = TilePackageReader(package_path)
-        assert self.active_package_reader is not None
-        return self.active_package_reader
+        if not hasattr(self._thread_local, "readers"):
+            self._thread_local.readers = {}
+        reader = self._thread_local.readers.get(package_path)
+        if reader is None:
+            reader = TilePackageReader(package_path)
+            self._thread_local.readers[package_path] = reader
+        return reader
 
     def __len__(self) -> int:
         return len(self.records)
@@ -354,6 +356,12 @@ class DistillationTileDataset(Dataset):
             self.active_package_path = None
         for reader in getattr(self, "feature_readers", {}).values():
             reader.close()
+        if getattr(self, "_thread_local", None) is not None:
+            readers = getattr(self._thread_local, "readers", None)
+            if readers:
+                for reader in readers.values():
+                    reader.close()
+                self._thread_local.readers = {}
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
@@ -363,6 +371,7 @@ class DistillationTileDataset(Dataset):
         state["feature_readers"] = {
             name: _FeatureReaderSet(paths) for name, paths in self.teacher_package_paths.items()
         }
+        state["_thread_local"] = None
         return state
 
     def __del__(self) -> None:
@@ -423,6 +432,7 @@ class PackageSampledDistillationDataset(Dataset):
         self.tensor_collate = bool(tensor_collate)
         self.mean_tensor = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1) if mean is not None else None
         self.std_tensor = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1) if std is not None else None
+        self._thread_local = threading.local()
 
     def _package_sample_counts(self, sample_count: int, rng: np.random.Generator) -> list[int]:
         if sample_count >= self.total_records:
@@ -537,31 +547,39 @@ class PackageSampledDistillationDataset(Dataset):
                 yield package_idx, per_package_chunks[package_idx][chunk_idx]
 
     def read_package_rows(self, package_idx: int, rows: np.ndarray) -> list[dict]:
-        tile_reader = TilePackageReader(self.tile_paths[package_idx])
-        feature_readers = {
-            name: FeatureCacheReader(paths[package_idx])
-            for name, paths in self.teacher_package_paths.items()
-        }
-        try:
-            samples = []
-            for row in sorted(int(row) for row in rows):
-                samples.append(
-                    {
-                        "_package_idx": package_idx,
-                        "tile_id": tile_reader.tile_id_at(row),
-                        "image": tile_reader.read_array_at(row),
-                        "teacher_features": {
-                            name: reader.read_feature_at(row)
-                            for name, reader in feature_readers.items()
-                        },
-                        **_prototype_payload(tile_reader.tile_id_at(row), self.prototype_labels),
-                    }
-                )
-            return samples
-        finally:
-            tile_reader.close()
-            for reader in feature_readers.values():
-                reader.close()
+        if not hasattr(self._thread_local, "readers"):
+            self._thread_local.readers = {}
+
+        tile_path = self.tile_paths[package_idx]
+        tile_reader = self._thread_local.readers.get(tile_path)
+        if tile_reader is None:
+            tile_reader = TilePackageReader(tile_path)
+            self._thread_local.readers[tile_path] = tile_reader
+
+        feature_readers = {}
+        for name, paths in self.teacher_package_paths.items():
+            feat_path = paths[package_idx]
+            feat_reader = self._thread_local.readers.get(feat_path)
+            if feat_reader is None:
+                feat_reader = FeatureCacheReader(feat_path)
+                self._thread_local.readers[feat_path] = feat_reader
+            feature_readers[name] = feat_reader
+
+        samples = []
+        for row in sorted(int(row) for row in rows):
+            samples.append(
+                {
+                    "_package_idx": package_idx,
+                    "tile_id": tile_reader.tile_id_at(row),
+                    "image": tile_reader.read_array_at(row),
+                    "teacher_features": {
+                        name: reader.read_feature_at(row)
+                        for name, reader in feature_readers.items()
+                    },
+                    **_prototype_payload(tile_reader.tile_id_at(row), self.prototype_labels),
+                }
+            )
+        return samples
 
     def _tile_reader(self, package_idx: int) -> TilePackageReader:
         self._activate_package(package_idx)
@@ -617,34 +635,42 @@ class PackageSampledDistillationDataset(Dataset):
         }
 
     def __getitems__(self, indices: list[int]) -> list[dict]:
+        if not hasattr(self._thread_local, "readers"):
+            self._thread_local.readers = {}
+
         results: list[dict | None] = [None for _ in indices]
         by_package: dict[int, list[tuple[int, int]]] = {}
         for out_idx, index in enumerate(indices):
             package_idx, row = self._locate_sample(index)
             by_package.setdefault(package_idx, []).append((out_idx, row))
         for package_idx, items in by_package.items():
-            tile_reader = TilePackageReader(self.tile_paths[package_idx])
-            feature_readers = {
-                name: FeatureCacheReader(paths[package_idx])
-                for name, paths in self.teacher_package_paths.items()
-            }
-            try:
-                for out_idx, row in sorted(items, key=lambda item: item[1]):
-                    tile_id = tile_reader.tile_id_at(row)
-                    image = tile_reader.read_array_at(row)
-                    results[out_idx] = {
-                        "tile_id": tile_id,
-                        "image": image,
-                        "teacher_features": {
-                            name: reader.read_feature_at(row)
-                            for name, reader in feature_readers.items()
-                        },
-                        **_prototype_payload(tile_id, self.prototype_labels),
-                    }
-            finally:
-                tile_reader.close()
-                for reader in feature_readers.values():
-                    reader.close()
+            tile_path = self.tile_paths[package_idx]
+            tile_reader = self._thread_local.readers.get(tile_path)
+            if tile_reader is None:
+                tile_reader = TilePackageReader(tile_path)
+                self._thread_local.readers[tile_path] = tile_reader
+
+            feature_readers = {}
+            for name, paths in self.teacher_package_paths.items():
+                feat_path = paths[package_idx]
+                feat_reader = self._thread_local.readers.get(feat_path)
+                if feat_reader is None:
+                    feat_reader = FeatureCacheReader(feat_path)
+                    self._thread_local.readers[feat_path] = feat_reader
+                feature_readers[name] = feat_reader
+
+            for out_idx, row in sorted(items, key=lambda item: item[1]):
+                tile_id = tile_reader.tile_id_at(row)
+                image = tile_reader.read_array_at(row)
+                results[out_idx] = {
+                    "tile_id": tile_id,
+                    "image": image,
+                    "teacher_features": {
+                        name: reader.read_feature_at(row)
+                        for name, reader in feature_readers.items()
+                    },
+                    **_prototype_payload(tile_id, self.prototype_labels),
+                }
         return [item for item in results if item is not None]
 
     def collate(self, batch: list[dict]) -> dict:
@@ -679,12 +705,19 @@ class PackageSampledDistillationDataset(Dataset):
         self.active_package_idx = None
         self.active_tile_reader = None
         self.active_feature_readers = {}
+        if getattr(self, "_thread_local", None) is not None:
+            readers = getattr(self._thread_local, "readers", None)
+            if readers:
+                for reader in readers.values():
+                    reader.close()
+                self._thread_local.readers = {}
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         state["active_package_idx"] = None
         state["active_tile_reader"] = None
         state["active_feature_readers"] = {}
+        state["_thread_local"] = None
         return state
 
     def __del__(self) -> None:

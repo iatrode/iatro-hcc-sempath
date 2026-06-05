@@ -33,7 +33,7 @@ def decode_jxl(payload: bytes) -> Image.Image:
 
 
 def decode_jxl_array(payload: bytes) -> np.ndarray:
-    arr = imagecodecs.jpegxl_decode(payload)
+    arr = imagecodecs.jpegxl_decode(payload, numthreads=1)
     if arr.ndim == 2:
         arr = np.stack([arr, arr, arr], axis=-1)
     return arr[:, :, :3].astype(np.uint8, copy=False)
