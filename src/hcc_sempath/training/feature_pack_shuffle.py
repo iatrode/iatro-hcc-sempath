@@ -181,16 +181,21 @@ def _rewrite_tile_pack(path: Path, permutation: np.ndarray, seed: int) -> Path:
         reader.close()
     shuffled_table = _shuffle_table(record_table, permutation)
     tmp_path = _temporary_output_path(path, ".rowshuffle.tiles.iac")
-    build_pack(
-        tmp_path,
-        _row_order_header(header, seed),
-        slide_table,
-        shuffled_table,
-        payloads,
-        overwrite=False,
-    )
-    _validate_seed(tmp_path, seed)
-    return tmp_path
+    try:
+        build_pack(
+            tmp_path,
+            _row_order_header(header, seed),
+            slide_table,
+            shuffled_table,
+            payloads,
+            overwrite=False,
+        )
+        _validate_seed(tmp_path, seed)
+        return tmp_path
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
 
 
 def _rewrite_feature_pack(path: Path, permutation: np.ndarray, seed: int) -> Path:
@@ -200,6 +205,8 @@ def _rewrite_feature_pack(path: Path, permutation: np.ndarray, seed: int) -> Pat
     record_bytes = int(header["merged_record_bytes"])
     reader = PackReader(path)
     data_path = None
+    tmp_path = None
+    success = False
     try:
         with NamedTemporaryFile(dir=path.parent, prefix=f".{path.stem}.data.", delete=False) as data_tmp:
             data_path = Path(data_tmp.name)
@@ -220,9 +227,12 @@ def _rewrite_feature_pack(path: Path, permutation: np.ndarray, seed: int) -> Pat
             overwrite=False,
         )
         _validate_seed(tmp_path, seed)
+        success = True
         return tmp_path
     finally:
         reader.close()
+        if not success and tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
         if data_path is not None and data_path.exists():
             data_path.unlink()
 

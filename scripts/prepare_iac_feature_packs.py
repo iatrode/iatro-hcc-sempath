@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,8 +62,7 @@ def _parse_teacher_roots(values: list[str] | None) -> dict[str, str]:
 
 
 def _merged_path(feature_root: Path, dataset: str, stem: str, teacher_roots: dict[str, str]) -> Path:
-    first_teacher = next(iter(teacher_roots))
-    return feature_root / teacher_roots[first_teacher] / dataset / f"{stem}{MERGED_FEATURE_SUFFIX}"
+    return feature_root / "merged" / dataset / f"{stem}{MERGED_FEATURE_SUFFIX}"
 
 
 def _source_feature_path(feature_root: Path, dataset: str, stem: str, teacher: str, teacher_roots: dict[str, str]) -> Path:
@@ -74,6 +73,21 @@ def _source_feature_path(feature_root: Path, dataset: str, stem: str, teacher: s
     if len(matches) > 1:
         raise RuntimeError(f"ambiguous_feature teacher={teacher} matches={matches}")
     return matches[0]
+
+
+def _existing_source_feature_paths(
+    feature_root: Path,
+    dataset: str,
+    stem: str,
+    teacher_roots: dict[str, str],
+) -> dict[str, Path]:
+    paths = {}
+    for teacher in teacher_roots:
+        try:
+            paths[teacher] = _source_feature_path(feature_root, dataset, stem, teacher, teacher_roots)
+        except FileNotFoundError:
+            continue
+    return paths
 
 
 def _expected_dims_from_sources(source_paths: dict[str, Path]) -> dict[str, int]:
@@ -98,6 +112,8 @@ def _prepare_one(
     seed: int,
     delete_sources: bool,
     dtype: str,
+    *,
+    validate_only: bool = False,
 ) -> PreparedPackage:
     dataset = tile_path.parent.name
     stem = _strip_suffix(tile_path, TILE_SUFFIX)
@@ -111,7 +127,12 @@ def _prepare_one(
             teacher_names=teacher_names,
             expected_dims=expected_dims,
         )
+        if delete_sources:
+            source_paths = _existing_source_feature_paths(feature_root, dataset, stem, teacher_roots)
+            _delete_source_packages(source_paths, keep_path=merged_path)
         status = "existing_merged"
+    elif validate_only:
+        status = "missing_merged"
     else:
         source_paths = {
             teacher: _source_feature_path(feature_root, dataset, stem, teacher, teacher_roots)
@@ -139,7 +160,8 @@ def _prepare_one(
         if delete_sources:
             _delete_source_packages(source_paths, keep_path=merged_path)
         status = "merged"
-    _prepare_tile_feature_pair(tile_path=tile_path, feature_path=merged_path, seed=seed)
+    if not validate_only and status != "missing_merged":
+        _prepare_tile_feature_pair(tile_path=tile_path, feature_path=merged_path, seed=seed)
     return PreparedPackage(tile_path=tile_path, merged_path=merged_path, status=status)
 
 
@@ -162,8 +184,9 @@ def main() -> None:
     parser.add_argument("--feature-root", required=True, help="Root containing <teacher-subdir>/<dataset>/<stem>.*.features.iac packages.")
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--dtype", default="float32")
+    parser.add_argument("--dtype", default="source", help="Merged feature dtype: source preserves each source package dtype.")
     parser.add_argument("--delete-source", action="store_true", help="Delete source teacher feature packages after validation.")
+    parser.add_argument("--validate-only", action="store_true", help="Validate existing merged package headers without writing data.")
     parser.add_argument(
         "--teacher",
         action="append",
@@ -180,9 +203,9 @@ def main() -> None:
         raise SystemExit(f"no tile packages found: {tile_root}")
 
     failures: list[tuple[Path, str]] = []
-    statuses = {"existing_merged": 0, "merged": 0}
+    statuses = {"existing_merged": 0, "merged": 0, "missing_merged": 0}
     workers = max(1, min(int(args.workers), len(tile_paths)))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(
                 _prepare_one,
@@ -192,6 +215,7 @@ def main() -> None:
                 int(args.seed),
                 bool(args.delete_source),
                 str(args.dtype),
+                validate_only=bool(args.validate_only),
             ): tile_path
             for tile_path in tile_paths
         }
@@ -213,7 +237,9 @@ def main() -> None:
         raise SystemExit(1)
     print(
         "prepare_iac_done "
-        f"packages={len(tile_paths)} existing_merged={statuses['existing_merged']} merged={statuses['merged']} seed={int(args.seed)}",
+        f"packages={len(tile_paths)} existing_merged={statuses['existing_merged']} "
+        f"merged={statuses['merged']} missing_merged={statuses['missing_merged']} "
+        f"seed={int(args.seed)} validate_only={bool(args.validate_only)}",
         flush=True,
     )
 
