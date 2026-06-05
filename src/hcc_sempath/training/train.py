@@ -187,7 +187,8 @@ def _limit_records(records: list, limit: int, seed: int) -> list:
 def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -> dict[str, PrototypeRegistry] | None:
     semantic_weight = float(cfg["loss"].get("semantic_weight", 0.0))
     prototype_filter_weight = float(cfg["loss"].get("prototype_filter_weight", 0.0))
-    if semantic_weight == 0 and prototype_filter_weight == 0:
+    zhcc_proto_weight = float(cfg["loss"].get("zhcc_proto_weight", 0.0))
+    if semantic_weight == 0 and prototype_filter_weight == 0 and zhcc_proto_weight == 0:
         return None
     prototype_paths = cfg["data"].get("prototype_paths")
     if isinstance(prototype_paths, dict):
@@ -195,7 +196,8 @@ def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -
     prototype_path = cfg["data"].get("prototype_path")
     if prototype_path is None:
         raise ValueError(
-            "data.prototype_path or data.prototype_paths is required when semantic_weight or prototype_filter_weight > 0"
+            "data.prototype_path or data.prototype_paths is required when semantic_weight, "
+            "prototype_filter_weight, or zhcc_proto_weight > 0"
         )
     return {name: load_prototype_registry(prototype_path, expected_dim=dim).to(device) for name, dim in dims.items()}
 
@@ -292,10 +294,9 @@ def main() -> None:
         float(cfg["loss"].get("prototype_filter_weight", 0.0)) > 0
         and float(cfg["loss"].get("prototype_label_weight", 0.4)) > 0
     )
-    if (float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0 or prototype_label_required) and prototype_manifest_path is None:
+    if prototype_label_required and prototype_manifest_path is None:
         raise ValueError(
-            "data.prototype_supervision_manifest_path is required when zhcc prototype supervision "
-            "or prototype-label adjudication is enabled"
+            "data.prototype_supervision_manifest_path is required when prototype-label adjudication is enabled"
         )
     train_prototype_labels = load_prototype_labels(
         prototype_manifest_path,

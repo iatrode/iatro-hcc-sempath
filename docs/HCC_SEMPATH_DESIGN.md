@@ -74,20 +74,26 @@ The model uses two forces:
 
 1. General morphology priors from multiple pathology foundation teachers.
    来自多个通用病理 foundation teachers 的通用 morphology priors。
-2. HCC-specific prototype supervision that reshapes the shared embedding around
-   HCC tissue states and attributes.
-   HCC-specific prototype supervision，用于把共享 embedding 重塑到 HCC tissue states
-   和 attributes 周围。
+2. HCC-specific prototype-mediated semantic response supervision that reshapes
+   the shared embedding around HCC tissue states and attributes.
+   HCC-specific prototype-mediated semantic response supervision，用于把共享 embedding
+   重塑到 HCC tissue states 和 attributes 周围。
 
 PAMT-D, Prototype-Adjudicated Multi-Teacher Distillation, is the current method
-formulation. Prototype responses are used both as direct HCC semantic
-supervision and as soft reliability signals for teacher distillation. A teacher
-signal that conflicts with HCC prototype semantics should be down-weighted, not
-blindly averaged into the shared space.
+formulation. Expert prototype tiles define a fixed HCC semantic blueprint. They
+are used to build teacher-space semantic prototypes and no-gradient
+student-space prototype centers, not as a hard-label image classification
+training set. Prototype responses are used as HCC semantic response supervision
+on ordinary training tiles and as soft reliability signals for teacher
+distillation. A teacher signal that conflicts with HCC prototype semantics
+should be down-weighted, not blindly averaged into the shared space.
 
-PAMT-D（Prototype-Adjudicated Multi-Teacher Distillation）是当前方法表述。Prototype
-response 同时作为 HCC semantic supervision 和 teacher distillation 的软可靠性信号。与
-HCC prototype semantics 冲突的 teacher signal 应被降权，而不是直接平均进共享空间。
+PAMT-D（Prototype-Adjudicated Multi-Teacher Distillation）是当前方法表述。专家
+prototype tiles 定义固定 HCC semantic blueprint，用于构建 teacher-space semantic
+prototypes 和无梯度 student-space prototype centers，而不是作为 hard-label 图像分类训练集。
+Prototype response 在普通训练 tile 上作为 HCC semantic response supervision，同时作为
+teacher distillation 的软可靠性信号。与 HCC prototype semantics 冲突的 teacher signal
+应被降权，而不是直接平均进共享空间。
 
 ## 4. Prototype Design / Prototype 设计
 

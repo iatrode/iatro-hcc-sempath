@@ -4,7 +4,11 @@ import pytest
 import torch
 
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
-from hcc_sempath.training.zhcc_losses import zhcc_prototype_loss
+from hcc_sempath.training.zhcc_losses import (
+    teacher_semantic_response_target,
+    zhcc_prototype_loss,
+    zhcc_response_distillation_loss,
+)
 
 
 def _registry(attribute_count: int = 1) -> PrototypeRegistry:
@@ -64,3 +68,40 @@ def test_zhcc_prototype_loss_allows_zero_width_level2_when_no_attributes() -> No
 
     assert loss.ndim == 0
     assert parts["zhcc_l2"].item() == 0.0
+
+
+def test_zhcc_response_distillation_uses_teacher_soft_targets_and_updates_student() -> None:
+    registry = PrototypeRegistry(
+        prototypes=torch.eye(4)[:3],
+        names=["primary_tumor", "primary_non_tumor", "lymphocyte_rich"],
+        groups=["primary", "primary", "attribute"],
+        levels=[1, 1, 2],
+        exclusive=[True, True, False],
+    )
+    teachers = {
+        "a": torch.tensor([[2.0, 0.0, 1.0, 0.0], [0.0, 2.0, 0.0, 0.0]]),
+        "b": torch.tensor([[2.0, 0.0, 1.0, 0.0], [0.0, 2.0, 0.0, 0.0]]),
+    }
+    target_primary, target_attributes = teacher_semantic_response_target(
+        teacher_by_name=teachers,
+        prototypes_by_teacher={"a": registry, "b": registry},
+        target_registry=registry,
+        primary_temperature=0.1,
+        attribute_temperature=0.1,
+    )
+    student = torch.randn(2, 4, requires_grad=True)
+
+    loss, parts = zhcc_response_distillation_loss(
+        embedding_norm=student,
+        prototypes=registry,
+        target_primary=target_primary,
+        target_attributes=target_attributes,
+        primary_temperature=0.1,
+        attribute_temperature=0.1,
+    )
+    loss.backward()
+
+    assert loss.ndim == 0
+    assert parts["zhcc_response"].ndim == 0
+    assert target_primary.requires_grad is False
+    assert student.grad is not None

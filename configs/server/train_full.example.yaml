@@ -6,6 +6,15 @@ runtime:
 data:
   train_manifest_path: configs/server/manifest.example.yaml
   teachers: [gigapath, h_optimus_1, uni2_h, virchow2]
+  prototype_paths:
+    gigapath: /path/to/prototypes/gigapath_hcc_semantic_prototypes.pt
+    h_optimus_1: /path/to/prototypes/h_optimus_1_hcc_semantic_prototypes.pt
+    uni2_h: /path/to/prototypes/uni2_h_hcc_semantic_prototypes.pt
+    virchow2: /path/to/prototypes/virchow2_hcc_semantic_prototypes.pt
+  zhcc_prototype_image_path: /path/to/prototypes/zhcc_hcc_prototype_images.pt
+  prototype_supervision_manifest_path: /path/to/prototypes/hcc_prototype_supervision_manifest.csv
+  prototype_supervision_train_splits: [train]
+  prototype_supervision_val_splits: [val]
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
   num_workers: 8
@@ -14,7 +23,6 @@ data:
   dynamic_package_sampling: true
   tensor_collate: true
   package_chunk_size: 64
-  package_buffer_batches: 4
 
 model:
   backbone_name: vit_small_patch16_224
@@ -37,22 +45,22 @@ loss:
     virchow2: 1.0
   feature_loss_type: cosine
   relation_weight: 0.05
-  scale_relation_by_alpha: false
-  semantic_weight: 0.0
+  scale_relation_by_alpha: true
+  semantic_weight: 0.02
   semantic_temperature: 1.0
   primary_temperature: 1.0
   attribute_temperature: 1.0
   zhcc_primary_temperature: 0.1
   zhcc_attribute_temperature: 0.1
-  zhcc_proto_weight: 0.0
+  zhcc_proto_weight: 0.2
   zhcc_level2_weight: 0.5
-  prototype_filter_weight: 0.0
+  prototype_filter_weight: 0.5
   prototype_filter_alpha_min: 0.25
   consensus_weight: 0.4
   prototype_label_weight: 0.4
   prototype_l1_agreement_weight: 0.5
   prototype_l2_agreement_weight: 0.5
-  zhcc_response_weight: 0.0
+  zhcc_response_weight: 0.15
   teacher_prior_plateau_window_steps: 1000
   teacher_prior_plateau_threshold: 0.01
   teacher_prior_plateau_patience: 2
@@ -76,7 +84,8 @@ train:
   topk: 10
   max_val_batches: 512
   max_eval_batches: 128
-  prototype_image_batch_size: 256
+  dynamic_prototype_batch_size: 512
+  scientific_score_zhcc_response_weight: 0.25
   log_interval: 0
   progress: tqdm
   tensorboard: true

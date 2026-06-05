@@ -21,23 +21,27 @@ teacher heads are training-time adapters.
 projection head 对接不同病理基座模型；推理和下游任务默认使用归一化学生 embedding
 （`embedding_norm`），teacher head 只是训练阶段的适配层。
 
-HCC prototype supervision further shapes the embedding space around
-domain-specific morphology and tissue context, including tumor, background
-liver, inflammatory/stromal, degenerative, hepatocellular, necrotic,
-hemorrhagic, bile-pigment, fibrous, vascular, and ductular/portal patterns.
+HCC prototype-mediated semantic response supervision further shapes the
+embedding space around domain-specific morphology and tissue context, including
+tumor, background liver, inflammatory/stromal, degenerative, hepatocellular,
+necrotic, hemorrhagic, bile-pigment, fibrous, vascular, and ductular/portal
+patterns.
 
-HCC prototype supervision 用于进一步把 embedding 空间塑造成专病语义空间，覆盖肿瘤、
+HCC prototype-mediated semantic response supervision 用于进一步把 embedding 空间塑造成专病语义空间，覆盖肿瘤、
 背景肝、炎症/间质、退变物、肝细胞性实质、坏死、出血、胆色素、纤维间质、血管结构和
 胆管/汇管区等 HCC 相关形态语义。
 
 The current method configuration is PAMT-D, Prototype-Adjudicated Multi-Teacher
 Distillation. Two-level HCC prototypes compute per-tile, per-teacher reliability
 from cross-teacher consensus, expert prototype-label agreement, and agreement
-with the current shared `z_hcc` prototype response.
+with the current shared `z_hcc` prototype response. The prototype tiles define
+the fixed HCC semantic blueprint; they are not used as a hard-label image
+classification training set.
 
 当前方法配置为 PAMT-D，即原型裁决的多教师蒸馏。两级 HCC prototype 通过跨 teacher
 共识、专家 prototype label 一致性，以及与当前共享 `z_hcc` prototype response 的一致性，计算
-每个 tile / teacher 的软可靠性权重。
+每个 tile / teacher 的软可靠性权重。Prototype tiles 定义固定 HCC semantic blueprint，
+不作为 hard-label 图像分类训练集。
 
 The public scientific design is maintained in
 [`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md).
@@ -139,16 +143,10 @@ Level-2 是并行 prototype 语义轴，不是父子层级；论文级主评价�
 
 ## Reproducibility Commands
 
-Run a preflight check before a long training job:
-
-```bash
-hcc-sempath preflight --config configs/distill_train.example.yaml
-```
-
 Train:
 
 ```bash
-hcc-sempath train --config configs/distill_train.example.yaml
+hcc-sempath train --config configs/server/train_full.example.yaml
 ```
 
 Large multi-package training uses `data.dynamic_package_sampling: true` in the
@@ -167,7 +165,7 @@ Resume:
 
 ```bash
 hcc-sempath train \
-  --config configs/distill_train.example.yaml \
+  --config configs/server/train_full.example.yaml \
   --resume outputs/hcc_sempath_v1/checkpoints/last.pt
 ```
 
@@ -175,13 +173,13 @@ Evaluate:
 
 ```bash
 hcc-sempath evaluate \
-  --config configs/distill_train.example.yaml \
-  --checkpoint outputs/hcc_sempath_v1/checkpoints/best.pt \
+  --config configs/server/train_full.example.yaml \
+  --checkpoint outputs/hcc_sempath_v1/checkpoints/best_scientific_score.pt \
   --split val
 ```
 
 The training `evaluate` command writes `eval_<split>.json` and reports
-teacher-imitation QC plus direct `z_hcc` prototype diagnostics from
+teacher-imitation QC plus `z_hcc` prototype-response diagnostics from
 `embedding_norm`, including Level-1 accuracy, Level-2 macro F1/AUC, prototype
 top-k precision, and neighborhood purity. The manuscript-grade primary
 evaluation is the blinded result-level morphology retrieval protocol described

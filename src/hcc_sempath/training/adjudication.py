@@ -1,30 +1,13 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
-from ..modeling.models import normalized_prototype_logits
 from ..modeling.prototypes import PrototypeRegistry
+from .zhcc_losses import prototype_response
 
 
 def _prototype_names(registry: PrototypeRegistry, indices: list[int]) -> list[str]:
     return [registry.names[idx] for idx in indices]
-
-
-def _positions_for_names(
-    *,
-    registry: PrototypeRegistry,
-    source_indices: list[int],
-    target_names: list[str],
-    label: str,
-    device: torch.device,
-) -> torch.Tensor:
-    source_names = _prototype_names(registry, source_indices)
-    positions = {name: idx for idx, name in enumerate(source_names)}
-    missing = [name for name in target_names if name not in positions]
-    if missing:
-        raise ValueError(f"{label} prototype package is missing required prototype names: {missing}")
-    return torch.tensor([positions[name] for name in target_names], dtype=torch.long, device=device)
 
 
 def _teacher_response(
@@ -34,28 +17,18 @@ def _teacher_response(
     primary_names: list[str],
     attribute_names: list[str],
     label: str,
+    primary_temperature: float = 0.1,
+    attribute_temperature: float = 0.1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    primary_logits = normalized_prototype_logits(features, registry.primary_prototypes)
-    primary_positions = _positions_for_names(
-        registry=registry,
-        source_indices=registry.primary_indices,
-        target_names=primary_names,
+    return prototype_response(
+        features,
+        registry,
+        primary_names=primary_names,
+        attribute_names=attribute_names,
         label=label,
-        device=features.device,
+        primary_temperature=primary_temperature,
+        attribute_temperature=attribute_temperature,
     )
-    primary = F.softmax(primary_logits, dim=-1).index_select(dim=1, index=primary_positions)
-    if not attribute_names:
-        return primary, features.new_zeros((features.shape[0], 0))
-    attribute_logits = normalized_prototype_logits(features, registry.attribute_prototypes)
-    attribute_positions = _positions_for_names(
-        registry=registry,
-        source_indices=registry.attribute_indices,
-        target_names=attribute_names,
-        label=label,
-        device=features.device,
-    )
-    attributes = torch.sigmoid(attribute_logits).index_select(dim=1, index=attribute_positions)
-    return primary, attributes
 
 
 def _agreement(
@@ -193,6 +166,8 @@ def prototype_adjudicated_teacher_weights(
     l2_agreement_weight: float = 0.5,
     zhcc_response_weight: float = 0.2,
     filter_strength: float = 1.0,
+    primary_temperature: float = 0.1,
+    attribute_temperature: float = 0.1,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     if set(teacher_by_name) != set(prototypes_by_teacher):
         raise ValueError(
@@ -219,6 +194,8 @@ def prototype_adjudicated_teacher_weights(
             primary_names=primary_names,
             attribute_names=attribute_names,
             label="zhcc",
+            primary_temperature=primary_temperature,
+            attribute_temperature=attribute_temperature,
         )
     else:
         first_teacher = next(iter(teacher_by_name.values()))
@@ -232,6 +209,8 @@ def prototype_adjudicated_teacher_weights(
             primary_names=primary_names,
             attribute_names=attribute_names,
             label=name,
+            primary_temperature=primary_temperature,
+            attribute_temperature=attribute_temperature,
         )
         for name, features in teacher_by_name.items()
     }
