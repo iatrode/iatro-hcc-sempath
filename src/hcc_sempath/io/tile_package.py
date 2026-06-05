@@ -35,8 +35,10 @@ def decode_jxl(payload: bytes) -> Image.Image:
 def decode_jxl_array(payload: bytes) -> np.ndarray:
     arr = imagecodecs.jpegxl_decode(payload, numthreads=1)
     if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=-1)
-    return arr[:, :, :3].astype(np.uint8, copy=False)
+        return np.stack([arr, arr, arr], axis=-1)
+    if arr.shape[2] > 3:
+        return np.ascontiguousarray(arr[:, :, :3])
+    return arr
 
 
 def _build_slide_table(records: list[TileRecord]) -> tuple[pa.Table, dict[str, int]]:

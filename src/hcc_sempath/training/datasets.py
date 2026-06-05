@@ -14,9 +14,14 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 from ..io.feature_cache import FeatureCacheReader
-from ..io.iatrocache import read_header
+from ..io.iatrocache import read_header, read_tables
 from ..io.manifests import TileRecord
 from ..io.tile_package import TilePackageReader
+from .feature_pack_merge import (
+    MERGED_FEATURE_PAYLOAD_TYPE,
+    MERGED_FEATURE_SUFFIX,
+    MergedTeacherFeatureCacheReader,
+)
 from .prototype_labels import PrototypeLabel
 
 
@@ -43,12 +48,23 @@ def _build_image_transform(
     return transforms.Compose(transform_steps)
 
 
+_EMPTY_PROTOTYPE_LEVEL2 = torch.zeros(0, dtype=torch.float32)
+_cached_zeros: dict[tuple[int, ...], torch.Tensor] = {}
+
+
+def _get_zero_tensor(like_tensor: torch.Tensor) -> torch.Tensor:
+    shape = tuple(like_tensor.shape)
+    if shape not in _cached_zeros:
+        _cached_zeros[shape] = torch.zeros(shape, dtype=like_tensor.dtype, device=like_tensor.device)
+    return _cached_zeros[shape]
+
+
 def _prototype_payload(tile_id: str, prototype_labels: dict[str, PrototypeLabel] | None) -> dict:
     if not prototype_labels:
         return {
             "prototype_mask": False,
             "prototype_level1": -1,
-            "prototype_level2": torch.zeros(0, dtype=torch.float32),
+            "prototype_level2": _EMPTY_PROTOTYPE_LEVEL2,
         }
     label = prototype_labels.get(tile_id)
     if label is None:
@@ -56,12 +72,12 @@ def _prototype_payload(tile_id: str, prototype_labels: dict[str, PrototypeLabel]
         return {
             "prototype_mask": False,
             "prototype_level1": -1,
-            "prototype_level2": torch.zeros_like(first.level2),
+            "prototype_level2": _get_zero_tensor(first.level2),
         }
     return {
         "prototype_mask": True,
         "prototype_level1": label.level1,
-        "prototype_level2": label.level2.clone(),
+        "prototype_level2": label.level2,
     }
 
 
@@ -149,14 +165,19 @@ def resolve_teacher_feature_packages(
                     packages[str(name)] = [Path(value)]
         else:
             for path in teacher_cache_package_paths:
-                reader = FeatureCacheReader(path)
-                try:
-                    teacher_name = str(reader.header.get("teacher") or Path(path).stem)
-                finally:
-                    reader.close()
-                if teacher_name in packages:
-                    raise ValueError(f"duplicate teacher feature package name: {teacher_name}")
-                packages[teacher_name] = [Path(path)]
+                header = read_header(path)
+                if header.get("payload_type") == MERGED_FEATURE_PAYLOAD_TYPE:
+                    for teacher_name in header.get("teachers", []):
+                        packages.setdefault(str(teacher_name), []).append(Path(path))
+                else:
+                    reader = FeatureCacheReader(path)
+                    try:
+                        teacher_name = str(reader.header.get("teacher") or Path(path).stem)
+                    finally:
+                        reader.close()
+                    if teacher_name in packages:
+                        raise ValueError(f"duplicate teacher feature package name: {teacher_name}")
+                    packages[teacher_name] = [Path(path)]
     elif teacher_cache_package_path is not None:
         reader = FeatureCacheReader(teacher_cache_package_path)
         try:
@@ -169,25 +190,82 @@ def resolve_teacher_feature_packages(
     return packages
 
 
-class _FeatureReaderSet:
-    def __init__(self, package_paths: list[Path]) -> None:
-        self.readers = [FeatureCacheReader(path) for path in package_paths]
-        self.tile_to_reader: dict[str, FeatureCacheReader] = {}
-        for reader in self.readers:
-            tile_ids = reader.record_table.column("tile_id").to_pylist()
-            for tile_id in tile_ids:
-                if tile_id in self.tile_to_reader:
-                    raise ValueError(f"duplicate tile_id across feature packages: {tile_id}")
-                self.tile_to_reader[tile_id] = reader
+def _open_feature_source(path: Path):
+    header = read_header(path)
+    if header.get("payload_type") == MERGED_FEATURE_PAYLOAD_TYPE:
+        return MergedTeacherFeatureCacheReader(path)
+    return FeatureCacheReader(path)
 
-    def read_feature(self, tile_id: str):
-        reader = self.tile_to_reader.get(tile_id)
-        if reader is None:
-            raise FileNotFoundError(f"missing packaged teacher feature: {tile_id}")
-        return reader.read_feature(tile_id)
+
+def _source_has_teacher(source, teacher_name: str) -> bool:
+    if isinstance(source, MergedTeacherFeatureCacheReader):
+        return source.has_teacher(teacher_name)
+    return True
+
+
+def _read_feature_from_source(source, row: int, teacher_name: str):
+    if isinstance(source, MergedTeacherFeatureCacheReader):
+        return source.read_feature_at(row, teacher_name)
+    return source.read_feature_at(row)
+
+
+def _read_teacher_features_at(feature_sources: dict[Path, object], teacher_paths: dict[str, Path], row: int) -> dict[str, np.ndarray]:
+    result: dict[str, np.ndarray] = {}
+    merged_groups: dict[Path, list[str]] = {}
+    for name, path in teacher_paths.items():
+        source = feature_sources[path]
+        if isinstance(source, MergedTeacherFeatureCacheReader):
+            merged_groups.setdefault(path, []).append(name)
+        else:
+            result[name] = source.read_feature_at(row)
+    for path, names in merged_groups.items():
+        source = feature_sources[path]
+        result.update(source.read_features_at(row, names))
+    return result
+
+
+class _TeacherFeatureStore:
+    def __init__(self, package_paths_by_teacher: dict[str, list[Path]]) -> None:
+        unique_paths = sorted({path for paths in package_paths_by_teacher.values() for path in paths})
+        self.sources = {path: _open_feature_source(path) for path in unique_paths}
+        self.tile_path_by_teacher: dict[str, dict[str, Path]] = {}
+        for teacher_name, package_paths in package_paths_by_teacher.items():
+            teacher_name = str(teacher_name)
+            tile_to_path: dict[str, Path] = {}
+            for path in package_paths:
+                source = self.sources[path]
+                if not _source_has_teacher(source, teacher_name):
+                    raise ValueError(f"feature package does not contain teacher={teacher_name}")
+                tile_ids = source.record_table.column("tile_id").to_pylist()
+                for tile_id in tile_ids:
+                    tile_id = str(tile_id)
+                    if tile_id in tile_to_path:
+                        raise ValueError(f"duplicate tile_id across feature packages: {tile_id}")
+                    tile_to_path[tile_id] = path
+            self.tile_path_by_teacher[teacher_name] = tile_to_path
+
+    def read_features(self, tile_id: str) -> dict[str, np.ndarray]:
+        result: dict[str, np.ndarray] = {}
+        merged_groups: dict[Path, list[str]] = {}
+        for teacher_name, tile_to_path in self.tile_path_by_teacher.items():
+            path = tile_to_path.get(tile_id)
+            if path is None:
+                raise FileNotFoundError(f"missing packaged teacher feature: {tile_id}")
+            source = self.sources[path]
+            if isinstance(source, MergedTeacherFeatureCacheReader):
+                merged_groups.setdefault(path, []).append(teacher_name)
+            else:
+                result[teacher_name] = source.read_feature(tile_id)
+        for path, teacher_names in merged_groups.items():
+            source = self.sources[path]
+            result.update(source.read_features(tile_id, teacher_names))
+        return result
+
+    def read_feature(self, tile_id: str, teacher_name: str):
+        return self.read_features(tile_id)[str(teacher_name)]
 
     def close(self) -> None:
-        for reader in self.readers:
+        for reader in self.sources.values():
             reader.close()
 
     def __del__(self) -> None:
@@ -202,6 +280,9 @@ def _strip_required_suffix(path: Path, suffix: str) -> str:
 
 
 def _feature_package_matches_tile_stem(feature_path: Path, tile_stem: str) -> bool:
+    if feature_path.name.endswith(MERGED_FEATURE_SUFFIX):
+        feature_stem = _strip_required_suffix(feature_path, MERGED_FEATURE_SUFFIX)
+        return feature_stem == tile_stem or feature_stem.startswith(f"{tile_stem}.")
     feature_stem = _strip_required_suffix(feature_path, ".features.iac")
     return feature_stem == tile_stem or feature_stem.startswith(f"{tile_stem}.")
 
@@ -238,7 +319,8 @@ def validate_teacher_feature_package_pairs(
         for teacher_name, feature_paths in teacher_paths_by_name.items():
             feature_path = feature_paths[package_idx]
             feature_header = read_header(feature_path)
-            if feature_header.get("payload_type") != "teacher_features":
+            payload_type = feature_header.get("payload_type")
+            if payload_type not in {"teacher_features", MERGED_FEATURE_PAYLOAD_TYPE}:
                 raise ValueError(f"not a teacher feature package: teacher={teacher_name} path={feature_path}")
             if not _feature_package_matches_tile_stem(feature_path, tile_stem):
                 raise ValueError(
@@ -251,6 +333,16 @@ def validate_teacher_feature_package_pairs(
                     f"feature/tile record count mismatch for teacher={teacher_name} package={tile_path}: "
                     f"features={feature_count} tiles={count}"
                 )
+            if payload_type == MERGED_FEATURE_PAYLOAD_TYPE:
+                teachers = {str(name) for name in feature_header.get("teachers", [])}
+                if teacher_name not in teachers:
+                    raise ValueError(f"merged feature package missing teacher={teacher_name}: path={feature_path}")
+                _, _, tile_records = read_tables(tile_path)
+                _, _, feature_records = read_tables(feature_path)
+                tile_ids = [str(value) for value in tile_records.column("tile_id").to_pylist()]
+                feature_ids = [str(value) for value in feature_records.column("tile_id").to_pylist()]
+                if feature_ids != tile_ids:
+                    raise ValueError(f"merged feature/tile tile_id order mismatch: teacher={teacher_name} path={feature_path}")
             for key in ("tile_width", "tile_height", "stride_x", "stride_y"):
                 if int(feature_header[key]) != int(tile_header[key]):
                     raise ValueError(
@@ -261,7 +353,10 @@ def validate_teacher_feature_package_pairs(
                 expected_dim = expected_dims.get(teacher_name)
                 if expected_dim is None:
                     raise ValueError(f"missing expected teacher dim for {teacher_name}")
-                feature_dim = int(feature_header["feature_dim"])
+                if payload_type == MERGED_FEATURE_PAYLOAD_TYPE:
+                    feature_dim = int(feature_header["teacher_dims"][teacher_name])
+                else:
+                    feature_dim = int(feature_header["feature_dim"])
                 if feature_dim != int(expected_dim):
                     raise ValueError(
                         f"feature dimension mismatch: teacher={teacher_name} expected={expected_dim} "
@@ -298,7 +393,7 @@ class DistillationTileDataset(Dataset):
             teacher_cache_package_path=teacher_cache_package_path,
             teacher_cache_package_paths=teacher_cache_package_paths,
         )
-        self.feature_readers = {name: _FeatureReaderSet(paths) for name, paths in self.teacher_package_paths.items()}
+        self.feature_store = _TeacherFeatureStore(self.teacher_package_paths)
         self.transform = _build_image_transform(
             image_size,
             mean,
@@ -334,8 +429,8 @@ class DistillationTileDataset(Dataset):
             with Image.open(record.tile_path) as image:
                 image_tensor = self.transform(image.convert("RGB"))
         teacher_features = {}
-        for name, reader in self.feature_readers.items():
-            teacher_feature = torch.from_numpy(reader.read_feature(record.tile_id)).float()
+        for name, feature in self.feature_store.read_features(record.tile_id).items():
+            teacher_feature = torch.from_numpy(feature).float()
             if teacher_feature.ndim != 1:
                 raise ValueError(f"teacher feature must be 1D: teacher={name} tile_id={record.tile_id}")
             teacher_features[name] = teacher_feature
@@ -354,8 +449,8 @@ class DistillationTileDataset(Dataset):
             self.active_package_reader.close()
             self.active_package_reader = None
             self.active_package_path = None
-        for reader in getattr(self, "feature_readers", {}).values():
-            reader.close()
+        if getattr(self, "feature_store", None) is not None:
+            self.feature_store.close()
         if getattr(self, "_thread_local", None) is not None:
             readers = getattr(self._thread_local, "readers", None)
             if readers:
@@ -368,9 +463,7 @@ class DistillationTileDataset(Dataset):
         state["package_reader"] = None
         state["active_package_path"] = None
         state["active_package_reader"] = None
-        state["feature_readers"] = {
-            name: _FeatureReaderSet(paths) for name, paths in self.teacher_package_paths.items()
-        }
+        state["feature_store"] = _TeacherFeatureStore(self.teacher_package_paths)
         state["_thread_local"] = None
         return state
 
@@ -398,13 +491,15 @@ class PackageSampledDistillationDataset(Dataset):
         }
         self.active_package_idx: int | None = None
         self.active_tile_reader: TilePackageReader | None = None
-        self.active_feature_readers: dict[str, FeatureCacheReader] = {}
+        self.active_feature_readers: dict[Path, object] = {}
+        self.active_teacher_feature_paths: dict[str, Path] = {}
         counts = validate_teacher_feature_package_pairs(
             self.tile_paths,
             self.teacher_package_paths,
             expected_dims=expected_dims,
         )
         self.package_counts = counts
+        self.sequential_iac_rows = all(int(read_header(path).get("row_order_seed", 0) or 0) > 0 for path in self.tile_paths)
         self.cumulative_counts: list[int] = []
         running_total = 0
         for count in counts:
@@ -472,6 +567,8 @@ class PackageSampledDistillationDataset(Dataset):
             return np.empty((0,), dtype=np.int64)
         if take >= package_count:
             return None
+        if self.sequential_iac_rows:
+            return np.arange(take, dtype=np.int64)
         stride = package_count / take
         offset = float(rng.random()) * stride
         rows = np.floor(offset + np.arange(take, dtype=np.float64) * stride).astype(np.int64)
@@ -500,7 +597,8 @@ class PackageSampledDistillationDataset(Dataset):
             if rows is None or len(rows):
                 package_order.append(package_idx)
                 package_rows[package_idx] = rows
-        rng.shuffle(package_order)
+        if not self.sequential_iac_rows:
+            rng.shuffle(package_order)
         block_offsets: list[int] = []
         running_total = 0
         for package_idx in package_order:
@@ -546,37 +644,38 @@ class PackageSampledDistillationDataset(Dataset):
             for package_idx in package_indices:
                 yield package_idx, per_package_chunks[package_idx][chunk_idx]
 
-    def read_package_rows(self, package_idx: int, rows: np.ndarray) -> list[dict]:
+    def _thread_reader_cache(self) -> dict[tuple[str, Path], object]:
         if not hasattr(self._thread_local, "readers"):
             self._thread_local.readers = {}
+        return self._thread_local.readers
 
-        tile_path = self.tile_paths[package_idx]
-        tile_reader = self._thread_local.readers.get(tile_path)
-        if tile_reader is None:
-            tile_reader = TilePackageReader(tile_path)
-            self._thread_local.readers[tile_path] = tile_reader
+    def _cached_thread_reader(self, kind: str, path: Path, opener):
+        cache = self._thread_reader_cache()
+        key = (kind, path)
+        reader = cache.get(key)
+        if reader is None:
+            reader = opener(path)
+            cache[key] = reader
+        return reader
 
-        feature_readers = {}
-        for name, paths in self.teacher_package_paths.items():
-            feat_path = paths[package_idx]
-            feat_reader = self._thread_local.readers.get(feat_path)
-            if feat_reader is None:
-                feat_reader = FeatureCacheReader(feat_path)
-                self._thread_local.readers[feat_path] = feat_reader
-            feature_readers[name] = feat_reader
-
+    def read_package_rows(self, package_idx: int, rows: np.ndarray) -> list[dict]:
+        tile_reader = self._cached_thread_reader("tile", self.tile_paths[package_idx], TilePackageReader)
+        teacher_paths = {name: paths[package_idx] for name, paths in self.teacher_package_paths.items()}
+        feature_sources = {
+            path: self._cached_thread_reader("feature", path, _open_feature_source)
+            for path in set(teacher_paths.values())
+        }
         samples = []
         for row in sorted(int(row) for row in rows):
+            tile_id = tile_reader.tile_id_at(row)
+            image = tile_reader.read_array_at(row)
             samples.append(
                 {
                     "_package_idx": package_idx,
-                    "tile_id": tile_reader.tile_id_at(row),
-                    "image": tile_reader.read_array_at(row),
-                    "teacher_features": {
-                        name: reader.read_feature_at(row)
-                        for name, reader in feature_readers.items()
-                    },
-                    **_prototype_payload(tile_reader.tile_id_at(row), self.prototype_labels),
+                    "tile_id": tile_id,
+                    "image": image,
+                    "teacher_features": _read_teacher_features_at(feature_sources, teacher_paths, row),
+                    **_prototype_payload(tile_id, self.prototype_labels),
                 }
             )
         return samples
@@ -586,19 +685,18 @@ class PackageSampledDistillationDataset(Dataset):
         assert self.active_tile_reader is not None
         return self.active_tile_reader
 
-    def _feature_reader(self, name: str, package_idx: int) -> FeatureCacheReader:
-        self._activate_package(package_idx)
-        return self.active_feature_readers[name]
-
     def _activate_package(self, package_idx: int) -> None:
         if self.active_package_idx == package_idx:
             return
         self._close_active_readers()
         self.active_package_idx = package_idx
         self.active_tile_reader = TilePackageReader(self.tile_paths[package_idx])
+        self.active_teacher_feature_paths = {
+            name: paths[package_idx] for name, paths in self.teacher_package_paths.items()
+        }
         self.active_feature_readers = {
-            name: FeatureCacheReader(paths[package_idx])
-            for name, paths in self.teacher_package_paths.items()
+            path: _open_feature_source(path)
+            for path in set(self.active_teacher_feature_paths.values())
         }
 
     def __len__(self) -> int:
@@ -623,10 +721,11 @@ class PackageSampledDistillationDataset(Dataset):
         image_reader = self._tile_reader(package_idx)
         tile_id = image_reader.tile_id_at(row)
         image = image_reader.read_array_at(row)
-        teacher_features = {}
-        for name in self.teacher_package_paths:
-            feature_reader = self._feature_reader(name, package_idx)
-            teacher_features[name] = feature_reader.read_feature_at(row)
+        teacher_features = _read_teacher_features_at(
+            self.active_feature_readers,
+            self.active_teacher_feature_paths,
+            row,
+        )
         return {
             "tile_id": tile_id,
             "image": image,
@@ -635,40 +734,25 @@ class PackageSampledDistillationDataset(Dataset):
         }
 
     def __getitems__(self, indices: list[int]) -> list[dict]:
-        if not hasattr(self._thread_local, "readers"):
-            self._thread_local.readers = {}
-
         results: list[dict | None] = [None for _ in indices]
         by_package: dict[int, list[tuple[int, int]]] = {}
         for out_idx, index in enumerate(indices):
             package_idx, row = self._locate_sample(index)
             by_package.setdefault(package_idx, []).append((out_idx, row))
         for package_idx, items in by_package.items():
-            tile_path = self.tile_paths[package_idx]
-            tile_reader = self._thread_local.readers.get(tile_path)
-            if tile_reader is None:
-                tile_reader = TilePackageReader(tile_path)
-                self._thread_local.readers[tile_path] = tile_reader
-
-            feature_readers = {}
-            for name, paths in self.teacher_package_paths.items():
-                feat_path = paths[package_idx]
-                feat_reader = self._thread_local.readers.get(feat_path)
-                if feat_reader is None:
-                    feat_reader = FeatureCacheReader(feat_path)
-                    self._thread_local.readers[feat_path] = feat_reader
-                feature_readers[name] = feat_reader
-
+            tile_reader = self._cached_thread_reader("tile", self.tile_paths[package_idx], TilePackageReader)
+            teacher_paths = {name: paths[package_idx] for name, paths in self.teacher_package_paths.items()}
+            feature_sources = {
+                path: self._cached_thread_reader("feature", path, _open_feature_source)
+                for path in set(teacher_paths.values())
+            }
             for out_idx, row in sorted(items, key=lambda item: item[1]):
                 tile_id = tile_reader.tile_id_at(row)
                 image = tile_reader.read_array_at(row)
                 results[out_idx] = {
                     "tile_id": tile_id,
                     "image": image,
-                    "teacher_features": {
-                        name: reader.read_feature_at(row)
-                        for name, reader in feature_readers.items()
-                    },
+                    "teacher_features": _read_teacher_features_at(feature_sources, teacher_paths, row),
                     **_prototype_payload(tile_id, self.prototype_labels),
                 }
         return [item for item in results if item is not None]
@@ -705,6 +789,7 @@ class PackageSampledDistillationDataset(Dataset):
         self.active_package_idx = None
         self.active_tile_reader = None
         self.active_feature_readers = {}
+        self.active_teacher_feature_paths = {}
         if getattr(self, "_thread_local", None) is not None:
             readers = getattr(self._thread_local, "readers", None)
             if readers:
@@ -717,8 +802,13 @@ class PackageSampledDistillationDataset(Dataset):
         state["active_package_idx"] = None
         state["active_tile_reader"] = None
         state["active_feature_readers"] = {}
+        state["active_teacher_feature_paths"] = {}
         state["_thread_local"] = None
         return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._thread_local = threading.local()
 
     def __del__(self) -> None:
         self.close()
@@ -741,7 +831,7 @@ def validate_teacher_cache(
         teacher_cache_package_paths=teacher_cache_package_paths,
     )
     for name, package_paths in packages.items():
-        reader = _FeatureReaderSet(package_paths)
+        reader = _TeacherFeatureStore({name: package_paths})
         try:
             if isinstance(expected_dim, dict):
                 dim = expected_dim.get(name)
@@ -750,7 +840,7 @@ def validate_teacher_cache(
             wrong_shape = []
             for item in records:
                 tile_id = _record_tile_id(item)
-                feature = reader.read_feature(tile_id)
+                feature = reader.read_feature(tile_id, name)
                 if feature.ndim != 1 or (dim is not None and feature.shape[0] != dim):
                     wrong_shape.append(f"{tile_id}:{tuple(feature.shape)}")
             if wrong_shape:

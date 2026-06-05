@@ -438,7 +438,9 @@ def run_epoch(
     global_step: int = 0,
     schedule_state: dict | None = None,
     summary_writer=None,
-) -> dict[str, float]:
+    collect_embeddings: bool = False,
+    max_eval_batches: int | None = None,
+) -> dict[str, float] | tuple[dict[str, float], tuple]:
     model.train(train)
     schedule_state = _ensure_schedule_state(schedule_state)
     totals = {
@@ -472,6 +474,16 @@ def run_epoch(
         zhcc_prototype_state = {"zhcc": zhcc_prototypes, "last_refresh_step": None}
     elif "zhcc" not in zhcc_prototype_state:
         zhcc_prototype_state["zhcc"] = zhcc_prototypes
+    embeddings_data = None
+    if collect_embeddings:
+        embeddings_data = {
+            "embeddings": [],
+            "prototype_masks": [],
+            "prototype_level1": [],
+            "prototype_level2": [],
+            "students_by_teacher": {},
+            "teachers_by_name": {},
+        }
     iterator = iter(loader)
     progress_total = len(loader)
     if max_batches is not None:
@@ -529,6 +541,21 @@ def run_epoch(
                 with torch.autocast(device_type=device.type, enabled=_amp_enabled(device, cfg, train)):
                     outputs = model(images)
                     student_by_teacher = outputs["teacher_outputs"]
+                    if collect_embeddings and (max_eval_batches is None or n_batches < max_eval_batches):
+                        embeddings_data["embeddings"].append(outputs["embedding_norm"].detach().cpu())
+                        p_mask = batch.get("prototype_mask", torch.zeros(len(batch["tile_id"]), dtype=torch.bool))
+                        p_lvl1 = batch.get("prototype_level1", torch.full((len(batch["tile_id"]),), -1, dtype=torch.long))
+                        p_lvl2 = batch.get("prototype_level2", torch.zeros((len(batch["tile_id"]), 0), dtype=torch.float32))
+                        embeddings_data["prototype_masks"].append(p_mask.detach().cpu())
+                        embeddings_data["prototype_level1"].append(p_lvl1.detach().cpu())
+                        embeddings_data["prototype_level2"].append(p_lvl2.detach().cpu())
+                        for name, tensor in student_by_teacher.items():
+                            embeddings_data["students_by_teacher"].setdefault(name, []).append(tensor.detach().cpu())
+                        for name, tensor in batch["teacher_features"].items():
+                            feat_tensor = tensor
+                            if isinstance(feat_tensor, np.ndarray):
+                                feat_tensor = torch.from_numpy(feat_tensor)
+                            embeddings_data["teachers_by_name"].setdefault(name, []).append(feat_tensor.detach().cpu())
                     if float(loss_cfg["prototype_filter_weight"]) > 0:
                         if prototypes is None:
                             raise ValueError(
@@ -700,6 +727,18 @@ def run_epoch(
     result["teacher_prior_loss_ema"] = float(schedule_state["teacher_prior_loss_ema"] or 0.0)
     result["teacher_prior_relative_improvement"] = float(schedule_state["teacher_prior_relative_improvement"] or 0.0)
     result["teacher_prior_plateau_count"] = float(schedule_state["teacher_prior_plateau_count"] or 0)
+    if collect_embeddings:
+        collated_embeddings = (
+            torch.cat(embeddings_data["embeddings"]),
+            {name: torch.cat(values) for name, values in embeddings_data["students_by_teacher"].items()},
+            {name: torch.cat(values) for name, values in embeddings_data["teachers_by_name"].items()},
+            {
+                "prototype_mask": torch.cat(embeddings_data["prototype_masks"]),
+                "prototype_level1": torch.cat(embeddings_data["prototype_level1"]),
+                "prototype_level2": torch.cat(embeddings_data["prototype_level2"]),
+            },
+        )
+        return result, collated_embeddings
     return result
 
 
@@ -812,7 +851,7 @@ def fit(
                 global_step=global_step,
                 needed=zhcc_image_bank is not None,
             )
-            val_metrics = run_epoch(
+            val_metrics, val_embeddings = run_epoch(
                 model,
                 val_loader,
                 prototypes,
@@ -828,21 +867,19 @@ def fit(
                 global_step=global_step,
                 schedule_state=schedule_state,
                 summary_writer=writer,
+                collect_embeddings=True,
+                max_eval_batches=cfg["train"].get("max_eval_batches", cfg["train"].get("max_val_batches")),
             )
             current_zhcc_prototypes = zhcc_prototype_state.get("zhcc", zhcc_prototypes)
-            embeddings, student_by_teacher, teacher_by_name, prototype_labels = collect_embeddings(
-                model,
-                val_loader,
-                device,
-                cfg=cfg,
-                max_batches=cfg["train"].get("max_eval_batches", cfg["train"].get("max_val_batches")),
-            )
+            embeddings, student_by_teacher, teacher_by_name, prototype_labels = val_embeddings
             cpu_prototypes = {name: registry.to("cpu") for name, registry in prototypes.items()} if prototypes else None
+            eval_pairwise_max_samples = int(cfg["train"].get("eval_pairwise_max_samples", 4096))
             embedding_metrics = evaluate_teacher_outputs(
                 student_by_teacher,
                 teacher_by_name,
                 cpu_prototypes,
                 int(cfg["train"]["topk"]),
+                max_pairwise_samples=eval_pairwise_max_samples,
             )
             zhcc_metrics = evaluate_zhcc_prototypes(
                 embeddings,
@@ -851,7 +888,9 @@ def fit(
                 prototype_labels["prototype_level2"],
                 current_zhcc_prototypes.to("cpu") if current_zhcc_prototypes is not None else None,
                 topk=int(cfg["train"]["topk"]),
+                max_pairwise_samples=eval_pairwise_max_samples,
             )
+            del val_embeddings, embeddings, student_by_teacher, teacher_by_name, prototype_labels
             prototype_bank_metrics = {}
             if zhcc_image_bank is not None and current_zhcc_prototypes is not None:
                 bank_batch_size = int(cfg["train"].get("dynamic_prototype_batch_size", cfg["train"].get("batch_size", 512)))
@@ -869,6 +908,7 @@ def fit(
                     zhcc_image_bank.level2,
                     current_zhcc_prototypes.to("cpu"),
                     topk=int(cfg["train"]["topk"]),
+                    max_pairwise_samples=eval_pairwise_max_samples,
                 )
                 prototype_bank_metrics = {f"prototype_bank_{key}": value for key, value in bank_metrics.items()}
             teacher_alignment_values = [

@@ -12,6 +12,18 @@ def feature_cosine(student: torch.Tensor, teacher: torch.Tensor) -> float:
     return float(F.cosine_similarity(student, teacher, dim=-1).mean().cpu())
 
 
+def _deterministic_subset(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    max_samples: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    max_samples = int(max_samples)
+    if max_samples <= 0 or student.shape[0] <= max_samples:
+        return student, teacher
+    idx = torch.linspace(0, student.shape[0] - 1, steps=max_samples, device=student.device).long()
+    return student.index_select(0, idx), teacher.index_select(0, idx)
+
+
 def retrieval_overlap(student: torch.Tensor, teacher: torch.Tensor, topk: int) -> float:
     k = min(topk + 1, student.shape[0])
     student_sim = F.normalize(student, dim=-1) @ F.normalize(student, dim=-1).T
@@ -36,11 +48,13 @@ def evaluate_embeddings(
     teacher: torch.Tensor,
     prototypes: PrototypeRegistry | None,
     topk: int,
+    max_pairwise_samples: int = 4096,
 ) -> dict[str, float]:
+    pairwise_student, pairwise_teacher = _deterministic_subset(student, teacher, max_pairwise_samples)
     metrics = {
         "feature_cosine": feature_cosine(student, teacher),
-        "relation_mse": float(relation_distillation_loss(student, teacher).cpu()),
-        "retrieval_overlap": retrieval_overlap(student, teacher, topk=topk),
+        "relation_mse": float(relation_distillation_loss(pairwise_student, pairwise_teacher).cpu()),
+        "retrieval_overlap": retrieval_overlap(pairwise_student, pairwise_teacher, topk=topk),
     }
     if prototypes is not None:
         metrics["prototype_semantic_loss"] = float(semantic_distillation_loss(student, teacher, prototypes).cpu())
@@ -53,6 +67,7 @@ def evaluate_teacher_outputs(
     teacher_by_name: dict[str, torch.Tensor],
     prototypes_by_teacher: dict[str, PrototypeRegistry] | None,
     topk: int,
+    max_pairwise_samples: int = 4096,
 ) -> dict[str, float]:
     metrics: dict[str, float] = {}
     for name in sorted(student_by_teacher):
@@ -61,6 +76,7 @@ def evaluate_teacher_outputs(
             teacher_by_name[name],
             prototypes_by_teacher.get(name) if prototypes_by_teacher else None,
             topk,
+            max_pairwise_samples=max_pairwise_samples,
         )
         metrics.update({f"{name}_{key}": value for key, value in teacher_metrics.items()})
     return metrics

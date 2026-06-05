@@ -138,7 +138,14 @@ def main() -> None:
         max_batches=cfg["train"].get("max_eval_batches", cfg["train"].get("max_val_batches")),
     )
     prototypes = _load_prototype_map(cfg, dims)
-    metrics = evaluate_teacher_outputs(student_by_teacher, teacher_by_name, prototypes, int(cfg["train"]["topk"]))
+    eval_pairwise_max_samples = int(cfg["train"].get("eval_pairwise_max_samples", 4096))
+    metrics = evaluate_teacher_outputs(
+        student_by_teacher,
+        teacher_by_name,
+        prototypes,
+        int(cfg["train"]["topk"]),
+        max_pairwise_samples=eval_pairwise_max_samples,
+    )
     metrics.update(
         evaluate_zhcc_prototypes(
             embeddings,
@@ -147,6 +154,7 @@ def main() -> None:
             supervised["prototype_level2"],
             zhcc_prototypes,
             topk=int(cfg["train"]["topk"]),
+            max_pairwise_samples=eval_pairwise_max_samples,
         )
     )
     write_json(f"{cfg['runtime']['output_dir']}/eval_{args.split}.json", metrics)

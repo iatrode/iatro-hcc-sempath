@@ -63,10 +63,14 @@ class _PackageShuffleBatchLoader:
 
     def _draw_batch(self, buffer: list[dict], rng: np.random.Generator) -> list[dict]:
         take = min(self.batch_size, len(buffer))
+        if bool(getattr(self.dataset, "sequential_iac_rows", False)):
+            batch = buffer[:take]
+            del buffer[:take]
+            return batch
         chosen = rng.choice(len(buffer), size=take, replace=False)
+        chosen_set = set(chosen)
         batch = [buffer[index] for index in chosen]
-        for index in sorted((int(index) for index in chosen), reverse=True):
-            buffer.pop(index)
+        buffer[:] = [item for index, item in enumerate(buffer) if index not in chosen_set]
         return batch
 
     def __iter__(self):
@@ -87,8 +91,8 @@ class _PackageShuffleBatchLoader:
                 yield self.collate_fn(self._draw_batch(buffer, rng))
             return
 
-        max_pending = max(1, self.num_workers + self.prefetch_batches)
         max_buffer_rows = self.batch_size * max(4, self.prefetch_batches * 2)
+        max_pending = max(self.num_workers + self.prefetch_batches, (max_buffer_rows + self.chunk_size - 1) // self.chunk_size)
         ready_queue: Queue = Queue(maxsize=max(1, self.prefetch_batches * 2))
         stop_event = Event()
         sentinel = object()
@@ -152,10 +156,14 @@ class _PackageShuffleBatchLoader:
                     if buf_len >= self.batch_size or (exhausted_flag[0] and buf_len > 0):
                         with buffer_lock:
                             take = min(self.batch_size, len(buffer))
-                            chosen = rng.choice(len(buffer), size=take, replace=False)
-                            batch_rows = [buffer[index] for index in chosen]
-                            for index in sorted((int(i) for i in chosen), reverse=True):
-                                buffer.pop(index)
+                            if bool(getattr(self.dataset, "sequential_iac_rows", False)):
+                                batch_rows = buffer[:take]
+                                del buffer[:take]
+                            else:
+                                chosen = rng.choice(len(buffer), size=take, replace=False)
+                                chosen_set = set(chosen)
+                                batch_rows = [buffer[index] for index in chosen]
+                                buffer[:] = [item for index, item in enumerate(buffer) if index not in chosen_set]
                         batch = self.collate_fn(batch_rows)
                         if torch.cuda.is_available():
                             batch["images"] = batch["images"].pin_memory()
@@ -570,6 +578,7 @@ def main() -> None:
         projector_type=cfg["model"].get("projector_type", "linear"),
         projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
         teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),
+        grad_checkpointing=bool(cfg["model"].get("grad_checkpointing", False)),
     ).to(device)
     resume_state = None
     if args.resume:

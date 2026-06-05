@@ -9,6 +9,7 @@ from PIL import Image
 import torch
 
 from hcc_sempath.io.feature_cache import build_teacher_feature_package_from_feature_map
+from hcc_sempath.io.iatrocache import read_header
 from hcc_sempath.io.manifests import write_tile_manifest
 from hcc_sempath.io.tile_package import build_tile_package, read_package_metadata
 from hcc_sempath.training.config import manifest_data_paths
@@ -21,6 +22,8 @@ from hcc_sempath.training.datasets import (
     validate_teacher_feature_package_pairs,
     validate_teacher_cache,
 )
+from hcc_sempath.training.feature_pack_merge import maybe_prepare_merged_teacher_feature_packages
+from hcc_sempath.training.feature_pack_shuffle import maybe_prepare_shuffled_iac_packages
 from hcc_sempath.training.manifest import build_training_manifest
 from hcc_sempath.training.manifest import validate_manifest_artifacts
 from hcc_sempath.training.engine import _prepare_images
@@ -67,6 +70,27 @@ def _write_package(root: Path, slide_id: str, value: int, count: int = 1) -> tup
         stride_y=int(metadata["stride_y"]),
     )
     return tile_package_path, feature_package_path
+
+
+def _write_other_feature_package(root: Path, tile_path: Path, teacher_name: str = "other", offset: int = 100) -> Path:
+    records = read_packaged_tile_records([tile_path])
+    metadata = read_package_metadata(tile_path)
+    slide_id = records[0].record.slide_id
+    feature_path = root / f"{slide_id}.{teacher_name}.features.iac"
+    build_teacher_feature_package_from_feature_map(
+        [item.record for item in records],
+        {
+            item.record.tile_id: np.full((4,), offset + idx, dtype=np.float32)
+            for idx, item in enumerate(records)
+        },
+        feature_path,
+        teacher_name=teacher_name,
+        tile_width=int(metadata["tile_width"]),
+        tile_height=int(metadata["tile_height"]),
+        stride_x=int(metadata["stride_x"]),
+        stride_y=int(metadata["stride_y"]),
+    )
+    return feature_path
 
 
 def test_multi_package_dataset_uses_external_slide_split(tmp_path: Path) -> None:
@@ -181,6 +205,59 @@ def test_manifest_data_paths_resolve_teacher_features_by_convention(tmp_path: Pa
 
     assert tile_packages == [str(tile_path)]
     assert feature_packages == {"toy": [str(expected_feature_path)]}
+
+
+def test_manifest_data_paths_prefers_existing_merged_after_source_delete(tmp_path: Path) -> None:
+    tile_root = tmp_path / "tiles" / "301"
+    feature_root = tmp_path / "features"
+    tile_root.mkdir(parents=True)
+    for subdir in ("toy", "other"):
+        (feature_root / subdir / "301").mkdir(parents=True)
+    tile_path, feature_a = _write_package(tile_root, "slide_a", 10, count=4)
+    feature_b = _write_other_feature_package(tile_root, tile_path)
+    expected_a = feature_root / "toy" / "301" / feature_a.name
+    expected_b = feature_root / "other" / "301" / feature_b.name
+    feature_a.replace(expected_a)
+    feature_b.replace(expected_b)
+    merged = maybe_prepare_merged_teacher_feature_packages(
+        cfg={
+            "data": {
+                "auto_merge_teacher_features": True,
+                "auto_merge_delete_source_features": True,
+            }
+        },
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths={"toy": [str(expected_a)], "other": [str(expected_b)]},
+        expected_dims={"toy": 4, "other": 4},
+    )
+    merged_path = Path(merged["toy"][0])
+    assert merged_path.exists()
+    assert not expected_a.exists()
+    assert not expected_b.exists()
+    manifest = {
+        "version": 1,
+        "tile_suffix": ".tiles.iac",
+        "datasets": {"internal": {"role": "development", "tile_root": str(tile_root)}},
+        "feature_roots": {
+            "toy": str(feature_root / "toy"),
+            "other": str(feature_root / "other"),
+        },
+        "splits": {"train": {"internal": ["slide_a"]}, "val": {}, "exval": {}},
+    }
+    cfg = {
+        "data": {
+            "teachers": ["toy", "other"],
+            "prefer_merged_teacher_features": True,
+        },
+        "model": {"teacher_dims": {"toy": 4, "other": 4}},
+        "runtime": {"seed": 13},
+    }
+
+    tile_packages, feature_packages = manifest_data_paths(cfg, manifest, "train")
+
+    assert tile_packages == [str(tile_path)]
+    assert feature_packages == {"toy": [str(merged_path)], "other": [str(merged_path)]}
 
 
 def test_validate_manifest_artifacts_checks_teacher_feature_packages(tmp_path: Path) -> None:
@@ -338,3 +415,384 @@ def test_package_sampled_tensor_collate_defers_image_preprocess_to_device(tmp_pa
 
     assert images.dtype == torch.float32
     assert images.shape == (4, 3, 32, 32)
+
+
+def test_auto_merge_teacher_feature_packages_replaces_sources(tmp_path: Path) -> None:
+    tile_path, feature_a = _write_package(tmp_path, "slide_a", 10, count=4)
+    records = read_packaged_tile_records([tile_path])
+    metadata = read_package_metadata(tile_path)
+    feature_b = tmp_path / "slide_a.other.features.iac"
+    build_teacher_feature_package_from_feature_map(
+        [item.record for item in records],
+        {
+            item.record.tile_id: np.full((4,), 100 + idx, dtype=np.float32)
+            for idx, item in enumerate(records)
+        },
+        feature_b,
+        teacher_name="other",
+        tile_width=int(metadata["tile_width"]),
+        tile_height=int(metadata["tile_height"]),
+        stride_x=int(metadata["stride_x"]),
+        stride_y=int(metadata["stride_y"]),
+    )
+
+    merged = maybe_prepare_merged_teacher_feature_packages(
+        cfg={
+            "data": {
+                "auto_merge_teacher_features": True,
+                "auto_merge_delete_source_features": True,
+            }
+        },
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths={"toy": [str(feature_a)], "other": [str(feature_b)]},
+        expected_dims={"toy": 4, "other": 4},
+    )
+
+    merged_path = Path(merged["toy"][0])
+    assert merged["other"][0] == str(merged_path)
+    assert merged_path.exists()
+    assert not feature_a.exists()
+    assert not feature_b.exists()
+
+    validate_teacher_feature_package_pairs(
+        [tile_path],
+        merged,
+        expected_dims={"toy": 4, "other": 4},
+    )
+    dataset = PackageSampledDistillationDataset(
+        [tile_path],
+        merged,
+        image_size=(32, 32),
+        max_records=4,
+        seed=13,
+        expected_dims={"toy": 4, "other": 4},
+    )
+    sample = dataset[0]
+    np.testing.assert_allclose(sample["teacher_features"]["toy"], np.full((4,), 10, dtype=np.float32))
+    np.testing.assert_allclose(sample["teacher_features"]["other"], np.full((4,), 100, dtype=np.float32))
+
+
+def test_auto_merge_allows_source_teacher_header_aliases(tmp_path: Path) -> None:
+    tile_path, _ = _write_package(tmp_path, "slide_a", 10, count=4)
+    feature_a = _write_other_feature_package(
+        tmp_path,
+        tile_path,
+        teacher_name="prov-gigapath-local",
+        offset=10,
+    )
+    feature_b = _write_other_feature_package(
+        tmp_path,
+        tile_path,
+        teacher_name="prov-uni-local",
+        offset=100,
+    )
+
+    merged = maybe_prepare_merged_teacher_feature_packages(
+        cfg={
+            "data": {
+                "auto_merge_teacher_features": True,
+                "auto_merge_delete_source_features": True,
+            }
+        },
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths={"gigapath": [str(feature_a)], "uni2_h": [str(feature_b)]},
+        expected_dims={"gigapath": 4, "uni2_h": 4},
+    )
+
+    merged_path = Path(merged["gigapath"][0])
+    header = read_header(merged_path)
+    assert header["teachers"] == ["gigapath", "uni2_h"]
+    assert header["source_teachers"] == {
+        "gigapath": "prov-gigapath-local",
+        "uni2_h": "prov-uni-local",
+    }
+    assert not feature_a.exists()
+    assert not feature_b.exists()
+
+    dataset = PackageSampledDistillationDataset(
+        [tile_path],
+        merged,
+        image_size=(32, 32),
+        max_records=4,
+        seed=13,
+        expected_dims={"gigapath": 4, "uni2_h": 4},
+    )
+    sample = dataset[0]
+    np.testing.assert_allclose(sample["teacher_features"]["gigapath"], np.full((4,), 10, dtype=np.float32))
+    np.testing.assert_allclose(sample["teacher_features"]["uni2_h"], np.full((4,), 100, dtype=np.float32))
+
+
+def test_auto_merge_existing_bad_metadata_keeps_sources(tmp_path: Path) -> None:
+    tile_path, feature_a = _write_package(tmp_path, "slide_a", 10, count=4)
+    feature_b = _write_other_feature_package(tmp_path, tile_path)
+    keep_sources_cfg = {
+        "data": {
+            "auto_merge_teacher_features": True,
+            "auto_merge_delete_source_features": False,
+        }
+    }
+    maybe_prepare_merged_teacher_feature_packages(
+        cfg=keep_sources_cfg,
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths={"toy": [str(feature_a)], "other": [str(feature_b)]},
+        expected_dims={"toy": 4, "other": 4},
+    )
+
+    with pytest.raises(ValueError, match="feature dim mismatch"):
+        maybe_prepare_merged_teacher_feature_packages(
+            cfg={
+                "data": {
+                    "auto_merge_teacher_features": True,
+                    "auto_merge_delete_source_features": True,
+                }
+            },
+            split="train",
+            tile_packages=[str(tile_path)],
+            teacher_package_paths={"toy": [str(feature_a)], "other": [str(feature_b)]},
+            expected_dims={"toy": 5, "other": 4},
+        )
+
+    assert feature_a.exists()
+    assert feature_b.exists()
+
+
+def test_auto_merge_existing_partial_sources_refuses_delete(tmp_path: Path) -> None:
+    tile_path, feature_a = _write_package(tmp_path, "slide_a", 10, count=4)
+    feature_b = _write_other_feature_package(tmp_path, tile_path)
+    maybe_prepare_merged_teacher_feature_packages(
+        cfg={
+            "data": {
+                "auto_merge_teacher_features": True,
+                "auto_merge_delete_source_features": False,
+            }
+        },
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths={"toy": [str(feature_a)], "other": [str(feature_b)]},
+        expected_dims={"toy": 4, "other": 4},
+    )
+    feature_a.unlink()
+
+    with pytest.raises(ValueError, match="refusing partial source deletion"):
+        maybe_prepare_merged_teacher_feature_packages(
+            cfg={
+                "data": {
+                    "auto_merge_teacher_features": True,
+                    "auto_merge_delete_source_features": True,
+                }
+            },
+            split="train",
+            tile_packages=[str(tile_path)],
+            teacher_package_paths={"toy": [str(feature_a)], "other": [str(feature_b)]},
+            expected_dims={"toy": 4, "other": 4},
+        )
+
+    assert feature_b.exists()
+
+
+def test_auto_shuffle_iac_rows_reorders_tile_and_merged_feature_together(tmp_path: Path) -> None:
+    tile_path, feature_a = _write_package(tmp_path, "slide_a", 10, count=8)
+    records = read_packaged_tile_records([tile_path])
+    metadata = read_package_metadata(tile_path)
+    feature_b = tmp_path / "slide_a.other.features.iac"
+    build_teacher_feature_package_from_feature_map(
+        [item.record for item in records],
+        {
+            item.record.tile_id: np.full((4,), 100 + idx, dtype=np.float32)
+            for idx, item in enumerate(records)
+        },
+        feature_b,
+        teacher_name="other",
+        tile_width=int(metadata["tile_width"]),
+        tile_height=int(metadata["tile_height"]),
+        stride_x=int(metadata["stride_x"]),
+        stride_y=int(metadata["stride_y"]),
+    )
+    cfg = {
+        "runtime": {"seed": 19},
+        "data": {
+            "auto_merge_teacher_features": True,
+            "auto_merge_delete_source_features": True,
+            "auto_shuffle_iac_rows": True,
+            "iac_row_order_seed": 19,
+        },
+    }
+    merged = maybe_prepare_merged_teacher_feature_packages(
+        cfg=cfg,
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths={"toy": [str(feature_a)], "other": [str(feature_b)]},
+        expected_dims={"toy": 4, "other": 4},
+    )
+    tile_paths, shuffled = maybe_prepare_shuffled_iac_packages(
+        cfg=cfg,
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths=merged,
+    )
+    merged_path = Path(shuffled["toy"][0])
+
+    assert tile_paths == [str(tile_path)]
+    assert shuffled["other"][0] == str(merged_path)
+    assert int(read_header(tile_path)["row_order_seed"]) == 19
+    assert int(read_header(merged_path)["row_order_seed"]) == 19
+
+    tile_ids = [item.record.tile_id for item in read_packaged_tile_records([tile_path])]
+    assert tile_ids != [item.record.tile_id for item in records]
+    validate_teacher_feature_package_pairs([tile_path], shuffled, expected_dims={"toy": 4, "other": 4})
+    dataset = PackageSampledDistillationDataset(
+        [tile_path],
+        shuffled,
+        image_size=(32, 32),
+        max_records=8,
+        seed=13,
+        expected_dims={"toy": 4, "other": 4},
+    )
+    assert dataset.sequential_iac_rows is True
+    sample = dataset[0]
+    original_idx = int(sample["tile_id"].split("_")[-1])
+    np.testing.assert_allclose(sample["teacher_features"]["toy"], np.full((4,), 10 + original_idx, dtype=np.float32))
+    np.testing.assert_allclose(sample["teacher_features"]["other"], np.full((4,), 100 + original_idx, dtype=np.float32))
+
+
+def test_auto_merge_and_shuffle_are_idempotent_after_source_delete(tmp_path: Path) -> None:
+    tile_path, feature_a = _write_package(tmp_path, "slide_a", 10, count=8)
+    feature_b = _write_other_feature_package(tmp_path, tile_path)
+    cfg = {
+        "runtime": {"seed": 19},
+        "data": {
+            "auto_merge_teacher_features": True,
+            "prefer_merged_teacher_features": True,
+            "auto_merge_delete_source_features": True,
+            "auto_shuffle_iac_rows": True,
+            "iac_row_order_seed": 19,
+        },
+    }
+    first_merged = maybe_prepare_merged_teacher_feature_packages(
+        cfg=cfg,
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths={"toy": [str(feature_a)], "other": [str(feature_b)]},
+        expected_dims={"toy": 4, "other": 4},
+    )
+    first_tile_paths, first_shuffled = maybe_prepare_shuffled_iac_packages(
+        cfg=cfg,
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths=first_merged,
+    )
+
+    second_merged = maybe_prepare_merged_teacher_feature_packages(
+        cfg=cfg,
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths={"toy": [str(feature_a)], "other": [str(feature_b)]},
+        expected_dims={"toy": 4, "other": 4},
+    )
+    second_tile_paths, second_shuffled = maybe_prepare_shuffled_iac_packages(
+        cfg=cfg,
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths=second_merged,
+    )
+
+    assert not feature_a.exists()
+    assert not feature_b.exists()
+    assert first_tile_paths == second_tile_paths == [str(tile_path)]
+    assert first_shuffled == second_shuffled
+    assert int(read_header(tile_path)["row_order_seed"]) == 19
+    assert int(read_header(first_shuffled["toy"][0])["row_order_seed"]) == 19
+
+
+def test_auto_merge_and_shuffle_prepare_packages_in_parallel(tmp_path: Path) -> None:
+    tile_paths = []
+    feature_paths_a = []
+    feature_paths_b = []
+    for idx in range(4):
+        tile_path, feature_a = _write_package(tmp_path, f"slide_{idx}", 10 + idx * 10, count=4)
+        feature_b = _write_other_feature_package(tmp_path, tile_path, offset=100 + idx * 10)
+        tile_paths.append(str(tile_path))
+        feature_paths_a.append(str(feature_a))
+        feature_paths_b.append(str(feature_b))
+    cfg = {
+        "runtime": {"seed": 19},
+        "data": {
+            "auto_merge_teacher_features": True,
+            "auto_merge_delete_source_features": True,
+            "auto_shuffle_iac_rows": True,
+            "iac_row_order_seed": 19,
+            "auto_iac_prepare_workers": 4,
+        },
+    }
+
+    merged = maybe_prepare_merged_teacher_feature_packages(
+        cfg=cfg,
+        split="train",
+        tile_packages=tile_paths,
+        teacher_package_paths={"toy": feature_paths_a, "other": feature_paths_b},
+        expected_dims={"toy": 4, "other": 4},
+    )
+    shuffled_tile_paths, shuffled = maybe_prepare_shuffled_iac_packages(
+        cfg=cfg,
+        split="train",
+        tile_packages=tile_paths,
+        teacher_package_paths=merged,
+    )
+
+    assert shuffled_tile_paths == tile_paths
+    for tile_path, feature_path in zip(shuffled_tile_paths, shuffled["toy"], strict=True):
+        assert shuffled["other"][shuffled_tile_paths.index(tile_path)] == feature_path
+        assert int(read_header(tile_path)["row_order_seed"]) == 19
+        assert int(read_header(feature_path)["row_order_seed"]) == 19
+    assert all(not Path(path).exists() for path in feature_paths_a)
+    assert all(not Path(path).exists() for path in feature_paths_b)
+
+
+def test_auto_shuffle_seed_conflict_keeps_existing_order(tmp_path: Path) -> None:
+    tile_path, feature_a = _write_package(tmp_path, "slide_a", 10, count=8)
+    feature_b = _write_other_feature_package(tmp_path, tile_path)
+    cfg = {
+        "runtime": {"seed": 19},
+        "data": {
+            "auto_merge_teacher_features": True,
+            "auto_merge_delete_source_features": True,
+            "auto_shuffle_iac_rows": True,
+            "iac_row_order_seed": 19,
+        },
+    }
+    merged = maybe_prepare_merged_teacher_feature_packages(
+        cfg=cfg,
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths={"toy": [str(feature_a)], "other": [str(feature_b)]},
+        expected_dims={"toy": 4, "other": 4},
+    )
+    _, shuffled = maybe_prepare_shuffled_iac_packages(
+        cfg=cfg,
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths=merged,
+    )
+    merged_path = Path(shuffled["toy"][0])
+    tile_ids_before = [item.record.tile_id for item in read_packaged_tile_records([tile_path])]
+
+    with pytest.raises(ValueError, match="existing row_order_seed conflicts"):
+        maybe_prepare_shuffled_iac_packages(
+            cfg={
+                "runtime": {"seed": 20},
+                "data": {
+                    "auto_shuffle_iac_rows": True,
+                    "iac_row_order_seed": 20,
+                },
+            },
+            split="train",
+            tile_packages=[str(tile_path)],
+            teacher_package_paths=shuffled,
+        )
+
+    assert int(read_header(tile_path)["row_order_seed"]) == 19
+    assert int(read_header(merged_path)["row_order_seed"]) == 19
+    assert [item.record.tile_id for item in read_packaged_tile_records([tile_path])] == tile_ids_before

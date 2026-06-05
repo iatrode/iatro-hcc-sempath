@@ -16,6 +16,7 @@ class StudentEncoder(nn.Module):
         pretrained: bool = False,
         projector_type: str = "linear",
         projector_hidden_dim: int = 2048,
+        grad_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         self.backbone = timm.create_model(
@@ -24,6 +25,8 @@ class StudentEncoder(nn.Module):
             num_classes=0,
             global_pool="avg",
         )
+        if grad_checkpointing:
+            self.backbone.set_grad_checkpointing(True)
         student_dim = int(self.backbone.num_features)
         if projector_type == "linear":
             self.projector = nn.Sequential(
@@ -88,6 +91,7 @@ class HCCSemPathModel(nn.Module):
         projector_type: str = "linear",
         projector_hidden_dim: int = 2048,
         teacher_head_type: str = "linear",
+        grad_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         if not teacher_dims:
@@ -98,6 +102,7 @@ class HCCSemPathModel(nn.Module):
             pretrained=pretrained,
             projector_type=projector_type,
             projector_hidden_dim=projector_hidden_dim,
+            grad_checkpointing=grad_checkpointing,
         )
         self.teacher_heads = nn.ModuleDict(
             {
