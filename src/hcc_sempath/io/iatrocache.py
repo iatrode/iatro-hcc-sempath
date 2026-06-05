@@ -436,6 +436,8 @@ class PackReader:
         self._header: dict | None = None
         self._slide_table: pa.Table | None = None
         self._record_table: pa.Table | None = None
+        self._offsets = None
+        self._lengths = None
 
     def _ensure_header(self) -> None:
         if self._header is not None:
@@ -462,6 +464,10 @@ class PackReader:
             raise ValueError(
                 f"num_records mismatch: header={self._header['num_records']} table={len(self._record_table)}"
             )
+        if "offset" in self._record_table.column_names:
+            import numpy as np
+            self._offsets = self._record_table.column("offset").to_numpy()
+            self._lengths = self._record_table.column("length").to_numpy()
 
     @property
     def header(self) -> dict:
@@ -486,8 +492,8 @@ class PackReader:
         assert self._file is not None
         assert self._header is not None
         assert self._record_table is not None
-        offset = self._record_table.column("offset")[row].as_py()
-        length = self._record_table.column("length")[row].as_py()
+        offset = int(self._offsets[row])
+        length = int(self._lengths[row])
         if offset < 0 or length < 0 or offset + length > int(self._header["data_length"]):
             raise ValueError(f"payload span outside data segment at row {row}: offset={offset} length={length}")
         self._file.seek(self._header["data_offset"] + offset)
@@ -515,6 +521,8 @@ class PackReader:
         self._header = None
         self._slide_table = None
         self._record_table = None
+        self._offsets = None
+        self._lengths = None
 
     def __getstate__(self) -> dict:
         return {"package_path": self.package_path}

@@ -234,6 +234,7 @@ class FeatureCacheReader:
     def __init__(self, package_path: str | Path) -> None:
         self._reader = PackReader(package_path)
         self._tile_index: dict[str, int] | None = None
+        self._tile_ids: list[str] | None = None
 
     @property
     def header(self) -> dict:
@@ -259,7 +260,8 @@ class FeatureCacheReader:
         if duplicates:
             sample = ", ".join(duplicates[:3])
             raise ValueError(f"duplicate tile_id values in feature package: count={len(duplicates)} sample={sample}")
-        self._tile_index = {tile_ids[i].as_py(): i for i in range(len(tile_ids))}
+        self._tile_ids = [str(x) for x in values]
+        self._tile_index = {self._tile_ids[i]: i for i in range(len(self._tile_ids))}
 
     def _record_bytes(self) -> int:
         header = self._reader.header
@@ -292,9 +294,11 @@ class FeatureCacheReader:
         return feature.astype(np.float32, copy=True)
 
     def tile_id_at(self, row: int) -> str:
-        if row < 0 or row >= len(self._reader.record_table):
+        self._ensure_index()
+        assert self._tile_ids is not None
+        if row < 0 or row >= len(self._tile_ids):
             raise IndexError(f"feature row out of range: {row}")
-        return str(self._reader.record_table.column("tile_id")[row].as_py())
+        return self._tile_ids[row]
 
     @property
     def record_count(self) -> int:
@@ -303,6 +307,7 @@ class FeatureCacheReader:
     def close(self) -> None:
         self._reader.close()
         self._tile_index = None
+        self._tile_ids = None
 
     def __getstate__(self) -> dict:
         return {"package_path": self._reader.package_path}
@@ -310,6 +315,7 @@ class FeatureCacheReader:
     def __setstate__(self, state: dict) -> None:
         self._reader = PackReader(state["package_path"])
         self._tile_index = None
+        self._tile_ids = None
 
     def __del__(self) -> None:
         self.close()

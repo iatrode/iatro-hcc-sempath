@@ -381,6 +381,7 @@ class TilePackageReader:
         self._reader = PackReader(package_path)
         self._slide_map: dict[int, tuple[str, str]] | None = None
         self._tile_index: dict[str, int] | None = None
+        self._tile_ids: list[str] | None = None
 
     def _ensure_index(self) -> None:
         if self._tile_index is not None:
@@ -389,7 +390,8 @@ class TilePackageReader:
         self._slide_map = _slide_map(self._reader.slide_table)
         tile_ids = self._reader.record_table.column("tile_id")
         _ensure_unique_column(self._reader.record_table, "tile_id")
-        self._tile_index = {tile_ids[i].as_py(): i for i in range(len(tile_ids))}
+        self._tile_ids = [str(x) for x in tile_ids.to_pylist()]
+        self._tile_index = {self._tile_ids[i]: i for i in range(len(self._tile_ids))}
 
     def read_image(self, tile_id: str) -> Image.Image:
         self._ensure_index()
@@ -418,9 +420,11 @@ class TilePackageReader:
         return arr
 
     def tile_id_at(self, row: int) -> str:
-        if row < 0 or row >= len(self._reader.record_table):
+        self._ensure_index()
+        assert self._tile_ids is not None
+        if row < 0 or row >= len(self._tile_ids):
             raise IndexError(f"tile row out of range: {row}")
-        return str(self._reader.record_table.column("tile_id")[row].as_py())
+        return self._tile_ids[row]
 
     @property
     def record_count(self) -> int:
