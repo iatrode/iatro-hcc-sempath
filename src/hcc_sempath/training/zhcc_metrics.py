@@ -10,14 +10,26 @@ from ..modeling.prototypes import PrototypeRegistry
 def _macro_auc(logits: torch.Tensor, targets: torch.Tensor) -> float:
     aucs: list[float] = []
     for idx in range(targets.shape[1]):
+        scores = logits[:, idx]
         y = targets[:, idx].bool()
-        pos = logits[y, idx]
-        neg = logits[~y, idx]
-        if pos.numel() == 0 or neg.numel() == 0:
+        n_pos = int(y.sum().item())
+        n_neg = int((~y).sum().item())
+        if n_pos == 0 or n_neg == 0:
             continue
-        greater = (pos[:, None] > neg[None, :]).float()
-        ties = (pos[:, None] == neg[None, :]).float()
-        aucs.append(float((greater + 0.5 * ties).mean().cpu()))
+        order = scores.argsort()
+        sorted_scores = scores[order]
+        ranks = torch.empty_like(scores, dtype=torch.float32)
+        start = 0
+        while start < sorted_scores.numel():
+            end = start + 1
+            while end < sorted_scores.numel() and bool(sorted_scores[end] == sorted_scores[start]):
+                end += 1
+            avg_rank = float(start + end + 1) / 2.0
+            ranks[order[start:end]] = avg_rank
+            start = end
+        pos_rank_sum = ranks[y].sum()
+        auc = (pos_rank_sum - n_pos * (n_pos + 1) / 2.0) / max(1, n_pos * n_neg)
+        aucs.append(float(auc.cpu()))
     return float(sum(aucs) / len(aucs)) if aucs else 0.0
 
 
@@ -70,6 +82,19 @@ def _neighborhood_purity(embedding: torch.Tensor, level1: torch.Tensor, level2: 
     return float(sum(l1_scores) / len(l1_scores)), float(sum(l2_scores) / len(l2_scores))
 
 
+def _deterministic_subset(
+    embedding: torch.Tensor,
+    level1: torch.Tensor,
+    level2: torch.Tensor,
+    max_samples: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    max_samples = int(max_samples)
+    if max_samples <= 0 or embedding.shape[0] <= max_samples:
+        return embedding, level1, level2
+    idx = torch.linspace(0, embedding.shape[0] - 1, steps=max_samples, device=embedding.device).long()
+    return embedding.index_select(0, idx), level1.index_select(0, idx), level2.index_select(0, idx)
+
+
 def evaluate_zhcc_prototypes(
     embedding_norm: torch.Tensor,
     prototype_mask: torch.Tensor,
@@ -78,6 +103,7 @@ def evaluate_zhcc_prototypes(
     prototypes: PrototypeRegistry | None,
     *,
     topk: int = 10,
+    max_pairwise_samples: int = 4096,
 ) -> dict[str, float]:
     count = int(prototype_mask.sum().item())
     metrics = {"zhcc_prototype_count": float(count)}
@@ -103,7 +129,13 @@ def evaluate_zhcc_prototypes(
         else embedding.new_zeros((embedding.shape[0], 0))
     )
     l1_pred = primary_logits.argmax(dim=1)
-    purity_l1, purity_l2 = _neighborhood_purity(embedding, level1, level2, topk=topk)
+    purity_embedding, purity_level1, purity_level2 = _deterministic_subset(
+        embedding,
+        level1,
+        level2,
+        max_pairwise_samples,
+    )
+    purity_l1, purity_l2 = _neighborhood_purity(purity_embedding, purity_level1, purity_level2, topk=topk)
     metrics.update(
         {
             "zhcc_level1_accuracy": float((l1_pred == level1).float().mean().cpu()),

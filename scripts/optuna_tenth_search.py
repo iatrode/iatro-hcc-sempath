@@ -155,7 +155,6 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     cfg["data"]["dynamic_package_sampling"] = bool(cfg["data"].get("dynamic_package_sampling", True))
     cfg["data"]["tensor_collate"] = bool(cfg["data"].get("tensor_collate", True))
     cfg["data"]["package_chunk_size"] = int(cfg["data"].get("package_chunk_size", 64))
-
     cfg["loss"]["relation_weight"] = 0.05
     cfg["loss"]["scale_relation_by_alpha"] = True
     cfg["loss"]["semantic_weight"] = trial.suggest_categorical("semantic_weight", [0.02, 0.05])
@@ -185,6 +184,7 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     cfg["train"]["max_grad_norm"] = 1.0
     cfg["train"]["max_val_batches"] = 256
     cfg["train"]["max_eval_batches"] = 64
+    cfg["train"]["eval_pairwise_max_samples"] = 2048
     cfg["train"]["dynamic_prototype_batch_size"] = 512
     cfg["train"]["log_interval"] = 0
     cfg["train"]["progress"] = "tqdm"

@@ -7,7 +7,8 @@ import yaml
 
 from ..io.feature_cache import FeatureCacheReader
 from ..io.iatrocache import read_header
-from .manifest import manifest_teacher_feature_packages_for_tiles, manifest_tile_packages
+from .feature_pack_merge import MERGED_FEATURE_PAYLOAD_TYPE, MERGED_FEATURE_SUFFIX
+from .manifest import manifest_teacher_feature_packages_for_tiles, manifest_tile_packages, package_stem
 
 
 EXCLUDED_TEACHER_NAMES = {
@@ -111,14 +112,20 @@ def teacher_feature_package_paths(cfg: dict) -> dict[str, list[str]]:
     if package_paths is not None:
         paths = {}
         for path in package_paths:
-            reader = FeatureCacheReader(path)
-            try:
-                name = str(reader.header.get("teacher") or Path(path).stem)
-            finally:
-                reader.close()
-            if name in paths:
-                raise ValueError(f"duplicate teacher feature package name: {name}")
-            paths[name] = [str(path)]
+            header = read_header(path)
+            if header.get("payload_type") == MERGED_FEATURE_PAYLOAD_TYPE:
+                for name in header.get("teachers", []):
+                    name = str(name)
+                    paths.setdefault(name, []).append(str(path))
+            else:
+                reader = FeatureCacheReader(path)
+                try:
+                    name = str(reader.header.get("teacher") or Path(path).stem)
+                finally:
+                    reader.close()
+                if name in paths:
+                    raise ValueError(f"duplicate teacher feature package name: {name}")
+                paths[name] = [str(path)]
         return paths
     package_path = data.get("teacher_feature_package_path")
     if package_path is None:
@@ -178,6 +185,59 @@ def _select_package_fraction(
     return sorted(selected)
 
 
+def _existing_merged_feature_package_for_tile(
+    cfg: dict,
+    manifest: dict,
+    tile_path: Path,
+    teachers: list[str],
+    feature_root: str | Path | None,
+) -> Path | None:
+    if not bool(cfg.get("data", {}).get("prefer_merged_teacher_features", True)):
+        return None
+    stem = package_stem(tile_path, str(manifest.get("tile_suffix", ".tiles.iac")))
+    candidates: list[Path] = []
+    feature_roots = manifest.get("feature_roots")
+    if isinstance(feature_roots, dict):
+        first_root = feature_roots.get(teachers[0])
+        if first_root is not None:
+            candidates.append(Path(first_root) / tile_path.parent.name / f"{stem}{MERGED_FEATURE_SUFFIX}")
+    elif feature_root is not None:
+        root = Path(feature_root)
+        candidates.extend(
+            [
+                root / teachers[0] / tile_path.parent.name / f"{stem}{MERGED_FEATURE_SUFFIX}",
+                root / teachers[0] / f"{stem}{MERGED_FEATURE_SUFFIX}",
+                root / tile_path.parent.name / f"{stem}{MERGED_FEATURE_SUFFIX}",
+            ]
+        )
+    for path in candidates:
+        if not path.exists():
+            continue
+        header = read_header(path)
+        if header.get("payload_type") != MERGED_FEATURE_PAYLOAD_TYPE:
+            raise ValueError(f"existing merged feature path has wrong payload_type: path={path}")
+        missing = sorted(set(teachers).difference(str(name) for name in header.get("teachers", [])))
+        if missing:
+            raise ValueError(f"existing merged feature package missing teachers: path={path} teachers={missing}")
+        tile_count = int(read_header(tile_path)["num_records"])
+        if int(header.get("num_records", -1)) != tile_count:
+            raise ValueError(
+                f"existing merged feature/tile record count mismatch: path={path} "
+                f"features={header.get('num_records')} tiles={tile_count}"
+            )
+        dims = cfg.get("model", {}).get("teacher_dims")
+        if isinstance(dims, dict):
+            merged_dims = {str(k): int(v) for k, v in header.get("teacher_dims", {}).items()}
+            for teacher in teachers:
+                if int(dims[teacher]) != int(merged_dims.get(teacher, -1)):
+                    raise ValueError(
+                        f"existing merged feature dim mismatch: teacher={teacher} "
+                        f"expected={dims[teacher]} got={merged_dims.get(teacher)} path={path}"
+                    )
+        return path
+    return None
+
+
 def validate_training_config(cfg: dict, names: list[str]) -> None:
     validate_teacher_names(names)
     expected = set(names)
@@ -226,14 +286,20 @@ def manifest_data_paths(cfg: dict, manifest: dict, split: str) -> tuple[list[str
         seed=int(cfg.get("runtime", {}).get("seed", 13)) + (0 if split == "train" else 1),
     )
     tile_packages = [str(path) for path in tile_paths]
-    feature_packages = {
-        name: [str(path) for path in paths]
-        for name, paths in manifest_teacher_feature_packages_for_tiles(
+    feature_packages = {name: [] for name in teachers}
+    for tile_path in tile_paths:
+        merged_path = _existing_merged_feature_package_for_tile(cfg, manifest, tile_path, teachers, feature_root)
+        if merged_path is not None:
+            for name in teachers:
+                feature_packages[name].append(str(merged_path))
+            continue
+        per_tile = manifest_teacher_feature_packages_for_tiles(
             manifest=manifest,
-            tile_paths=tile_paths,
+            tile_paths=[tile_path],
             teachers=teachers,
             feature_root=feature_root,
             feature_suffix_template=data.get("feature_suffix_template", ".{teacher}.features.iac"),
-        ).items()
-    }
+        )
+        for name, paths in per_tile.items():
+            feature_packages[name].append(str(paths[0]))
     return tile_packages, feature_packages
