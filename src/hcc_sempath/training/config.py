@@ -200,11 +200,20 @@ def _existing_merged_feature_package_for_tile(
     if isinstance(feature_roots, dict):
         first_root = feature_roots.get(teachers[0])
         if first_root is not None:
-            candidates.append(Path(first_root) / tile_path.parent.name / f"{stem}{MERGED_FEATURE_SUFFIX}")
+            first_root_path = Path(first_root)
+            candidates.extend(
+                [
+                    first_root_path.parent / "merged" / tile_path.parent.name / f"{stem}{MERGED_FEATURE_SUFFIX}",
+                    first_root_path / tile_path.parent.name / f"{stem}{MERGED_FEATURE_SUFFIX}",
+                ]
+            )
+        if feature_root is not None:
+            candidates.append(Path(feature_root) / "merged" / tile_path.parent.name / f"{stem}{MERGED_FEATURE_SUFFIX}")
     elif feature_root is not None:
         root = Path(feature_root)
         candidates.extend(
             [
+                root / "merged" / tile_path.parent.name / f"{stem}{MERGED_FEATURE_SUFFIX}",
                 root / teachers[0] / tile_path.parent.name / f"{stem}{MERGED_FEATURE_SUFFIX}",
                 root / teachers[0] / f"{stem}{MERGED_FEATURE_SUFFIX}",
                 root / tile_path.parent.name / f"{stem}{MERGED_FEATURE_SUFFIX}",

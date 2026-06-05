@@ -197,7 +197,7 @@ def maybe_prepare_merged_teacher_feature_packages(
             expected_dims=expected_dims,
             auto_merge=auto_merge,
             delete_sources=delete_sources,
-            dtype=str(data_cfg.get("auto_merge_feature_dtype", "float32")),
+            dtype=str(data_cfg.get("auto_merge_feature_dtype", "source")),
         )
 
     if worker_count == 1:
@@ -403,6 +403,7 @@ def _validate_merged_against_sources(
             if header.get("payload_type") == MERGED_FEATURE_PAYLOAD_TYPE:
                 continue
             source_readers[name] = _SourceFeatureReader(path)
+        merged_dtypes = {str(k): np.dtype(v) for k, v in merged_reader.header.get("teacher_dtypes", {}).items()}
         for row in _sample_rows(merged_reader.record_count):
             for name, source_reader in source_readers.items():
                 merged_feature = merged_reader.read_feature_at(row, name)
@@ -413,12 +414,8 @@ def _validate_merged_against_sources(
                         f"feature sample shape mismatch: teacher={name} row={row} "
                         f"source={source_feature.shape} merged={merged_feature.shape}"
                     )
-                np.testing.assert_allclose(
-                    merged_feature,
-                    source_feature.astype(np.float32, copy=False),
-                    rtol=1e-6,
-                    atol=1e-6,
-                )
+                expected_feature = source_feature.astype(merged_dtypes[name], copy=False).astype(np.float32, copy=False)
+                np.testing.assert_array_equal(merged_feature, expected_feature)
     finally:
         merged_reader.close()
         for reader in source_readers.values():
@@ -433,11 +430,12 @@ def _build_merged_package(
     expected_dims: dict[str, int],
     dtype: str,
 ) -> None:
-    out_dtype = np.dtype(dtype)
+    preserve_source_dtype = str(dtype).lower() in {"source", "preserve", "original"}
     tile_header, tile_slides, tile_record_table = read_tables(tile_path)
     tile_ids = [str(value) for value in tile_record_table.column("tile_id").to_pylist()]
     teacher_names = list(source_paths)
     source_readers = {}
+    source_dtypes: dict[str, np.dtype] = {}
     try:
         for name, path in source_paths.items():
             if not path.exists():
@@ -459,12 +457,14 @@ def _build_merged_package(
                         f"feature/tile header mismatch: teacher={name} key={key} "
                         f"feature={header[key]} tile={tile_header[key]} path={path}"
                     )
+            source_dtypes[name] = np.dtype(header["dtype"]) if preserve_source_dtype else np.dtype(dtype)
             source_readers[name] = _SourceFeatureReader(path)
 
         offsets: dict[str, int] = {}
         record_bytes: dict[str, int] = {}
         offset = 0
         for name in teacher_names:
+            out_dtype = source_dtypes[name]
             offsets[name] = offset
             bytes_for_teacher = int(expected_dims[name]) * out_dtype.itemsize
             record_bytes[name] = bytes_for_teacher
@@ -472,15 +472,17 @@ def _build_merged_package(
         merged_record_bytes = offset
 
         merged_path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(dir=merged_path.parent, delete=False) as tmp:
-            data_path = Path(tmp.name)
-            for row in range(len(tile_ids)):
-                for name in teacher_names:
-                    feature = source_readers[name].read_feature_at(row)
-                    if feature.shape != (int(expected_dims[name]),):
-                        raise ValueError(f"invalid source feature shape: teacher={name} row={row} shape={feature.shape}")
-                    tmp.write(np.ascontiguousarray(feature.astype(out_dtype, copy=False)).tobytes(order="C"))
+        data_path = None
         try:
+            with NamedTemporaryFile(dir=merged_path.parent, delete=False) as tmp:
+                data_path = Path(tmp.name)
+                for row in range(len(tile_ids)):
+                    for name in teacher_names:
+                        out_dtype = source_dtypes[name]
+                        feature = source_readers[name].read_feature_at(row)
+                        if feature.shape != (int(expected_dims[name]),):
+                            raise ValueError(f"invalid source feature shape: teacher={name} row={row} shape={feature.shape}")
+                        tmp.write(np.ascontiguousarray(feature.astype(out_dtype, copy=False)).tobytes(order="C"))
             expected_length = len(tile_ids) * merged_record_bytes
             if data_path.stat().st_size != expected_length:
                 raise ValueError(f"merged data size mismatch: expected={expected_length} got={data_path.stat().st_size}")
@@ -488,7 +490,7 @@ def _build_merged_package(
                 "payload_type": MERGED_FEATURE_PAYLOAD_TYPE,
                 "teachers": teacher_names,
                 "teacher_dims": {name: int(expected_dims[name]) for name in teacher_names},
-                "teacher_dtypes": {name: out_dtype.name for name in teacher_names},
+                "teacher_dtypes": {name: source_dtypes[name].name for name in teacher_names},
                 "teacher_offsets": offsets,
                 "teacher_record_bytes": record_bytes,
                 "merged_record_bytes": merged_record_bytes,
@@ -496,7 +498,7 @@ def _build_merged_package(
                     name: str(source_readers[name].header.get("teacher") or name)
                     for name in teacher_names
                 },
-                "dtype": out_dtype.name,
+                "dtype": "mixed" if len({source_dtypes[name].name for name in teacher_names}) > 1 else source_dtypes[teacher_names[0]].name,
                 "tile_width": int(tile_header["tile_width"]),
                 "tile_height": int(tile_header["tile_height"]),
                 "stride_x": int(tile_header["stride_x"]),
@@ -519,7 +521,7 @@ def _build_merged_package(
                 overwrite=False,
             )
         finally:
-            if data_path.exists():
+            if data_path is not None and data_path.exists():
                 data_path.unlink()
     finally:
         for reader in source_readers.values():

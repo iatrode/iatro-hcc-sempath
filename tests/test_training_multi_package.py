@@ -22,7 +22,7 @@ from hcc_sempath.training.datasets import (
     validate_teacher_feature_package_pairs,
     validate_teacher_cache,
 )
-from hcc_sempath.training.feature_pack_merge import maybe_prepare_merged_teacher_feature_packages
+from hcc_sempath.training.feature_pack_merge import _build_merged_package, maybe_prepare_merged_teacher_feature_packages
 from hcc_sempath.training.feature_pack_shuffle import maybe_prepare_shuffled_iac_packages
 from hcc_sempath.training.manifest import build_training_manifest
 from hcc_sempath.training.manifest import validate_manifest_artifacts
@@ -258,6 +258,126 @@ def test_manifest_data_paths_prefers_existing_merged_after_source_delete(tmp_pat
 
     assert tile_packages == [str(tile_path)]
     assert feature_packages == {"toy": [str(merged_path)], "other": [str(merged_path)]}
+
+
+def test_manifest_data_paths_prefers_merged_feature_root_directory(tmp_path: Path) -> None:
+    tile_root = tmp_path / "tiles" / "301"
+    feature_root = tmp_path / "features"
+    tile_root.mkdir(parents=True)
+    for subdir in ("toy", "other", "merged"):
+        (feature_root / subdir / "301").mkdir(parents=True)
+    tile_path, feature_a = _write_package(tile_root, "slide_a", 10, count=4)
+    feature_b = _write_other_feature_package(tile_root, tile_path)
+    expected_a = feature_root / "toy" / "301" / feature_a.name
+    expected_b = feature_root / "other" / "301" / feature_b.name
+    feature_a.replace(expected_a)
+    feature_b.replace(expected_b)
+    merged = maybe_prepare_merged_teacher_feature_packages(
+        cfg={"data": {"auto_merge_teacher_features": True}},
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths={"toy": [str(expected_a)], "other": [str(expected_b)]},
+        expected_dims={"toy": 4, "other": 4},
+    )
+    merged_path = Path(merged["toy"][0])
+    canonical_merged = feature_root / "merged" / "301" / merged_path.name
+    merged_path.replace(canonical_merged)
+    expected_a.unlink()
+    expected_b.unlink()
+    manifest = {
+        "version": 1,
+        "tile_suffix": ".tiles.iac",
+        "datasets": {"internal": {"role": "development", "tile_root": str(tile_root)}},
+        "splits": {"train": {"internal": ["slide_a"]}, "val": {}, "exval": {}},
+    }
+    cfg = {
+        "data": {
+            "feature_root": str(feature_root),
+            "teachers": ["toy", "other"],
+            "prefer_merged_teacher_features": True,
+        },
+        "model": {"teacher_dims": {"toy": 4, "other": 4}},
+        "runtime": {"seed": 13},
+    }
+
+    tile_packages, feature_packages = manifest_data_paths(cfg, manifest, "train")
+
+    assert tile_packages == [str(tile_path)]
+    assert feature_packages == {"toy": [str(canonical_merged)], "other": [str(canonical_merged)]}
+
+
+def test_manifest_data_paths_prefers_merged_directory_with_manifest_feature_roots(tmp_path: Path) -> None:
+    tile_root = tmp_path / "tiles" / "301"
+    feature_root = tmp_path / "features"
+    tile_root.mkdir(parents=True)
+    for subdir in ("toy", "other", "merged"):
+        (feature_root / subdir / "301").mkdir(parents=True)
+    tile_path, feature_a = _write_package(tile_root, "slide_a", 10, count=4)
+    feature_b = _write_other_feature_package(tile_root, tile_path)
+    expected_a = feature_root / "toy" / "301" / feature_a.name
+    expected_b = feature_root / "other" / "301" / feature_b.name
+    feature_a.replace(expected_a)
+    feature_b.replace(expected_b)
+    merged = maybe_prepare_merged_teacher_feature_packages(
+        cfg={"data": {"auto_merge_teacher_features": True}},
+        split="train",
+        tile_packages=[str(tile_path)],
+        teacher_package_paths={"toy": [str(expected_a)], "other": [str(expected_b)]},
+        expected_dims={"toy": 4, "other": 4},
+    )
+    canonical_merged = feature_root / "merged" / "301" / Path(merged["toy"][0]).name
+    Path(merged["toy"][0]).replace(canonical_merged)
+    expected_a.unlink()
+    expected_b.unlink()
+    manifest = {
+        "version": 1,
+        "tile_suffix": ".tiles.iac",
+        "datasets": {"internal": {"role": "development", "tile_root": str(tile_root)}},
+        "feature_roots": {
+            "toy": str(feature_root / "toy"),
+            "other": str(feature_root / "other"),
+        },
+        "splits": {"train": {"internal": ["slide_a"]}, "val": {}, "exval": {}},
+    }
+    cfg = {
+        "data": {
+            "teachers": ["toy", "other"],
+            "prefer_merged_teacher_features": True,
+        },
+        "model": {"teacher_dims": {"toy": 4, "other": 4}},
+        "runtime": {"seed": 13},
+    }
+
+    tile_packages, feature_packages = manifest_data_paths(cfg, manifest, "train")
+
+    assert tile_packages == [str(tile_path)]
+    assert feature_packages == {"toy": [str(canonical_merged)], "other": [str(canonical_merged)]}
+
+
+def test_build_merged_package_cleans_data_temp_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tile_path, feature_a = _write_package(tmp_path, "slide_a", 10, count=4)
+    feature_b = _write_other_feature_package(tmp_path, tile_path)
+    merged_path = tmp_path / "merged" / "slide_a.merged.features.iac"
+
+    def fail_read_feature_at(self, row: int):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(
+        "hcc_sempath.training.feature_pack_merge._SourceFeatureReader.read_feature_at",
+        fail_read_feature_at,
+    )
+
+    with pytest.raises(OSError, match="No space left on device"):
+        _build_merged_package(
+            tile_path=tile_path,
+            source_paths={"toy": feature_a, "other": feature_b},
+            merged_path=merged_path,
+            expected_dims={"toy": 4, "other": 4},
+            dtype="float32",
+        )
+
+    assert not merged_path.exists()
+    assert list(merged_path.parent.glob("tmp*")) == []
 
 
 def test_validate_manifest_artifacts_checks_teacher_feature_packages(tmp_path: Path) -> None:
