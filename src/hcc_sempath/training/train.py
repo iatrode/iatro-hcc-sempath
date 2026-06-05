@@ -203,9 +203,9 @@ def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -
 def _load_zhcc_prototypes(cfg: dict, device: torch.device) -> PrototypeRegistry | None:
     prototype_path = cfg["data"].get("zhcc_prototype_path")
     if prototype_path is None:
-        if float(cfg["loss"].get("zhcc_response_weight", 0.0)) > 0:
+        if float(cfg["loss"].get("zhcc_response_weight", 0.0)) > 0 and not cfg["data"].get("zhcc_prototype_image_path"):
             raise ValueError(
-                "data.zhcc_prototype_path is required only when loss.zhcc_response_weight > 0"
+                "data.zhcc_prototype_path or data.zhcc_prototype_image_path is required when loss.zhcc_response_weight > 0"
             )
         return None
     return load_prototype_registry(prototype_path, expected_dim=embedding_dim(cfg)).to(device)
