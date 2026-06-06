@@ -199,7 +199,7 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     return cfg
 
 
-def score_row(row: dict[str, str], objective: str) -> float:
+def score_row(row: dict[str, str], objective: str, target_zhcc_proto_weight: float = 0.20) -> float:
     def value(key: str) -> float:
         try:
             return float(row.get(key, 0.0) or 0.0)
@@ -218,7 +218,10 @@ def score_row(row: dict[str, str], objective: str) -> float:
         return train_tiles_per_sec
     if objective in {"prototype_qc", "response_alignment"}:
         return -response_loss
-    return teacher_alignment - 0.25 * response_loss
+
+    current_weight = value("scheduled_zhcc_proto_weight")
+    scale = min(1.0, current_weight / target_zhcc_proto_weight) if target_zhcc_proto_weight > 0 else 0.0
+    return teacher_alignment - 0.25 * response_loss * scale
 
 
 def read_metric_rows(metrics_path: Path) -> list[dict[str, str]]:
@@ -282,6 +285,10 @@ def train_with_pruning(
     thread = threading.Thread(target=stream_process, args=(process, log_path), daemon=True)
     thread.start()
     metrics_path = output_dir / "metrics.csv"
+    
+    # Extract target zhcc_proto_weight
+    target_zhcc_proto_weight = float(trial.params.get("zhcc_proto_weight", 0.20))
+    
     reported_epochs: set[int] = set()
     best_score = float("-inf")
     while process.poll() is None:
@@ -289,7 +296,7 @@ def train_with_pruning(
             epoch = int(float(row.get("epoch", "0") or 0))
             if epoch <= 0 or epoch in reported_epochs:
                 continue
-            score = score_row(row, objective)
+            score = score_row(row, objective, target_zhcc_proto_weight=target_zhcc_proto_weight)
             reported_epochs.add(epoch)
             best_score = max(best_score, score)
             trial.report(score, step=epoch)
@@ -306,7 +313,7 @@ def train_with_pruning(
     rows = read_metric_rows(metrics_path)
     if not rows:
         raise RuntimeError(f"training produced no metrics: {metrics_path}")
-    final_score = score_row(rows[-1], objective)
+    final_score = score_row(rows[-1], objective, target_zhcc_proto_weight=target_zhcc_proto_weight)
     best_score = max(best_score, final_score)
     trial.set_user_attr("output_dir", str(output_dir))
     trial.set_user_attr("final_epoch", rows[-1].get("epoch"))

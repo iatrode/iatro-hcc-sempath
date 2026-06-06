@@ -11,6 +11,9 @@ def _prototype_names(registry: PrototypeRegistry, indices: list[int]) -> list[st
     return [registry.names[idx] for idx in indices]
 
 
+_POSITIONS_CACHE: dict[tuple, torch.Tensor] = {}
+
+
 def _positions_for_names(
     *,
     registry: PrototypeRegistry,
@@ -19,12 +22,17 @@ def _positions_for_names(
     label: str,
     device: torch.device,
 ) -> torch.Tensor:
+    key = (id(registry), tuple(source_indices), tuple(target_names), device)
+    if key in _POSITIONS_CACHE:
+        return _POSITIONS_CACHE[key]
     source_names = _prototype_names(registry, source_indices)
     positions = {name: idx for idx, name in enumerate(source_names)}
     missing = [name for name in target_names if name not in positions]
     if missing:
         raise ValueError(f"{label} prototype package is missing required prototype names: {missing}")
-    return torch.tensor([positions[name] for name in target_names], dtype=torch.long, device=device)
+    tensor = torch.tensor([positions[name] for name in target_names], dtype=torch.long, device=device)
+    _POSITIONS_CACHE[key] = tensor
+    return tensor
 
 
 def prototype_response(
