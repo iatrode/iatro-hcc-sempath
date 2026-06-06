@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import gc
 import math
 from numbers import Number
 import random
@@ -195,6 +197,14 @@ def _cuda_memory_mb(device: torch.device) -> float:
     if device.type != "cuda":
         return 0.0
     return float(torch.cuda.memory_allocated(device) / (1024 * 1024))
+
+
+def _release_host_memory() -> None:
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        return
 
 
 
@@ -908,6 +918,7 @@ def fit(
                 max_pairwise_samples=eval_pairwise_max_samples,
             )
             del val_embeddings, embeddings, student_by_teacher, teacher_by_name, prototype_labels
+            _release_host_memory()
             prototype_bank_metrics = {}
             if zhcc_image_bank is not None and current_zhcc_prototypes is not None:
                 bank_batch_size = int(cfg["train"].get("dynamic_prototype_batch_size", cfg["train"].get("batch_size", 512)))
@@ -928,6 +939,8 @@ def fit(
                     max_pairwise_samples=eval_pairwise_max_samples,
                 )
                 prototype_bank_metrics = {f"prototype_bank_{key}": value for key, value in bank_metrics.items()}
+                del bank_embeddings
+                _release_host_memory()
             teacher_alignment_values = [
                 float(value) for key, value in embedding_metrics.items() if key.endswith("_feature_cosine")
             ]
@@ -1020,6 +1033,7 @@ def fit(
                 )
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+            _release_host_memory()
     finally:
         close_prefetched_train = getattr(prefetched_train_iterator, "close", None)
         if callable(close_prefetched_train):

@@ -49,6 +49,7 @@ class _PackageShuffleBatchLoader:
         chunk_size: int | None = None,
         buffer_batches: int = 1,
         reshuffle_each_epoch: bool = True,
+        pin_memory: bool = False,
     ) -> None:
         self.dataset = dataset
         self.batch_size = int(batch_size)
@@ -60,6 +61,7 @@ class _PackageShuffleBatchLoader:
         self._epoch = 0
         self.chunk_size = max(1, int(chunk_size or self.batch_size))
         self.buffer_target = max(self.batch_size, self.batch_size * max(1, int(buffer_batches)))
+        self.pin_memory = bool(pin_memory)
 
     def _draw_batch(self, buffer: list[dict], rng: np.random.Generator) -> list[dict]:
         take = min(self.batch_size, len(buffer))
@@ -165,7 +167,7 @@ class _PackageShuffleBatchLoader:
                                 batch_rows = [buffer[index] for index in chosen]
                                 buffer[:] = [item for index, item in enumerate(buffer) if index not in chosen_set]
                         batch = self.collate_fn(batch_rows)
-                        if torch.cuda.is_available():
+                        if self.pin_memory and torch.cuda.is_available():
                             batch["images"] = batch["images"].pin_memory()
                             batch["teacher_features"] = {
                                 name: feat.pin_memory()
@@ -552,6 +554,7 @@ def main() -> None:
             chunk_size=package_chunk_size,
             buffer_batches=package_buffer_batches,
             reshuffle_each_epoch=True,
+            pin_memory=bool(cfg["data"].get("package_pin_memory", False)),
         )
         val_loader = _PackageShuffleBatchLoader(
             val_ds,
@@ -563,6 +566,7 @@ def main() -> None:
             chunk_size=package_chunk_size,
             buffer_batches=package_buffer_batches,
             reshuffle_each_epoch=False,
+            pin_memory=bool(cfg["data"].get("package_pin_memory", False)),
         )
     else:
         train_loader = DataLoader(
