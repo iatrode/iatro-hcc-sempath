@@ -920,27 +920,37 @@ def fit(
             del val_embeddings, embeddings, student_by_teacher, teacher_by_name, prototype_labels
             _release_host_memory()
             prototype_bank_metrics = {}
-            if zhcc_image_bank is not None and current_zhcc_prototypes is not None:
-                bank_batch_size = int(cfg["train"].get("dynamic_prototype_batch_size", cfg["train"].get("batch_size", 512)))
-                bank_embeddings = collect_student_prototype_image_embeddings(
-                    model=model,
-                    image_bank=zhcc_image_bank,
-                    cfg=cfg,
-                    device=device,
-                    batch_size=bank_batch_size,
-                ).cpu()
-                bank_metrics = evaluate_zhcc_prototypes(
-                    bank_embeddings,
-                    torch.ones(zhcc_image_bank.count, dtype=torch.bool),
-                    zhcc_image_bank.level1,
-                    zhcc_image_bank.level2,
-                    current_zhcc_prototypes.to("cpu"),
-                    topk=int(cfg["train"]["topk"]),
-                    max_pairwise_samples=eval_pairwise_max_samples,
-                )
-                prototype_bank_metrics = {f"prototype_bank_{key}": value for key, value in bank_metrics.items()}
-                del bank_embeddings
-                _release_host_memory()
+            if zhcc_image_bank is not None:
+                if current_zhcc_prototypes is not None:
+                    bank_batch_size = int(cfg["train"].get("dynamic_prototype_batch_size", cfg["train"].get("batch_size", 512)))
+                    bank_embeddings = collect_student_prototype_image_embeddings(
+                        model=model,
+                        image_bank=zhcc_image_bank,
+                        cfg=cfg,
+                        device=device,
+                        batch_size=bank_batch_size,
+                    ).cpu()
+                    bank_metrics = evaluate_zhcc_prototypes(
+                        bank_embeddings,
+                        torch.ones(zhcc_image_bank.count, dtype=torch.bool),
+                        zhcc_image_bank.level1,
+                        zhcc_image_bank.level2,
+                        current_zhcc_prototypes.to("cpu"),
+                        topk=int(cfg["train"]["topk"]),
+                        max_pairwise_samples=eval_pairwise_max_samples,
+                    )
+                    prototype_bank_metrics = {f"prototype_bank_{key}": value for key, value in bank_metrics.items()}
+                    del bank_embeddings
+                    _release_host_memory()
+                else:
+                    dummy_metrics = evaluate_zhcc_prototypes(
+                        None,
+                        torch.zeros(0, dtype=torch.bool),
+                        torch.zeros(0, dtype=torch.long),
+                        torch.zeros((0, 0), dtype=torch.float32),
+                        None,
+                    )
+                    prototype_bank_metrics = {f"prototype_bank_{key}": value for key, value in dummy_metrics.items()}
             teacher_alignment_values = [
                 float(value) for key, value in embedding_metrics.items() if key.endswith("_feature_cosine")
             ]
@@ -949,9 +959,15 @@ def fit(
                 if teacher_alignment_values
                 else float("-inf")
             )
+            target_zhcc_proto_weight = float(cfg["loss"].get("zhcc_proto_weight", 0.0))
+            current_zhcc_proto_weight = float(val_metrics.get("scheduled_zhcc_proto_weight", 0.0))
+            zhcc_penalty_scale = min(1.0, current_zhcc_proto_weight / target_zhcc_proto_weight) if target_zhcc_proto_weight > 0 else 0.0
+
             scientific_score = (
                 (0.0 if not math.isfinite(teacher_alignment) else teacher_alignment)
-                - float(cfg["train"].get("scientific_score_zhcc_response_weight", 0.25)) * float(val_metrics["zhcc_proto"])
+                - float(cfg["train"].get("scientific_score_zhcc_response_weight", 0.25))
+                * zhcc_penalty_scale
+                * float(val_metrics["zhcc_proto"])
             )
             loss_cfg = scheduled_loss_config(
                 cfg,
