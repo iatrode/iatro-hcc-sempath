@@ -32,9 +32,37 @@ def write_json(path: str | Path, payload: dict) -> None:
 def append_csv(path: str | Path, row: dict) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
-        if not exists:
+    row = {str(key): value for key, value in row.items()}
+    if not path.exists():
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
             writer.writeheader()
+            writer.writerow(row)
+        return
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        new_fields = [key for key in row if key not in fieldnames]
+        if not new_fields:
+            rows = None
+        else:
+            rows = []
+            for existing_row in reader:
+                existing_row.pop(None, None)
+                rows.append(existing_row)
+            fieldnames.extend(new_fields)
+
+    if rows is None:
+        with path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writerow(row)
+        return
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
         writer.writerow(row)
+    tmp_path.replace(path)

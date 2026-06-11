@@ -16,3 +16,4 @@ results/**/*.iac
 results/**/*.png
 results/**/tile_manifest.csv
 .vscode/
+final_weight/
