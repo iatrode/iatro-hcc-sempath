@@ -27,8 +27,8 @@ def _fake_features(record_count: int, dim: int, seed: int):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build fake teacher packages and a prototype-free epoch-smoke config.")
-    parser.add_argument("--tile-package", default="smoke_data/tiles.iac")
-    parser.add_argument("--output-root", default="real_smoke/fake_teacher_epoch")
+    parser.add_argument("--tile-package", default="outputs/smoke/fixture/tiles.iac")
+    parser.add_argument("--output-root", default="outputs/smoke/fake_teacher_epoch")
     parser.add_argument("--train-count", type=int, default=16)
     parser.add_argument("--val-count", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=4)

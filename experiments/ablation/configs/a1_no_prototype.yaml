@@ -1,0 +1,29 @@
+inherits: ../../../configs/server/train_tenth.example.yaml
+
+# Ablation A1 — multi-teacher distillation WITHOUT any HCC prototype supervision.
+# Design doc §7 item 4.
+#
+# Single variable vs A0: all prototype-driven forces are turned off. With all
+# three prototype weights at 0, train.py:_load_prototype_map returns None, no
+# prototype assets are loaded, and the config validator does not require
+# prototype paths (config.py:270-279). Teacher distillation falls back to
+# uniform teacher_weights because prototype_filter_weight=0 sets
+# alpha_by_teacher=None (engine.py:593-594).
+#
+# NOTE: _deep_merge is union-only and cannot delete inherited keys, so the
+# prototype asset paths must be explicitly nulled here rather than omitted.
+# load_prototype_labels(None, ...) returns {} safely (prototype_labels.py:38).
+
+runtime:
+  output_dir: outputs/experiments/ablation/a1_no_prototype
+
+data:
+  prototype_paths: null
+  zhcc_prototype_image_path: null
+  prototype_supervision_manifest_path: null
+
+loss:
+  semantic_weight: 0.0
+  zhcc_proto_weight: 0.0
+  zhcc_response_weight: 0.0
+  prototype_filter_weight: 0.0

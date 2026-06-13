@@ -1,0 +1,34 @@
+inherits: ../../../configs/server/train_tenth.example.yaml
+
+# Ablation A3 — single-teacher student distillation, no prototype supervision.
+# Design doc §7 item 3.
+#
+# Single conceptual change vs A1: only one teacher is distilled. Combined with
+# no prototype supervision, this is the "plain single-teacher student" floor.
+# Teacher chosen: virchow2 (strongest feature alignment in the final run,
+# feature_cosine ~0.908; see artifacts/models/hcc-sempath-full/finish.txt).
+#
+# NOTE: _deep_merge is union-only, so teachers/teacher_dims/teacher_weights must
+# be restated in full — shrinking the inherited 4-teacher dicts by override is
+# impossible, and leftover entries would trip _unexpected_keys (config.py:64).
+
+runtime:
+  output_dir: outputs/experiments/ablation/a3_single_teacher
+
+data:
+  teachers: [virchow2]
+  prototype_paths: null
+  zhcc_prototype_image_path: null
+  prototype_supervision_manifest_path: null
+
+model:
+  teacher_dims:
+    virchow2: 2560
+
+loss:
+  teacher_weights:
+    virchow2: 1.0
+  semantic_weight: 0.0
+  zhcc_proto_weight: 0.0
+  zhcc_response_weight: 0.0
+  prototype_filter_weight: 0.0

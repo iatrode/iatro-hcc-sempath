@@ -486,7 +486,7 @@ def main() -> None:
     parser.add_argument("--config", default="outputs/trail/trial_0002/resolved_config.json")
     parser.add_argument("--checkpoint", default="outputs/trail/trial_0002/checkpoints/last.pt")
     parser.add_argument("--manifest", default="configs/local/mac/manifest.yaml")
-    parser.add_argument("--prototype-dir", default="outputs/prototypes")
+    parser.add_argument("--prototype-dir", default="artifacts/prototypes")
     parser.add_argument("--split", default="val")
     parser.add_argument("--output-dir", default="outputs/trail/local_tile_attention/trial_0002_last")
     parser.add_argument("--device", default="auto")

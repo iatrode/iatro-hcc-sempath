@@ -13,7 +13,7 @@ from hcc_sempath.io.tiling import tile_raster_image
 
 
 def main() -> None:
-    root = Path("smoke_data")
+    root = Path("outputs/smoke/fixture")
     slides_dir = root / "slides"
     tiles_dir = root / "tiles"
     slides_dir.mkdir(parents=True, exist_ok=True)
@@ -80,7 +80,7 @@ def main() -> None:
         },
         root / "prototypes.pt",
     )
-    print("smoke_data_ok")
+    print("smoke_fixture_ok")
 
 
 if __name__ == "__main__":

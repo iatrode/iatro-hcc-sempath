@@ -1,0 +1,21 @@
+inherits: ../../../configs/server/train_tenth.example.yaml
+
+# Ablation A2 — PAMT-D WITHOUT prototype-adjudicated teacher reliability.
+# Design doc §7 item 5.
+#
+# Single variable vs A0: prototype semantic supervision is fully retained
+# (semantic_weight, zhcc_proto_weight, zhcc_response_weight unchanged), but the
+# adjudication filter is disabled. With prototype_filter_weight=0,
+# alpha_by_teacher=None (engine.py:593-594), so multi-teacher distillation uses
+# uniform teacher_weights instead of per-tile/per-teacher reliability. This
+# isolates the contribution of the "adjudicated" part of PAMT-D: same prototype
+# shaping, but teachers are averaged rather than reliability-weighted.
+#
+# Prototypes are still loaded because semantic_weight/zhcc_proto_weight > 0, so
+# prototype asset paths are left inherited (not nulled).
+
+runtime:
+  output_dir: outputs/experiments/ablation/a2_no_adjudication
+
+loss:
+  prototype_filter_weight: 0.0
