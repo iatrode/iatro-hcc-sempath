@@ -3,10 +3,11 @@ __pycache__/
 *.egg-info/
 *.local.sh
 configs/local/
+artifacts/*
+!artifacts/README.md
 outputs/
 annotations/
 smoke_data/
-weights/
 data/*
 !data/manifests/
 !data/manifests/*.freeze.yaml
@@ -16,10 +17,14 @@ results/**/*.iac
 results/**/*.png
 results/**/tile_manifest.csv
 .vscode/
-final_weight/
 .DS_Store
 **/.DS_Store
 
-# Manuscript experiment workspaces and generated artifacts are prepared for
-# release separately from the source tree.
-final_experiments/
+# Manuscript experiment code and reports are tracked; generated runs are local.
+experiments/**/logs/
+experiments/**/results/
+
+# Local release links point into ignored artifacts.
+release/hcc-sempath/*
+!release/hcc-sempath/README.md
+!release/hcc-sempath/model.pt

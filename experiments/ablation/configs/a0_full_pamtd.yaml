@@ -1,0 +1,12 @@
+inherits: ../../../configs/server/train_tenth.example.yaml
+
+# Ablation A0 — full PAMT-D at 1/10 scale (reference condition).
+#
+# This is the reduced-scale counterpart of the manuscript final model. It
+# changes nothing in the method; it only renames the output directory so the
+# ablation matrix has a clean same-scale reference to compare against. Every
+# other ablation in this directory inherits from train_tenth.yaml and differs
+# from THIS run by exactly one documented variable.
+
+runtime:
+  output_dir: outputs/experiments/ablation/a0_full_pamtd

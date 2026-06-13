@@ -1,0 +1,37 @@
+inherits: ../../../configs/server/train_tenth.example.yaml
+
+# Ablation A4 — HCC prototype supervision WITHOUT multi-teacher distillation.
+# Design doc §7 item 6.
+#
+# Single variable vs A0: only one teacher is used, but all prototype supervision
+# AND adjudication are retained. This isolates the contribution of the
+# multi-teacher ensemble: same prototype shaping, but the cross-teacher
+# consensus term degenerates (adjudication.py:227 sets consensus=1 for a single
+# teacher, so reliability is driven by prototype-label + z_hcc agreement only).
+#
+# Contrast map:
+#   A0 = multi-teacher + prototype           (full)
+#   A3 = single-teacher, no prototype        (floor)
+#   A4 = single-teacher + prototype          (this) -> A0 vs A4 = multi-teacher gain
+#
+# Teacher: virchow2 (same choice as A3 for a clean A3/A4 pair).
+#
+# NOTE: teachers/teacher_dims/teacher_weights and prototype_paths must all be
+# restated to the single teacher — union merge cannot drop the other three, and
+# _unexpected_keys (config.py:64) rejects leftover teacher entries.
+
+runtime:
+  output_dir: outputs/experiments/ablation/a4_single_teacher_prototype
+
+data:
+  teachers: [virchow2]
+  prototype_paths:
+    virchow2: artifacts/prototypes/virchow2_hcc_semantic_prototypes.pt
+
+model:
+  teacher_dims:
+    virchow2: 2560
+
+loss:
+  teacher_weights:
+    virchow2: 1.0

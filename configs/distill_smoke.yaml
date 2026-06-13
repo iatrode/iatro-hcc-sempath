@@ -1,12 +1,12 @@
 runtime:
   device: cpu
   seed: 13
-  output_dir: outputs/smoke
+  output_dir: outputs/smoke/run
 
 data:
-  image_tile_package_path: smoke_data/tiles.iac
-  teacher_feature_package_path: smoke_data/smoke.features.iac
-  prototype_path: smoke_data/prototypes.pt
+  image_tile_package_path: outputs/smoke/fixture/tiles.iac
+  teacher_feature_package_path: outputs/smoke/fixture/smoke.features.iac
+  prototype_path: outputs/smoke/fixture/prototypes.pt
   num_workers: 0
 
 model:
