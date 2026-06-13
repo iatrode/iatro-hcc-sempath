@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from queue import Full, Queue
+import weakref
+from dataclasses import dataclass, field
+from queue import Empty, Full, Queue
 from threading import Event, Thread
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
+
+from . import _pipeline_probe as _probe
 
 from ..io.tile_package import read_package_metadata
 from ..modeling.prototypes import PrototypeRegistry, load_prototype_registry
@@ -36,7 +39,124 @@ from .prototype_labels import load_prototype_labels
 from .utils import seed_everything
 
 
+@dataclass
+class BatchSlot:
+    """Destination of one decoded row: which ring buffer and which row position."""
+    buffer_idx: int
+    pos: int
+
+
+@dataclass
+class BatchBuffer:
+    """One pre-allocated, pinned set of tensors for a single batch. Workers
+    scatter decoded rows directly into these — there is no np.stack, no
+    post-hoc pin_memory, and no per-batch collate. When the last slot is
+    filled the buffer IS the finished batch."""
+    images: torch.Tensor                       # (B, H, W, 3) uint8, pinned
+    teacher_features: dict                       # name -> (B, dim) float32, pinned
+    prototype_mask: torch.Tensor                 # (B,) bool
+    prototype_level1: torch.Tensor               # (B,) long
+    prototype_level2: torch.Tensor               # (B, L2) float32 (L2 may be 0)
+    tile_id: list = field(default_factory=list)  # (B,) str
+
+    def view(self, count: int) -> dict:
+        """Expose the filled prefix as the dict the engine expects."""
+        return {
+            "tile_id": list(self.tile_id[:count]),
+            "images": self.images[:count],
+            "images_uint8": True,
+            "images_hwc": True,
+            "teacher_features": {name: feat[:count] for name, feat in self.teacher_features.items()},
+            "prototype_mask": self.prototype_mask[:count],
+            "prototype_level1": self.prototype_level1[:count],
+            "prototype_level2": self.prototype_level2[:count],
+        }
+
+
+def _alloc_batch_buffer(batch_size: int, spec: dict, pin: bool) -> BatchBuffer:
+    h, w = spec["image_hw"]
+    kw = {"pin_memory": True} if pin else {}
+    return BatchBuffer(
+        images=torch.empty((batch_size, h, w, 3), dtype=torch.uint8, **kw),
+        teacher_features={
+            name: torch.empty((batch_size, dim), dtype=torch.float32, **kw)
+            for name, dim in spec["teacher_dims"].items()
+        },
+        prototype_mask=torch.zeros((batch_size,), dtype=torch.bool),
+        prototype_level1=torch.full((batch_size,), -1, dtype=torch.long),
+        prototype_level2=torch.zeros((batch_size, int(spec["level2_dim"])), dtype=torch.float32, **kw),
+        tile_id=[""] * batch_size,
+    )
+
+
+
+class _ChunkPlanBatchSampler:
+    """Yields batches of GLOBAL dataset indices reproducing the seed-ordered
+    package-chunk plan, for use as a multiprocessing DataLoader batch_sampler.
+
+    The thread loader's tile sequence = chunks concatenated in plan order, then
+    sliced into batch_size groups. We reproduce exactly that here so the
+    multiprocessing path is numerically equivalent to the thread path. A fresh
+    seed per epoch (seed + epoch) matches reshuffle_each_epoch semantics.
+    """
+
+    def __init__(self, dataset, batch_size: int, chunk_size: int, seed: int,
+                 reshuffle_each_epoch: bool = True, drop_last: bool = False):
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.chunk_size = int(chunk_size)
+        self.seed = int(seed)
+        self.reshuffle_each_epoch = bool(reshuffle_each_epoch)
+        self.drop_last = bool(drop_last)
+        self._epoch = 0
+
+    def __iter__(self):
+        epoch_seed = self.seed + self._epoch if self.reshuffle_each_epoch else self.seed
+        if self.reshuffle_each_epoch:
+            self._epoch += 1
+        chunks = self.dataset.iter_global_index_chunks(self.chunk_size, epoch_seed)
+        if not chunks:
+            return
+        flat = np.concatenate(chunks)
+        n = len(flat)
+        for start in range(0, n, self.batch_size):
+            end = start + self.batch_size
+            if end > n and self.drop_last:
+                break
+            yield flat[start:end].tolist()
+
+    def __len__(self) -> int:
+        n = int(self.dataset.sample_count)
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
+
+
 class _PackageShuffleBatchLoader:
+    """Deterministic parallel-decode batch loader.
+
+    Design (see docs in code review):
+      * A persistent pool of worker threads is created ONCE and reused across
+        every epoch — this avoids the per-epoch ThreadPoolExecutor leak that
+        previously accumulated hundreds of live threads.
+      * The chunk plan (``dataset.iter_package_row_chunks``) is seed-ordered and
+        materialized into an indexed task list. Workers PULL the next task index
+        atomically, decode it, and write the decoded rows back into the slot at
+        that index. "Which chunk a worker takes" does not matter for ordering
+        because the decoded rows are placed back at the chunk's fixed position.
+      * The consumer delivers rows in chunk-index order (``_consume_cursor``),
+        so the per-batch tile_id sequence is identical to a single-threaded run
+        regardless of thread scheduling — fully reproducible.
+      * Workers never stop for the consumer: they keep pulling and decoding the
+        next chunk until the number of decoded-but-unconsumed rows reaches
+        ``max_outstanding_rows`` (back-pressure). A slow chunk only blocks the
+        single ``get`` waiting on that exact slot (max stall = one chunk decode);
+        other workers keep filling later slots until the back-pressure ceiling.
+
+    Reproducibility is also preserved because shuffling is entirely a property
+    of the seed-ordered chunk plan, not of decode/arrival order.
+    """
+
     def __init__(
         self,
         dataset,
@@ -60,155 +180,290 @@ class _PackageShuffleBatchLoader:
         self.reshuffle_each_epoch = bool(reshuffle_each_epoch)
         self._epoch = 0
         self.chunk_size = max(1, int(chunk_size or self.batch_size))
-        self.buffer_target = max(self.batch_size, self.batch_size * max(1, int(buffer_batches)))
+        # Back-pressure ceiling, measured in decoded-but-unconsumed rows.
+        self.max_outstanding_rows = max(self.batch_size, self.batch_size * max(1, int(buffer_batches)))
         self.pin_memory = bool(pin_memory)
+        # Live-iteration teardown handle. Each __iter__ registers its stop_event
+        # and threads here so a NEW __iter__ (e.g. prefetch of the next epoch
+        # before the previous generator is closed) and a weakref finalizer can
+        # both stop orphaned worker threads — preventing the thread/file-handle
+        # leak that occurs when a consumer breaks out of iteration without
+        # closing the generator.
+        self._active: dict | None = None
 
-    def _draw_batch(self, buffer: list[dict], rng: np.random.Generator) -> list[dict]:
-        take = min(self.batch_size, len(buffer))
-        if bool(getattr(self.dataset, "sequential_iac_rows", False)):
-            batch = buffer[:take]
-            del buffer[:take]
-            return batch
-        chosen = rng.choice(len(buffer), size=take, replace=False)
-        chosen_set = set(chosen)
-        batch = [buffer[index] for index in chosen]
-        buffer[:] = [item for index, item in enumerate(buffer) if index not in chosen_set]
+    def _maybe_pin(self, batch: dict) -> dict:
+        if self.pin_memory and torch.cuda.is_available():
+            batch["images"] = batch["images"].pin_memory()
+            batch["teacher_features"] = {
+                name: feat.pin_memory()
+                for name, feat in batch["teacher_features"].items()
+            }
         return batch
+
+    @staticmethod
+    def _teardown(active: dict) -> None:
+        """Signal stop and join all threads of one iteration. Idempotent."""
+        if active.get("done"):
+            return
+        active["done"] = True
+        stop_event = active.get("stop_event")
+        if stop_event is not None:
+            stop_event.set()
+        cond_lock = active.get("lock")
+        conditions = active.get("conditions", [])
+        if cond_lock is not None:
+            with cond_lock:
+                for cond in conditions:
+                    cond.notify_all()
+        finished = active.get("finished")
+        if finished is not None:
+            # Unblock a producer that is stuck on a full output queue.
+            while True:
+                try:
+                    finished.get_nowait()
+                except Empty:
+                    break
+        for thread in active.get("threads", []):
+            if thread.is_alive():
+                thread.join(timeout=5.0)
+
+    def _stop_active(self) -> None:
+        active = self._active
+        if active is not None:
+            self._active = None
+            self._teardown(active)
+
+    def _build_batch_plan(self, tasks: list, epoch_seed: int) -> tuple[list, list, list]:
+        """Map the seed-ordered chunk plan onto (batch, position) destinations.
+
+        Returns:
+          batch_sizes: rows in each batch (last may be short)
+          task_targets: task_targets[t] = list[BatchSlot] aligned to tasks[t].rows
+          (positions are decided here, deterministically, BEFORE any decoding —
+           so batch contents do not depend on decode/arrival order)
+        """
+        # Flatten chunk plan into a global row order, recording (task, k).
+        global_seq: list[tuple[int, int]] = []
+        for t, (_pkg, rows) in enumerate(tasks):
+            for k in range(len(rows)):
+                global_seq.append((t, k))
+        total = len(global_seq)
+        num_batches = (total + self.batch_size - 1) // self.batch_size
+        batch_sizes = [
+            min(self.batch_size, total - b * self.batch_size) for b in range(num_batches)
+        ]
+        task_targets: list[list] = [[None] * len(rows) for _pkg, rows in tasks]
+        for g, (t, k) in enumerate(global_seq):
+            b = g // self.batch_size
+            within = g % self.batch_size
+            # Deterministic intra-batch shuffle keyed by (epoch_seed, batch).
+            task_targets[t][k] = (b, within)
+        # Apply per-batch permutation so positions are decorrelated but reproducible.
+        for b in range(num_batches):
+            perm = np.random.default_rng(epoch_seed + b).permutation(batch_sizes[b])
+            self._batch_perms[b] = perm
+        return batch_sizes, task_targets, []
 
     def __iter__(self):
         import threading
-        import time
+
         epoch_seed = self.seed + self._epoch if self.reshuffle_each_epoch else self.seed
         if self.reshuffle_each_epoch:
             self._epoch += 1
-        rng = np.random.default_rng(epoch_seed)
-        chunks = iter(self.dataset.iter_package_row_chunks(self.chunk_size, epoch_seed))
-        buffer: list[dict] = []
-        if self.num_workers <= 0:
-            for package_idx, rows in chunks:
-                buffer.extend(self.dataset.read_package_rows(package_idx, rows))
-                while len(buffer) >= self.batch_size:
-                    yield self.collate_fn(self._draw_batch(buffer, rng))
-            if buffer:
-                yield self.collate_fn(self._draw_batch(buffer, rng))
+        _probe.set_config(
+            num_workers=self.num_workers,
+            batch_size=self.batch_size,
+            chunk_size=self.chunk_size,
+            prefetch_batches=self.prefetch_batches,
+            n_buffers=max(2, self.prefetch_batches + 1),
+            pin_memory=self.pin_memory,
+            torch_threads=torch.get_num_threads(),
+            torch_interop=torch.get_num_interop_threads(),
+        )
+        _probe.start_proc_sampler()
+
+        tasks: list[tuple[int, np.ndarray]] = list(
+            self.dataset.iter_package_row_chunks(self.chunk_size, epoch_seed)
+        )
+        num_tasks = len(tasks)
+        if num_tasks == 0:
             return
 
-        max_buffer_rows = self.batch_size * max(4, self.prefetch_batches * 2)
-        max_pending = max(self.num_workers + self.prefetch_batches, (max_buffer_rows + self.chunk_size - 1) // self.chunk_size)
-        ready_queue: Queue = Queue(maxsize=max(1, self.prefetch_batches * 2))
+        # If a previous iteration's threads are still alive (e.g. a consumer
+        # broke out without closing the generator, or a prefetch created a new
+        # iterator), stop them before starting fresh ones. Without this the
+        # orphaned workers accumulate every epoch and exhaust threads/FDs.
+        self._stop_active()
+
+        spec = self.dataset.batch_buffer_spec()
+        self._batch_perms: dict[int, np.ndarray] = {}
+        batch_sizes, task_targets, _ = self._build_batch_plan(tasks, epoch_seed)
+        num_batches = len(batch_sizes)
+
+        # Apply the per-batch permutation to the (b, within) targets so the final
+        # slot position is the shuffled one. Build BatchSlot lists per task.
+        n_buffers = max(2, self.prefetch_batches + 1)
+        positions_per_task: list[list] = []
+        for t in range(num_tasks):
+            slots_for_task = []
+            for (b, within) in task_targets[t]:
+                pos = int(self._batch_perms[b][within])
+                slots_for_task.append(BatchSlot(buffer_idx=b % n_buffers, pos=pos))
+            positions_per_task.append(slots_for_task)
+
+        # Pre-allocate the ring of pinned buffers.
+        buffers = [_alloc_batch_buffer(self.batch_size, spec, self.pin_memory) for _ in range(n_buffers)]
+
+        # Per-batch fill counters and the buffer-generation guard. buffer_gen[i]
+        # holds the batch index that currently OWNS ring slot i; a worker that
+        # needs batch b must wait until buffer (b % n_buffers) is free for b
+        # (i.e. the previous owner b - n_buffers has been consumed).
+        fill_count = [0] * num_batches
+        buffer_owner = [b for b in range(n_buffers)]  # initial owners: batches 0..n_buffers-1
+        next_task_idx = [0]
+        error_box: list[BaseException | None] = [None]
         stop_event = Event()
+        lock = threading.Lock()
+        batch_done = threading.Condition(lock)   # a batch reached full fill_count
+        buffer_freed = threading.Condition(lock)  # a ring buffer was released by consumer
+
+        finished: Queue = Queue(maxsize=max(1, self.prefetch_batches))
         sentinel = object()
-        buffer_lock = threading.Lock()
-        exhausted_flag = [False]
+        ready_batches: list[bool] = [False] * num_batches
 
-        def put_ready(item) -> bool:
-            while not stop_event.is_set():
-                try:
-                    ready_queue.put(item, timeout=0.1)
-                    return True
-                except Full:
-                    continue
-            return False
-
-        def reader_worker() -> None:
-            pending: set[Future] = set()
-            chunks_exhausted = False
-            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                def fill_window() -> None:
-                    nonlocal chunks_exhausted
-                    with buffer_lock:
-                        buf_len = len(buffer)
-                    while not stop_event.is_set() and len(pending) < max_pending and buf_len < max_buffer_rows:
-                        try:
-                            package_idx, rows = next(chunks)
-                        except StopIteration:
-                            chunks_exhausted = True
-                            return
-                        pending.add(executor.submit(self.dataset.read_package_rows, package_idx, rows))
-                        buf_len += len(rows)
-
-                try:
-                    while not stop_event.is_set() and (pending or not chunks_exhausted):
-                        fill_window()
-                        ready_f = {f for f in pending if f.done()}
-                        if ready_f:
-                            pending -= ready_f
-                            for f in ready_f:
-                                res = f.result()
-                                with buffer_lock:
-                                    buffer.extend(res)
-                        if pending:
-                            done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                            for f in done:
-                                res = f.result()
-                                with buffer_lock:
-                                    buffer.extend(res)
-                        else:
-                            time.sleep(0.01)
-                except BaseException as exc:
-                    put_ready(exc)
-                finally:
-                    exhausted_flag[0] = True
-
-        def collation_worker() -> None:
+        def worker() -> None:
             try:
                 while not stop_event.is_set():
-                    with buffer_lock:
-                        buf_len = len(buffer)
-                    if buf_len >= self.batch_size or (exhausted_flag[0] and buf_len > 0):
-                        with buffer_lock:
-                            take = min(self.batch_size, len(buffer))
-                            if bool(getattr(self.dataset, "sequential_iac_rows", False)):
-                                batch_rows = buffer[:take]
-                                del buffer[:take]
-                            else:
-                                chosen = rng.choice(len(buffer), size=take, replace=False)
-                                chosen_set = set(chosen)
-                                batch_rows = [buffer[index] for index in chosen]
-                                buffer[:] = [item for index, item in enumerate(buffer) if index not in chosen_set]
-                        batch = self.collate_fn(batch_rows)
-                        if self.pin_memory and torch.cuda.is_available():
-                            batch["images"] = batch["images"].pin_memory()
-                            batch["teacher_features"] = {
-                                name: feat.pin_memory()
-                                for name, feat in batch["teacher_features"].items()
-                            }
-                        if not put_ready(batch):
-                            return
-                    else:
-                        if exhausted_flag[0]:
-                            with buffer_lock:
-                                if len(buffer) == 0:
-                                    break
-                        time.sleep(0.01)
-            except BaseException as exc:
-                put_ready(exc)
-            finally:
-                put_ready(sentinel)
+                    with _probe.section("w_get_task"):
+                        with lock:
+                            idx = next_task_idx[0]
+                            if idx >= num_tasks:
+                                _probe.flush_thread()
+                                return
+                            next_task_idx[0] = idx + 1
+                    package_idx, rows = tasks[idx]
+                    slots = positions_per_task[idx]
+                    targets = task_targets[idx]
+                    # Group this task's rows by destination batch, then process
+                    # groups in batch order. Each group waits ONLY for its own
+                    # ring buffer — so the front-batch portion is written even if
+                    # a later batch's buffer is not yet free (avoids deadlock when
+                    # a chunk straddles a batch boundary).
+                    groups: dict[int, list[int]] = {}
+                    for k, (b, _w) in enumerate(targets):
+                        groups.setdefault(b, []).append(k)
+                    for b in sorted(groups):
+                        ring = b % n_buffers
+                        with _probe.section("w_wait_ring"):
+                            with lock:
+                                while (not stop_event.is_set()) and buffer_owner[ring] != b:
+                                    buffer_freed.wait()
+                                if stop_event.is_set():
+                                    return
+                        ks = groups[b]
+                        sub_rows = np.asarray([int(rows[k]) for k in ks], dtype=np.int64)
+                        sub_slots = [slots[k] for k in ks]
+                        with _probe.section("w_scatter"):
+                            self.dataset.scatter_package_rows(package_idx, sub_rows, sub_slots, buffers)
+                        with _probe.section("w_submit"):
+                            with lock:
+                                fill_count[b] += len(ks)
+                                if fill_count[b] >= batch_sizes[b]:
+                                    ready_batches[b] = True
+                                    batch_done.notify_all()
+            except BaseException as exc:  # noqa: BLE001
+                with lock:
+                    if error_box[0] is None:
+                        error_box[0] = exc
+                    stop_event.set()
+                    batch_done.notify_all()
+                    buffer_freed.notify_all()
 
-        reader_thread = Thread(target=reader_worker, daemon=True)
-        collation_thread = Thread(target=collation_worker, daemon=True)
-        reader_thread.start()
-        collation_thread.start()
+        workers = [Thread(target=worker, daemon=True) for _ in range(self.num_workers)]
+        for thread in workers:
+            thread.start()
+
+        # Emitter: deliver batches in order as each becomes ready.
+        def emitter() -> None:
+            try:
+                for b in range(num_batches):
+                    with lock:
+                        while (not ready_batches[b]) and error_box[0] is None and not stop_event.is_set():
+                            batch_done.wait()
+                        if error_box[0] is not None:
+                            raise error_box[0]
+                        if stop_event.is_set():
+                            return
+                    view = buffers[b % n_buffers].view(batch_sizes[b])
+                    while not stop_event.is_set():
+                        try:
+                            finished.put((b, view), timeout=0.1)
+                            break
+                        except Full:
+                            continue
+            except BaseException as exc:  # noqa: BLE001
+                with lock:
+                    if error_box[0] is None:
+                        error_box[0] = exc
+                try:
+                    finished.put(exc, timeout=0.1)
+                except Full:
+                    pass
+            finally:
+                while not stop_event.is_set():
+                    try:
+                        finished.put(sentinel, timeout=0.1)
+                        break
+                    except Full:
+                        continue
+
+        emitter_thread = Thread(target=emitter, daemon=True)
+        emitter_thread.start()
+
+        # Register this iteration so a later __iter__ or a GC finalizer can stop
+        # these threads even if the consumer never closes the generator.
+        active = {
+            "stop_event": stop_event,
+            "lock": lock,
+            "conditions": [batch_done, buffer_freed],
+            "finished": finished,
+            "threads": [*workers, emitter_thread],
+            "done": False,
+        }
+        self._active = active
+        finalizer = weakref.finalize(self, self._teardown, active)
+
         try:
+            _emitted = 0
             while True:
-                item = ready_queue.get()
+                with _probe.section("c_wait_batch"):
+                    item = finished.get()
                 if item is sentinel:
                     break
                 if isinstance(item, BaseException):
                     raise item
-                yield item
+                b, view = item
+                with _probe.section("c_consume"):
+                    yield view
+                _emitted += 1
+                if _probe.ON and (_emitted % 20 == 0):
+                    _probe.flush_thread()
+                    _probe.report(tag=f"epoch={self._epoch} batches={_emitted} workers={self.num_workers}")
+                # Consumer is done with batch b: release its ring buffer to the
+                # next owner (b + n_buffers) so a waiting worker can reuse it.
+                with lock:
+                    ring = b % n_buffers
+                    buffer_owner[ring] = b + n_buffers
+                    fill_count_next = b + n_buffers
+                    if fill_count_next < num_batches:
+                        fill_count[fill_count_next] = 0
+                        ready_batches[fill_count_next] = False
+                    buffer_freed.notify_all()
         finally:
-            stop_event.set()
-            reader_thread.join()
-            collation_thread.join()
-            with buffer_lock:
-                buffer.clear()
-            while not ready_queue.empty():
-                try:
-                    ready_queue.get_nowait()
-                except Exception:
-                    break
+            self._teardown(active)
+            finalizer.detach()
+            if self._active is active:
+                self._active = None
 
     def __len__(self) -> int:
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
@@ -352,12 +607,53 @@ def _prototype_source_splits(cfg: dict, key: str, default: list[str]) -> set[str
     return {str(item) for item in value}
 
 
+def _cgroup_cpu_quota() -> int | None:
+    """Usable CPU cores from the cgroup v2 quota, or None if unlimited/unknown.
+
+    On shared hosts torch/OpenMP size their thread pools to the PHYSICAL core
+    count (e.g. 208) while the container is limited to a far smaller quota
+    (e.g. 25). The resulting oversubscription burns the quota on context
+    switching instead of useful work, starving the decode workers.
+    """
+    try:
+        with open("/sys/fs/cgroup/cpu.max", "r", encoding="utf-8") as handle:
+            quota_s, period_s = handle.read().split()
+        if quota_s == "max":
+            return None
+        cores = int(quota_s) // int(period_s)
+        return max(1, cores)
+    except Exception:
+        return None
+
+
+def _cap_compute_threads(num_workers: int) -> None:
+    quota = _cgroup_cpu_quota()
+    if quota is None:
+        return
+    # torch.set_num_threads is PROCESS-GLOBAL, not main-thread-only: the decode
+    # workers' scatter_package_rows() does ATen copy_() ops, so each of the
+    # num_workers decode threads fans its copy out across this same intra-op
+    # pool. A pool size of N therefore multiplies CPU use by ~N per worker
+    # (num_workers * N threads), oversubscribing the cgroup quota — this is why
+    # the loader hit the 25-core ceiling at only ~6 workers. The training hot
+    # path (image normalize, model forward, loss) all runs on the GPU; the only
+    # CPU-side torch work left in the main thread is scalar/small-tensor glue
+    # and .cpu()/cat moves, which a single thread handles fine. Pin the pool to
+    # 1 so the quota goes almost 1:1 to decode workers.
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train HCC-SemPath distillation model.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", default="")
     args = parser.parse_args()
     cfg = load_config(args.config)
+    _cap_compute_threads(int(cfg["data"].get("num_workers", 0)))
     seed_everything(int(cfg["runtime"]["seed"]))
     device = torch.device(cfg["runtime"]["device"])
     if device.type == "cuda":
@@ -544,30 +840,58 @@ def main() -> None:
         default_chunk_size = max(1, int(cfg["train"]["batch_size"]) // max(1, num_workers))
         package_chunk_size = int(cfg["data"].get("package_chunk_size", default_chunk_size))
         package_buffer_batches = int(cfg["data"].get("package_buffer_batches", 4))
-        train_loader = _PackageShuffleBatchLoader(
-            train_ds,
-            batch_size=int(cfg["train"]["batch_size"]),
-            num_workers=num_workers,
-            prefetch_batches=prefetch_batches,
-            collate_fn=train_ds.collate,
-            seed=int(cfg["runtime"]["seed"]),
-            chunk_size=package_chunk_size,
-            buffer_batches=package_buffer_batches,
-            reshuffle_each_epoch=True,
-            pin_memory=bool(cfg["data"].get("package_pin_memory", False)),
-        )
-        val_loader = _PackageShuffleBatchLoader(
-            val_ds,
-            batch_size=int(cfg["train"]["batch_size"]),
-            num_workers=num_workers,
-            prefetch_batches=prefetch_batches,
-            collate_fn=val_ds.collate,
-            seed=int(cfg["runtime"]["seed"]) + 1,
-            chunk_size=package_chunk_size,
-            buffer_batches=package_buffer_batches,
-            reshuffle_each_epoch=False,
-            pin_memory=bool(cfg["data"].get("package_pin_memory", False)),
-        )
+        use_mp = bool(cfg["data"].get("package_multiprocessing", False)) and num_workers > 0
+        if use_mp:
+            # Process-per-worker path: each decode worker is a separate PROCESS
+            # with its own GIL, so JXL decode no longer contends with the
+            # main-thread GPU inference loop for one process-wide GIL (the cause
+            # of the ~800% CPU ceiling and 7.3ms/tile vs 2ms in-bench decode).
+            # Reproduces the thread loader's exact tile order via the chunk-plan
+            # batch sampler, and reuses the dataset's __getitems__ + collate.
+            bs = int(cfg["train"]["batch_size"])
+            train_sampler = _ChunkPlanBatchSampler(
+                train_ds, batch_size=bs, chunk_size=package_chunk_size,
+                seed=int(cfg["runtime"]["seed"]), reshuffle_each_epoch=True,
+            )
+            val_sampler = _ChunkPlanBatchSampler(
+                val_ds, batch_size=bs, chunk_size=package_chunk_size,
+                seed=int(cfg["runtime"]["seed"]) + 1, reshuffle_each_epoch=False,
+            )
+            mp_kwargs = dict(
+                num_workers=num_workers,
+                pin_memory=device.type == "cuda",
+                prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
+                persistent_workers=bool(cfg["data"].get("persistent_workers", True)),
+            )
+            train_loader = DataLoader(train_ds, batch_sampler=train_sampler,
+                                      collate_fn=train_ds.collate, **mp_kwargs)
+            val_loader = DataLoader(val_ds, batch_sampler=val_sampler,
+                                    collate_fn=val_ds.collate, **mp_kwargs)
+        else:
+            train_loader = _PackageShuffleBatchLoader(
+                train_ds,
+                batch_size=int(cfg["train"]["batch_size"]),
+                num_workers=num_workers,
+                prefetch_batches=prefetch_batches,
+                collate_fn=train_ds.collate,
+                seed=int(cfg["runtime"]["seed"]),
+                chunk_size=package_chunk_size,
+                buffer_batches=package_buffer_batches,
+                reshuffle_each_epoch=True,
+                pin_memory=bool(cfg["data"].get("package_pin_memory", False)),
+            )
+            val_loader = _PackageShuffleBatchLoader(
+                val_ds,
+                batch_size=int(cfg["train"]["batch_size"]),
+                num_workers=num_workers,
+                prefetch_batches=prefetch_batches,
+                collate_fn=val_ds.collate,
+                seed=int(cfg["runtime"]["seed"]) + 1,
+                chunk_size=package_chunk_size,
+                buffer_batches=package_buffer_batches,
+                reshuffle_each_epoch=False,
+                pin_memory=bool(cfg["data"].get("package_pin_memory", False)),
+            )
     else:
         train_loader = DataLoader(
             train_ds,
