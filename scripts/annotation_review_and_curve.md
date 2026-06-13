@@ -66,6 +66,24 @@ Change `--class-a` and `--class-b` for other two-class reviews.
 - L1 mode actions are three-way: accept suggested, keep current, or use selected.
 - Pair mode actions are the two class buttons.
 
+### Teacher-disagreement review
+
+Use the existing `val` and `exval` top-500 caches as one fixed 1,000-tile
+blinded L1 adjudication queue:
+
+```bash
+python scripts/annotation_review_ui.py \
+  --mode disagreement \
+  --disagreement-csv artifacts/caches/local_cache/teacher_disagreement/val/teacher_disagreement_top500.csv \
+  --disagreement-csv artifacts/caches/local_cache/teacher_disagreement/exval/teacher_disagreement_top500.csv \
+  --output-json artifacts/caches/local_cache/teacher_disagreement/top1000_l1_review.json
+```
+
+The reviewer sees only a randomized `TD-####` identifier and the tile image.
+Teacher names, votes, confidence, split, and disagreement rank remain hidden in
+the browser. The output JSON and companion `.review.csv` retain those fields for
+post-review analysis and support resume.
+
 ## PrototypeSample information curve
 
 Script:

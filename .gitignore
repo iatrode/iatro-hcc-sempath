@@ -28,3 +28,7 @@ experiments/**/results/
 release/hcc-sempath/*
 !release/hcc-sempath/README.md
 !release/hcc-sempath/model.pt
+
+# Local review plugin
+scripts/visuals_plugin.py
+

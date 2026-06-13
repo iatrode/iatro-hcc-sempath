@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import random
 import socket
 import sys
 import tempfile
@@ -53,6 +54,56 @@ def _load_payload(path: Path) -> dict:
     if not isinstance(payload.get("annotations"), dict):
         raise ValueError(f"annotation JSON missing annotations object: {path}")
     return payload
+
+
+def _load_disagreement_payload(paths: list[Path], seed: int) -> dict:
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for path in paths:
+        filename = path.name.lower()
+        if "random" in filename:
+            source_group = "random500"
+        else:
+            source_group = "top500"
+
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                tile_id = str(row.get("tile_id") or "").strip()
+                package_path = str(row.get("package_path") or "").strip()
+                row_idx = str(row.get("row_idx") or "").strip()
+                if not tile_id or not package_path or not row_idx:
+                    raise ValueError(f"disagreement CSV row missing tile_id/package_path/row_idx: {path}")
+                if tile_id in seen:
+                    raise ValueError(f"duplicate disagreement tile_id across inputs: {tile_id}")
+                seen.add(tile_id)
+                item = dict(row)
+                item["source_group"] = source_group
+                rows.append(item)
+    if not rows:
+        raise ValueError("disagreement CSV inputs contain no review rows")
+
+    random.Random(seed).shuffle(rows)
+    annotations: dict[str, dict] = {}
+    for index, row in enumerate(rows, start=1):
+        review_id = f"TD-{index:04d}"
+        item = dict(row)
+        item.update(
+            {
+                "review_id": review_id,
+                "iac_path": row["package_path"],
+                "row": int(row["row_idx"]),
+                "l1": "",
+                "reviewed": False,
+            }
+        )
+        annotations[review_id] = item
+    return {
+        "review_type": "teacher_disagreement_l1_adjudication",
+        "blind_seed": int(seed),
+        "source_csvs": [str(path) for path in paths],
+        "l1_prototypes": list(L1_PROTOTYPES),
+        "annotations": annotations,
+    }
 
 
 def _parse_str_list(value: str) -> list[str]:
@@ -238,6 +289,18 @@ def build_candidates(
         if bool(item.get("reviewed")):
             continue
         current = str(item.get("l1") or item.get("level1_label") or "")
+        if mode == "disagreement":
+            candidates.append(
+                ReviewCandidate(
+                    key=str(key),
+                    tile_id=str(item.get("review_id") or key),
+                    current_l1=current,
+                    suggested_l1="",
+                    uncertainty=0.0,
+                    score_summary="",
+                )
+            )
+            continue
         if mode == "binary" and current not in {binary_a, binary_b}:
             continue
         suggested, uncertainty, score_summary = _suggest_l1(item, mode, binary_a, binary_b, scorer)
@@ -255,13 +318,15 @@ def build_candidates(
                 score_summary=score_summary,
             )
         )
+    if mode == "disagreement":
+        return candidates
     return sorted(candidates, key=lambda item: (-item.uncertainty, item.tile_id, item.key))
 
 
 class ReviewState:
     def __init__(
         self,
-        annotation_json: Path,
+        annotation_json: Path | None,
         output_json: Path | None,
         *,
         mode: str,
@@ -271,11 +336,28 @@ class ReviewState:
         teacher_feature_root: Path | None = None,
         teacher_feature_packages: str = "",
         unstable_l1: set[str] | None = None,
+        disagreement_csvs: list[Path] | None = None,
+        blind_seed: int = 13,
     ) -> None:
         self.annotation_json = annotation_json
-        self.output_json = output_json or annotation_json
-        state_path = self.output_json if self.output_json.exists() else annotation_json
-        self.payload = _load_payload(state_path)
+        if mode == "disagreement":
+            if output_json is None:
+                raise ValueError("--output-json is required for disagreement review")
+            self.output_json = output_json
+            if self.output_json.exists():
+                self.payload = _load_payload(self.output_json)
+            else:
+                csvs = disagreement_csvs or []
+                if not csvs:
+                    raise ValueError("at least one --disagreement-csv is required")
+                self.payload = _load_disagreement_payload(csvs, blind_seed)
+                self.flush()
+        else:
+            if annotation_json is None:
+                raise ValueError("--annotation-json is required for L1/binary review")
+            self.output_json = output_json or annotation_json
+            state_path = self.output_json if self.output_json.exists() else annotation_json
+            self.payload = _load_payload(state_path)
         self.mode = mode
         self.binary_a = binary_a
         self.binary_b = binary_b
@@ -313,6 +395,17 @@ class ReviewState:
 
     def candidate_payload(self) -> dict:
         candidates = self.candidates()
+        queue_type = "standard"
+        if self.mode == "disagreement":
+            source_csvs = self.payload.get("source_csvs", [])
+            has_random = any("random" in s.lower() for s in source_csvs)
+            has_disagreement = any("top500" in s.lower() or "disagreement" in s.lower() for s in source_csvs)
+            if has_random and has_disagreement:
+                queue_type = "mixed"
+            elif has_random:
+                queue_type = "random"
+            else:
+                queue_type = "disagreement"
         return {
             "remaining": len(candidates),
             "candidates": [candidate.__dict__ for candidate in candidates],
@@ -320,10 +413,22 @@ class ReviewState:
             "mode": self.mode,
             "binary_a": self.binary_a,
             "binary_b": self.binary_b,
+            "queue_type": queue_type,
         }
 
     def item(self, key: str) -> dict:
         return self.payload["annotations"][key]
+
+    def public_item(self, key: str) -> dict:
+        item = self.item(key)
+        if self.mode == "disagreement":
+            return {
+                "review_id": item.get("review_id", key),
+                "reviewed": bool(item.get("reviewed")),
+                "l1": item.get("l1", ""),
+                "source_group": item.get("source_group", ""),
+            }
+        return item
 
     def viewer(self, iac_path: str) -> IacViewerData:
         if iac_path not in self._viewers:
@@ -342,7 +447,15 @@ class ReviewState:
             return item
         current = str(item.get("l1") or "")
         suggested = _suggest_l1(item, self.mode, self.binary_a, self.binary_b, self.scorer)[0]
-        if decision == "accept":
+        if self.mode == "disagreement" and decision == "uncertain":
+            item["l1"] = ""
+            item["adjudication_status"] = "uncertain"
+        elif self.mode == "disagreement" and decision == "adjust":
+            if new_l1 not in self.payload.get("l1_prototypes", L1_PROTOTYPES):
+                raise ValueError("disagreement adjudication requires a valid L1 label")
+            item["l1"] = new_l1
+            item["adjudication_status"] = "adjudicated"
+        elif decision == "accept":
             item["l1"] = suggested
         elif decision == "adjust":
             if not new_l1:
@@ -366,9 +479,29 @@ class ReviewState:
             tmp_path = Path(handle.name)
         tmp_path.replace(self.output_json)
         with self.csv_path.open("w", newline="", encoding="utf-8") as handle:
+            base_fields = [
+                "review_id",
+                "tile_id",
+                "split",
+                "rank",
+                "l1",
+                "adjudication_status",
+                "reviewed",
+                "review_decision",
+                "review_previous_l1",
+                "review_suggested_l1",
+            ]
+            extra_fields = sorted(
+                {
+                    field
+                    for item in self.payload.get("annotations", {}).values()
+                    for field in item
+                    if field not in base_fields and field not in {"iac_path", "row"}
+                }
+            )
             writer = csv.DictWriter(
                 handle,
-                fieldnames=["tile_id", "l1", "reviewed", "review_decision", "review_previous_l1", "review_suggested_l1"],
+                fieldnames=base_fields + extra_fields,
             )
             writer.writeheader()
             for item in self.payload.get("annotations", {}).values():
@@ -422,7 +555,22 @@ function isMobile(){return window.matchMedia('(max-width:760px)').matches;}
 function text(el,value){el.textContent=value;}
 async function load(selectIndex=0){
   const p=await api('/api/candidates'); queue=p.candidates; labels=p.l1_prototypes; mode=p.mode; classA=p.binary_a; classB=p.binary_b;
-  text(els.count,`${p.remaining} remaining - ${p.mode}`); fillLabels(); renderList();
+  let modeDesc = p.mode;
+  if(p.mode==='disagreement'){
+    if (p.queue_type === 'mixed') {
+      modeDesc = 'blinded mixed review (混合分歧/对照)';
+      document.title = 'Mixed Queue - Annotation Review';
+      const qtEl = document.querySelector('.queueTitle');
+      if(qtEl) qtEl.textContent = 'Mixed Queue (混合评估队列)';
+    } else {
+      const isRandom = p.queue_type==='random';
+      modeDesc = isRandom ? 'blinded random control (随机对照)' : 'blinded high disagreement (高混淆分歧)';
+      document.title = isRandom ? 'Random Queue - Annotation Review' : 'Disagreement Queue - Annotation Review';
+      const qtEl = document.querySelector('.queueTitle');
+      if(qtEl) qtEl.textContent = isRandom ? 'Random Queue (随机对照)' : 'Disagreement Queue (高混淆分歧)';
+    }
+  }
+  text(els.count,`${p.remaining} remaining - ${modeDesc}`); fillLabels(); renderList();
   if(queue.length){await show(queue[Math.max(0,Math.min(selectIndex,queue.length-1))].key);} else {complete();}
 }
 function fillLabels(){els.select.innerHTML=''; labels.forEach(label=>{const o=document.createElement('option'); o.value=label; o.textContent=label; els.select.appendChild(o);});}
@@ -432,26 +580,44 @@ function renderList(){
   queue.forEach((candidate,index)=>{
     const row=document.createElement('div'); row.className='row'+(current&&current.key===candidate.key?' active':'');
     const title=document.createElement('div'); title.className='rowTitle'; title.textContent=candidate.tile_id;
-    const meta=document.createElement('div'); meta.className='rowMeta'; meta.textContent=`${index+1}. ${candidate.current_l1} -> ${candidate.suggested_l1} - ${candidate.uncertainty.toFixed(3)}`;
+    const meta=document.createElement('div'); meta.className='rowMeta';
+    meta.textContent=mode==='disagreement' ? `${index+1}. blinded L1 adjudication` : `${index+1}. ${candidate.current_l1} -> ${candidate.suggested_l1} - ${candidate.uncertainty.toFixed(3)}`;
     row.append(title,meta); row.addEventListener('click',()=>{show(candidate.key); if(isMobile())setQueueOpen(false);}); els.list.appendChild(row);
   });
 }
 async function show(key){
   const data=await api('/api/item?key='+encodeURIComponent(key)); current=data.candidate;
   const index=queue.findIndex(candidate=>candidate.key===key);
-  text(els.title,data.item.tile_id||current.tile_id); text(els.progress,index>=0?`${index+1}/${queue.length}`:'');
-  text(els.currentChip,`Current: ${current.current_l1}`); text(els.suggestedChip,`Suggested: ${current.suggested_l1}`);
-  text(els.scores,current.score_summary||`Uncertainty: ${current.uncertainty.toFixed(3)}`);
-  els.tile.src='/api/tile?key='+encodeURIComponent(key)+'&t='+Date.now(); els.tile.alt=data.item.tile_id||current.tile_id;
-  els.select.value=current.suggested_l1; renderDecision(); renderList();
+  const groupLabel = data.item.source_group === 'top500' ? ' [高混淆分歧组]' : (data.item.source_group === 'random500' ? ' [随机对照组]' : '');
+  text(els.title, (data.item.review_id||data.item.tile_id||current.tile_id) + groupLabel); text(els.progress,index>=0?`${index+1}/${queue.length}`:'');
+  if(mode==='disagreement'){
+    text(els.currentChip,'Blinded tile'); text(els.suggestedChip,'Select adjudicated L1');
+    text(els.scores,'Teacher identities, votes, confidence, split, and disagreement rank are hidden during review.');
+    els.select.value=labels[0]||'';
+  }else{
+    text(els.currentChip,`Current: ${current.current_l1}`); text(els.suggestedChip,`Suggested: ${current.suggested_l1}`);
+    text(els.scores,current.score_summary||`Uncertainty: ${current.uncertainty.toFixed(3)}`);
+    els.select.value=current.suggested_l1;
+  }
+  els.tile.src='/api/tile?key='+encodeURIComponent(key)+'&t='+Date.now(); els.tile.alt=data.item.review_id||data.item.tile_id||current.tile_id;
+  renderDecision(); renderList();
 }
 function renderDecision(){
   els.pairButtons.innerHTML='';
-  if(mode==='binary'){
+  if(mode==='disagreement'){
+    els.pairButtons.classList.add('hidden'); els.l1Choices.classList.remove('hidden');
+    document.getElementById('acceptBtn').classList.add('hidden');
+    document.getElementById('rejectBtn').classList.remove('hidden');
+    document.getElementById('rejectBtn').textContent='Unable to determine';
+    document.getElementById('adjustBtn').textContent='Save selected L1';
+  }else if(mode==='binary'){
     els.pairButtons.classList.remove('hidden'); els.l1Choices.classList.add('hidden');
     [classA,classB].forEach(label=>{const b=document.createElement('button'); b.type='button'; b.className='primary'; b.textContent=label; b.addEventListener('click',()=>choose(label)); els.pairButtons.appendChild(b);});
   }else{
     els.pairButtons.classList.add('hidden'); els.l1Choices.classList.remove('hidden');
+    document.getElementById('acceptBtn').classList.remove('hidden');
+    document.getElementById('rejectBtn').textContent='Keep current';
+    document.getElementById('adjustBtn').textContent='Use selected';
   }
   setBusy(busy);
 }
@@ -479,7 +645,7 @@ async function act(decision){
 document.getElementById('toggleQueue').addEventListener('click',()=>setQueueOpen(layout.classList.contains('queue-collapsed')));
 document.getElementById('hideQueue').addEventListener('click',()=>setQueueOpen(false));
 document.getElementById('acceptBtn').addEventListener('click',()=>act('accept'));
-document.getElementById('rejectBtn').addEventListener('click',()=>act('reject'));
+document.getElementById('rejectBtn').addEventListener('click',()=>act(mode==='disagreement'?'uncertain':'reject'));
 document.getElementById('adjustBtn').addEventListener('click',()=>act('adjust'));
 if(isMobile())setQueueOpen(false);
 load().catch(e=>text(els.status,e.message||String(e)));
@@ -517,7 +683,7 @@ def make_handler(state: ReviewState):
                     return
                 if parsed.path == "/api/item":
                     key = qs["key"][0]
-                    _json_response(self, {"candidate": state.candidate(key).__dict__, "item": state.item(key)})
+                    _json_response(self, {"candidate": state.candidate(key).__dict__, "item": state.public_item(key)})
                     return
                 if parsed.path == "/api/tile":
                     body = state.tile_png(qs["key"][0])
@@ -548,9 +714,11 @@ def make_handler(state: ReviewState):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Open a focused annotation review UI.")
-    parser.add_argument("--annotation-json", required=True)
+    parser.add_argument("--annotation-json", default="")
     parser.add_argument("--output-json", default="")
-    parser.add_argument("--mode", choices=["l1", "binary"], default="l1")
+    parser.add_argument("--mode", choices=["l1", "binary", "disagreement"], default="l1")
+    parser.add_argument("--disagreement-csv", action="append", default=[])
+    parser.add_argument("--blind-seed", type=int, default=13)
     parser.add_argument("--class-a", "--binary-a", dest="binary_a", default="HCC-tumor")
     parser.add_argument("--class-b", "--binary-b", dest="binary_b", default="Inflammatory-stromal")
     parser.add_argument("--teachers", default="")
@@ -560,9 +728,30 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--no-open", action="store_true")
+    parser.add_argument("--plugin", nargs="?", const="scripts/visuals_plugin.py", default="")
     args = parser.parse_args()
+
+    # Generic external plugin extension hook
+    if args.plugin:
+        plugin_path = Path(args.plugin)
+        if plugin_path.exists():
+            print(f"[UI] Loading plugin from {plugin_path}...", flush=True)
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("plugin_mod", str(plugin_path))
+            plugin_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(plugin_mod)
+            global HTML, make_handler
+            HTML, make_handler = plugin_mod.apply_patch(HTML, make_handler)
+        else:
+            print(f"[UI] Error: plugin file not found: {plugin_path}", flush=True)
+            sys.exit(1)
+    else:
+        default_plugin = Path("scripts/visuals_plugin.py")
+        if default_plugin.exists():
+            print(f"[UI] Info: Optional visuals plugin detected at {default_plugin}. Run with '--plugin' to enable it.", flush=True)
+
     state = ReviewState(
-        Path(args.annotation_json),
+        Path(args.annotation_json) if args.annotation_json else None,
         Path(args.output_json) if args.output_json else None,
         mode=args.mode,
         binary_a=args.binary_a,
@@ -571,6 +760,8 @@ def main() -> None:
         teacher_feature_root=Path(args.teacher_feature_root) if args.teacher_feature_root else None,
         teacher_feature_packages=args.teacher_feature_packages,
         unstable_l1=set(_parse_str_list(args.unstable_l1)),
+        disagreement_csvs=[Path(path) for path in args.disagreement_csv],
+        blind_seed=args.blind_seed,
     )
     port = _find_free_port(args.host, args.port)
     server = ThreadingHTTPServer((args.host, port), make_handler(state))
