@@ -17,3 +17,9 @@ results/**/*.png
 results/**/tile_manifest.csv
 .vscode/
 final_weight/
+.DS_Store
+**/.DS_Store
+
+# Manuscript experiment workspaces and generated artifacts are prepared for
+# release separately from the source tree.
+final_experiments/

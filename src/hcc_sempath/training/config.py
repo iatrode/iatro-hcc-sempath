@@ -21,12 +21,21 @@ EXCLUDED_TEACHER_NAMES = {
 }
 
 
+# Teacher-keyed maps describe the active teacher set. When a child config
+# provides one, it should define that set wholesale rather than union-merge with
+# the parent's teachers — otherwise a single-teacher override cannot drop the
+# parent's other teachers and config validation rejects the leftovers.
+_REPLACE_ON_OVERRIDE_KEYS = frozenset({"teacher_dims", "teacher_weights", "prototype_paths"})
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     result = dict(base)
     for key, value in override.items():
         if key == "inherits":
             continue
-        if isinstance(value, dict) and isinstance(result.get(key), dict):
+        if key in _REPLACE_ON_OVERRIDE_KEYS:
+            result[key] = value
+        elif isinstance(value, dict) and isinstance(result.get(key), dict):
             result[key] = _deep_merge(result[key], value)
         else:
             result[key] = value

@@ -35,6 +35,10 @@ def _prepare_images(batch: dict, cfg: dict, device: torch.device) -> torch.Tenso
     images = batch["images"].to(device, non_blocking=device.type == "cuda")
     if not bool(batch.get("images_uint8", False)):
         return images
+    if bool(batch.get("images_hwc", False)):
+        # Scatter loader delivers pinned HWC uint8; do the NHWC->NCHW permute on
+        # the GPU (cheap) rather than spending CPU on it during collation.
+        images = images.permute(0, 3, 1, 2)
     images = images.to(torch.float32).div_(255.0)
     mean = torch.tensor(cfg["data"].get("mean", [0.0, 0.0, 0.0]), dtype=torch.float32, device=device).view(1, 3, 1, 1)
     std = torch.tensor(cfg["data"].get("std", [1.0, 1.0, 1.0]), dtype=torch.float32, device=device).view(1, 3, 1, 1)
@@ -779,6 +783,8 @@ def collect_embeddings(
         else:
             images = batch["images"].to(device, non_blocking=device.type == "cuda")
             if bool(batch.get("images_uint8", False)):
+                if bool(batch.get("images_hwc", False)):
+                    images = images.permute(0, 3, 1, 2)
                 images = images.to(torch.float32).div_(255.0)
         outputs = model(images)
         embeddings.append(outputs["embedding_norm"].cpu())

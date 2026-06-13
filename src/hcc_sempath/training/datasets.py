@@ -10,6 +10,8 @@ import threading
 import torch
 import numpy as np
 from PIL import Image
+
+from . import _pipeline_probe as _probe
 from torch.utils.data import Dataset
 from torchvision import transforms
 
@@ -527,6 +529,15 @@ class PackageSampledDistillationDataset(Dataset):
         self.tensor_collate = bool(tensor_collate)
         self.mean_tensor = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1) if mean is not None else None
         self.std_tensor = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1) if std is not None else None
+        self._image_hw = (int(image_size), int(image_size)) if isinstance(image_size, int) else (int(image_size[0]), int(image_size[1]))
+        self._teacher_dims: dict[str, int] = dict(expected_dims) if expected_dims else {}
+        self._level2_dim = int(next(iter(self.prototype_labels.values())).level2.numel()) if self.prototype_labels else 0
+        # Per-thread reader LRU cap (entries = tile/feature readers). Keeps total
+        # open file handles bounded across many worker threads. Each cached entry
+        # is one open package file; with ~1.8k packages an unbounded cache would
+        # exhaust the process FD limit. 32 entries/thread balances handle count
+        # against reopen churn (a worker streams a few packages at a time).
+        self._reader_cache_cap = 32
         self._thread_local = threading.local()
 
     def _package_sample_counts(self, sample_count: int, rng: np.random.Generator) -> list[int]:
@@ -644,18 +655,74 @@ class PackageSampledDistillationDataset(Dataset):
             for package_idx in package_indices:
                 yield package_idx, per_package_chunks[package_idx][chunk_idx]
 
-    def _thread_reader_cache(self) -> dict[tuple[str, Path], object]:
+    def iter_global_index_chunks(self, chunk_size: int, seed: int) -> "list[np.ndarray]":
+        """Same seed-ordered chunk plan as iter_package_row_chunks, but each
+        chunk is expressed as GLOBAL dataset indices (the [0, sample_count)
+        space __getitem__ expects). Lets a standard multiprocessing DataLoader
+        reproduce the exact sampling order via a batch_sampler — each worker is
+        a separate PROCESS with its own GIL, so decode no longer contends with
+        the main-thread GPU inference for one process-wide GIL.
+
+        A package occupies a contiguous global-index block at block_offsets[b]
+        (b = position of that package in package_order), in the SAME order its
+        sampled rows are laid out in package_sample_rows. So the k-th sampled
+        row of a package maps to global index block_offsets[b] + k.
+        """
+        chunk_size = max(1, int(chunk_size))
+        pkg_block_start: dict[int, int] = {}
+        for b, package_idx in enumerate(self.package_order):
+            pkg_block_start[package_idx] = self.block_offsets[b]
+        per_package_chunks: dict[int, list[np.ndarray]] = {}
+        max_chunks = 0
+        for package_idx in self.package_order:
+            rows = self.package_sample_rows[package_idx]
+            n = self.package_counts[package_idx] if rows is None else len(rows)
+            base = pkg_block_start[package_idx]
+            chunks = [
+                np.arange(base + start, base + min(start + chunk_size, n), dtype=np.int64)
+                for start in range(0, n, chunk_size)
+            ]
+            if chunks:
+                per_package_chunks[package_idx] = chunks
+                max_chunks = max(max_chunks, len(chunks))
+        rng = np.random.default_rng(seed)
+        out: list[np.ndarray] = []
+        for chunk_idx in range(max_chunks):
+            package_indices = [pi for pi, ch in per_package_chunks.items() if chunk_idx < len(ch)]
+            rng.shuffle(package_indices)
+            for package_idx in package_indices:
+                out.append(per_package_chunks[package_idx][chunk_idx])
+        return out
+
+
+    def _thread_reader_cache(self):
         if not hasattr(self._thread_local, "readers"):
-            self._thread_local.readers = {}
+            from collections import OrderedDict
+            self._thread_local.readers = OrderedDict()
         return self._thread_local.readers
 
     def _cached_thread_reader(self, kind: str, path: Path, opener):
         cache = self._thread_reader_cache()
         key = (kind, path)
         reader = cache.get(key)
-        if reader is None:
-            reader = opener(path)
-            cache[key] = reader
+        if reader is not None:
+            cache.move_to_end(key)
+            return reader
+        reader = opener(path)
+        cache[key] = reader
+        # Bound the per-thread open-file handles. With many worker threads and
+        # ~1.8k packages an unbounded cache exhausts the process FD limit
+        # (OSError: Too many open files). Evict + close the least-recently-used
+        # readers once the per-thread cache exceeds the cap.
+        cap = self._reader_cache_cap
+        while len(cache) > cap:
+            _old_key, old_reader = cache.popitem(last=False)
+            close = getattr(old_reader, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
         return reader
 
     def read_package_rows(self, package_idx: int, rows: np.ndarray) -> list[dict]:
@@ -679,6 +746,110 @@ class PackageSampledDistillationDataset(Dataset):
                 }
             )
         return samples
+
+    def batch_buffer_spec(self) -> dict:
+        """Return shapes needed to pre-allocate one batch's pinned tensors.
+
+        teacher dims come from ``expected_dims`` when available, otherwise they
+        are probed once by reading a single feature vector per teacher.
+        """
+        teacher_dims = dict(self._teacher_dims)
+        missing = [name for name in self.teacher_package_paths if name not in teacher_dims]
+        if missing:
+            teacher_paths = {name: paths[0] for name, paths in self.teacher_package_paths.items()}
+            sources = {path: _open_feature_source(path) for path in set(teacher_paths.values())}
+            feats = _read_teacher_features_at(sources, teacher_paths, 0)
+            for name in missing:
+                teacher_dims[name] = int(np.asarray(feats[name]).reshape(-1).shape[0])
+            for src in sources.values():
+                src.close()
+            self._teacher_dims = teacher_dims
+        return {
+            "image_hw": self._image_hw,
+            "teacher_dims": teacher_dims,
+            "level2_dim": self._level2_dim,
+        }
+
+    def scatter_package_rows(
+        self,
+        package_idx: int,
+        rows: np.ndarray,
+        positions: "list[BatchSlot]",
+        buffers: "list[BatchBuffer]",
+    ) -> None:
+        """Decode rows and write them into pre-allocated pinned batch tensors at
+        their final positions. ``positions[k]`` is the (buffer, slot) for
+        ``rows[k]``; all positions in one call share the same ring buffer.
+
+        GIL strategy: only the JXL decode + feature reads run per-tile (decode
+        releases the GIL, so those parallelize across workers). The tensor
+        writes (copy_/scalar assignment) HOLD the GIL and do NOT parallelize —
+        a per-tile copy_ loop makes 8 GIL-bound ATen calls per tile, and the
+        GIL hand-off thrash across workers made copy_feats scale at 0.5x (12
+        threads SLOWER than 1). So we accumulate decoded rows into local numpy
+        arrays and flush them with ONE index_copy_ per tensor — turning
+        ~8*chunk GIL-held ATen ops into ~6 per chunk, collapsing the thrash.
+        """
+        with _probe.section("scatter_open_readers"):
+            tile_reader = self._cached_thread_reader("tile", self.tile_paths[package_idx], TilePackageReader)
+            teacher_paths = {name: paths[package_idx] for name, paths in self.teacher_package_paths.items()}
+            feature_sources = {
+                path: self._cached_thread_reader("feature", path, _open_feature_source)
+                for path in set(teacher_paths.values())
+            }
+        n = len(rows)
+        if n == 0:
+            return
+        order = sorted(range(n), key=lambda k: int(rows[k]))
+        buf = buffers[positions[0].buffer_idx]
+        h, w = int(buf.images.shape[1]), int(buf.images.shape[2])
+        l2_dim = int(buf.prototype_level2.shape[1])
+        teacher_names = list(buf.teacher_features.keys())
+
+        # Local staging arrays (no GIL contention — plain numpy in this thread).
+        img_stage = np.empty((n, h, w, 3), dtype=np.uint8)
+        feat_stage = {name: np.empty((n, buf.teacher_features[name].shape[1]), dtype=np.float32) for name in teacher_names}
+        pos_stage = np.empty(n, dtype=np.int64)
+        mask_stage = np.zeros(n, dtype=bool)
+        l1_stage = np.full(n, -1, dtype=np.int64)
+        l2_stage = np.zeros((n, l2_dim), dtype=np.float32) if l2_dim > 0 else None
+        tid_stage: list = [None] * n
+
+        for i, k in enumerate(order):
+            row = int(rows[k])
+            pos_stage[i] = positions[k].pos
+            with _probe.section("decode_image"):
+                tile_id = tile_reader.tile_id_at(row)
+                img_stage[i] = tile_reader.read_array_at(row)  # HWC uint8
+            with _probe.section("read_feats"):
+                feats = _read_teacher_features_at(feature_sources, teacher_paths, row)
+            for name, feat in feats.items():
+                feat_stage[name][i] = np.asarray(feat, dtype=np.float32)
+            with _probe.section("proto"):
+                proto = _prototype_payload(tile_id, self.prototype_labels)
+                tid_stage[i] = tile_id
+                mask_stage[i] = bool(proto["prototype_mask"])
+                l1_stage[i] = int(proto["prototype_level1"])
+                if l2_stage is not None:
+                    level2 = proto["prototype_level2"]
+                    if level2.numel() == l2_dim:
+                        l2_stage[i] = level2.numpy()
+
+        # Single batched, GIL-held flush per tensor (was 8*n per-tile ops).
+        with _probe.section("copy_flush"):
+            pos_t = torch.from_numpy(pos_stage)
+            buf.images.index_copy_(0, pos_t, torch.from_numpy(img_stage))
+            for name in teacher_names:
+                buf.teacher_features[name].index_copy_(0, pos_t, torch.from_numpy(feat_stage[name]))
+            buf.prototype_mask.index_copy_(0, pos_t, torch.from_numpy(mask_stage))
+            buf.prototype_level1.index_copy_(0, pos_t, torch.from_numpy(l1_stage))
+            if l2_stage is not None:
+                buf.prototype_level2.index_copy_(0, pos_t, torch.from_numpy(l2_stage))
+            for i in range(n):
+                buf.tile_id[int(pos_stage[i])] = tid_stage[i]
+        _probe.flush_thread()
+
+
 
     def _tile_reader(self, package_idx: int) -> TilePackageReader:
         self._activate_package(package_idx)

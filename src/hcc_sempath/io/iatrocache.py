@@ -8,6 +8,7 @@ project-specific data model (TileRecord, manifest, etc.).
 from __future__ import annotations
 
 import json
+import mmap
 import os
 import struct
 import zlib
@@ -433,6 +434,7 @@ class PackReader:
     def __init__(self, package_path: str | Path) -> None:
         self.package_path = Path(package_path)
         self._file = None
+        self._mmap = None
         self._header: dict | None = None
         self._slide_table: pa.Table | None = None
         self._record_table: pa.Table | None = None
@@ -445,6 +447,16 @@ class PackReader:
         self._file = self.package_path.open("rb")
         self._header = _read_fixed_header(self._file)
         _validate_layout(self._header, _file_size(self._file))
+        # mmap the whole file for lock-free random reads. seek()+read() holds
+        # the GIL and issues a syscall per tile; under many decode workers that
+        # serialized and DROPPED multi-thread read throughput below single-thread
+        # (read_only bench: 4 threads = 0.3x). A memoryview slice over the mmap
+        # is a pure-memory copy, no syscall, no file-position state to serialize,
+        # so decode workers stop contending on payload reads.
+        try:
+            self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        except (ValueError, OSError):
+            self._mmap = None
 
     def _ensure_loaded(self) -> None:
         if self._slide_table is not None and self._record_table is not None:
@@ -496,8 +508,12 @@ class PackReader:
         length = int(self._lengths[row])
         if offset < 0 or length < 0 or offset + length > int(self._header["data_length"]):
             raise ValueError(f"payload span outside data segment at row {row}: offset={offset} length={length}")
-        self._file.seek(self._header["data_offset"] + offset)
-        payload = self._file.read(length)
+        start = self._header["data_offset"] + offset
+        if self._mmap is not None:
+            payload = self._mmap[start:start + length]
+        else:
+            self._file.seek(start)
+            payload = self._file.read(length)
         if len(payload) != length:
             raise ValueError(f"short payload read at row {row}: expected={length} got={len(payload)}")
         return payload
@@ -508,13 +524,20 @@ class PackReader:
         assert self._header is not None
         if offset < 0 or length < 0 or offset + length > int(self._header["data_length"]):
             raise ValueError(f"data span outside data segment: offset={offset} length={length}")
-        self._file.seek(self._header["data_offset"] + offset)
-        payload = self._file.read(length)
+        start = self._header["data_offset"] + offset
+        if self._mmap is not None:
+            payload = self._mmap[start:start + length]
+        else:
+            self._file.seek(start)
+            payload = self._file.read(length)
         if len(payload) != length:
             raise ValueError(f"short data span read: expected={length} got={len(payload)}")
         return payload
 
     def close(self) -> None:
+        if self._mmap is not None:
+            self._mmap.close()
+            self._mmap = None
         if self._file is not None:
             self._file.close()
             self._file = None
@@ -530,6 +553,7 @@ class PackReader:
     def __setstate__(self, state: dict) -> None:
         self.package_path = state["package_path"]
         self._file = None
+        self._mmap = None
         self._header = None
         self._slide_table = None
         self._record_table = None
