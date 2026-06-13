@@ -164,3 +164,52 @@ def normalized_prototype_logits(features: torch.Tensor, prototypes: torch.Tensor
     features = F.normalize(features, dim=-1)
     prototypes = F.normalize(prototypes, dim=-1)
     return features @ prototypes.transpose(0, 1)
+
+
+class HCCSemPath(nn.Module):
+    """Self-contained HCC-SemPath model containing encoder and pre-computed prototype buffers."""
+
+    def __init__(
+        self,
+        backbone_name: str = "vit_tiny_patch16_224",
+        embedding_dim: int = 256,
+        projector_type: str = "linear",
+        projector_hidden_dim: int = 2048,
+        l1_num_classes: int = 4,
+        l2_num_attributes: int = 10,
+    ) -> None:
+        super().__init__()
+        self.encoder = StudentEncoder(
+            backbone_name=backbone_name,
+            embedding_dim=embedding_dim,
+            pretrained=False,
+            projector_type=projector_type,
+            projector_hidden_dim=projector_hidden_dim,
+        )
+        # Register prototypes as buffers (static weights)
+        self.register_buffer("l1_prototypes", torch.zeros(l1_num_classes, embedding_dim))
+        self.register_buffer("l2_prototypes", torch.zeros(l2_num_attributes, embedding_dim))
+        # Register calibration parameters as buffers
+        self.register_buffer("l2_biases", torch.zeros(l2_num_attributes))
+        self.register_buffer("l1_temperature", torch.tensor(0.1))
+        self.register_buffer("l2_temperature", torch.tensor(0.05))
+
+    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+        embedding = self.encoder(images)
+        embedding_norm = F.normalize(embedding, dim=-1)
+
+        # L1 predictions (using cosine similarity to primary prototypes)
+        l1_logits = (embedding_norm @ self.l1_prototypes.T) / self.l1_temperature
+        l1_probs = F.softmax(l1_logits, dim=-1)
+
+        # L2 calibrated predictions (using median-shifted cosine similarity to attribute prototypes)
+        l2_logits = embedding_norm @ self.l2_prototypes.T
+        l2_probs = torch.sigmoid((l2_logits - self.l2_biases) / self.l2_temperature)
+
+        return {
+            "embedding": embedding,
+            "embedding_norm": embedding_norm,
+            "l1_probabilities": l1_probs,
+            "l2_probabilities": l2_probs,
+        }
+

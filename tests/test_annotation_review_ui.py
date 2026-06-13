@@ -124,3 +124,84 @@ def test_binary_mode_filters_to_requested_classes() -> None:
     candidates = module.build_candidates(payload, mode="binary", binary_a="HCC-tumor", binary_b="Inflammatory-stromal")
 
     assert {candidate.key for candidate in candidates} == {"stromal", "tumor"}
+
+
+def test_disagreement_csvs_build_blinded_resumable_queue(tmp_path: Path) -> None:
+    module = _load_module()
+    fields = [
+        "rank",
+        "split",
+        "tile_id",
+        "package_path",
+        "row_idx",
+        "disagreement_score",
+        "gigapath_l1",
+    ]
+    val_csv = tmp_path / "val.csv"
+    exval_csv = tmp_path / "exval.csv"
+    for path, split, tile_id in ((val_csv, "val", "v1"), (exval_csv, "exval", "e1")):
+        path.write_text(
+            ",".join(fields)
+            + "\n"
+            + f"1,{split},{tile_id},/tmp/{tile_id}.iac,3,1.2,HCC-tumor\n",
+            encoding="utf-8",
+        )
+
+    output_json = tmp_path / "review.json"
+    state = module.ReviewState(
+        None,
+        output_json,
+        mode="disagreement",
+        binary_a="HCC-tumor",
+        binary_b="Inflammatory-stromal",
+        disagreement_csvs=[val_csv, exval_csv],
+        blind_seed=7,
+    )
+
+    candidates = state.candidates()
+    assert {candidate.tile_id for candidate in candidates} == {"TD-0001", "TD-0002"}
+    public = state.public_item(candidates[0].key)
+    assert set(public) == {"review_id", "reviewed", "l1", "source_group"}
+    assert "gigapath_l1" not in public
+
+    reviewed = state.review(candidates[0].key, "adjust", "Background-liver")
+    assert reviewed["adjudication_status"] == "adjudicated"
+    assert reviewed["l1"] == "Background-liver"
+    assert output_json.exists()
+    review_csv = tmp_path / "review.review.csv"
+    assert review_csv.exists()
+    assert "gigapath_l1" in review_csv.read_text(encoding="utf-8")
+
+    resumed = module.ReviewState(
+        None,
+        output_json,
+        mode="disagreement",
+        binary_a="HCC-tumor",
+        binary_b="Inflammatory-stromal",
+        disagreement_csvs=[val_csv, exval_csv],
+    )
+    assert len(resumed.candidates()) == 1
+
+
+def test_disagreement_review_can_mark_tile_uncertain(tmp_path: Path) -> None:
+    module = _load_module()
+    source = tmp_path / "source.csv"
+    source.write_text(
+        "rank,split,tile_id,package_path,row_idx\n"
+        "1,val,tile-1,/tmp/tile-1.iac,0\n",
+        encoding="utf-8",
+    )
+    state = module.ReviewState(
+        None,
+        tmp_path / "review.json",
+        mode="disagreement",
+        binary_a="HCC-tumor",
+        binary_b="Inflammatory-stromal",
+        disagreement_csvs=[source],
+    )
+
+    item = state.review("TD-0001", "uncertain")
+
+    assert item["reviewed"] is True
+    assert item["adjudication_status"] == "uncertain"
+    assert item["l1"] == ""
