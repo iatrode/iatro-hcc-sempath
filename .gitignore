@@ -6,7 +6,8 @@ configs/local/
 artifacts/*
 !artifacts/README.md
 outputs/
-annotations/
+annotations/*
+!annotations/README.md
 smoke_data/
 data/*
 !data/manifests/
@@ -31,4 +32,3 @@ release/hcc-sempath/*
 
 # Local review plugin
 scripts/visuals_plugin.py
-
