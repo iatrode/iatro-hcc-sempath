@@ -9,6 +9,7 @@ import socket
 import sys
 import tempfile
 import webbrowser
+from collections import OrderedDict
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,7 @@ from hcc_sempath.cli.view_iac import IacViewerData
 DEFAULT_UNSTABLE_L1 = {
     "Degenerative-material",
 }
+MAX_OPEN_IAC_VIEWERS = 8
 
 
 @dataclass(frozen=True)
@@ -361,7 +363,7 @@ class ReviewState:
         self.mode = mode
         self.binary_a = binary_a
         self.binary_b = binary_b
-        self._viewers: dict[str, IacViewerData] = {}
+        self._viewers: OrderedDict[str, IacViewerData] = OrderedDict()
         self.unstable_l1 = unstable_l1 or DEFAULT_UNSTABLE_L1
         self.scorer: FeatureL1Scorer | None = None
         self._candidate_cache: list[ReviewCandidate] | None = None
@@ -431,9 +433,16 @@ class ReviewState:
         return item
 
     def viewer(self, iac_path: str) -> IacViewerData:
-        if iac_path not in self._viewers:
-            self._viewers[iac_path] = IacViewerData(iac_path)
-        return self._viewers[iac_path]
+        viewer = self._viewers.get(iac_path)
+        if viewer is not None:
+            self._viewers.move_to_end(iac_path)
+            return viewer
+        viewer = IacViewerData(iac_path)
+        self._viewers[iac_path] = viewer
+        while len(self._viewers) > MAX_OPEN_IAC_VIEWERS:
+            _, stale = self._viewers.popitem(last=False)
+            stale.close()
+        return viewer
 
     def tile_png(self, key: str) -> bytes:
         item = self.item(key)
@@ -510,6 +519,7 @@ class ReviewState:
     def close(self) -> None:
         for viewer in self._viewers.values():
             viewer.close()
+        self._viewers.clear()
         if self.scorer is not None:
             self.scorer.close()
 

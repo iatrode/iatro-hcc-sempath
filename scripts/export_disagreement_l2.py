@@ -1,13 +1,11 @@
 import argparse
 import csv
 import json
-import random
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 # Add src/ to python path
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,8 +14,7 @@ if SRC_ROOT.exists() and str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from hcc_sempath.io.tile_package import TilePackageReader
-from hcc_sempath.modeling.models import HCCSemPathModel, normalized_prototype_logits
-from hcc_sempath.modeling.prototypes import PrototypeRegistry
+from hcc_sempath.modeling.models import HCCSemPathModel, calibrated_attribute_scores, normalized_prototype_logits
 from hcc_sempath.training.config import embedding_dim, teacher_dims, teacher_names
 from hcc_sempath.training.engine import _prepare_images
 from hcc_sempath.training.prototype_images import load_prototype_image_bank, build_student_prototype_registry
@@ -57,6 +54,15 @@ def _load_model(cfg: dict, checkpoint: Path, device: torch.device) -> HCCSemPath
 def _read_csv(path: Path) -> list[dict]:
     with path.open("r", newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
+
+
+def _robust_calibration(cosine_scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Center each attribute at its median and map its IQR approximately to 0.25-0.75."""
+    biases = np.median(cosine_scores, axis=0)
+    q25, q75 = np.quantile(cosine_scores, [0.25, 0.75], axis=0)
+    temperatures = np.maximum((q75 - q25) / (2.0 * np.log(3.0)), 1e-4)
+    return biases.astype(np.float32), temperatures.astype(np.float32)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Level-2 predictions of all models on disagreement tiles.")
@@ -164,7 +170,7 @@ def main() -> None:
     print("Loading prototype image bank...")
     image_bank = load_prototype_image_bank(image_bank_path)
 
-    # Dictionary to save raw probability matrices
+    # Save both raw cosine scores for retrieval and centered scores for display.
     npz_data = {}
     l2_names = None
 
@@ -193,12 +199,9 @@ def main() -> None:
             l2_names = [zhcc_registry.names[idx] for idx in zhcc_registry.attribute_indices]
             print(f"Level-2 attributes detected ({len(l2_names)}): {l2_names}")
             
-        # Sigmoid temperature
-        temp = float(cfg["loss"].get("zhcc_attribute_temperature", 0.1))
-        
         # Batch inference
         batch_size = 64
-        model_probs = []
+        model_cosine_scores = []
         with torch.no_grad():
             for start_idx in range(0, len(valid_rows), batch_size):
                 end_idx = min(start_idx + batch_size, len(valid_rows))
@@ -214,23 +217,32 @@ def main() -> None:
                 outputs = model(preprocessed_imgs)
                 embeddings = outputs["embedding_norm"]
                 
-                # Compute L2 logits
+                # Raw cosine similarity is the ranking signal. Do not sharpen it before calibration.
                 attr_prototypes = zhcc_registry.attribute_prototypes
-                logits = normalized_prototype_logits(embeddings, attr_prototypes) / temp
-                probs = torch.sigmoid(logits)
+                cosine_scores = normalized_prototype_logits(embeddings, attr_prototypes)
+                model_cosine_scores.append(cosine_scores.cpu().numpy())
                 
-                model_probs.append(probs.cpu().numpy())
-                
-        # Concat batch probabilities -> (1000, 10)
-        prob_matrix = np.concatenate(model_probs, axis=0)
+        cosine_matrix = np.concatenate(model_cosine_scores, axis=0)
+        biases, temperatures = _robust_calibration(cosine_matrix)
+        prob_matrix = calibrated_attribute_scores(
+            torch.from_numpy(cosine_matrix),
+            torch.from_numpy(biases),
+            torch.from_numpy(temperatures),
+        ).numpy()
         npz_data[key] = prob_matrix
+        npz_data[f"raw_{key}"] = cosine_matrix
+        npz_data[f"bias_{key}"] = biases
+        npz_data[f"temperature_{key}"] = temperatures
         
         # Calculate statistics
         print(f"=== {key} Level-2 Statistics ===")
         mean_probs = prob_matrix.mean(axis=0)
         activation_rates = (prob_matrix > 0.5).mean(axis=0)
         for idx, attr_name in enumerate(l2_names):
-            print(f"  {attr_name:<35}: Mean Prob={mean_probs[idx]:.4f}, Active Rate (>0.5)={activation_rates[idx]*100:.1f}%")
+            print(
+                f"  {attr_name:<35}: Mean relative score={mean_probs[idx]:.4f}, "
+                f"Above median={activation_rates[idx]*100:.1f}%"
+            )
         print()
         
         del model, zhcc_registry
@@ -244,6 +256,7 @@ def main() -> None:
     # Include metadata in NPZ
     npz_data["l2_names"] = np.array(l2_names)
     npz_data["review_ids"] = np.array([r["review_id"] for r in valid_rows])
+    npz_data["l2_score_kind"] = np.array("median_iqr_relative_retrieval_score_v1")
     
     np.savez_compressed(output_npz, **npz_data)
     print(f"Successfully saved all Level-2 probabilities to {output_npz}")
