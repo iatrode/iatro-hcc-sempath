@@ -11,7 +11,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if SRC_ROOT.exists() and str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from hcc_sempath.modeling.models import HCCSemPathModel, HCCSemPath
+from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.training.config import embedding_dim, teacher_dims, teacher_names
 from hcc_sempath.training.prototype_images import load_prototype_image_bank, build_student_prototype_registry
 
@@ -90,30 +90,36 @@ def main() -> None:
     l1_names = [zhcc_registry.names[idx] for idx in zhcc_registry.primary_indices]
     l2_names = [zhcc_registry.names[idx] for idx in zhcc_registry.attribute_indices]
 
-    # Calculate calibration biases from exval set (using median of cosine similarities)
-    print("Calculating post-hoc L2 calibration biases...")
+    # Load the same robust calibration used by the review/retrieval export.
+    print("Loading post-hoc L2 retrieval calibration...")
     if l2_npz_path.exists():
         npz_data = np.load(l2_npz_path)
-        probs_raw = npz_data["pred_full"] # shape (1000, 10)
-        temp_orig = 0.1
-        eps = 1e-9
-        probs_clipped = np.clip(probs_raw, eps, 1.0 - eps)
-        # Reconstruct cos similarities: cos_sim = logit * temp_orig = log(p / (1-p)) * 0.1
-        cos_sims = np.log(probs_clipped / (1.0 - probs_clipped)) * temp_orig
-        l2_biases = np.median(cos_sims, axis=0)
-        print(f"Calculated median-shift biases: {l2_biases}")
+        if "bias_pred_full" in npz_data and "temperature_pred_full" in npz_data:
+            l2_biases = npz_data["bias_pred_full"]
+            l2_temperatures = npz_data["temperature_pred_full"]
+        else:
+            probs_raw = npz_data["pred_full"]
+            eps = 1e-6
+            cos_sims = np.log(np.clip(probs_raw, eps, 1.0 - eps) / np.clip(1.0 - probs_raw, eps, 1.0)) * 0.1
+            l2_biases = np.median(cos_sims, axis=0)
+            q25, q75 = np.quantile(cos_sims, [0.25, 0.75], axis=0)
+            l2_temperatures = np.maximum((q75 - q25) / (2.0 * np.log(3.0)), 1e-4)
+        print(f"L2 biases: {l2_biases}")
+        print(f"L2 temperatures: {l2_temperatures}")
     else:
-        # Fallback if NPZ is missing (no calibration shift, bias = 0)
         l2_biases = np.zeros(10)
+        l2_temperatures = np.full(10, 0.1)
         print("Warning: L2 NPZ file not found. Setting calibration biases to zero.")
 
     l2_biases_tensor = torch.tensor(l2_biases, dtype=torch.float32)
+    l2_temperatures_tensor = torch.tensor(l2_temperatures, dtype=torch.float32)
 
     # Instantiate the unified deployable classifier model
-    print("Assembling the unified HCCSemPath...")
-    deploy_model = HCCSemPath(
+    print("Assembling the unified HCCSemPathModel...")
+    deploy_model = HCCSemPathModel(
         backbone_name=cfg["model"]["backbone_name"],
         embedding_dim=embedding_dim(cfg),
+        teacher_dims={},
         projector_type=cfg["model"].get("projector_type", "linear"),
         projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
         l1_num_classes=len(l1_names),
@@ -129,10 +135,9 @@ def main() -> None:
     deploy_model.l2_biases.copy_(l2_biases_tensor)
     
     l1_temp = float(cfg["loss"].get("zhcc_primary_temperature", 0.1))
-    l2_temp = 0.05 # Use the sharpened calibration temperature
     
     deploy_model.l1_temperature.copy_(torch.tensor(l1_temp))
-    deploy_model.l2_temperature.copy_(torch.tensor(l2_temp))
+    deploy_model.l2_temperature.copy_(l2_temperatures_tensor)
 
     release_config = {
         "format": "hcc-sempath-classifier-state-dict",
@@ -152,7 +157,8 @@ def main() -> None:
         "l1_names": l1_names,
         "l2_names": l2_names,
         "l1_temperature": l1_temp,
-        "l2_temperature": l2_temp
+        "l2_temperature": l2_temperatures.tolist(),
+        "l2_score_kind": "median_iqr_relative_retrieval_score_v1"
     }
 
     # Save the complete model state dict

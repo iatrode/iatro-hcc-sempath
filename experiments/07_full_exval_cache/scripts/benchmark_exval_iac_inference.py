@@ -9,29 +9,10 @@ import numpy as np
 import torch
 
 from hcc_sempath.io.tile_package import TilePackageReader, read_package_manifest, read_package_metadata
-from hcc_sempath.modeling.models import HCCSemPathModel
-from hcc_sempath.training.config import embedding_dim, load_config, manifest_data_paths, teacher_dims, teacher_names
+from hcc_sempath.modeling.models import load_hcc_sempath_release
+from hcc_sempath.training.config import load_config, manifest_data_paths
 from hcc_sempath.training.engine import _prepare_images
 from hcc_sempath.training.manifest import load_training_manifest
-
-
-def _load_model(cfg: dict, checkpoint: Path, device: torch.device) -> HCCSemPathModel:
-    names = teacher_names(cfg)
-    dims = teacher_dims(cfg, names)
-    model = HCCSemPathModel(
-        backbone_name=cfg["model"]["backbone_name"],
-        embedding_dim=embedding_dim(cfg),
-        teacher_dims=dims,
-        pretrained=False,
-        projector_type=cfg["model"].get("projector_type", "linear"),
-        projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
-        teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),
-        grad_checkpointing=False,
-    ).to(device)
-    payload = torch.load(checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(payload["model"])
-    model.eval()
-    return model
 
 
 def _localize_cfg(cfg: dict, manifest: str, prototype_dir: str, device: str, batch_size: int) -> dict:
@@ -60,7 +41,8 @@ def _batch_tensor(arrays: list[np.ndarray]) -> torch.Tensor:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark real exval IAC decode + final-model MPS inference.")
     parser.add_argument("--config", default="artifacts/models/hcc-sempath-full/resolved_config.json")
-    parser.add_argument("--checkpoint", default="artifacts/models/hcc-sempath-full/checkpoints/best_scientific_score.pt")
+    parser.add_argument("--release-config", default="artifacts/release/config.json")
+    parser.add_argument("--release-checkpoint", default="artifacts/release/hcc_sempath_release.pt")
     parser.add_argument("--manifest", default="configs/local/mac/manifest.yaml")
     parser.add_argument("--prototype-dir", default="artifacts/prototypes")
     parser.add_argument("--split", default="exval")
@@ -73,7 +55,7 @@ def main() -> None:
 
     cfg = _localize_cfg(load_config(args.config), args.manifest, args.prototype_dir, args.device, args.batch_size)
     device = torch.device(cfg["runtime"]["device"])
-    model = _load_model(cfg, Path(args.checkpoint), device)
+    model, _ = load_hcc_sempath_release(args.release_config, args.release_checkpoint, device)
     manifest = load_training_manifest(cfg["data"]["train_manifest_path"])
     tile_packages, _ = manifest_data_paths(cfg, manifest, args.split)
     metadata = read_package_metadata(tile_packages[0])
@@ -97,14 +79,14 @@ def main() -> None:
             return
         batch = {"images": _batch_tensor(batch_arrays), "images_uint8": True}
         if warmup_batches_left > 0:
-            with torch.no_grad():
+            with torch.inference_mode():
                 model(_prepare_images(batch, cfg, device))
             warmup_batches_left -= 1
             return
         t0 = time.perf_counter()
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model(_prepare_images(batch, cfg, device))
-            _ = outputs["embedding_norm"].detach().cpu()
+            _ = outputs["l2_cosine_scores"].cpu()
         infer_seconds += time.perf_counter() - t0
         total_batches += 1
 
@@ -155,7 +137,8 @@ def main() -> None:
         "inference_tiles_per_sec": measured_tiles / infer_seconds if infer_seconds > 0 else 0.0,
         "first_tile_ids": first_tile_ids,
         "last_tile_id": last_tile_id,
-        "checkpoint": args.checkpoint,
+        "checkpoint": args.release_checkpoint,
+        "output": "l2_cosine_scores",
     }
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -80,7 +83,7 @@ class TeacherProjectionHead(nn.Module):
 
 
 class HCCSemPathModel(nn.Module):
-    """Shared HCC encoder with teacher-specific training heads."""
+    """Shared HCC encoder with optional training heads and deployable prototype readouts."""
 
     def __init__(
         self,
@@ -92,9 +95,11 @@ class HCCSemPathModel(nn.Module):
         projector_hidden_dim: int = 2048,
         teacher_head_type: str = "linear",
         grad_checkpointing: bool = False,
+        l1_num_classes: int = 0,
+        l2_num_attributes: int = 0,
     ) -> None:
         super().__init__()
-        if not teacher_dims:
+        if teacher_dims is None:
             teacher_dims = {"teacher": embedding_dim}
         self.encoder = StudentEncoder(
             backbone_name=backbone_name,
@@ -115,6 +120,23 @@ class HCCSemPathModel(nn.Module):
                 for name, dim in teacher_dims.items()
             }
         )
+        self.register_buffer(
+            "l1_prototypes",
+            torch.zeros(l1_num_classes, embedding_dim) if l1_num_classes > 0 else None,
+        )
+        self.register_buffer(
+            "l2_prototypes",
+            torch.zeros(l2_num_attributes, embedding_dim) if l2_num_attributes > 0 else None,
+        )
+        self.register_buffer(
+            "l2_biases",
+            torch.zeros(l2_num_attributes) if l2_num_attributes > 0 else None,
+        )
+        self.register_buffer("l1_temperature", torch.tensor(0.1) if l1_num_classes > 0 else None)
+        self.register_buffer(
+            "l2_temperature",
+            torch.full((l2_num_attributes,), 0.1) if l2_num_attributes > 0 else None,
+        )
 
     @property
     def teacher_names(self) -> list[str]:
@@ -129,11 +151,27 @@ class HCCSemPathModel(nn.Module):
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
         embedding = self.encode(images)
         embedding_norm = F.normalize(embedding, dim=-1)
-        return {
+        outputs: dict[str, torch.Tensor | dict[str, torch.Tensor]] = {
             "embedding": embedding,
             "embedding_norm": embedding_norm,
             "teacher_outputs": self.project_teachers(embedding),
         }
+        if self.l1_prototypes is not None and self.l1_temperature is not None:
+            l1_logits = (embedding_norm @ self.l1_prototypes.T) / self.l1_temperature
+            outputs["l1_probabilities"] = F.softmax(l1_logits, dim=-1)
+        if (
+            self.l2_prototypes is not None
+            and self.l2_biases is not None
+            and self.l2_temperature is not None
+        ):
+            l2_cosine_scores = embedding_norm @ self.l2_prototypes.T
+            outputs["l2_cosine_scores"] = l2_cosine_scores
+            outputs["l2_probabilities"] = calibrated_attribute_scores(
+                l2_cosine_scores,
+                self.l2_biases,
+                self.l2_temperature,
+            )
+        return outputs
 
 
 class ToyTeacherEncoder(nn.Module):
@@ -166,50 +204,35 @@ def normalized_prototype_logits(features: torch.Tensor, prototypes: torch.Tensor
     return features @ prototypes.transpose(0, 1)
 
 
-class HCCSemPath(nn.Module):
-    """Self-contained HCC-SemPath model containing encoder and pre-computed prototype buffers."""
+def calibrated_attribute_scores(
+    cosine_scores: torch.Tensor,
+    biases: torch.Tensor,
+    temperatures: torch.Tensor,
+) -> torch.Tensor:
+    """Map per-attribute cosine scores to centered relative retrieval scores."""
+    temperatures = temperatures.to(device=cosine_scores.device, dtype=cosine_scores.dtype).clamp_min(1e-6)
+    biases = biases.to(device=cosine_scores.device, dtype=cosine_scores.dtype)
+    return torch.sigmoid((cosine_scores - biases) / temperatures)
 
-    def __init__(
-        self,
-        backbone_name: str = "vit_tiny_patch16_224",
-        embedding_dim: int = 256,
-        projector_type: str = "linear",
-        projector_hidden_dim: int = 2048,
-        l1_num_classes: int = 4,
-        l2_num_attributes: int = 10,
-    ) -> None:
-        super().__init__()
-        self.encoder = StudentEncoder(
-            backbone_name=backbone_name,
-            embedding_dim=embedding_dim,
-            pretrained=False,
-            projector_type=projector_type,
-            projector_hidden_dim=projector_hidden_dim,
-        )
-        # Register prototypes as buffers (static weights)
-        self.register_buffer("l1_prototypes", torch.zeros(l1_num_classes, embedding_dim))
-        self.register_buffer("l2_prototypes", torch.zeros(l2_num_attributes, embedding_dim))
-        # Register calibration parameters as buffers
-        self.register_buffer("l2_biases", torch.zeros(l2_num_attributes))
-        self.register_buffer("l1_temperature", torch.tensor(0.1))
-        self.register_buffer("l2_temperature", torch.tensor(0.05))
 
-    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
-        embedding = self.encoder(images)
-        embedding_norm = F.normalize(embedding, dim=-1)
-
-        # L1 predictions (using cosine similarity to primary prototypes)
-        l1_logits = (embedding_norm @ self.l1_prototypes.T) / self.l1_temperature
-        l1_probs = F.softmax(l1_logits, dim=-1)
-
-        # L2 calibrated predictions (using median-shifted cosine similarity to attribute prototypes)
-        l2_logits = embedding_norm @ self.l2_prototypes.T
-        l2_probs = torch.sigmoid((l2_logits - self.l2_biases) / self.l2_temperature)
-
-        return {
-            "embedding": embedding,
-            "embedding_norm": embedding_norm,
-            "l1_probabilities": l1_probs,
-            "l2_probabilities": l2_probs,
-        }
-
+def load_hcc_sempath_release(
+    config_path: str | Path,
+    checkpoint_path: str | Path,
+    device: torch.device | str = "cpu",
+) -> tuple[HCCSemPathModel, dict]:
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    model_config = config["model"]
+    model = HCCSemPathModel(
+        backbone_name=model_config["backbone_name"],
+        embedding_dim=int(model_config["embedding_dim"]),
+        teacher_dims={},
+        pretrained=False,
+        projector_type=model_config.get("projector_type", "linear"),
+        projector_hidden_dim=int(model_config.get("projector_hidden_dim", 2048)),
+        l1_num_classes=int(model_config["l1_num_classes"]),
+        l2_num_attributes=int(model_config["l2_num_attributes"]),
+    ).to(device)
+    state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+    return model, config

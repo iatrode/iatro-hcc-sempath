@@ -23,6 +23,23 @@ def test_hcc_sempath_model_returns_shared_embedding_and_teacher_outputs() -> Non
     assert outputs["teacher_outputs"]["teacher_b"].shape == (2, 7)
 
 
+def test_hcc_sempath_model_uses_same_class_for_release_prototype_outputs() -> None:
+    model = HCCSemPathModel(
+        backbone_name="vit_tiny_patch16_224",
+        embedding_dim=11,
+        teacher_dims={},
+        pretrained=False,
+        l1_num_classes=4,
+        l2_num_attributes=3,
+    )
+    outputs = model(torch.randn(2, 3, 224, 224))
+
+    assert outputs["teacher_outputs"] == {}
+    assert outputs["l1_probabilities"].shape == (2, 4)
+    assert outputs["l2_cosine_scores"].shape == (2, 3)
+    assert outputs["l2_probabilities"].shape == (2, 3)
+
+
 def test_multi_teacher_distillation_loss_aggregates_named_heads() -> None:
     student_by_teacher = {
         "teacher_a": torch.randn(4, 5, requires_grad=True),

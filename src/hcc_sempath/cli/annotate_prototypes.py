@@ -14,6 +14,7 @@ import socket
 import tempfile
 import threading
 import webbrowser
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -32,6 +33,7 @@ from hcc_sempath.io.tile_package import decode_jxl
 LOG = logging.getLogger("hcc_sempath.annotate_prototypes")
 OVERVIEW_CELL_PX = 4
 OVERVIEW_WORKERS = 8
+MAX_OPEN_IAC_VIEWERS = 8
 
 L1_PROTOTYPES = [
     "HCC-tumor",
@@ -343,7 +345,7 @@ class AnnotationData:
         self.cache_root = (self.input_root if self.input_root.is_dir() else self.input_root.parent) / ".hcc_sempath_annotation_cache"
         self.packages: list[AnnotationPackage] = []
         self.state = AnnotationState(state_path, input_path)
-        self._viewers: dict[int, IacViewerData] = {}
+        self._viewers: OrderedDict[int, IacViewerData] = OrderedDict()
         self._lock = threading.RLock()
         self._scan_done = False
         self._scan_error = ""
@@ -381,6 +383,7 @@ class AnnotationData:
     def close(self) -> None:
         for viewer in self._viewers.values():
             viewer.close()
+        self._viewers.clear()
 
     def scan_status(self) -> dict:
         with self._lock:
@@ -411,6 +414,9 @@ class AnnotationData:
         with self._lock:
             package = self.packages[index]
             cached = self._viewers.get(index)
+            if cached is not None:
+                self._viewers.move_to_end(index)
+                return cached
         if cached is None:
             start = perf_counter()
             LOG.info("iac_open_start index=%d rel_path=%s path=%s", index, package.rel_path, package.path)
@@ -420,6 +426,13 @@ class AnnotationData:
                 raise ValueError(f"annotation requires image-tile IAC package: {package.path}")
             with self._lock:
                 self._viewers[index] = viewer
+                stale_viewers = []
+                while len(self._viewers) > MAX_OPEN_IAC_VIEWERS:
+                    stale_index, stale_viewer = self._viewers.popitem(last=False)
+                    stale_viewers.append((stale_index, stale_viewer))
+            for stale_index, stale_viewer in stale_viewers:
+                LOG.info("iac_close_lru index=%d", stale_index)
+                stale_viewer.close()
             LOG.info(
                 "iac_open_done index=%d rel_path=%s records=%d tile=%dx%d stride=%dx%d elapsed=%.3fs",
                 index,
@@ -432,7 +445,7 @@ class AnnotationData:
                 perf_counter() - start,
             )
             return viewer
-        return cached
+        raise RuntimeError("unreachable viewer cache state")
 
     def package_json(self) -> list[dict]:
         items = []
