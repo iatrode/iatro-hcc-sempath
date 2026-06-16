@@ -28,12 +28,17 @@ def main() -> None:
     parser.add_argument("--config", default="artifacts/models/hcc-sempath-full/resolved_config.json")
     parser.add_argument("--prototype-dir", default="artifacts/prototypes")
     parser.add_argument("--l2-npz", default="artifacts/caches/local_cache/teacher_disagreement/teacher_disagreement_l2_probabilities.npz")
+    parser.add_argument(
+        "--l2-thresholds",
+        default="artifacts/caches/local_cache/train_l2_thresholds/thresholds.json",
+    )
     parser.add_argument("--output-dir", default="artifacts/release")
     args = parser.parse_args()
 
     checkpoint_path = Path(args.checkpoint)
     config_path = Path(args.config)
     l2_npz_path = Path(args.l2_npz)
+    l2_threshold_path = Path(args.l2_thresholds)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -139,6 +144,10 @@ def main() -> None:
     deploy_model.l1_temperature.copy_(torch.tensor(l1_temp))
     deploy_model.l2_temperature.copy_(l2_temperatures_tensor)
 
+    threshold_payload = json.loads(l2_threshold_path.read_text(encoding="utf-8"))
+    if threshold_payload["l2_names"] != l2_names:
+        raise ValueError("L2 threshold names do not match release prototype names")
+
     release_config = {
         "format": "hcc-sempath-classifier-state-dict",
         "version": 1,
@@ -158,7 +167,13 @@ def main() -> None:
         "l2_names": l2_names,
         "l1_temperature": l1_temp,
         "l2_temperature": l2_temperatures.tolist(),
-        "l2_score_kind": "median_iqr_relative_retrieval_score_v1"
+        "l2_score_kind": "median_iqr_relative_retrieval_score_v1",
+        "l2_decision_score": "raw_cosine",
+        "l2_decision_thresholds": threshold_payload["thresholds"],
+        "l2_threshold_target_prevalence": threshold_payload["target_prevalence"],
+        "l2_threshold_method": threshold_payload["method"],
+        "l2_threshold_training_tiles": threshold_payload["cached_tiles"],
+        "l2_threshold_prototype_samples": 3000,
     }
 
     # Save the complete model state dict

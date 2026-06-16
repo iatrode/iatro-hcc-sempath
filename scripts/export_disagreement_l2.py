@@ -69,6 +69,8 @@ def main() -> None:
     parser.add_argument("--predictions-csv", default="artifacts/caches/local_cache/teacher_disagreement/teacher_disagreement_model_predictions.csv")
     parser.add_argument("--prototype-dir", default="artifacts/prototypes")
     parser.add_argument("--output-npz", default="artifacts/caches/local_cache/teacher_disagreement/teacher_disagreement_l2_probabilities.npz")
+    parser.add_argument("--models", nargs="*", default=[])
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     device = _resolve_device()
@@ -158,6 +160,14 @@ def main() -> None:
         "pred_a4": {
             "checkpoint": "artifacts/experiments/ablation/a4_single_teacher_prototype/checkpoints/best_scientific_score.pt",
             "config": "artifacts/experiments/ablation/a4_single_teacher_prototype/resolved_config.json"
+        },
+        "pred_a5": {
+            "checkpoint": "artifacts/experiments/ablation/a5_static_prototypes/checkpoints/best_scientific_score.pt",
+            "config": "artifacts/experiments/ablation/a5_static_prototypes/resolved_config.json"
+        },
+        "pred_a6": {
+            "checkpoint": "artifacts/experiments/ablation/a6_full_filter/checkpoints/best_scientific_score.pt",
+            "config": "artifacts/experiments/ablation/a6_full_filter/resolved_config.json"
         }
     }
 
@@ -170,11 +180,31 @@ def main() -> None:
     print("Loading prototype image bank...")
     image_bank = load_prototype_image_bank(image_bank_path)
 
-    # Save both raw cosine scores for retrieval and centered scores for display.
+    # Resume from the model-wise cache and only infer missing requested models.
+    output_npz = Path(args.output_npz)
     npz_data = {}
     l2_names = None
+    if output_npz.exists():
+        with np.load(output_npz, allow_pickle=True) as cached:
+            npz_data = {key: cached[key].copy() for key in cached.files}
+        cached_ids = [str(value) for value in npz_data.get("review_ids", [])]
+        current_ids = [row["review_id"] for row in valid_rows]
+        if cached_ids and cached_ids != current_ids:
+            raise RuntimeError("cached L2 review IDs do not match the current prediction rows")
+        if "l2_names" in npz_data:
+            l2_names = [str(value) for value in npz_data["l2_names"].tolist()]
+
+    requested = set(args.models)
+    if requested:
+        unknown = requested.difference(model_paths)
+        if unknown:
+            raise ValueError(f"unknown model keys: {sorted(unknown)}")
+        model_paths = {key: value for key, value in model_paths.items() if key in requested}
 
     for key, paths in model_paths.items():
+        if not args.force and key in npz_data and f"raw_{key}" in npz_data:
+            print(f"Using cached L2 scores for model: {key}")
+            continue
         chk_path = Path(paths["checkpoint"])
         cfg_path = Path(paths["config"])
         if not chk_path.exists() or not cfg_path.exists():
@@ -250,7 +280,6 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     # Save to NPZ
-    output_npz = Path(args.output_npz)
     output_npz.parent.mkdir(parents=True, exist_ok=True)
     
     # Include metadata in NPZ

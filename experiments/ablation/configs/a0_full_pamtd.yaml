@@ -1,12 +1,11 @@
 inherits: ../../../configs/server/train_tenth.example.yaml
 
-# Ablation A0 — full PAMT-D at 1/10 scale (reference condition).
+# Ablation A0 — dynamic prototypes with half-strength filtering at 1/10 scale.
 #
-# This is the reduced-scale counterpart of the manuscript final model. It
-# changes nothing in the method; it only renames the output directory so the
-# ablation matrix has a clean same-scale reference to compare against. Every
-# other ablation in this directory inherits from train_tenth.yaml and differs
-# from THIS run by exactly one documented variable.
+# This historical reference condition is retained specifically for the A0-A5
+# dynamic-versus-static prototype contrast. It is not the universal reference
+# for the full ablation matrix; A6 is the matched complete-filter condition for
+# A6-A2.
 
 runtime:
   output_dir: outputs/experiments/ablation/a0_full_pamtd

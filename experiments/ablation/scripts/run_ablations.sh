@@ -10,6 +10,8 @@ declare -A CONFIGS=(
   [a2]="experiments/ablation/configs/a2_no_adjudication.yaml"
   [a3]="experiments/ablation/configs/a3_single_teacher.yaml"
   [a4]="experiments/ablation/configs/a4_single_teacher_prototype.yaml"
+  [a5]="experiments/ablation/configs/a5_static_prototypes.yaml"
+  [a0p]="experiments/ablation/configs/a6_full_filter.yaml"
 )
 
 conditions=("$@")
