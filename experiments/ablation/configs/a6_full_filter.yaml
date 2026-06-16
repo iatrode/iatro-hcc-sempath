@@ -1,0 +1,12 @@
+inherits: ../../../configs/local/server/train_tenth.yaml
+
+# A0': A0 with complete application of the computed reliability weights.
+# Prototype and filter intervention timing remains unchanged. This is the
+# matched full-filter variant for the A0'-A2 contrast, not a replacement for A0
+# in the A0-A5 dynamic-prototype contrast.
+
+runtime:
+  output_dir: runtime/ablation/a6_full_filter
+
+loss:
+  prototype_filter_weight: 1.0

@@ -32,3 +32,20 @@ release/hcc-sempath/*
 
 # Local review plugin
 scripts/visuals_plugin.py
+
+# Local working documents and agent runtime context
+/manuscript/*.aux
+/manuscript/*.fdb_latexmk
+/manuscript/*.fls
+/manuscript/*.log
+/manuscript/*.out
+/manuscript/*.pdf
+/manuscript/*.synctex.gz
+/.apc/
+/AGENTS.md
+
+# Ignore local exhibit selector state and reviewed case selections
+experiments/06_attention_qc/configs/exval_selector_*
+experiments/06_attention_qc/configs/reviewed_attention_*
+experiments/06_attention_qc/reports/figure5_microscopic_attribution.pdf
+

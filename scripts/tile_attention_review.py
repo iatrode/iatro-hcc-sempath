@@ -231,6 +231,15 @@ def _sample_package_rows(tile_packages: list[str], count: int, seed: int) -> lis
             reader.close()
 
 
+def _read_selection(path: Path) -> list[dict[str, str]]:
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    required = {"package_idx", "row_idx"}
+    if not rows or not required.issubset(rows[0]):
+        raise ValueError(f"selection CSV must contain {sorted(required)}: {path}")
+    return rows
+
+
 def _primary_top(registry: PrototypeRegistry, logits: torch.Tensor) -> tuple[str, float, float]:
     idx = torch.tensor(registry.primary_indices, device=logits.device)
     values = logits.index_select(0, idx)
@@ -332,86 +341,53 @@ def _score_sample(
         return result
 
 
-def _saliency(
+def _occlusion_sensitivity(
     model: HCCSemPathModel,
     sample: TileSample,
     cfg: dict[str, Any],
-    teacher_prototypes: dict[str, PrototypeRegistry],
-    zhcc_registry: PrototypeRegistry | None,
+    zhcc_registry: PrototypeRegistry,
     device: torch.device,
+    batch_size: int = 32,
 ) -> np.ndarray:
-    names = teacher_names(cfg)
     images = _image_tensor(sample, cfg, device)
-    images.requires_grad_(True)
-    model.zero_grad(set_to_none=True)
-    outputs = model(images)
-    if zhcc_registry is not None:
-        logits = normalized_prototype_logits(outputs["embedding_norm"], zhcc_registry.prototypes)[0]
-        primary_idx = torch.tensor(zhcc_registry.primary_indices, device=device)
-        score = logits.index_select(0, primary_idx).max()
-    else:
-        parts = []
-        for name in names:
-            teacher_feature = torch.from_numpy(sample.teacher_features[name]).to(device=device, dtype=torch.float32)
-            parts.append(F.cosine_similarity(outputs["teacher_outputs"][name][0], teacher_feature, dim=0))
-        score = torch.stack(parts).mean()
-    score.backward()
-    grad = images.grad.detach().abs().amax(dim=1)[0]
-    grad = grad - grad.min()
-    grad = grad / grad.max().clamp_min(1e-6)
-    return grad.cpu().numpy()
+    primary_idx = torch.tensor(zhcc_registry.primary_indices, device=device)
+    primary_prototypes = zhcc_registry.prototypes.index_select(0, primary_idx)
+    with torch.no_grad():
+        baseline_embedding = model(images)["embedding_norm"]
+        baseline_logits = normalized_prototype_logits(baseline_embedding, primary_prototypes)[0]
+    top_order = baseline_logits.argsort(descending=True)
+    target_idx = int(top_order[0].item())
+    competitor_indices = [idx for idx in range(len(primary_idx)) if idx != target_idx]
+    baseline_margin = float(
+        baseline_logits[target_idx] - baseline_logits[competitor_indices].max()
+    )
 
+    patch_size = int(getattr(model.encoder.backbone.patch_embed, "patch_size", (16, 16))[0])
+    height, width = images.shape[-2:]
+    grid_h = height // patch_size
+    grid_w = width // patch_size
+    variants = []
+    for row in range(grid_h):
+        for col in range(grid_w):
+            variant = images[0].clone()
+            y0 = row * patch_size
+            x0 = col * patch_size
+            variant[:, y0 : y0 + patch_size, x0 : x0 + patch_size] = 0.0
+            variants.append(variant)
 
-def _attention_rollout(
-    model: HCCSemPathModel,
-    sample: TileSample,
-    cfg: dict[str, Any],
-    device: torch.device,
-) -> np.ndarray | None:
-    attentions: list[torch.Tensor] = []
-    handles = []
-    for block in getattr(model.encoder.backbone, "blocks", []):
-        attn = getattr(block, "attn", None)
-        attn_drop = getattr(attn, "attn_drop", None)
-        if attn_drop is None:
-            continue
-
-        def _hook(_module, hook_input, _hook_output):
-            if hook_input:
-                attentions.append(hook_input[0].detach())
-
-        handles.append(attn_drop.register_forward_hook(_hook))
-    try:
-        with torch.no_grad():
-            model(_image_tensor(sample, cfg, device))
-    finally:
-        for handle in handles:
-            handle.remove()
-    if not attentions:
-        return None
-    mats = []
-    for attn in attentions:
-        if attn.ndim != 4 or attn.shape[0] != 1:
-            continue
-        mat = attn[0].mean(dim=0)
-        eye = torch.eye(mat.shape[-1], device=mat.device, dtype=mat.dtype)
-        mat = mat + eye
-        mat = mat / mat.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        mats.append(mat)
-    if not mats:
-        return None
-    joint = mats[0]
-    for mat in mats[1:]:
-        joint = mat @ joint
-    patch_scores = joint[0, 1:]
-    side = int(round(float(patch_scores.numel()) ** 0.5))
-    if side * side != patch_scores.numel():
-        return None
-    heatmap = patch_scores.reshape(1, 1, side, side)
-    heatmap = F.interpolate(heatmap, size=sample.image.size[::-1], mode="bilinear", align_corners=False)[0, 0]
-    heatmap = heatmap - heatmap.min()
+    importance = []
+    with torch.no_grad():
+        for start in range(0, len(variants), batch_size):
+            batch = torch.stack(variants[start : start + batch_size]).to(device)
+            embeddings = model(batch)["embedding_norm"]
+            logits = normalized_prototype_logits(embeddings, primary_prototypes)
+            margins = logits[:, target_idx] - logits[:, competitor_indices].max(dim=1).values
+            importance.extend((baseline_margin - margins).detach().cpu().tolist())
+    heatmap = torch.tensor(importance, dtype=torch.float32).reshape(1, 1, grid_h, grid_w)
+    heatmap = F.interpolate(heatmap, size=(height, width), mode="bilinear", align_corners=False)[0, 0]
+    heatmap = heatmap.clamp_min(0)
     heatmap = heatmap / heatmap.max().clamp_min(1e-6)
-    return heatmap.cpu().numpy()
+    return heatmap.numpy()
 
 
 def _overlay(image: Image.Image, heatmap: np.ndarray) -> np.ndarray:
@@ -423,8 +399,7 @@ def _overlay(image: Image.Image, heatmap: np.ndarray) -> np.ndarray:
 def _write_outputs(
     samples: list[TileSample],
     rows: list[dict[str, Any]],
-    heatmaps: list[np.ndarray],
-    attention_maps: list[np.ndarray | None],
+    occlusion_maps: list[np.ndarray],
     out_dir: Path,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -433,23 +408,14 @@ def _write_outputs(
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    fig, axes = plt.subplots(len(samples), 4, figsize=(15, max(3.0, 2.7 * len(samples))), squeeze=False)
-    for idx, (sample, row, heatmap, attention_map) in enumerate(
-        zip(samples, rows, heatmaps, attention_maps, strict=True)
-    ):
+    fig, axes = plt.subplots(len(samples), 3, figsize=(12, max(3.0, 2.7 * len(samples))), squeeze=False)
+    for idx, (sample, row, occlusion_map) in enumerate(zip(samples, rows, occlusion_maps, strict=True)):
         axes[idx, 0].imshow(sample.image)
         axes[idx, 0].set_title("tile")
         axes[idx, 0].axis("off")
-        if attention_map is None:
-            axes[idx, 1].imshow(sample.image)
-            axes[idx, 1].text(0.5, 0.5, "attention unavailable", ha="center", va="center")
-        else:
-            axes[idx, 1].imshow(_overlay(sample.image, attention_map))
-        axes[idx, 1].set_title("ViT rollout")
+        axes[idx, 1].imshow(_overlay(sample.image, occlusion_map))
+        axes[idx, 1].set_title("decision-margin occlusion")
         axes[idx, 1].axis("off")
-        axes[idx, 2].imshow(_overlay(sample.image, heatmap))
-        axes[idx, 2].set_title("student saliency")
-        axes[idx, 2].axis("off")
         text_lines = [
             f"{sample.tile_id.encode('ascii', 'replace').decode('ascii')}",
             f"pkg={sample.package_idx} row={sample.row}",
@@ -457,27 +423,29 @@ def _write_outputs(
             f"teacher L1 unique={row['teacher_l1_unique']}",
             f"student L1 unique={row['student_l1_unique']}",
         ]
+        if row.get("selection_stratum"):
+            text_lines.insert(1, f"stratum={row['selection_stratum']}")
+        if row.get("selection_expert_l1"):
+            text_lines.append(f"expert={row['selection_expert_l1']}")
+        if row.get("selection_teacher_plurality"):
+            text_lines.append(f"plurality={row['selection_teacher_plurality']}")
+        if row.get("selection_full_prediction"):
+            text_lines.append(f"full={row['selection_full_prediction']}")
         if row.get("zhcc_student_l1"):
             text_lines.append(
                 f"z_hcc={row['zhcc_student_l1']} "
                 f"margin={float(row['zhcc_student_l1_margin']):.3f}"
             )
             text_lines.append(f"attr={row['zhcc_student_attr']}")
-        axes[idx, 3].text(0.0, 1.0, "\n".join(text_lines), va="top", ha="left", fontsize=9)
-        axes[idx, 3].axis("off")
-    fig.suptitle("Tile-level student saliency and prototype response", y=0.995)
+        axes[idx, 2].text(0.0, 1.0, "\n".join(text_lines), va="top", ha="left", fontsize=9)
+        axes[idx, 2].axis("off")
+    fig.suptitle("Final-decision occlusion sensitivity", y=0.995)
     fig.tight_layout()
     fig.savefig(out_dir / "tile_attention_sheet.png", dpi=180)
     plt.close(fig)
-    for sample, heatmap in zip(samples, heatmaps, strict=True):
-        Image.fromarray((np.asarray(_overlay(sample.image, heatmap)) * 255).astype(np.uint8)).save(
-            out_dir / f"{sample.tile_id}.saliency.png"
-        )
-    for sample, attention_map in zip(samples, attention_maps, strict=True):
-        if attention_map is None:
-            continue
-        Image.fromarray((np.asarray(_overlay(sample.image, attention_map)) * 255).astype(np.uint8)).save(
-            out_dir / f"{sample.tile_id}.attention.png"
+    for sample, occlusion_map in zip(samples, occlusion_maps, strict=True):
+        Image.fromarray((np.asarray(_overlay(sample.image, occlusion_map)) * 255).astype(np.uint8)).save(
+            out_dir / f"{sample.tile_id}.occlusion.png"
         )
 
 
@@ -492,6 +460,11 @@ def main() -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--candidates", type=int, default=24)
     parser.add_argument("--samples", type=int, default=8)
+    parser.add_argument(
+        "--selection-csv",
+        default="",
+        help="Optional fixed package_idx,row_idx case list; bypasses random candidate selection.",
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--zhcc-bank-max", type=int, default=512)
     parser.add_argument("--zhcc-bank-batch-size", type=int, default=64)
@@ -513,7 +486,12 @@ def main() -> None:
 
     manifest = load_training_manifest(cfg["data"]["train_manifest_path"])
     tile_packages, teacher_packages = manifest_data_paths(cfg, manifest, args.split)
-    package_rows = _sample_package_rows(tile_packages, count=max(args.candidates, args.samples), seed=args.seed)
+    selection_rows = _read_selection(Path(args.selection_csv)) if args.selection_csv else []
+    package_rows = (
+        [(int(row["package_idx"]), int(row["row_idx"])) for row in selection_rows]
+        if selection_rows
+        else _sample_package_rows(tile_packages, count=max(args.candidates, args.samples), seed=args.seed)
+    )
     tile_readers: dict[int, TilePackageReader] = {}
     try:
         candidates = [
@@ -528,14 +506,24 @@ def main() -> None:
         _score_sample(model, sample, cfg, teacher_prototypes, zhcc_registry, device)
         for sample in candidates
     ]
-    order = sorted(range(len(scored)), key=lambda idx: float(scored[idx]["selection_score"]), reverse=True)
-    take = order[: max(1, args.samples)]
+    if selection_rows:
+        for result, selection in zip(scored, selection_rows, strict=True):
+            for key, value in selection.items():
+                result[f"selection_{key}"] = value
+        take = list(range(len(scored)))
+    else:
+        order = sorted(range(len(scored)), key=lambda idx: float(scored[idx]["selection_score"]), reverse=True)
+        take = order[: max(1, args.samples)]
     selected_samples = [candidates[idx] for idx in take]
     selected_rows = [scored[idx] for idx in take]
-    heatmaps = [_saliency(model, sample, cfg, teacher_prototypes, zhcc_registry, device) for sample in selected_samples]
-    attention_maps = [_attention_rollout(model, sample, cfg, device) for sample in selected_samples]
+    if zhcc_registry is None:
+        raise RuntimeError("decision-margin occlusion requires the z_hcc prototype registry")
+    occlusion_maps = [
+        _occlusion_sensitivity(model, sample, cfg, zhcc_registry, device)
+        for sample in selected_samples
+    ]
     out_dir = Path(args.output_dir)
-    _write_outputs(selected_samples, selected_rows, heatmaps, attention_maps, out_dir)
+    _write_outputs(selected_samples, selected_rows, occlusion_maps, out_dir)
     print(
         f"tile_attention_ok device={device} candidates={len(candidates)} samples={len(selected_samples)} "
         f"zhcc_registry={'yes' if zhcc_registry is not None else 'no'} output={out_dir}"

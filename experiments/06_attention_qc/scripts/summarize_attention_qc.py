@@ -13,14 +13,12 @@ def main() -> None:
     result_dir = Path(args.result_dir)
     with (result_dir / "tile_attention_rows.csv").open("r", newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    saliency_count = len(list(result_dir.glob("*.saliency.png")))
-    attention_count = len(list(result_dir.glob("*.attention.png")))
+    occlusion_count = len(list(result_dir.glob("*.occlusion.png")))
     lines = [
         "# Attention QC Summary",
         "",
         f"Sampled tiles: {len(rows)}.",
-        f"Saliency overlays: {saliency_count}.",
-        f"Attention rollout overlays: {attention_count}.",
+        f"Decision-margin occlusion overlays: {occlusion_count}.",
         "",
         "Primary sheet: `tile_attention_sheet.png`.",
     ]

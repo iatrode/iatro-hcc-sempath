@@ -32,6 +32,10 @@ Elapsed seconds: 141.0.
 | intermediate | 117 |
 | low_margin | 14 |
 
-## Gate Interpretation
+## Interpretation
 
-Automatic representation audit completed. Expert scoring remains the only unresolved morphology-relevance endpoint.
+`z_hcc` retains teacher/prototype semantic structure at a level comparable to
+the individual teacher retrieval spaces, while its nearest-neighbor sets are
+not simple copies of any single teacher. Mean overlap@10 with individual
+teachers is only 2.12-2.52, leaving 7.48-7.88 unique `z_hcc` neighbors per
+query.

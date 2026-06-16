@@ -12,9 +12,9 @@ python scripts/tile_attention_review.py \
   --prototype-dir artifacts/prototypes \
   --split exval \
   --output-dir experiments/06_attention_qc/results \
-  --device mps \
-  --candidates 6 \
-  --samples 2 \
+  --device cpu \
+  --selection-csv experiments/06_attention_qc/configs/reviewed_attention_cases.csv \
+  --samples 8 \
   --zhcc-bank-max 64 \
   --zhcc-bank-batch-size 16 \
   | tee experiments/06_attention_qc/logs/attention_qc.log
@@ -25,3 +25,5 @@ cp experiments/06_attention_qc/results/tile_attention_scores.csv \
 python experiments/06_attention_qc/scripts/summarize_attention_qc.py \
   --result-dir experiments/06_attention_qc/results \
   --report experiments/06_attention_qc/reports/attention_qc_summary.md
+
+python experiments/06_attention_qc/scripts/plot_attention_manuscript_panel.py

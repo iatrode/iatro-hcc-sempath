@@ -70,6 +70,8 @@ def main() -> None:
     parser.add_argument("--prototype-dir", default="artifacts/prototypes")
     parser.add_argument("--output-csv", default="artifacts/caches/local_cache/teacher_disagreement/teacher_disagreement_model_predictions.csv")
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--models", nargs="*", default=[])
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     device = _resolve_device()
@@ -187,6 +189,14 @@ def main() -> None:
         "pred_a4": {
             "checkpoint": "artifacts/experiments/ablation/a4_single_teacher_prototype/checkpoints/best_scientific_score.pt",
             "config": "artifacts/experiments/ablation/a4_single_teacher_prototype/resolved_config.json"
+        },
+        "pred_a5": {
+            "checkpoint": "artifacts/experiments/ablation/a5_static_prototypes/checkpoints/best_scientific_score.pt",
+            "config": "artifacts/experiments/ablation/a5_static_prototypes/resolved_config.json"
+        },
+        "pred_a6": {
+            "checkpoint": "artifacts/experiments/ablation/a6_full_filter/checkpoints/best_scientific_score.pt",
+            "config": "artifacts/experiments/ablation/a6_full_filter/resolved_config.json"
         }
     }
 
@@ -200,10 +210,32 @@ def main() -> None:
     print("Loading prototype image bank...")
     image_bank = load_prototype_image_bank(image_bank_path)
 
-    # Dictionary to store predictions for each model key
-    predictions = {key: [] for key in model_paths}
+    requested = set(args.models)
+    if requested:
+        unknown = requested.difference(model_paths)
+        if unknown:
+            raise ValueError(f"unknown model keys: {sorted(unknown)}")
+
+    existing_by_id = {}
+    output_path = Path(args.output_csv)
+    if output_path.exists():
+        existing_by_id = {row["review_id"]: row for row in _read_csv(output_path)}
+
+    # Dictionary to store predictions for each model key.
+    predictions = {}
+    for key in model_paths:
+        cached = [existing_by_id.get(row["review_id"], {}).get(key, "") for row in valid_rows]
+        if not args.force and key not in requested and all(value not in {"", "N/A"} for value in cached):
+            predictions[key] = cached
+        elif not args.force and requested and key not in requested:
+            predictions[key] = cached
+        else:
+            predictions[key] = []
 
     for key, paths in model_paths.items():
+        if predictions[key]:
+            print(f"Using cached L1 predictions for model: {key}")
+            continue
         chk_path = Path(paths["checkpoint"])
         cfg_path = Path(paths["config"])
         if not chk_path.exists() or not cfg_path.exists():
@@ -264,7 +296,6 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     # 5. Export results
-    output_path = Path(args.output_csv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     output_rows = []
@@ -282,11 +313,14 @@ def main() -> None:
             "pred_a2": predictions["pred_a2"][idx],
             "pred_a3": predictions["pred_a3"][idx],
             "pred_a4": predictions["pred_a4"][idx],
+            "pred_a5": predictions["pred_a5"][idx],
+            "pred_a6": predictions["pred_a6"][idx],
         })
         
     fieldnames = [
         "review_id", "tile_id", "slide_id", "patient_id", "package_path", "row_idx",
-        "pred_full", "pred_a0", "pred_a1", "pred_a2", "pred_a3", "pred_a4"
+        "pred_full", "pred_a0", "pred_a1", "pred_a2", "pred_a3", "pred_a4",
+        "pred_a5", "pred_a6",
     ]
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)

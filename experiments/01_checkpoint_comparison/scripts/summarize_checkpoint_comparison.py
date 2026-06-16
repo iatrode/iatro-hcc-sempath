@@ -52,7 +52,7 @@ def main() -> None:
     lines = [
         "# Checkpoint Comparison",
         "",
-        "Protocol: same fixed-seed local sampled MPS evaluation as `00_local_eval`.",
+        "Protocol: fixed-seed local sampled MPS evaluation.",
         "",
         "| split | metric | epoch61 | epoch100 | delta |",
         "|---|---|---:|---:|---:|",
