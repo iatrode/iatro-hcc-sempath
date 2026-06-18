@@ -49,3 +49,13 @@ experiments/06_attention_qc/configs/exval_selector_*
 experiments/06_attention_qc/configs/reviewed_attention_*
 experiments/06_attention_qc/reports/figure5_microscopic_attribution.pdf
 
+# Generated experiment result artifacts (figures, tables, benchmark dumps).
+# Source scripts and README/markdown reports stay tracked; rendered outputs are local.
+experiments/**/reports/figures/
+experiments/**/tables/*.csv
+experiments/**/reports/*.json
+experiments/07_full_exval_cache/reports/output_morphology_*.png
+experiments/07_full_exval_cache/reports/output_morphology_*_selection.csv
+experiments/07_full_exval_cache/scripts/render_output_morphology_panel.py
+
+
