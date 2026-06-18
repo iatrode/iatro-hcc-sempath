@@ -10,7 +10,7 @@ Purpose: Generate representation-level patch-occlusion sensitivity overlays for 
 
 ## Execution
 
-Run the script using the conda python environment:
+Run the script with the project's Python environment:
 
 ```bash
 python experiments/12_representation_attribution/scripts/run_attribution.py

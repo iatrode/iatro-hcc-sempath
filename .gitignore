@@ -58,4 +58,15 @@ experiments/07_full_exval_cache/reports/output_morphology_*.png
 experiments/07_full_exval_cache/reports/output_morphology_*_selection.csv
 experiments/07_full_exval_cache/scripts/render_output_morphology_panel.py
 
+# Internal research status / evidence-tracking docs (team-facing, not for public repo)
+experiments/reports/current_experiment_status.md
+experiments/reports/manuscript_evidence_status.md
+experiments/reports/paper_experiment_matrix.md
+
+# Secrets / credentials safeguards
+.env
+*.env
+*.auth-token
+
+
 

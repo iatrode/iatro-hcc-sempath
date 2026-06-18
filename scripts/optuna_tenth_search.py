@@ -195,7 +195,7 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     cfg["train"]["system_profile_interval"] = int(cfg["train"].get("system_profile_interval", 1))
     cfg["train"]["batch_profile_csv"] = bool(cfg["train"].get("batch_profile_csv", True))
     cfg["train"]["batch_profile_csv_interval"] = int(cfg["train"].get("batch_profile_csv_interval", 1))
-    cfg["train"]["system_profile_paths"] = cfg["train"].get("system_profile_paths", ["runtime"])
+    cfg["train"]["system_profile_paths"] = cfg["train"].get("system_profile_paths", ["."])
     return cfg
 
 

@@ -10,7 +10,7 @@ Purpose: Generate a 2D UMAP projection of the student embedding space $z_{\mathr
 
 ## Execution
 
-Run the script using the conda python environment:
+Run the script with the project's Python environment:
 
 ```bash
 python experiments/11_representation_umap/scripts/run_umap.py
