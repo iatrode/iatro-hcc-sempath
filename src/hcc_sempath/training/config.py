@@ -6,7 +6,7 @@ import random
 import yaml
 
 from ..io.feature_cache import FeatureCacheReader
-from ..io.iatrocache import read_header
+from ..io.iatro_iac import read_header
 from .feature_pack_merge import MERGED_FEATURE_PAYLOAD_TYPE, MERGED_FEATURE_SUFFIX
 from .manifest import manifest_teacher_feature_packages_for_tiles, manifest_tile_packages, package_stem
 

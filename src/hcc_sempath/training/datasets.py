@@ -16,7 +16,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 from ..io.feature_cache import FeatureCacheReader
-from ..io.iatrocache import read_header, read_tables
+from ..io.iatro_iac import read_header, read_tables
 from ..io.manifests import TileRecord
 from ..io.tile_package import TilePackageReader
 from .feature_pack_merge import (

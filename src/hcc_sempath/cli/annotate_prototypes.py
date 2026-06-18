@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, urlparse
 from PIL import Image, ImageDraw
 
 from hcc_sempath.cli.view_iac import IacRecord, IacViewerData
-from hcc_sempath.io.iatrocache import read_header, read_payload
+from hcc_sempath.io.iatro_iac import read_header, read_payload
 from hcc_sempath.io.tile_package import decode_jxl
 
 

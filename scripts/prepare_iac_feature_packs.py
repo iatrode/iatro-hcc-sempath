@@ -6,7 +6,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-from hcc_sempath.io.iatrocache import read_header
+from hcc_sempath.io.iatro_iac import read_header
 from hcc_sempath.training.feature_pack_merge import (
     MERGED_FEATURE_SUFFIX,
     TILE_SUFFIX,

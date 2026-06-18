@@ -8,7 +8,7 @@ import pyarrow as pa
 
 from hcc_sempath.cli.view_iac import IacViewerData
 from hcc_sempath.io.feature_cache import build_teacher_feature_package
-from hcc_sempath.io.iatrocache import build_pack
+from hcc_sempath.io.iatro_iac import build_pack
 from hcc_sempath.io.manifests import TileRecord
 from hcc_sempath.io.tile_package import build_tile_package_from_records, encode_jxl_array
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from hcc_sempath.io.iatrocache import read_payload, read_tables
+from hcc_sempath.io.iatro_iac import read_payload, read_tables
 from hcc_sempath.io.manifests import write_tile_manifest
 from hcc_sempath.io.tile_package import build_tile_package, read_package_manifest
 from hcc_sempath.io.validate_package import _validate_common, _validate_image_tiles, _validate_record_payload_spans

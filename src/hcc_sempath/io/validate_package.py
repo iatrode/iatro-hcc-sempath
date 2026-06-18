@@ -1,13 +1,13 @@
-"""Compatibility shim — moved to the shared ``iatrocache`` package.
+"""Compatibility shim — moved to the shared ``iatro_iac`` package.
 
-Package validation now lives in ``iatrocache.validate``. This keeps existing
+Package validation now lives in ``iatro_iac.validate``. This keeps existing
 ``hcc_sempath.io.validate_package`` imports (and the ``validate-package`` CLI
-entry) working. New code should import from ``iatrocache.validate`` directly.
+entry) working. New code should import from ``iatro_iac.validate`` directly.
 """
 
 from __future__ import annotations
 
-from iatrocache.validate import (  # noqa: F401
+from iatro_iac.validate import (  # noqa: F401
     main,
     validate_package,
     _discover_packages,

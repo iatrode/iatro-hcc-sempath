@@ -8,7 +8,7 @@ from pathlib import Path
 import imagecodecs
 import numpy as np
 
-from hcc_sempath.io.iatrocache import build_pack_data_segment, read_payload, read_tables
+from hcc_sempath.io.iatro_iac import build_pack_data_segment, read_payload, read_tables
 from hcc_sempath.io.validate_package import validate_package
 
 

@@ -1,17 +1,17 @@
 """Compatibility shim.
 
 The IatroCache container format has been extracted to the standalone
-``iatrocache`` package (../../iatrocache), so it can be shared across the
+``iatro_iac`` package (../../iatro-iac), so it can be shared across the
 HCC-CAMoE projects (SemPath image/feature caches, Course clinical-text caches).
 
 This module re-exports the format layer unchanged. Project adapters
 (``tile_package``, ``feature_cache``) keep importing from here, so no call
-sites changed. New code may import from ``iatrocache`` directly.
+sites changed. New code may import from ``iatro_iac`` directly.
 """
 
 from __future__ import annotations
 
-from iatrocache import (  # noqa: F401
+from iatro_iac import (  # noqa: F401
     FORMAT_VERSION,
     HEADER_BYTES,
     MAGIC,

@@ -1,14 +1,14 @@
-"""Compatibility shim — moved to the shared ``iatrocache`` package.
+"""Compatibility shim — moved to the shared ``iatro_iac`` package.
 
-The teacher-feature cache now lives in ``iatrocache.adapters.features`` and is
-re-exported from ``iatrocache``. This module keeps existing
+The teacher-feature cache now lives in ``iatro_iac.adapters.features`` and is
+re-exported from ``iatro_iac``. This module keeps existing
 ``hcc_sempath.io.feature_cache`` imports working. New code should import from
-``iatrocache`` directly.
+``iatro_iac`` directly.
 """
 
 from __future__ import annotations
 
-from iatrocache.adapters.features import (  # noqa: F401
+from iatro_iac.adapters.features import (  # noqa: F401
     FeatureCacheReader,
     build_teacher_feature_package,
     build_teacher_feature_package_from_feature_map,

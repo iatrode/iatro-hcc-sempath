@@ -22,6 +22,7 @@ dependencies = [
   "openslide-python",
   "openslide-bin",
   "pyarrow",
+  "iatro-iac",
 ]
 
 [project.optional-dependencies]

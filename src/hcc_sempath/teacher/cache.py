@@ -21,7 +21,7 @@ from timm.data import create_transform, resolve_model_data_config
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from ..io.feature_cache import build_teacher_feature_package, build_teacher_feature_package_from_tile_package
-from ..io.iatrocache import read_tables
+from ..io.iatro_iac import read_tables
 from ..io.manifests import TileRecord
 from ..io.tile_package import TilePackageReader, read_package_manifest, read_package_metadata
 from ..io.validate_package import _validate_common, _validate_teacher_features

@@ -7,7 +7,7 @@ from tempfile import NamedTemporaryFile
 import numpy as np
 import pyarrow as pa
 
-from ..io.iatrocache import PackReader, build_pack, build_pack_data_segment_from_file, read_header, read_tables
+from ..io.iatro_iac import PackReader, build_pack, build_pack_data_segment_from_file, read_header, read_tables
 from .feature_pack_merge import MERGED_FEATURE_PAYLOAD_TYPE
 
 

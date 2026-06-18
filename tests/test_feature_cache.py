@@ -17,8 +17,8 @@ from hcc_sempath.io.feature_cache import (
     build_teacher_feature_package_from_tile_package,
     read_feature_package_records,
 )
-from hcc_sempath.io.iatrocache import read_tables
-from hcc_sempath.io.iatrocache import build_pack_data_segment
+from hcc_sempath.io.iatro_iac import read_tables
+from hcc_sempath.io.iatro_iac import build_pack_data_segment
 from hcc_sempath.io.manifests import read_tile_manifest, write_tile_manifest
 from hcc_sempath.io.tile_package import build_tile_package
 from hcc_sempath.io.validate_package import _validate_common, _validate_teacher_features
