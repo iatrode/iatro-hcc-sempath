@@ -1,0 +1,3 @@
+[submodule "manuscript"]
+	path = manuscript
+	url = https://github.com/iWiley/iatro-hcc-sempath-manuscript.git
