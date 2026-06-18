@@ -9,6 +9,15 @@ import torch.nn.functional as F
 import timm
 
 
+# Soft ceiling applied to prototype/attribute logits before any softmax/sigmoid.
+# A finite tanh bound keeps probabilities away from the saturated 0.9-0.99 band
+# at training and deployment time. Shared by the loss modules so student and
+# teacher responses use the same response scale. The default limit of 4.0 caps
+# attribute sigmoids at ~0.982 and 4-class L1 softmax at ~0.999.
+LOGIT_LIMIT = 4.0
+PROB_EPS = 1e-4
+
+
 class StudentEncoder(nn.Module):
     """Lightweight tile encoder that produces the reusable HCC embedding."""
 
@@ -158,6 +167,7 @@ class HCCSemPathModel(nn.Module):
         }
         if self.l1_prototypes is not None and self.l1_temperature is not None:
             l1_logits = (embedding_norm @ self.l1_prototypes.T) / self.l1_temperature
+            l1_logits = bounded_logits(l1_logits)
             outputs["l1_probabilities"] = F.softmax(l1_logits, dim=-1)
         if (
             self.l2_prototypes is not None
@@ -166,11 +176,13 @@ class HCCSemPathModel(nn.Module):
         ):
             l2_cosine_scores = embedding_norm @ self.l2_prototypes.T
             outputs["l2_cosine_scores"] = l2_cosine_scores
-            outputs["l2_probabilities"] = calibrated_attribute_scores(
+            l2_centered_scores = centered_attribute_scores(
                 l2_cosine_scores,
                 self.l2_biases,
                 self.l2_temperature,
             )
+            outputs["l2_centered_scores"] = l2_centered_scores
+            outputs["l2_scores"] = l2_centered_scores
         return outputs
 
 
@@ -199,8 +211,8 @@ class ToyTeacherEncoder(nn.Module):
 
 
 def normalized_prototype_logits(features: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
-    features = F.normalize(features, dim=-1)
-    prototypes = F.normalize(prototypes, dim=-1)
+    features = F.normalize(features.float(), dim=-1)
+    prototypes = F.normalize(prototypes.float(), dim=-1)
     return features @ prototypes.transpose(0, 1)
 
 
@@ -213,6 +225,46 @@ def calibrated_attribute_scores(
     temperatures = temperatures.to(device=cosine_scores.device, dtype=cosine_scores.dtype).clamp_min(1e-6)
     biases = biases.to(device=cosine_scores.device, dtype=cosine_scores.dtype)
     return torch.sigmoid((cosine_scores - biases) / temperatures)
+
+
+def bounded_logits(value: torch.Tensor, limit: float = LOGIT_LIMIT) -> torch.Tensor:
+    limit = float(limit)
+    if limit <= 0:
+        raise ValueError(f"logit limit must be positive, got {limit}")
+    value = value.float()
+    return limit * torch.tanh(value / limit)
+
+
+def clamp_probability(value: torch.Tensor, *, normalize: bool = False, eps: float = PROB_EPS) -> torch.Tensor:
+    """Pull a probability/target tensor away from the degenerate 0/1 boundary.
+
+    Upcasts to float32, optionally renormalizes across the last dim, then clamps
+    into ``[eps, 1 - eps]`` so downstream KL/BCE terms stay finite under fp16.
+    """
+    value = value.float()
+    if normalize:
+        value = value / value.sum(dim=-1, keepdim=True).clamp_min(eps)
+    return value.clamp(eps, 1.0 - eps)
+
+
+def centered_attribute_scores(
+    cosine_scores: torch.Tensor,
+    biases: torch.Tensor,
+    temperatures: torch.Tensor,
+    limit: float = LOGIT_LIMIT,
+) -> torch.Tensor:
+    """Map calibrated cosine scores to bounded non-probabilistic L2 evidence.
+
+    The output is a relative morphology score, not a calibrated probability.
+    This keeps deployment aligned with training-time v2 semantics: pull the
+    teacher/prototype response scale back before interpretation instead of
+    hiding saturated logits behind a final sigmoid.
+    """
+    cosine_scores = cosine_scores.float()
+    temperatures = temperatures.to(device=cosine_scores.device, dtype=cosine_scores.dtype).clamp_min(1e-6)
+    biases = biases.to(device=cosine_scores.device, dtype=cosine_scores.dtype)
+    scaled = (cosine_scores - biases) / temperatures
+    return bounded_logits(scaled, limit=limit)
 
 
 def load_hcc_sempath_release(

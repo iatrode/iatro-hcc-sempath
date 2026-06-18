@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from ..modeling.models import normalized_prototype_logits
+from ..modeling.models import PROB_EPS, bounded_logits, clamp_probability, normalized_prototype_logits
 from ..modeling.prototypes import PrototypeRegistry
 
 
@@ -49,7 +49,9 @@ def prototype_response(
         raise ValueError(f"primary_temperature must be positive, got {primary_temperature}")
     if attribute_temperature <= 0:
         raise ValueError(f"attribute_temperature must be positive, got {attribute_temperature}")
-    primary_logits = normalized_prototype_logits(features, registry.primary_prototypes) / float(primary_temperature)
+    primary_logits = bounded_logits(
+        normalized_prototype_logits(features, registry.primary_prototypes) / float(primary_temperature)
+    )
     primary_positions = _positions_for_names(
         registry=registry,
         source_indices=registry.primary_indices,
@@ -57,10 +59,15 @@ def prototype_response(
         label=label,
         device=features.device,
     )
-    primary = F.softmax(primary_logits, dim=-1).index_select(dim=1, index=primary_positions)
+    primary = clamp_probability(F.softmax(primary_logits, dim=-1)).index_select(
+        dim=1, index=primary_positions
+    )
+    primary = primary / primary.sum(dim=1, keepdim=True).clamp_min(PROB_EPS)
     if not attribute_names:
         return primary, features.new_zeros((features.shape[0], 0))
-    attribute_logits = normalized_prototype_logits(features, registry.attribute_prototypes) / float(attribute_temperature)
+    attribute_logits = bounded_logits(
+        normalized_prototype_logits(features, registry.attribute_prototypes) / float(attribute_temperature)
+    )
     attribute_positions = _positions_for_names(
         registry=registry,
         source_indices=registry.attribute_indices,
@@ -68,7 +75,7 @@ def prototype_response(
         label=label,
         device=features.device,
     )
-    attributes = torch.sigmoid(attribute_logits).index_select(dim=1, index=attribute_positions)
+    attributes = clamp_probability(torch.sigmoid(attribute_logits)).index_select(dim=1, index=attribute_positions)
     return primary, attributes
 
 
@@ -122,10 +129,10 @@ def teacher_semantic_response_target(
     if primary_sum is None or attribute_sum is None or weight_sum is None:
         raise ValueError("at least one teacher must have a positive loss weight")
     denom = weight_sum.clamp_min(1e-6)
-    primary_target = primary_sum / denom
-    primary_target = primary_target / primary_target.sum(dim=1, keepdim=True).clamp_min(1e-6)
-    attribute_target = attribute_sum / denom
-    return primary_target, attribute_target.clamp(0.0, 1.0)
+    primary_target = clamp_probability(primary_sum / denom, normalize=True)
+    primary_target = primary_target / primary_target.sum(dim=1, keepdim=True).clamp_min(PROB_EPS)
+    attribute_target = clamp_probability(attribute_sum / denom)
+    return primary_target, attribute_target
 
 
 def zhcc_response_distillation_loss(
@@ -142,19 +149,23 @@ def zhcc_response_distillation_loss(
         raise ValueError(f"primary_temperature must be positive, got {primary_temperature}")
     if attribute_temperature <= 0:
         raise ValueError(f"attribute_temperature must be positive, got {attribute_temperature}")
-    primary_logits = normalized_prototype_logits(embedding_norm, prototypes.primary_prototypes) / float(primary_temperature)
+    primary_logits = bounded_logits(
+        normalized_prototype_logits(embedding_norm, prototypes.primary_prototypes) / float(primary_temperature)
+    )
     if target_primary.shape != primary_logits.shape:
         raise ValueError(f"target_primary shape mismatch: target={tuple(target_primary.shape)} logits={tuple(primary_logits.shape)}")
     l1 = (
         F.kl_div(
             F.log_softmax(primary_logits, dim=-1),
-            target_primary.to(device=embedding_norm.device, dtype=embedding_norm.dtype),
+            clamp_probability(target_primary.to(device=embedding_norm.device), normalize=True),
             reduction="batchmean",
         )
         * (float(primary_temperature) ** 2)
     )
     if prototypes.attribute_indices:
-        attribute_logits = normalized_prototype_logits(embedding_norm, prototypes.attribute_prototypes) / float(attribute_temperature)
+        attribute_logits = bounded_logits(
+            normalized_prototype_logits(embedding_norm, prototypes.attribute_prototypes) / float(attribute_temperature)
+        )
         if target_attributes.shape != attribute_logits.shape:
             raise ValueError(
                 f"target_attributes shape mismatch: target={tuple(target_attributes.shape)} "
@@ -162,7 +173,7 @@ def zhcc_response_distillation_loss(
             )
         l2 = F.binary_cross_entropy_with_logits(
             attribute_logits,
-            target_attributes.to(device=embedding_norm.device, dtype=embedding_norm.dtype),
+            clamp_probability(target_attributes.to(device=embedding_norm.device)),
         ) * (float(attribute_temperature) ** 2)
     else:
         l2 = embedding_norm.new_zeros(())
@@ -194,9 +205,9 @@ def zhcc_prototype_loss(
         zero = embedding_norm.new_zeros(())
         return zero, {"zhcc_proto": zero.detach(), "zhcc_l1": zero.detach(), "zhcc_l2": zero.detach()}
 
-    supervised_embedding = embedding_norm[prototype_mask]
+    supervised_embedding = embedding_norm[prototype_mask].float()
     l1_targets = prototype_level1[prototype_mask].long()
-    l2_targets = prototype_level2[prototype_mask].to(supervised_embedding.dtype)
+    l2_targets = prototype_level2[prototype_mask].float()
     num_primary = len(prototypes.primary_indices)
     num_attributes = len(prototypes.attribute_indices)
     if l1_targets.numel() > 0:
@@ -210,10 +221,14 @@ def zhcc_prototype_loss(
         raise ValueError(
             f"prototype_level2 width mismatch: labels={l2_targets.shape[1]} attributes={num_attributes}"
         )
-    primary_logits = normalized_prototype_logits(supervised_embedding, prototypes.primary_prototypes) / float(primary_temperature)
+    primary_logits = bounded_logits(
+        normalized_prototype_logits(supervised_embedding, prototypes.primary_prototypes) / float(primary_temperature)
+    )
     l1 = F.cross_entropy(primary_logits, l1_targets)
     if num_attributes > 0:
-        attribute_logits = normalized_prototype_logits(supervised_embedding, prototypes.attribute_prototypes) / float(attribute_temperature)
+        attribute_logits = bounded_logits(
+            normalized_prototype_logits(supervised_embedding, prototypes.attribute_prototypes) / float(attribute_temperature)
+        )
         l2 = F.binary_cross_entropy_with_logits(attribute_logits, l2_targets)
     else:
         l2 = embedding_norm.new_zeros(())

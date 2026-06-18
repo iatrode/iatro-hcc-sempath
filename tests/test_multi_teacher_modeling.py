@@ -37,7 +37,9 @@ def test_hcc_sempath_model_uses_same_class_for_release_prototype_outputs() -> No
     assert outputs["teacher_outputs"] == {}
     assert outputs["l1_probabilities"].shape == (2, 4)
     assert outputs["l2_cosine_scores"].shape == (2, 3)
-    assert outputs["l2_probabilities"].shape == (2, 3)
+    assert outputs["l2_centered_scores"].shape == (2, 3)
+    assert outputs["l2_scores"].shape == (2, 3)
+    assert "l2_probabilities" not in outputs
 
 
 def test_multi_teacher_distillation_loss_aggregates_named_heads() -> None:

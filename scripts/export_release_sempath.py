@@ -167,7 +167,7 @@ def main() -> None:
         "l2_names": l2_names,
         "l1_temperature": l1_temp,
         "l2_temperature": l2_temperatures.tolist(),
-        "l2_score_kind": "median_iqr_relative_retrieval_score_v1",
+        "l2_score_kind": "bounded_centered_cosine_evidence_v2",
         "l2_decision_score": "raw_cosine",
         "l2_decision_thresholds": threshold_payload["thresholds"],
         "l2_threshold_target_prevalence": threshold_payload["target_prevalence"],

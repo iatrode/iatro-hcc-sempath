@@ -5,6 +5,7 @@ import torch
 
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 from hcc_sempath.training.zhcc_losses import (
+    prototype_response,
     teacher_semantic_response_target,
     zhcc_prototype_loss,
     zhcc_response_distillation_loss,
@@ -104,4 +105,58 @@ def test_zhcc_response_distillation_uses_teacher_soft_targets_and_updates_studen
     assert loss.ndim == 0
     assert parts["zhcc_response"].ndim == 0
     assert target_primary.requires_grad is False
+    assert student.grad is not None
+
+
+def test_teacher_prototype_response_is_bounded_before_sigmoid_or_softmax() -> None:
+    registry = PrototypeRegistry(
+        prototypes=torch.eye(4)[:3],
+        names=["primary_tumor", "primary_non_tumor", "lymphocyte_rich"],
+        groups=["primary", "primary", "attribute"],
+        levels=[1, 1, 2],
+        exclusive=[True, True, False],
+    )
+    features = torch.tensor([[1000.0, 0.0, 1000.0, 0.0]], dtype=torch.float16)
+
+    primary, attributes = prototype_response(
+        features,
+        registry,
+        primary_names=["primary_tumor", "primary_non_tumor"],
+        attribute_names=["lymphocyte_rich"],
+        label="teacher",
+        primary_temperature=0.1,
+        attribute_temperature=0.1,
+    )
+
+    assert primary.dtype == torch.float32
+    assert attributes.dtype == torch.float32
+    assert primary.min().item() > 1e-4
+    assert primary.max().item() < 1.0 - 1e-4
+    assert attributes.min().item() > 1e-4
+    assert attributes.max().item() < 1.0 - 1e-4
+
+
+def test_zhcc_losses_remain_float32_with_half_precision_inputs() -> None:
+    registry = PrototypeRegistry(
+        prototypes=torch.eye(4)[:3],
+        names=["primary_tumor", "primary_non_tumor", "lymphocyte_rich"],
+        groups=["primary", "primary", "attribute"],
+        levels=[1, 1, 2],
+        exclusive=[True, True, False],
+    )
+    student = torch.tensor([[1000.0, 0.0, 1000.0, 0.0]], dtype=torch.float16, requires_grad=True)
+
+    loss, _ = zhcc_prototype_loss(
+        embedding_norm=student,
+        prototype_mask=torch.tensor([True]),
+        prototype_level1=torch.tensor([0]),
+        prototype_level2=torch.tensor([[1.0]]),
+        prototypes=registry,
+        primary_temperature=0.1,
+        attribute_temperature=0.1,
+    )
+    loss.backward()
+
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss)
     assert student.grad is not None

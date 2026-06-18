@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from ..modeling.models import normalized_prototype_logits
+from ..modeling.models import bounded_logits, clamp_probability, normalized_prototype_logits
 from ..modeling.prototypes import PrototypeRegistry
 
 
@@ -20,6 +20,8 @@ def feature_distillation_loss_per_sample(
     teacher: torch.Tensor,
     loss_type: str = "cosine",
 ) -> torch.Tensor:
+    student = student.float()
+    teacher = teacher.float()
     cosine = 1.0 - F.cosine_similarity(student, teacher, dim=-1)
     if loss_type == "cosine":
         return cosine
@@ -48,6 +50,8 @@ def relation_distillation_loss(
     teacher: torch.Tensor,
     sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    student = student.float()
+    teacher = teacher.float()
     student_norm = F.normalize(student, dim=-1)
     teacher_norm = F.normalize(teacher, dim=-1)
     student_rel = student_norm @ student_norm.transpose(0, 1)
@@ -81,12 +85,13 @@ def primary_prototype_kl_loss(
     temperature: float = 1.0,
 ) -> torch.Tensor:
     primary = prototypes.primary_prototypes
-    student_logits = normalized_prototype_logits(student, primary) / temperature
-    teacher_logits = normalized_prototype_logits(teacher, primary) / temperature
+    student_logits = bounded_logits(normalized_prototype_logits(student, primary) / temperature)
+    teacher_logits = bounded_logits(normalized_prototype_logits(teacher, primary) / temperature)
+    teacher_target = clamp_probability(F.softmax(teacher_logits, dim=-1), normalize=True)
     return (
         F.kl_div(
             F.log_softmax(student_logits, dim=-1),
-            F.softmax(teacher_logits, dim=-1),
+            teacher_target,
             reduction="batchmean",
         )
         * (temperature**2)
@@ -102,9 +107,11 @@ def attribute_prototype_bce_loss(
     if not prototypes.attribute_indices:
         return student.new_zeros(())
     attributes = prototypes.attribute_prototypes
-    student_logits = normalized_prototype_logits(student, attributes) / temperature
+    student_logits = bounded_logits(normalized_prototype_logits(student, attributes) / temperature)
     with torch.no_grad():
-        teacher_targets = torch.sigmoid(normalized_prototype_logits(teacher, attributes) / temperature)
+        teacher_targets = clamp_probability(
+            torch.sigmoid(bounded_logits(normalized_prototype_logits(teacher, attributes) / temperature))
+        )
     return F.binary_cross_entropy_with_logits(student_logits, teacher_targets) * (temperature**2)
 
 
