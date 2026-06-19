@@ -54,3 +54,14 @@ experiments/07_full_exval_cache/reports/output_morphology_*.png
 experiments/07_full_exval_cache/reports/output_morphology_*_selection.csv
 experiments/07_full_exval_cache/scripts/render_output_morphology_panel.py
 
+# Locally generated experiment summaries, tables, and figures
+experiments/07_full_exval_cache/reports/exval_iac_inference_benchmark*.json
+experiments/09_representation_audit/tables/
+experiments/10_teacher_disagreement_review/reports/figures/
+experiments/10_teacher_disagreement_review/tables/
+experiments/ablation/reports/figures/
+experiments/ablation/tables/
+experiments/reports/
+
+# Manuscript is maintained as a separate local working tree.
+/manuscript/
