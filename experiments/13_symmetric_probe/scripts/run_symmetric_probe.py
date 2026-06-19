@@ -5,9 +5,10 @@ expert-adjudicated asset, so the comparison is method-symmetric (unlike Table 1,
 where the student uses a trained prototype readout and teachers use zero-shot
 nearest-centroid). Protocols:
 
-  * Linear probe  : stratified k-fold CV, logistic regression on standardized
-                    features (L1: multinomial; L2: per-attribute one-vs-rest).
-  * kNN           : leave-one-out cosine kNN (k=10) for L1.
+  * Linear probe  : slide-grouped stratified k-fold CV, logistic regression on
+                    standardized features (L1: multinomial; L2: per-attribute
+                    one-vs-rest).
+  * kNN           : cosine kNN (k=10) excluding all same-slide tiles for L1.
   * Neighborhood  : reuse training _neighborhood_purity (L1 + L2 Jaccard).
 
 Reported per queue: Random500, Top500, All. The probe is fit by CV ON the 1000
@@ -25,7 +26,7 @@ import numpy as np
 import probe_data as P
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, balanced_accuracy_score, f1_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler
 
 MODELS = ["z_hcc", *P.TEACHERS]
@@ -45,11 +46,11 @@ def _masks(labels: dict) -> dict[str, np.ndarray]:
     return {"All": np.ones(n, bool), "Random500": labels["random500"], "Top500": labels["top500"]}
 
 
-def linear_probe_l1(feats: np.ndarray, y: np.ndarray, masks: dict) -> dict:
-    """Stratified k-fold CV LR; collect out-of-fold predictions, score per queue."""
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+def linear_probe_l1(feats: np.ndarray, y: np.ndarray, groups: np.ndarray, masks: dict) -> dict:
+    """Slide-grouped stratified CV LR; score out-of-fold predictions per queue."""
+    skf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     oof = np.full(len(y), -1, dtype=np.int64)
-    for tr, te in skf.split(feats, y):
+    for tr, te in skf.split(feats, y, groups):
         scaler = StandardScaler().fit(feats[tr])
         clf = LogisticRegression(max_iter=2000, C=1.0, class_weight="balanced")
         clf.fit(scaler.transform(feats[tr]), y[tr])
@@ -64,17 +65,19 @@ def linear_probe_l1(feats: np.ndarray, y: np.ndarray, masks: dict) -> dict:
     return out
 
 
-def linear_probe_l2(feats: np.ndarray, Y: np.ndarray, masks: dict) -> dict:
+def linear_probe_l2(feats: np.ndarray, Y: np.ndarray, groups: np.ndarray, masks: dict) -> dict:
     """Per-attribute one-vs-rest LR via CV; out-of-fold probabilities -> macro AP/AUC."""
     n, k = Y.shape
     oof_prob = np.zeros((n, k), dtype=np.float64)
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    skf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     for j in range(k):
         yj = Y[:, j]
-        if yj.sum() < N_FOLDS or (1 - yj).sum() < N_FOLDS:
+        positive_groups = len(np.unique(groups[yj == 1]))
+        negative_groups = len(np.unique(groups[yj == 0]))
+        if positive_groups < N_FOLDS or negative_groups < N_FOLDS:
             oof_prob[:, j] = yj.mean()  # too few positives to CV; constant prior
             continue
-        for tr, te in skf.split(feats, yj):
+        for tr, te in skf.split(feats, yj, groups):
             scaler = StandardScaler().fit(feats[tr])
             clf = LogisticRegression(max_iter=2000, C=1.0, class_weight="balanced")
             clf.fit(scaler.transform(feats[tr]), yj[tr])
@@ -96,11 +99,11 @@ def linear_probe_l2(feats: np.ndarray, Y: np.ndarray, masks: dict) -> dict:
     return out
 
 
-def knn_l1(feats: np.ndarray, y: np.ndarray, masks: dict, k: int = KNN_K) -> dict:
-    """Leave-one-out cosine kNN majority vote for L1."""
+def knn_l1(feats: np.ndarray, y: np.ndarray, groups: np.ndarray, masks: dict, k: int = KNN_K) -> dict:
+    """Cosine kNN majority vote after excluding every same-slide tile."""
     f = _l2norm(feats.astype(np.float64))
     sim = f @ f.T
-    np.fill_diagonal(sim, -np.inf)
+    sim[groups[:, None] == groups[None, :]] = -np.inf
     nn = np.argsort(-sim, axis=1)[:, :k]
     pred = np.array([np.bincount(y[nn[i]], minlength=int(y.max()) + 1).argmax() for i in range(len(y))])
     return {q: {"accuracy": round(float((pred[m] == y[m]).mean()), 4)} for q, m in masks.items()}
@@ -127,15 +130,18 @@ def main() -> None:
     feats = P.load_or_cache_features(rows, CACHE)
     masks = _masks(labels)
     y, Y = labels["l1"], labels["l2"]
+    groups = np.asarray([row["slide_id"] for row in rows])
 
-    report = {"protocol": {"folds": N_FOLDS, "knn_k": KNN_K, "seed": SEED, "n_tiles": len(rows)}, "models": {}}
+    report = {"protocol": {"folds": N_FOLDS, "knn_k": KNN_K, "seed": SEED,
+                           "n_tiles": len(rows), "cv_group": "slide_id",
+                           "knn_exclusion": "same_slide"}, "models": {}}
     for name in MODELS:
         f = feats[name]
         report["models"][name] = {
             "feature_dim": int(f.shape[1]),
-            "linear_probe_l1": linear_probe_l1(f, y, masks),
-            "knn_l1": knn_l1(f, y, masks),
-            "linear_probe_l2": linear_probe_l2(f, Y, masks),
+            "linear_probe_l1": linear_probe_l1(f, y, groups, masks),
+            "knn_l1": knn_l1(f, y, groups, masks),
+            "linear_probe_l2": linear_probe_l2(f, Y, groups, masks),
             "neighborhood_purity": neighborhood_purity(f, y, Y, masks),
         }
         print(f"done: {name}")

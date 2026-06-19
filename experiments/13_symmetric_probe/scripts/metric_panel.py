@@ -1,4 +1,4 @@
-"""Full metric panel for the symmetric probe: accuracy, balanced accuracy,
+"""Slide-grouped metric panel for the symmetric probe: accuracy, balanced accuracy,
 macro-F1, and macro one-vs-rest AUC for L1, per model per queue, with paired
 bootstrap CIs (z_HCC vs best teacher) on EACH metric.
 
@@ -15,7 +15,7 @@ import numpy as np
 import probe_data as P
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler
 
 MODELS = ["z_hcc", *P.TEACHERS]
@@ -24,13 +24,13 @@ CACHE = RESULTS / "cache"
 N_FOLDS, SEED, N_BOOT = 5, 13, 2000
 
 
-def oof_predict(feats, y):
+def oof_predict(feats, y, groups):
     """Return out-of-fold hard preds and class-probability matrix."""
-    skf = StratifiedKFold(N_FOLDS, shuffle=True, random_state=SEED)
+    skf = StratifiedGroupKFold(N_FOLDS, shuffle=True, random_state=SEED)
     classes = np.unique(y)
     proba = np.zeros((len(y), len(classes)))
     pred = np.full(len(y), -1)
-    for tr, te in skf.split(feats, y):
+    for tr, te in skf.split(feats, y, groups):
         sc = StandardScaler().fit(feats[tr])
         clf = LogisticRegression(max_iter=2000, class_weight="balanced").fit(sc.transform(feats[tr]), y[tr])
         proba[te] = clf.predict_proba(sc.transform(feats[te]))
@@ -74,7 +74,10 @@ def paired_ci(metric_fn, y, predA, prA, predB, prB, classes, mask, rng):
     return round(float(md), 4), [round(float(lo), 4), round(float(hi), 4)], bool(lo > 0)
 
 
-def _bacc(y, p, pr, c): return balanced_accuracy_score(y, p)
+def _bacc(y, p, pr, c):
+    """Mean recall over classes present in a bootstrap resample, without warnings."""
+    present = np.unique(y)
+    return float(np.mean([(p[y == cls] == cls).mean() for cls in present]))
 def _mf1(y, p, pr, c): return f1_score(y, p, average="macro")
 def _auc(y, p, pr, c):
     aucs = []
@@ -89,10 +92,11 @@ def main():
     rows = P.load_review_rows()
     lab = P.build_labels(rows)
     y = lab["l1"]
+    groups = np.asarray([row["slide_id"] for row in rows])
     feats = P.load_or_cache_features(rows, CACHE)
     masks = {"Random500": lab["random500"], "Top500": lab["top500"], "All": np.ones(len(y), bool)}
 
-    oof = {m: oof_predict(feats[m], y) for m in MODELS}
+    oof = {m: oof_predict(feats[m], y, groups) for m in MODELS}
     panel = {q: {} for q in masks}
     for q, mk in masks.items():
         for m in MODELS:

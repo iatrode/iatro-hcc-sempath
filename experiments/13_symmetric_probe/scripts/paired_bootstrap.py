@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import probe_data as P
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler
 
 MODELS = ["z_hcc", *P.TEACHERS]
@@ -22,20 +22,20 @@ SEED = 13
 N_BOOT = 2000
 
 
-def _oof_lr(feats, y):
-    skf = StratifiedKFold(5, shuffle=True, random_state=SEED)
+def _oof_lr(feats, y, groups):
+    skf = StratifiedGroupKFold(5, shuffle=True, random_state=SEED)
     oof = np.full(len(y), -1)
-    for tr, te in skf.split(feats, y):
+    for tr, te in skf.split(feats, y, groups):
         sc = StandardScaler().fit(feats[tr])
         clf = LogisticRegression(max_iter=2000, class_weight="balanced").fit(sc.transform(feats[tr]), y[tr])
         oof[te] = clf.predict(sc.transform(feats[te]))
     return oof
 
 
-def _oof_knn(feats, y, k=10):
+def _oof_knn(feats, y, groups, k=10):
     fn = feats / np.clip(np.linalg.norm(feats, axis=1, keepdims=True), 1e-12, None)
     sim = fn @ fn.T
-    np.fill_diagonal(sim, -np.inf)
+    sim[groups[:, None] == groups[None, :]] = -np.inf
     nn = np.argsort(-sim, axis=1)[:, :k]
     return np.array([np.bincount(y[nn[i]], minlength=int(y.max()) + 1).argmax() for i in range(len(y))])
 
@@ -50,13 +50,14 @@ def main():
     rows = P.load_review_rows()
     lab = P.build_labels(rows)
     y = lab["l1"]
+    groups = np.asarray([row["slide_id"] for row in rows])
     feats = P.load_or_cache_features(rows, RESULTS / "cache")
     masks = {"Random500": lab["random500"], "Top500": lab["top500"], "All": np.ones(len(y), bool)}
     rng = np.random.default_rng(SEED)
 
     pred = {
-        "LR": {m: _oof_lr(feats[m], y) for m in MODELS},
-        "kNN": {m: _oof_knn(feats[m], y) for m in MODELS},
+        "LR": {m: _oof_lr(feats[m], y, groups) for m in MODELS},
+        "kNN": {m: _oof_knn(feats[m], y, groups) for m in MODELS},
     }
     report = {}
     for proto in ("LR", "kNN"):
