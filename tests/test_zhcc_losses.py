@@ -160,3 +160,39 @@ def test_zhcc_losses_remain_float32_with_half_precision_inputs() -> None:
     assert loss.dtype == torch.float32
     assert torch.isfinite(loss)
     assert student.grad is not None
+
+
+def test_zhcc_response_distillation_supports_asymmetric_level2_weights() -> None:
+    registry = PrototypeRegistry(
+        prototypes=torch.eye(4)[:3],
+        names=["primary_tumor", "primary_non_tumor", "necrosis"],
+        groups=["primary", "primary", "attribute"],
+        levels=[1, 1, 2],
+        exclusive=[True, True, False],
+    )
+    student = torch.tensor([[0.0, 0.0, 5.0, 0.0]], requires_grad=True)
+    target_primary = torch.tensor([[0.5, 0.5]])
+    target_attributes = torch.tensor([[0.01]])
+
+    weak_negative, _ = zhcc_response_distillation_loss(
+        embedding_norm=student,
+        prototypes=registry,
+        target_primary=target_primary,
+        target_attributes=target_attributes,
+        attribute_gate=torch.ones((1, 1)),
+        attribute_negative_weight=torch.zeros((1, 1)),
+        primary_temperature=0.1,
+        attribute_temperature=0.1,
+    )
+    strong_negative, _ = zhcc_response_distillation_loss(
+        embedding_norm=student,
+        prototypes=registry,
+        target_primary=target_primary,
+        target_attributes=target_attributes,
+        attribute_gate=torch.ones((1, 1)),
+        attribute_negative_weight=torch.ones((1, 1)),
+        primary_temperature=0.1,
+        attribute_temperature=0.1,
+    )
+
+    assert strong_negative > weak_negative

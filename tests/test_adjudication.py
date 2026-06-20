@@ -4,7 +4,10 @@ import pytest
 import torch
 
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
-from hcc_sempath.training.adjudication import prototype_adjudicated_teacher_weights
+from hcc_sempath.training.adjudication import (
+    attribute_adjudicated_level2_target,
+    prototype_adjudicated_teacher_weights,
+)
 
 
 def _registry(prototypes: torch.Tensor, names: list[str] | None = None) -> PrototypeRegistry:
@@ -116,3 +119,87 @@ def test_prototype_label_weight_only_changes_labeled_tiles() -> None:
 
     assert with_prototype_label["teacher"][0] < no_prototype_label["teacher"][0]
     assert abs(with_prototype_label["teacher"][1].item() - no_prototype_label["teacher"][1].item()) < 1e-6
+
+
+def _attribute_registry() -> PrototypeRegistry:
+    return PrototypeRegistry(
+        prototypes=torch.eye(4),
+        names=["primary_tumor", "primary_non_tumor", "necrosis", "bile"],
+        groups=["primary", "primary", "attribute", "attribute"],
+        levels=[1, 1, 2, 2],
+        exclusive=[True, True, False, False],
+    )
+
+
+def test_attribute_level2_adjudication_is_attribute_specific() -> None:
+    registry = _attribute_registry()
+    teachers = {
+        "mixed": torch.tensor([[5.0, 0.0, 5.0, 0.0]]),
+        "reference": torch.tensor([[5.0, 0.0, 5.0, 5.0]]),
+    }
+
+    target = attribute_adjudicated_level2_target(
+        teacher_by_name=teachers,
+        prototypes_by_teacher={"mixed": registry, "reference": registry},
+        target_registry=registry,
+        teacher_attribute_prior={"mixed": {"necrosis": 1.0, "bile": 0.05}, "reference": {"necrosis": 1.0, "bile": 1.0}},
+        prototype_mask=torch.tensor([True]),
+        prototype_level2=torch.tensor([[1.0, 1.0]]),
+        attribute_temperature=0.1,
+    )
+
+    assert target.target.shape == (1, 2)
+    assert target.reliability_by_teacher["mixed"][0, 0] > target.reliability_by_teacher["mixed"][0, 1]
+    assert target.target[0, 0] > 0.90
+    assert target.target[0, 1] > 0.80
+    assert "l2_attr_reliability_mean/mixed" in target.diagnostics
+
+
+def test_attribute_level2_uncertainty_gate_penalizes_agreed_ambiguous_more_than_conflict() -> None:
+    registry = _attribute_registry()
+    ambiguous = {
+        "a": torch.tensor([[5.0, 0.0, 0.0, 0.0]]),
+        "b": torch.tensor([[5.0, 0.0, 0.0, 0.0]]),
+    }
+    conflicting = {
+        "a": torch.tensor([[5.0, 0.0, 5.0, 0.0]]),
+        "b": torch.tensor([[5.0, 0.0, -5.0, 0.0]]),
+    }
+
+    ambiguous_target = attribute_adjudicated_level2_target(
+        teacher_by_name=ambiguous,
+        prototypes_by_teacher={"a": registry, "b": registry},
+        target_registry=registry,
+        prototype_mask=torch.tensor([False]),
+        prototype_level2=torch.tensor([[0.0, 0.0]]),
+        attribute_temperature=0.1,
+        uncertainty_eta=0.5,
+    )
+    conflicting_target = attribute_adjudicated_level2_target(
+        teacher_by_name=conflicting,
+        prototypes_by_teacher={"a": registry, "b": registry},
+        target_registry=registry,
+        prototype_mask=torch.tensor([False]),
+        prototype_level2=torch.tensor([[0.0, 0.0]]),
+        attribute_temperature=0.1,
+        uncertainty_eta=0.5,
+    )
+
+    assert ambiguous_target.gate[0, 0] < conflicting_target.gate[0, 0]
+
+
+def test_attribute_level2_anchor_sets_gate_and_complete_negative_weight() -> None:
+    registry = _attribute_registry()
+    teachers = {"teacher": torch.tensor([[5.0, 0.0, 0.0, 0.0]])}
+
+    target = attribute_adjudicated_level2_target(
+        teacher_by_name=teachers,
+        prototypes_by_teacher={"teacher": registry},
+        target_registry=registry,
+        prototype_mask=torch.tensor([True]),
+        prototype_level2=torch.tensor([[0.0, 1.0]]),
+        attribute_temperature=0.1,
+    )
+
+    assert target.gate.flatten().tolist() == pytest.approx([1.0, 1.0])
+    assert target.negative_weight[0, 0].item() == pytest.approx(1.0)

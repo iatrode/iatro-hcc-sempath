@@ -27,8 +27,9 @@ from hcc_sempath.training.feature_pack_shuffle import maybe_prepare_shuffled_iac
 from hcc_sempath.training.manifest import build_training_manifest
 from hcc_sempath.training.manifest import validate_manifest_artifacts
 from hcc_sempath.training.engine import _prepare_images
-from hcc_sempath.training.train import _PackageShuffleBatchLoader
+from hcc_sempath.training.train import BatchSlot, _PackageShuffleBatchLoader, _alloc_batch_buffer
 from hcc_sempath.training.prototype_labels import PrototypeLabel
+from hcc_sempath.training.roi import RoiTileTarget
 
 
 def _write_package(root: Path, slide_id: str, value: int, count: int = 1) -> tuple[Path, Path]:
@@ -150,6 +151,65 @@ def test_dataset_adds_dynamic_prototype_supervision_fields(tmp_path: Path) -> No
     assert batch["prototype_mask"].tolist() == [True, False]
     assert batch["prototype_level1"].tolist() == [1, -1]
     assert batch["prototype_level2"].shape == (2, 2)
+
+
+def test_dataset_collates_roi_targets_and_preserves_ignore_mask(tmp_path: Path) -> None:
+    tile_a, feature_a = _write_package(tmp_path, "slide_a", 10, count=2)
+    records = read_packaged_tile_records([tile_a])
+    target = torch.zeros((2, 2, 2), dtype=torch.float32)
+    valid = torch.zeros((2, 2, 2), dtype=torch.bool)
+    target[0, 0, 0] = 1
+    valid[0, 0, 0] = True
+    dataset = DistillationTileDataset(
+        records,
+        teacher_cache_dir=None,
+        image_size=(32, 32),
+        teacher_cache_package_paths={"toy": [feature_a]},
+        roi_targets={
+            "slide_a_0000000": RoiTileTarget(
+                target=target,
+                valid=valid,
+                consistency=torch.tensor([True, False]),
+            )
+        },
+        roi_attribute_count=2,
+        roi_grid_size=(2, 2),
+    )
+    batch = collate_distillation([dataset[0], dataset[1]])
+
+    assert batch["roi_target"].shape == (2, 2, 2, 2)
+    assert batch["roi_valid"][0].sum().item() == 1
+    assert batch["roi_valid"][1].sum().item() == 0
+
+
+def test_package_scatter_loader_copies_roi_tensors(tmp_path: Path) -> None:
+    tile_path, feature_path = _write_package(tmp_path, "slide_a", 10, count=2)
+    target = torch.zeros((1, 2, 2), dtype=torch.float32)
+    valid = torch.zeros((1, 2, 2), dtype=torch.bool)
+    target[0, 1, 1] = 1
+    valid[0, 1, 1] = True
+    dataset = PackageSampledDistillationDataset(
+        [tile_path],
+        {"toy": [feature_path]},
+        image_size=(32, 32),
+        expected_dims={"toy": 4},
+        roi_targets={
+            "slide_a_0000000": RoiTileTarget(target, valid, torch.tensor([True]))
+        },
+        roi_attribute_count=1,
+        roi_grid_size=(2, 2),
+    )
+    buffer = _alloc_batch_buffer(2, dataset.batch_buffer_spec(), pin=False)
+    dataset.scatter_package_rows(
+        0,
+        np.asarray([0, 1], dtype=np.int64),
+        [BatchSlot(0, 0), BatchSlot(0, 1)],
+        [buffer],
+    )
+
+    assert buffer.roi_target[0, 0, 1, 1].item() == 1
+    assert buffer.roi_valid[0].sum().item() == 1
+    assert buffer.roi_valid[1].sum().item() == 0
 
 
 def test_build_training_manifest_splits_public_heldout_by_count(tmp_path: Path) -> None:

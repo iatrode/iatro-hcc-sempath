@@ -22,7 +22,18 @@ def _positions_for_names(
     label: str,
     device: torch.device,
 ) -> torch.Tensor:
-    key = (id(registry), tuple(source_indices), tuple(target_names), device)
+    # Do not key only by id(registry): Python may recycle object ids across
+    # short-lived PrototypeRegistry instances in the same process, which can
+    # silently reuse a stale name-position map when registries use different
+    # prototype ordering.
+    key = (
+        tuple(registry.names),
+        tuple(registry.primary_indices),
+        tuple(registry.attribute_indices),
+        tuple(source_indices),
+        tuple(target_names),
+        device,
+    )
     if key in _POSITIONS_CACHE:
         return _POSITIONS_CACHE[key]
     source_names = _prototype_names(registry, source_indices)
@@ -135,12 +146,78 @@ def teacher_semantic_response_target(
     return primary_target, attribute_target
 
 
+def global_attribute_logits(
+    embedding_norm: torch.Tensor,
+    prototypes: PrototypeRegistry,
+    *,
+    attribute_temperature: float = 0.1,
+) -> torch.Tensor:
+    if attribute_temperature <= 0:
+        raise ValueError(f"attribute_temperature must be positive, got {attribute_temperature}")
+    if not prototypes.attribute_indices:
+        return embedding_norm.new_zeros((embedding_norm.shape[0], 0))
+    return bounded_logits(
+        normalized_prototype_logits(embedding_norm, prototypes.attribute_prototypes)
+        / float(attribute_temperature)
+    )
+
+
+def roi_guided_level2_loss(
+    *,
+    patch_logits: torch.Tensor,
+    local_logits: torch.Tensor,
+    global_logits: torch.Tensor,
+    roi_target: torch.Tensor,
+    roi_valid: torch.Tensor,
+    roi_consistency: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """ROI-token supervision plus one-way local-to-global transfer.
+
+    Unmarked tokens are ignored. The detached local response may reshape the
+    deployable global L2 readout, while global predictions never supervise the
+    spatial map.
+    """
+    if patch_logits.shape != roi_target.shape or patch_logits.shape != roi_valid.shape:
+        raise ValueError(
+            f"ROI tensor shape mismatch: logits={tuple(patch_logits.shape)} "
+            f"target={tuple(roi_target.shape)} valid={tuple(roi_valid.shape)}"
+        )
+    if local_logits.shape != global_logits.shape or local_logits.shape != roi_consistency.shape:
+        raise ValueError(
+            f"ROI consistency shape mismatch: local={tuple(local_logits.shape)} "
+            f"global={tuple(global_logits.shape)} mask={tuple(roi_consistency.shape)}"
+        )
+    target = roi_target.to(device=patch_logits.device, dtype=patch_logits.dtype)
+    valid = roi_valid.to(device=patch_logits.device, dtype=patch_logits.dtype)
+    token_terms = F.binary_cross_entropy_with_logits(patch_logits, target, reduction="none")
+    valid_count = valid.sum()
+    roi_loss = (token_terms * valid).sum() / valid_count.clamp_min(1.0)
+    roi_loss = torch.where(valid_count > 0, roi_loss, patch_logits.sum() * 0.0)
+
+    consistency = roi_consistency.to(device=global_logits.device, dtype=global_logits.dtype)
+    local_target = torch.sigmoid(local_logits.detach())
+    consistency_terms = F.binary_cross_entropy_with_logits(global_logits, local_target, reduction="none")
+    consistency_count = consistency.sum()
+    consistency_loss = (consistency_terms * consistency).sum() / consistency_count.clamp_min(1.0)
+    consistency_loss = torch.where(
+        consistency_count > 0, consistency_loss, global_logits.sum() * 0.0
+    )
+    diagnostics = {
+        "roi_valid_tokens": valid_count.detach(),
+        "roi_supervised_attributes": consistency_count.detach(),
+        "roi_activation_fraction": (torch.sigmoid(patch_logits) >= 0.5).float().mean().detach(),
+    }
+    return roi_loss, consistency_loss, diagnostics
+
+
 def zhcc_response_distillation_loss(
     *,
     embedding_norm: torch.Tensor,
     prototypes: PrototypeRegistry,
     target_primary: torch.Tensor,
     target_attributes: torch.Tensor,
+    attribute_gate: torch.Tensor | None = None,
+    attribute_negative_weight: torch.Tensor | None = None,
     primary_temperature: float = 0.1,
     attribute_temperature: float = 0.1,
     level2_weight: float = 0.5,
@@ -163,18 +240,45 @@ def zhcc_response_distillation_loss(
         * (float(primary_temperature) ** 2)
     )
     if prototypes.attribute_indices:
-        attribute_logits = bounded_logits(
-            normalized_prototype_logits(embedding_norm, prototypes.attribute_prototypes) / float(attribute_temperature)
+        attribute_logits = global_attribute_logits(
+            embedding_norm, prototypes, attribute_temperature=attribute_temperature
         )
         if target_attributes.shape != attribute_logits.shape:
             raise ValueError(
                 f"target_attributes shape mismatch: target={tuple(target_attributes.shape)} "
                 f"logits={tuple(attribute_logits.shape)}"
             )
-        l2 = F.binary_cross_entropy_with_logits(
-            attribute_logits,
-            clamp_probability(target_attributes.to(device=embedding_norm.device)),
-        ) * (float(attribute_temperature) ** 2)
+        target = clamp_probability(target_attributes.to(device=embedding_norm.device))
+        if attribute_gate is None and attribute_negative_weight is None:
+            l2 = F.binary_cross_entropy_with_logits(attribute_logits, target) * (float(attribute_temperature) ** 2)
+        else:
+            gate = (
+                torch.ones_like(attribute_logits)
+                if attribute_gate is None
+                else attribute_gate.to(device=embedding_norm.device, dtype=attribute_logits.dtype)
+            )
+            negative_weight = (
+                torch.ones_like(attribute_logits)
+                if attribute_negative_weight is None
+                else attribute_negative_weight.to(device=embedding_norm.device, dtype=attribute_logits.dtype)
+            )
+            if gate.shape != attribute_logits.shape:
+                raise ValueError(
+                    f"attribute_gate shape mismatch: gate={tuple(gate.shape)} "
+                    f"logits={tuple(attribute_logits.shape)}"
+                )
+            if negative_weight.shape != attribute_logits.shape:
+                raise ValueError(
+                    f"attribute_negative_weight shape mismatch: "
+                    f"negative_weight={tuple(negative_weight.shape)} logits={tuple(attribute_logits.shape)}"
+                )
+            positive_term = -target * F.logsigmoid(attribute_logits)
+            negative_term = -negative_weight.clamp(0.0, 1.0) * (1.0 - target) * F.logsigmoid(-attribute_logits)
+            normalizer = (
+                gate * (target + negative_weight.clamp(0.0, 1.0) * (1.0 - target))
+            ).sum().clamp_min(1e-6)
+            l2 = (gate.clamp(0.0, 1.0) * (positive_term + negative_term)).sum() / normalizer
+            l2 = l2 * (float(attribute_temperature) ** 2)
     else:
         l2 = embedding_norm.new_zeros(())
     total = l1 + float(level2_weight) * l2

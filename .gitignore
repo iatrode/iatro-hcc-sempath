@@ -62,6 +62,3 @@ experiments/10_teacher_disagreement_review/tables/
 experiments/ablation/reports/figures/
 experiments/ablation/tables/
 experiments/reports/
-
-# Manuscript is maintained as a separate local working tree.
-/manuscript/

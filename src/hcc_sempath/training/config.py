@@ -266,6 +266,14 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
     prototype_filter_weight = float(cfg.get("loss", {}).get("prototype_filter_weight", 0.0))
     zhcc_proto_weight = float(cfg.get("loss", {}).get("zhcc_proto_weight", 0.0))
     loss_cfg = cfg.get("loss", {})
+    for key in ("roi_weight", "roi_consistency_weight"):
+        if key in loss_cfg and float(loss_cfg[key]) < 0:
+            raise ValueError(f"loss.{key} must be non-negative")
+    for key in ("roi_top_q", "roi_patch_temperature"):
+        if key in cfg.get("model", {}) and float(cfg["model"][key]) <= 0:
+            raise ValueError(f"model.{key} must be positive")
+    if float(cfg.get("model", {}).get("roi_top_q", 0.1)) > 1:
+        raise ValueError("model.roi_top_q must be <= 1")
     for key in ("zhcc_primary_temperature", "zhcc_attribute_temperature", "primary_temperature", "attribute_temperature"):
         if key in loss_cfg and float(loss_cfg[key]) <= 0:
             raise ValueError(f"loss.{key} must be positive")

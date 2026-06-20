@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from ..modeling.prototypes import PrototypeRegistry
-from .adjudication import prototype_adjudicated_teacher_weights
+from .adjudication import attribute_adjudicated_level2_target, prototype_adjudicated_teacher_weights
 from .losses import multi_teacher_distillation_loss
 from .metrics import evaluate_teacher_outputs
 from .prototype_images import (
@@ -20,7 +20,12 @@ from .prototype_images import (
     collect_student_prototype_image_embeddings,
 )
 from .utils import append_csv, ensure_dir, write_json
-from .zhcc_losses import teacher_semantic_response_target, zhcc_response_distillation_loss
+from .zhcc_losses import (
+    global_attribute_logits,
+    roi_guided_level2_loss,
+    teacher_semantic_response_target,
+    zhcc_response_distillation_loss,
+)
 from .zhcc_metrics import evaluate_zhcc_prototypes
 
 
@@ -50,6 +55,15 @@ def _move_prototype_batch(batch: dict, device: torch.device) -> tuple[torch.Tens
         batch.get("prototype_mask", torch.zeros(len(batch["tile_id"]), dtype=torch.bool)).to(device),
         batch.get("prototype_level1", torch.full((len(batch["tile_id"]),), -1, dtype=torch.long)).to(device),
         batch.get("prototype_level2", torch.zeros((len(batch["tile_id"]), 0), dtype=torch.float32)).to(device),
+    )
+
+
+def _move_roi_batch(batch: dict, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    size = len(batch["tile_id"])
+    return (
+        batch.get("roi_target", torch.zeros((size, 0, 0, 0))).to(device),
+        batch.get("roi_valid", torch.zeros((size, 0, 0, 0), dtype=torch.bool)).to(device),
+        batch.get("roi_consistency", torch.zeros((size, 0), dtype=torch.bool)).to(device),
     )
 
 
@@ -282,7 +296,7 @@ def _write_tensorboard_batch(
     if writer is None:
         return
     writer.add_scalar(f"{phase}_batch/loss", float(loss.detach().cpu()), global_step)
-    for key in ("feature", "relation", "semantic", "zhcc_proto", "zhcc_response"):
+    for key in ("feature", "relation", "semantic", "zhcc_proto", "zhcc_response", "roi", "roi_consistency"):
         if key in parts:
             writer.add_scalar(f"{phase}_batch/{key}", float(parts[key].detach().cpu()), global_step)
     writer.add_scalar("train/lr_step", float(lr), global_step)
@@ -358,6 +372,10 @@ def scheduled_loss_config(
         int(filter_start) if filter_start is not None else None,
         int(loss_cfg.get("filter_ramp_steps", 1000)),
     )
+    roi_start = int(loss_cfg.get("roi_start_step", 0))
+    roi_ramp = int(loss_cfg.get("roi_ramp_steps", 1000))
+    roi_backbone_start = int(loss_cfg.get("roi_backbone_start_step", roi_start + roi_ramp))
+    roi_consistency_start = int(loss_cfg.get("roi_consistency_start_step", roi_backbone_start))
     return {
         "teacher_weights": loss_cfg.get("teacher_weights"),
         "relation_weight": float(loss_cfg["relation_weight"]),
@@ -381,6 +399,18 @@ def scheduled_loss_config(
         "prototype_l1_agreement_weight": float(loss_cfg.get("prototype_l1_agreement_weight", 0.5)),
         "prototype_l2_agreement_weight": float(loss_cfg.get("prototype_l2_agreement_weight", 0.5)),
         "zhcc_response_weight": zhcc_response_weight,
+        "l2_attribute_adjudication": bool(loss_cfg.get("l2_attribute_adjudication", False)),
+        "l2_attribute_uncertainty_eta": float(loss_cfg.get("l2_attribute_uncertainty_eta", 0.5)),
+        "l2_negative_evidence_power": float(loss_cfg.get("l2_negative_evidence_power", 2.0)),
+        "teacher_attribute_prior": loss_cfg.get("teacher_attribute_prior"),
+        "roi_weight": _step_ramp(float(loss_cfg.get("roi_weight", 0.1)), int(global_step), roi_start, roi_ramp),
+        "roi_consistency_weight": _step_ramp(
+            float(loss_cfg.get("roi_consistency_weight", 0.05)),
+            int(global_step),
+            roi_consistency_start,
+            roi_ramp,
+        ),
+        "roi_detach_backbone": int(global_step) < roi_backbone_start,
         "scale_relation_by_alpha": bool(loss_cfg.get("scale_relation_by_alpha", False)),
         "prototype_start_step": prototype_start,
         "filter_start_step": filter_start,
@@ -469,6 +499,8 @@ def run_epoch(
         "zhcc_response": 0.0,
         "zhcc_l1": 0.0,
         "zhcc_l2": 0.0,
+        "roi": 0.0,
+        "roi_consistency": 0.0,
     }
     n_batches = 0
     n_tiles = 0
@@ -529,6 +561,7 @@ def run_epoch(
             interval_tiles += int(images.shape[0])
             teachers = _move_teachers(batch, device)
             prototype_mask, prototype_level1, prototype_level2 = _move_prototype_batch(batch, device)
+            roi_target, roi_valid, roi_consistency = _move_roi_batch(batch, device)
             with torch.set_grad_enabled(train):
                 loss_cfg = scheduled_loss_config(
                     cfg,
@@ -550,11 +583,16 @@ def run_epoch(
                             float(loss_cfg["zhcc_proto_weight"]) > 0
                             or float(loss_cfg["prototype_filter_weight"]) > 0
                             or float(loss_cfg["zhcc_response_weight"]) > 0
+                            or float(loss_cfg["roi_consistency_weight"]) > 0
                         )
                     ),
                 )
                 with torch.autocast(device_type=device.type, enabled=_amp_enabled(device, cfg, train)):
-                    outputs = model(images)
+                    roi_model = getattr(model, "_orig_mod", model)
+                    if int(getattr(roi_model, "roi_l2_num_attributes", 0)) > 0:
+                        outputs = model(images, roi_detach_backbone=bool(loss_cfg["roi_detach_backbone"]))
+                    else:
+                        outputs = model(images)
                     student_by_teacher = outputs["teacher_outputs"]
                     if collect_embeddings and (max_eval_batches is None or n_batches < max_eval_batches):
                         embeddings_data["embeddings"].append(outputs["embedding_norm"].detach().cpu())
@@ -623,11 +661,35 @@ def run_epoch(
                             primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
                             attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
                         )
+                        attribute_gate = None
+                        attribute_negative_weight = None
+                        if bool(loss_cfg["l2_attribute_adjudication"]):
+                            adjudicated_l2 = attribute_adjudicated_level2_target(
+                                teacher_by_name=teachers,
+                                prototypes_by_teacher=prototypes,
+                                target_registry=active_zhcc_prototypes,
+                                teacher_weights=loss_cfg.get("teacher_weights"),
+                                teacher_attribute_prior=loss_cfg.get("teacher_attribute_prior"),
+                                prototype_mask=prototype_mask,
+                                prototype_level2=prototype_level2,
+                                consensus_weight=float(loss_cfg["consensus_weight"]),
+                                prototype_label_weight=float(loss_cfg["prototype_label_weight"]),
+                                uncertainty_eta=float(loss_cfg["l2_attribute_uncertainty_eta"]),
+                                negative_evidence_power=float(loss_cfg["l2_negative_evidence_power"]),
+                                primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
+                                attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
+                            )
+                            target_attributes = adjudicated_l2.target
+                            attribute_gate = adjudicated_l2.gate
+                            attribute_negative_weight = adjudicated_l2.negative_weight
+                            alpha_diag.update(adjudicated_l2.diagnostics)
                         zhcc_loss, zhcc_parts = zhcc_response_distillation_loss(
                             embedding_norm=outputs["embedding_norm"],
                             prototypes=active_zhcc_prototypes,
                             target_primary=target_primary,
                             target_attributes=target_attributes,
+                            attribute_gate=attribute_gate,
+                            attribute_negative_weight=attribute_negative_weight,
                             level2_weight=float(loss_cfg["zhcc_level2_weight"]),
                             primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
                             attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
@@ -640,7 +702,36 @@ def run_epoch(
                             "zhcc_l1": loss.new_zeros(()),
                             "zhcc_l2": loss.new_zeros(()),
                         }
-                    loss = loss + float(loss_cfg["zhcc_proto_weight"]) * zhcc_loss
+                    roi_loss = loss.new_zeros(())
+                    roi_consistency_loss = loss.new_zeros(())
+                    roi_diag = {}
+                    if "roi_patch_logits" in outputs and roi_valid.numel() > 0:
+                        if active_zhcc_prototypes is None:
+                            if float(loss_cfg["roi_consistency_weight"]) > 0:
+                                raise ValueError("ROI local-to-global consistency requires HCC student prototypes")
+                            global_logits = outputs["roi_local_logits"].detach().new_zeros(
+                                outputs["roi_local_logits"].shape
+                            )
+                        else:
+                            global_logits = global_attribute_logits(
+                                outputs["embedding_norm"],
+                                active_zhcc_prototypes,
+                                attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
+                            )
+                        roi_loss, roi_consistency_loss, roi_diag = roi_guided_level2_loss(
+                            patch_logits=outputs["roi_patch_logits"],
+                            local_logits=outputs["roi_local_logits"],
+                            global_logits=global_logits,
+                            roi_target=roi_target,
+                            roi_valid=roi_valid,
+                            roi_consistency=roi_consistency,
+                        )
+                    loss = (
+                        loss
+                        + float(loss_cfg["zhcc_proto_weight"]) * zhcc_loss
+                        + float(loss_cfg["roi_weight"]) * roi_loss
+                        + float(loss_cfg["roi_consistency_weight"]) * roi_consistency_loss
+                    )
                 if train:
                     optimizer.zero_grad(set_to_none=True)
                     if scaler is not None and scaler.is_enabled():
@@ -670,6 +761,11 @@ def run_epoch(
                 totals[key] = totals[key] + parts[key].detach()
             for key in ("zhcc_proto", "zhcc_response", "zhcc_l1", "zhcc_l2"):
                 totals[key] = totals[key] + zhcc_parts[key].detach()
+            totals["roi"] = totals["roi"] + roi_loss.detach()
+            totals["roi_consistency"] = totals["roi_consistency"] + roi_consistency_loss.detach()
+            for key, value in roi_diag.items():
+                totals.setdefault(key, 0.0)
+                totals[key] = totals[key] + value.detach()
             for key, value in alpha_diag.items():
                 totals.setdefault(key, 0.0)
                 totals[key] = totals[key] + value.detach()
@@ -685,7 +781,7 @@ def run_epoch(
                     phase=phase,
                     global_step=global_step,
                     loss=loss,
-                    parts={**parts, **zhcc_parts},
+                    parts={**parts, **zhcc_parts, "roi": roi_loss, "roi_consistency": roi_consistency_loss},
                     lr=float(optimizer.param_groups[0]["lr"]),
                 )
             if progress_bar is not None:
@@ -740,6 +836,8 @@ def run_epoch(
     result["scheduled_zhcc_proto_weight"] = float(last_loss_cfg["zhcc_proto_weight"])
     result["scheduled_prototype_filter_weight"] = float(last_loss_cfg["prototype_filter_weight"])
     result["scheduled_zhcc_response_weight"] = float(last_loss_cfg["zhcc_response_weight"])
+    result["scheduled_roi_weight"] = float(last_loss_cfg["roi_weight"])
+    result["scheduled_roi_consistency_weight"] = float(last_loss_cfg["roi_consistency_weight"])
     result["prototype_start_step"] = float(schedule_state["prototype_start_step"] or -1)
     result["filter_start_step"] = float(schedule_state["filter_start_step"] or -1)
     result["teacher_prior_loss_ema"] = float(schedule_state["teacher_prior_loss_ema"] or 0.0)
@@ -990,6 +1088,8 @@ def fit(
                 "scheduled_prototype_filter_weight": float(loss_cfg["prototype_filter_weight"]),
                 "scheduled_zhcc_proto_weight": float(loss_cfg["zhcc_proto_weight"]),
                 "scheduled_zhcc_response_weight": float(loss_cfg["zhcc_response_weight"]),
+                "scheduled_roi_weight": float(loss_cfg["roi_weight"]),
+                "scheduled_roi_consistency_weight": float(loss_cfg["roi_consistency_weight"]),
                 "prototype_start_step": -1 if loss_cfg["prototype_start_step"] is None else int(loss_cfg["prototype_start_step"]),
                 "filter_start_step": -1 if loss_cfg["filter_start_step"] is None else int(loss_cfg["filter_start_step"]),
                 "teacher_prior_loss_ema": 0.0

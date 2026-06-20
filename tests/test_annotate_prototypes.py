@@ -209,13 +209,30 @@ def test_annotation_state_writes_resume_json_and_csv(tmp_path: Path) -> None:
     try:
         package = data.packages[0]
         record = data.viewer(0).records[0]
-        data.state.save_annotation(package, record, L1_PROTOTYPES[0], [L2_PROTOTYPES[0], L2_PROTOTYPES[3]])
+        data.state.save_annotation(
+            package,
+            record,
+            L1_PROTOTYPES[0],
+            [L2_PROTOTYPES[0], L2_PROTOTYPES[3]],
+            [
+                {
+                    "attribute": L2_PROTOTYPES[0],
+                    "state": "positive",
+                    "geometry": {
+                        "type": "point",
+                        "coordinate_space": "normalized",
+                        "point": [0.5, 0.5],
+                    },
+                }
+            ],
+        )
     finally:
         data.close()
 
     reloaded = AnnotationState(state_path, iac_path)
     assert len(reloaded.annotations) == 1
     assert reloaded.last_iac == "tiles.iac"
+    assert next(iter(reloaded.annotations.values()))["roi"][0]["geometry"]["type"] == "point"
     csv_text = state_path.with_suffix(".csv").read_text(encoding="utf-8")
     assert "HCC-tumor" in csv_text
     assert "hepatocellular-parenchyma-present;bile-pigment-present" in csv_text

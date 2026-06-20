@@ -43,10 +43,12 @@ classification training set.
 每个 tile / teacher 的软可靠性权重。Prototype tiles 定义固定 HCC semantic blueprint，
 不作为 hard-label 图像分类训练集。
 
-The public scientific design is maintained in
-[`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md).
+The active V2 scientific design is maintained in
+[`docs/HCC_SEMPATH_V2_DESIGN.md`](docs/HCC_SEMPATH_V2_DESIGN.md). The former V1 design is retained
+only as [`docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md`](docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md).
 
-公开科学设计以 [`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md) 为准。
+V2 当前设计以 [`docs/HCC_SEMPATH_V2_DESIGN.md`](docs/HCC_SEMPATH_V2_DESIGN.md) 为准。V1 历史设计保留于
+[`docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md`](docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md)，已弃用。
 
 ## Repository Scope
 
@@ -130,14 +132,14 @@ bash scripts/run_contract_smoke.sh
 ## Scientific Prototype Design
 
 The current prototype design is part of the scientific method and is documented
-in [`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md). It uses four
+in [`docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md`](docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md). It uses four
 mutually exclusive Level-1 tissue states and ten non-exclusive Level-2 morphology
 presence attributes. Level-1 and Level-2 are parallel prototype axes rather than
 a parent-child taxonomy; the manuscript-grade primary evaluation is not
 prototype reconstruction.
 
 当前 prototype 设计属于科学方法本身，见
-[`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md)。它包含 4 个互斥 Level-1
+[`docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md`](docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md)。它包含 4 个互斥 Level-1
 tissue states 和 10 个非互斥 Level-2 morphology presence attributes。Level-1 与
 Level-2 是并行 prototype 语义轴，不是父子层级；论文级主评价不是 prototype reconstruction。
 
@@ -183,9 +185,9 @@ teacher-imitation QC plus `z_hcc` prototype-response diagnostics from
 `embedding_norm`, including Level-1 accuracy, Level-2 macro F1/AUC, prototype
 top-k precision, and neighborhood purity. The manuscript-grade primary
 evaluation is the blinded result-level morphology retrieval protocol described
-in `docs/HCC_SEMPATH_DESIGN.md`; it is not dense exval tile annotation and not a
+in `docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md`; it is not dense exval tile annotation and not a
 clinical endpoint benchmark.
 
 ## Documentation
 
-- `docs/HCC_SEMPATH_DESIGN.md`: single public scientific design and evaluation protocol.
+- `docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md`: deprecated V1 scientific design retained for traceability.

@@ -60,6 +60,21 @@ class StudentEncoder(nn.Module):
         features = self.backbone(images)
         return self.projector(features)
 
+    def forward_with_patch_tokens(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+        """Return the unchanged global embedding plus spatial ViT patch tokens."""
+        tokens = self.backbone.forward_features(images)
+        if tokens.ndim != 3:
+            raise ValueError(f"ROI-guided L2 requires token-shaped backbone features, got {tuple(tokens.shape)}")
+        global_features = self.backbone.forward_head(tokens, pre_logits=True)
+        prefix_tokens = int(getattr(self.backbone, "num_prefix_tokens", 1))
+        patch_tokens = tokens[:, prefix_tokens:]
+        grid = tuple(int(value) for value in self.backbone.patch_embed.grid_size)
+        if patch_tokens.shape[1] != grid[0] * grid[1]:
+            raise ValueError(
+                f"patch-token/grid mismatch: tokens={patch_tokens.shape[1]} grid={grid[0]}x{grid[1]}"
+            )
+        return self.projector(global_features), patch_tokens, grid
+
 
 class TeacherProjectionHead(nn.Module):
     """Teacher-specific alignment head used during distillation."""
@@ -106,6 +121,10 @@ class HCCSemPathModel(nn.Module):
         grad_checkpointing: bool = False,
         l1_num_classes: int = 0,
         l2_num_attributes: int = 0,
+        roi_l2_num_attributes: int = 0,
+        roi_patch_dim: int | None = None,
+        roi_top_q: float = 0.1,
+        roi_patch_temperature: float = 0.1,
     ) -> None:
         super().__init__()
         if teacher_dims is None:
@@ -146,6 +165,24 @@ class HCCSemPathModel(nn.Module):
             "l2_temperature",
             torch.full((l2_num_attributes,), 0.1) if l2_num_attributes > 0 else None,
         )
+        self.roi_l2_num_attributes = int(roi_l2_num_attributes)
+        self.roi_top_q = float(roi_top_q)
+        self.roi_patch_temperature = float(roi_patch_temperature)
+        if self.roi_l2_num_attributes > 0:
+            if not 0 < self.roi_top_q <= 1:
+                raise ValueError(f"roi_top_q must be in (0, 1], got {roi_top_q}")
+            if self.roi_patch_temperature <= 0:
+                raise ValueError(f"roi_patch_temperature must be positive, got {roi_patch_temperature}")
+            patch_dim = int(roi_patch_dim or embedding_dim)
+            student_dim = int(self.encoder.backbone.num_features)
+            self.roi_patch_projector = nn.Sequential(nn.LayerNorm(student_dim), nn.Linear(student_dim, patch_dim))
+            # These queries are never trained from global pseudo-labels. ROI token loss is
+            # their semantic anchor, so local maps cannot learn to echo global context alone.
+            self.roi_attribute_queries = nn.Parameter(torch.empty(self.roi_l2_num_attributes, patch_dim))
+            nn.init.trunc_normal_(self.roi_attribute_queries, std=0.02)
+        else:
+            self.roi_patch_projector = None
+            self.register_parameter("roi_attribute_queries", None)
 
     @property
     def teacher_names(self) -> list[str]:
@@ -157,14 +194,37 @@ class HCCSemPathModel(nn.Module):
     def project_teachers(self, embedding: torch.Tensor) -> dict[str, torch.Tensor]:
         return {name: head(embedding) for name, head in self.teacher_heads.items()}
 
-    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
-        embedding = self.encode(images)
+    def forward(
+        self,
+        images: torch.Tensor,
+        *,
+        roi_detach_backbone: bool = False,
+    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+        if self.roi_patch_projector is None:
+            embedding = self.encode(images)
+            patch_tokens = None
+            patch_grid = None
+        else:
+            embedding, patch_tokens, patch_grid = self.encoder.forward_with_patch_tokens(images)
         embedding_norm = F.normalize(embedding, dim=-1)
         outputs: dict[str, torch.Tensor | dict[str, torch.Tensor]] = {
             "embedding": embedding,
             "embedding_norm": embedding_norm,
             "teacher_outputs": self.project_teachers(embedding),
         }
+        if patch_tokens is not None and patch_grid is not None and self.roi_attribute_queries is not None:
+            if roi_detach_backbone:
+                patch_tokens = patch_tokens.detach()
+            patch_embedding = F.normalize(self.roi_patch_projector(patch_tokens), dim=-1)
+            queries = F.normalize(self.roi_attribute_queries, dim=-1)
+            patch_logits = (patch_embedding @ queries.T) / self.roi_patch_temperature
+            patch_logits = bounded_logits(patch_logits)
+            top_count = max(1, int(round(patch_logits.shape[1] * self.roi_top_q)))
+            local_logits = patch_logits.topk(top_count, dim=1).values.mean(dim=1)
+            outputs["roi_patch_logits"] = patch_logits.transpose(1, 2).reshape(
+                patch_logits.shape[0], self.roi_l2_num_attributes, patch_grid[0], patch_grid[1]
+            )
+            outputs["roi_local_logits"] = local_logits
         if self.l1_prototypes is not None and self.l1_temperature is not None:
             l1_logits = (embedding_norm @ self.l1_prototypes.T) / self.l1_temperature
             l1_logits = bounded_logits(l1_logits)

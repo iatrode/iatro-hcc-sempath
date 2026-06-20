@@ -23,6 +23,42 @@ def test_hcc_sempath_model_returns_shared_embedding_and_teacher_outputs() -> Non
     assert outputs["teacher_outputs"]["teacher_b"].shape == (2, 7)
 
 
+def test_roi_enabled_model_exposes_patch_maps_without_changing_encode_contract() -> None:
+    model = HCCSemPathModel(
+        backbone_name="vit_tiny_patch16_224",
+        embedding_dim=11,
+        teacher_dims={},
+        pretrained=False,
+        roi_l2_num_attributes=3,
+        roi_patch_dim=13,
+        roi_top_q=0.1,
+    ).eval()
+    images = torch.randn(2, 3, 224, 224)
+    with torch.no_grad():
+        direct = model.encode(images)
+        outputs = model(images)
+
+    torch.testing.assert_close(outputs["embedding"], direct)
+    assert outputs["roi_patch_logits"].shape == (2, 3, 14, 14)
+    assert outputs["roi_local_logits"].shape == (2, 3)
+
+
+def test_roi_head_warmup_detaches_patch_gradient_from_backbone() -> None:
+    model = HCCSemPathModel(
+        backbone_name="vit_tiny_patch16_224",
+        embedding_dim=11,
+        teacher_dims={},
+        pretrained=False,
+        roi_l2_num_attributes=2,
+        roi_patch_dim=13,
+    )
+    outputs = model(torch.randn(1, 3, 224, 224), roi_detach_backbone=True)
+    outputs["roi_patch_logits"].sum().backward()
+
+    assert any(parameter.grad is not None for parameter in model.roi_patch_projector.parameters())
+    assert all(parameter.grad is None for parameter in model.encoder.backbone.parameters())
+
+
 def test_hcc_sempath_model_uses_same_class_for_release_prototype_outputs() -> None:
     model = HCCSemPathModel(
         backbone_name="vit_tiny_patch16_224",

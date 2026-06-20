@@ -264,12 +264,30 @@ class AnnotationState:
         skipped = len(self.skipped_for_package(package))
         return {"annotated": annotated, "total": package.total, "remaining": max(0, package.total - annotated - skipped), "skipped": skipped}
 
-    def save_annotation(self, package: AnnotationPackage, record: IacRecord, l1: str, l2: list[str]) -> None:
+    def save_annotation(
+        self,
+        package: AnnotationPackage,
+        record: IacRecord,
+        l1: str,
+        l2: list[str],
+        roi: list[dict] | None = None,
+    ) -> None:
         if l1 not in self.l1_prototypes:
             raise ValueError(f"unknown L1 prototype: {l1}")
         unknown_l2 = sorted(set(l2) - set(self.l2_prototypes))
         if unknown_l2:
             raise ValueError(f"unknown L2 prototype(s): {unknown_l2}")
+        roi = list(roi or [])
+        for item in roi:
+            if item.get("attribute") not in self.l2_prototypes:
+                raise ValueError(f"unknown ROI L2 attribute: {item.get('attribute')}")
+            if item.get("state", "positive") not in {"positive", "negative"}:
+                raise ValueError(f"unknown ROI state: {item.get('state')}")
+            geometry = item.get("geometry")
+            if geometry is None and not bool(item.get("review_complete", False)):
+                raise ValueError("ROI item requires geometry or review_complete=true")
+            if geometry is not None and geometry.get("type") not in {"point", "brush", "circle", "polygon"}:
+                raise ValueError(f"unsupported ROI geometry: {geometry.get('type')}")
         payload = {
             "dataset": package.dataset,
             "iac": package.rel_path,
@@ -277,10 +295,12 @@ class AnnotationState:
             "tile_id": record.tile_id,
             "row": record.row,
             "slide": record.slide_label,
+            "split": record.split,
             "x": record.display_x,
             "y": record.display_y,
             "l1": l1,
             "l2": list(l2),
+            "roi": roi,
         }
         key = _annotation_key(package, record)
         self.annotations[key] = payload
@@ -320,7 +340,7 @@ class AnnotationState:
         LOG.info("state_flush json=%s csv=%s annotations=%d", self.state_path, self.csv_path, len(self.annotations))
 
     def _write_csv(self) -> None:
-        base_fields = ["dataset", "iac", "iac_path", "tile_id", "row", "slide", "x", "y", "l1", "l2"]
+        base_fields = ["dataset", "iac", "iac_path", "tile_id", "row", "slide", "split", "x", "y", "l1", "l2"]
         extra_fields = sorted(
             {
                 key
@@ -703,7 +723,7 @@ main{min-width:0;display:grid;grid-template-rows:auto minmax(0,1fr);height:100sv
 .pkg>*{position:relative;z-index:1}.pkg::before{content:"";position:absolute;inset:0 auto 0 0;width:var(--pct,0%);background:#dff3eb;z-index:0}
 .muted{color:var(--muted);font-size:12px}.thumbWrap{min-height:220px;border:1px solid #c7cbd1;background:white;overflow:auto}
 .thumb{display:block;width:auto;height:auto;max-width:none;background:white;cursor:crosshair}.loading{padding:18px;color:#6b7280;font-size:12px}
-.tile{width:224px;height:224px;object-fit:contain;border:1px solid #c7cbd1;background:#fff}.chips{display:grid;grid-template-columns:1fr;gap:6px;margin:8px 0 16px}
+.tileStage{position:relative;width:224px;height:224px;border:1px solid #c7cbd1;background:#fff}.tile{position:absolute;inset:0;width:224px;height:224px;object-fit:contain;background:#fff}.roiCanvas{position:absolute;inset:0;width:224px;height:224px;touch-action:none;cursor:crosshair}.roiTools{display:flex;flex-wrap:wrap;gap:5px;margin:8px 0}.roiTools button{min-height:32px;padding:4px 8px}.roiTools button.selected{background:var(--blue);color:#fff}.chips{display:grid;grid-template-columns:1fr;gap:6px;margin:8px 0 16px}
 .panzoom{touch-action:none;transform-origin:0 0;will-change:transform;cursor:grab}.panzoom.dragging{cursor:grabbing}
 button.chip{position:relative;text-align:left;border:1px solid #c7cbd1;background:#fff;padding:8px;cursor:pointer;overflow:hidden}button.chip::before{content:"";position:absolute;inset:0 auto 0 0;width:var(--pct,0%);background:#eef4ff;z-index:0}button.chip.selected{background:#1a73e8;color:white;border-color:#1a73e8}button.chip.selected::before{background:rgba(255,255,255,.18)}button.chip span{position:relative;z-index:1}.chipRow{display:flex;justify-content:space-between;gap:8px}.chipCount{font-variant-numeric:tabular-nums;color:#374151}button.chip.selected .chipCount{color:white}
 .actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.actions button{padding:8px 10px}.bar{height:8px;background:#e5e7eb;margin:6px 0 10px}.bar>div{height:8px;background:#18865b}
@@ -722,13 +742,14 @@ pre{white-space:pre-wrap;font-size:12px;background:#f1f3f4;padding:8px}
 <body><div id="authGate" class="authGate"><div class="authBox"><h3>Annotation token</h3><input id="authInput" autocomplete="off"><button id="authSubmit" class="primary" type="button">Open</button><div id="authStatus" class="status"></div></div></div>
 <div id="layout" class="layout"><aside><div class="panelHead"><div><div class="panelTitle">IAC packages</div><div id="packageSummary" class="muted"></div></div><button id="hideQueue" class="ghost" type="button">Hide</button></div><div id="packages" class="panelBody"></div></aside>
 <main><div class="topbar"><button id="toggleQueue" type="button">Tiles</button><button id="toggleLabels" type="button">Labels</button><button id="contextBtn" type="button">Context</button><div id="title" class="topbarTitle">Prototype annotation</div></div><section class="workspace"><div class="muted" id="recordMeta"></div>
-<p><img id="tile" class="tile panzoom"></p><h3>Location overview</h3><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom"></div></section></main>
+<p><div class="tileStage"><img id="tile" class="tile"><canvas id="roiCanvas" class="roiCanvas" width="224" height="224"></canvas></div></p><div class="roiTools"><button type="button" data-roi-tool="point">Point</button><button type="button" data-roi-tool="brush">Brush</button><button type="button" data-roi-tool="circle">Circle</button><button type="button" id="roiUndo">Undo</button><button type="button" id="roiClear">Clear</button><label><input id="roiComplete" type="checkbox"> completely reviewed</label></div><div id="roiStatus" class="muted">Select an L2 attribute, then annotate its ROI.</div><h3>Location overview</h3><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom"></div></section></main>
 <section class="right"><div class="panelHead"><div class="panelTitle">Labels</div><button id="hideLabels" class="ghost" type="button">Hide</button></div><div class="panelBody labelBody"><h3>Progress</h3><div id="progress"></div><h3>L1 primary</h3><div id="l1" class="chips"></div>
 <h3>L2 attributes</h3><div id="l2" class="chips"></div></div><div class="labelActions"><div class="actions"><button onclick="save()" class="primary">Save + next</button><button onclick="nextRandom()">Skip / random</button></div><pre id="status"></pre></div></section>
 </div>
 <div id="contextOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>5x5 context</b><div id="contextMeta" class="muted"></div></div><button id="contextClose" type="button">Close</button></div><div class="contextStage"><img id="contextImg" class="panzoom"></div></div>
 <script>
 let packages=[], pkg=0, current=null, l1="", l2=new Set(), l1Counts={}, l2Counts={}, restoredLastIac=false;
+let roi=[],roiTool='point',roiAttribute='',roiDrawing=null,roiCompleteAttrs=new Set();
 const TOKEN_KEYS=['token','auth_token','access_token'];
 let AUTH_TOKEN='';
 function tokenFromUrl(){const params=new URLSearchParams(location.search); for(const key of TOKEN_KEYS){const value=params.get(key); if(value)return value;} return '';}
@@ -742,16 +763,19 @@ async function ensureAuth(){setAuthToken(tokenFromUrl()||localStorage.getItem('h
 async function submitAuth(){setAuthToken(document.getElementById('authInput').value.trim()); try{await api('/api/scan-status'); document.getElementById('authGate').style.display='none'; refreshPackage().catch(e=>document.getElementById('status').textContent=e.message||String(e));}catch(e){document.getElementById('authStatus').textContent='Invalid token.';}}
 function setupPanZoom(el,onClick){let scale=1,tx=0,ty=0,drag=false,sx=0,sy=0,stx=0,sty=0,moved=0; const apply=()=>{el.style.transform=`translate(${tx}px,${ty}px) scale(${scale})`;}; el.addEventListener('wheel',ev=>{ev.preventDefault(); const next=Math.min(12,Math.max(.25,scale*(ev.deltaY<0?1.15:.87))); scale=next; apply();},{passive:false}); el.addEventListener('pointerdown',ev=>{drag=true;moved=0;sx=ev.clientX;sy=ev.clientY;stx=tx;sty=ty;el.classList.add('dragging');el.setPointerCapture(ev.pointerId);}); el.addEventListener('pointermove',ev=>{if(!drag)return; const dx=ev.clientX-sx,dy=ev.clientY-sy; moved=Math.max(moved,Math.abs(dx)+Math.abs(dy)); tx=stx+dx; ty=sty+dy; apply();}); el.addEventListener('pointerup',ev=>{if(!drag)return; drag=false; el.classList.remove('dragging'); if(moved<6&&onClick)onClick(ev);}); el.addEventListener('dblclick',ev=>{ev.preventDefault(); scale=1;tx=0;ty=0;apply();}); el.resetPanZoom=()=>{scale=1;tx=0;ty=0;apply();};}
 function prototypeButton(name, selected, count, maxCount, onClick){const b=document.createElement('button'); const pct=maxCount?Math.round(count/maxCount*100):0; b.className='chip'+(selected?' selected':''); b.style.setProperty('--pct',pct+'%'); b.innerHTML=`<span class=chipRow><span>${name}</span><span class=chipCount>${count}</span></span>`; b.onclick=onClick; return b;}
-function renderLabels(){const a=document.getElementById('l1'); a.innerHTML=''; const l1Max=Math.max(1,...Object.values(l1Counts)); L1.forEach(x=>a.appendChild(prototypeButton(x,l1===x,l1Counts[x]||0,l1Max,()=>{l1=x;renderLabels()}))); const b=document.getElementById('l2'); b.innerHTML=''; const l2Max=Math.max(1,...Object.values(l2Counts)); L2.forEach(x=>b.appendChild(prototypeButton(x,l2.has(x),l2Counts[x]||0,l2Max,()=>{l2.has(x)?l2.delete(x):l2.add(x);renderLabels()})));}
+function renderLabels(){const a=document.getElementById('l1'); a.innerHTML=''; const l1Max=Math.max(1,...Object.values(l1Counts)); L1.forEach(x=>a.appendChild(prototypeButton(x,l1===x,l1Counts[x]||0,l1Max,()=>{l1=x;renderLabels()}))); const b=document.getElementById('l2'); b.innerHTML=''; const l2Max=Math.max(1,...Object.values(l2Counts)); L2.forEach(x=>b.appendChild(prototypeButton(x,l2.has(x),l2Counts[x]||0,l2Max,()=>{roiAttribute=x;l2.add(x);renderLabels();renderRoi()}))); document.getElementById('roiComplete').checked=roiAttribute&&roiCompleteAttrs.has(roiAttribute);document.getElementById('roiStatus').textContent=roiAttribute?`ROI attribute: ${roiAttribute}`:'Select an L2 attribute, then annotate its ROI.';}
+function roiPoint(ev){const r=document.getElementById('roiCanvas').getBoundingClientRect();return{x:(ev.clientX-r.left)/r.width,y:(ev.clientY-r.top)/r.height}}
+function renderRoi(){const c=document.getElementById('roiCanvas'),x=c.getContext('2d');x.clearRect(0,0,c.width,c.height);for(const item of roi){const g=item.geometry;x.strokeStyle=item.attribute===roiAttribute?'#ff1f1f':'#ffb000';x.fillStyle='rgba(255,31,31,.25)';x.lineWidth=3;if(g.type==='point'){x.beginPath();x.arc(g.point[0]*224,g.point[1]*224,5,0,Math.PI*2);x.fill();x.stroke()}else if(g.type==='circle'){x.beginPath();x.arc(g.center[0]*224,g.center[1]*224,g.radius*224,0,Math.PI*2);x.fill();x.stroke()}else if(g.type==='brush'){x.beginPath();g.points.forEach((p,i)=>i?x.lineTo(p[0]*224,p[1]*224):x.moveTo(p[0]*224,p[1]*224));x.stroke()}}}
+function setupRoi(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerdown',ev=>{if(!roiAttribute)return;if(roiTool==='point'){const p=roiPoint(ev);roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'point',coordinate_space:'normalized',point:[p.x,p.y],radius:.035}});renderRoi();return}const p=roiPoint(ev);roiDrawing={start:p,points:[[p.x,p.y]]};c.setPointerCapture(ev.pointerId)});c.addEventListener('pointermove',ev=>{if(!roiDrawing)return;const p=roiPoint(ev);roiDrawing.points.push([p.x,p.y])});c.addEventListener('pointerup',ev=>{if(!roiDrawing)return;const p=roiPoint(ev);if(roiTool==='circle'){const dx=p.x-roiDrawing.start.x,dy=p.y-roiDrawing.start.y;roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'circle',coordinate_space:'normalized',center:[roiDrawing.start.x,roiDrawing.start.y],radius:Math.sqrt(dx*dx+dy*dy)}})}else{roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'brush',coordinate_space:'normalized',points:roiDrawing.points,width:.035}})}roiDrawing=null;renderRoi()})}
 function setThumbnailSrc(){const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); const token=`${Date.now()}-${pkg}`; const row=current?`&row=${current.row}`:''; img.dataset.token=String(token); loading.style.display='block'; loading.textContent='Building overview...'; img.style.display='none'; img.onload=()=>{if(img.dataset.token!==String(token)) return; loading.style.display='none'; img.style.display='block'; if(img.resetPanZoom)img.resetPanZoom();}; img.onerror=()=>{if(img.dataset.token===String(token)) loading.textContent='Overview failed to load.';}; img.src=authed(`/api/thumbnail?package=${pkg}${row}&thumb_token=${encodeURIComponent(token)}&t=${Date.now()}`);}
 async function loadPackages(){packages=await api('/api/packages'); const scan=await api('/api/scan-status'); if(!restoredLastIac&&scan.last_iac){const found=packages.find(p=>p.rel_path===scan.last_iac); if(found)pkg=found.index; restoredLastIac=true;} document.getElementById('packageSummary').textContent=`${packages.length} IAC package${packages.length===1?'':'s'}${scan.done?'':' · scanning...'}`; if(scan.error){document.getElementById('status').textContent=scan.error;} const box=document.getElementById('packages'); box.innerHTML=''; packages.forEach(p=>{const pct=p.total?Math.round(p.annotated/p.total*100):0; const d=document.createElement('div'); d.className='pkg'+(p.index===pkg?' active':''); d.style.setProperty('--pct',pct+'%'); d.innerHTML=`<b>${p.name}</b><div class=muted>${p.dataset||'no dataset'} · ${p.annotated}/${p.total} · ${pct}%</div>`; d.onclick=()=>{pkg=p.index; restoredLastIac=true; if(isMobile())setQueueOpen(false); refreshPackage();}; box.appendChild(d)}); return scan;}
 async function refreshPackage(){const scan=await loadPackages(); if(!packages.length){document.getElementById('recordMeta').textContent=scan.done?'No image-tile IAC packages found.':'Scanning IAC packages...'; setTimeout(refreshPackage,1000); return;} if(pkg>=packages.length) pkg=0; setThumbnailSrc(); await progress(); await nextRandom();}
 async function progress(){const p=await api('/api/progress?package='+pkg); l1Counts=p.l1; l2Counts=p.l2; renderLabels(); const overallPct=p.overall.total?Math.round(p.overall.annotated/p.overall.total*100):0; const pkgPct=p.package.total?Math.round(p.package.annotated/p.package.total*100):0; document.getElementById('progress').innerHTML=`<div><b>${p.overall.annotated}/${p.overall.total}</b> tiles marked (${overallPct}%)</div><div class=bar><div style="width:${overallPct}%"></div></div><div class="muted">Skipped: ${p.overall.skipped} · Remaining: ${p.overall.remaining}</div><div class="muted">Current IAC: ${p.package.annotated}/${p.package.total} (${pkgPct}%) · skipped ${p.package.skipped}</div>`;}
-async function showRecord(rec){current=rec; l1=""; l2=new Set(); renderLabels(); if(!rec){document.getElementById('recordMeta').textContent='All tiles in this IAC are annotated.'; document.getElementById('tile').removeAttribute('src'); return;} document.getElementById('recordMeta').textContent=`${packages[pkg].rel_path} · ${rec.tile_id} · x=${rec.x} y=${rec.y} row=${rec.row}`; const tile=document.getElementById('tile'); tile.onload=()=>{if(tile.resetPanZoom)tile.resetPanZoom();}; tile.src=authed(`/api/tile?package=${pkg}&row=${rec.row}`); setThumbnailSrc();}
+async function showRecord(rec){current=rec; l1=""; l2=new Set();roi=[];roiAttribute='';roiCompleteAttrs=new Set();document.getElementById('roiComplete').checked=false;renderLabels();renderRoi(); if(!rec){document.getElementById('recordMeta').textContent='All tiles in this IAC are annotated.'; document.getElementById('tile').removeAttribute('src'); return;} document.getElementById('recordMeta').textContent=`${packages[pkg].rel_path} · ${rec.tile_id} · x=${rec.x} y=${rec.y} row=${rec.row}`; const tile=document.getElementById('tile'); tile.src=authed(`/api/tile?package=${pkg}&row=${rec.row}`); setThumbnailSrc();}
 async function nextRandom(){const r=await api('/api/random?package='+pkg); await showRecord(r.record);}
-async function save(){if(!current){await nextRandom(); return;} if(!l1){document.getElementById('status').textContent='Select one L1 primary prototype first.'; return;} await api('/api/annotation',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({package:pkg,row:current.row,l1,l2:[...l2]})}); document.getElementById('status').textContent='Saved.'; setThumbnailSrc(); await progress(); await loadPackages(); await nextRandom();}
+async function save(){if(!current){await nextRandom(); return;} if(!l1){document.getElementById('status').textContent='Select one L1 primary prototype first.'; return;}const roiPayload=[...roi,...[...roiCompleteAttrs].map(attribute=>({attribute,state:'negative',review_complete:true}))]; await api('/api/annotation',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({package:pkg,row:current.row,l1,l2:[...l2],roi:roiPayload})}); document.getElementById('status').textContent='Saved.'; setThumbnailSrc(); await progress(); await loadPackages(); await nextRandom();}
 async function openContext(){if(!current){document.getElementById('status').textContent='No tile selected.'; return;} const overlay=document.getElementById('contextOverlay'); const img=document.getElementById('contextImg'); document.getElementById('contextMeta').textContent=`${packages[pkg].rel_path} · ${current.tile_id}`; overlay.classList.remove('hidden'); img.onload=()=>{if(img.resetPanZoom)img.resetPanZoom();}; img.src=authed(`/api/context?package=${pkg}&row=${current.row}&t=${Date.now()}`);}
-setupPanZoom(document.getElementById('tile'));
+setupRoi();document.querySelectorAll('[data-roi-tool]').forEach(b=>b.addEventListener('click',()=>{roiTool=b.dataset.roiTool;document.querySelectorAll('[data-roi-tool]').forEach(x=>x.classList.toggle('selected',x===b))}));document.getElementById('roiUndo').onclick=()=>{roi.pop();renderRoi()};document.getElementById('roiClear').onclick=()=>{roi=roi.filter(x=>x.attribute!==roiAttribute);renderRoi()};document.getElementById('roiComplete').onchange=ev=>{if(!roiAttribute){ev.target.checked=false;return}ev.target.checked?roiCompleteAttrs.add(roiAttribute):roiCompleteAttrs.delete(roiAttribute)};document.querySelector('[data-roi-tool="point"]').classList.add('selected');
 setupPanZoom(document.getElementById('contextImg'));
 setupPanZoom(document.getElementById('thumb'),async ev=>{const img=ev.target, r=img.getBoundingClientRect(); const x=(ev.clientX-r.left)/r.width, y=(ev.clientY-r.top)/r.height; const rec=await api(`/api/nearest?package=${pkg}&rx=${x}&ry=${y}`); await showRecord(rec.record);});
 document.getElementById('toggleQueue').addEventListener('click',()=>setQueueOpen(document.getElementById('layout').classList.contains('queue-collapsed')));
@@ -873,7 +897,13 @@ def make_handler(data: AnnotationData, auth_token: str):
                 record = viewer._by_row[row]
                 package = data.package(index)
                 LOG.info("annotation_request iac=%s row=%d l1=%s l2=%s", package.rel_path, row, payload.get("l1"), payload.get("l2", []))
-                data.state.save_annotation(package, record, str(payload["l1"]), list(payload.get("l2", [])))
+                data.state.save_annotation(
+                    package,
+                    record,
+                    str(payload["l1"]),
+                    list(payload.get("l2", [])),
+                    list(payload.get("roi", [])),
+                )
                 _json_response(self, {"ok": True})
             except Exception as exc:
                 LOG.exception("api_post_failed path=%s", parsed.path)

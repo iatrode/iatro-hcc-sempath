@@ -25,6 +25,7 @@ from .feature_pack_merge import (
     MergedTeacherFeatureCacheReader,
 )
 from .prototype_labels import PrototypeLabel
+from .roi import RoiTileTarget, roi_payload
 
 
 @dataclass(frozen=True)
@@ -384,6 +385,9 @@ class DistillationTileDataset(Dataset):
             | None
         ) = None,
         prototype_labels: dict[str, PrototypeLabel] | None = None,
+        roi_targets: dict[str, RoiTileTarget] | None = None,
+        roi_attribute_count: int = 0,
+        roi_grid_size: tuple[int, int] = (0, 0),
     ) -> None:
         self.records = records
         if teacher_cache_dir is not None:
@@ -403,6 +407,9 @@ class DistillationTileDataset(Dataset):
             resize=True,
         )
         self.prototype_labels = prototype_labels or {}
+        self.roi_targets = roi_targets or {}
+        self.roi_attribute_count = int(roi_attribute_count)
+        self.roi_grid_size = tuple(int(value) for value in roi_grid_size)
         self._thread_local = threading.local()
 
     def _packaged_reader(self, package_path: Path) -> TilePackageReader:
@@ -441,6 +448,12 @@ class DistillationTileDataset(Dataset):
             "image": image_tensor,
             "teacher_features": teacher_features,
             **_prototype_payload(record.tile_id, self.prototype_labels),
+            **roi_payload(
+                record.tile_id,
+                self.roi_targets,
+                attribute_count=self.roi_attribute_count,
+                grid_size=self.roi_grid_size,
+            ),
         }
 
     def close(self) -> None:
@@ -486,6 +499,9 @@ class PackageSampledDistillationDataset(Dataset):
         expected_dims: dict[str, int] | None = None,
         prototype_labels: dict[str, PrototypeLabel] | None = None,
         tensor_collate: bool = False,
+        roi_targets: dict[str, RoiTileTarget] | None = None,
+        roi_attribute_count: int = 0,
+        roi_grid_size: tuple[int, int] = (0, 0),
     ) -> None:
         self.tile_paths = [Path(path) for path in image_tile_package_paths]
         self.teacher_package_paths = {
@@ -526,6 +542,9 @@ class PackageSampledDistillationDataset(Dataset):
             resize=False,
         )
         self.prototype_labels = prototype_labels or {}
+        self.roi_targets = roi_targets or {}
+        self.roi_attribute_count = int(roi_attribute_count)
+        self.roi_grid_size = tuple(int(value) for value in roi_grid_size)
         self.tensor_collate = bool(tensor_collate)
         self.mean_tensor = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1) if mean is not None else None
         self.std_tensor = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1) if std is not None else None
@@ -768,6 +787,7 @@ class PackageSampledDistillationDataset(Dataset):
             "image_hw": self._image_hw,
             "teacher_dims": teacher_dims,
             "level2_dim": self._level2_dim,
+            "roi_shape": (self.roi_attribute_count, *self.roi_grid_size),
         }
 
     def scatter_package_rows(
@@ -827,6 +847,12 @@ class PackageSampledDistillationDataset(Dataset):
                 feat_stage[name][i] = np.asarray(feat, dtype=np.float32)
             with _probe.section("proto"):
                 proto = _prototype_payload(tile_id, self.prototype_labels)
+                roi = roi_payload(
+                    tile_id,
+                    self.roi_targets,
+                    attribute_count=self.roi_attribute_count,
+                    grid_size=self.roi_grid_size,
+                )
                 tid_stage[i] = tile_id
                 mask_stage[i] = bool(proto["prototype_mask"])
                 l1_stage[i] = int(proto["prototype_level1"])
@@ -834,6 +860,10 @@ class PackageSampledDistillationDataset(Dataset):
                     level2 = proto["prototype_level2"]
                     if level2.numel() == l2_dim:
                         l2_stage[i] = level2.numpy()
+                if buf.roi_target.numel() > 0:
+                    buf.roi_target[int(pos_stage[i])].copy_(roi["roi_target"])
+                    buf.roi_valid[int(pos_stage[i])].copy_(roi["roi_valid"])
+                    buf.roi_consistency[int(pos_stage[i])].copy_(roi["roi_consistency"])
 
         # Single batched, GIL-held flush per tensor (was 8*n per-tile ops).
         with _probe.section("copy_flush"):
@@ -902,6 +932,12 @@ class PackageSampledDistillationDataset(Dataset):
             "image": image,
             "teacher_features": teacher_features,
             **_prototype_payload(tile_id, self.prototype_labels),
+            **roi_payload(
+                tile_id,
+                self.roi_targets,
+                attribute_count=self.roi_attribute_count,
+                grid_size=self.roi_grid_size,
+            ),
         }
 
     def __getitems__(self, indices: list[int]) -> list[dict]:
@@ -925,6 +961,12 @@ class PackageSampledDistillationDataset(Dataset):
                     "image": image,
                     "teacher_features": _read_teacher_features_at(feature_sources, teacher_paths, row),
                     **_prototype_payload(tile_id, self.prototype_labels),
+                    **roi_payload(
+                        tile_id,
+                        self.roi_targets,
+                        attribute_count=self.roi_attribute_count,
+                        grid_size=self.roi_grid_size,
+                    ),
                 }
         return [item for item in results if item is not None]
 
@@ -947,6 +989,9 @@ class PackageSampledDistillationDataset(Dataset):
             "prototype_mask": torch.tensor([bool(item["prototype_mask"]) for item in batch], dtype=torch.bool),
             "prototype_level1": torch.tensor([int(item["prototype_level1"]) for item in batch], dtype=torch.long),
             "prototype_level2": torch.stack([item["prototype_level2"] for item in batch]),
+            "roi_target": torch.stack([item["roi_target"] for item in batch]),
+            "roi_valid": torch.stack([item["roi_valid"] for item in batch]),
+            "roi_consistency": torch.stack([item["roi_consistency"] for item in batch]),
         }
 
     def close(self) -> None:
@@ -1034,4 +1079,7 @@ def collate_distillation(batch: list[dict]) -> dict:
         "prototype_mask": torch.tensor([bool(item.get("prototype_mask", False)) for item in batch], dtype=torch.bool),
         "prototype_level1": torch.tensor([int(item.get("prototype_level1", -1)) for item in batch], dtype=torch.long),
         "prototype_level2": torch.stack([item.get("prototype_level2", torch.zeros(0, dtype=torch.float32)) for item in batch]),
+        "roi_target": torch.stack([item.get("roi_target", torch.zeros((0, 0, 0))) for item in batch]),
+        "roi_valid": torch.stack([item.get("roi_valid", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),
+        "roi_consistency": torch.stack([item.get("roi_consistency", torch.zeros(0, dtype=torch.bool)) for item in batch]),
     }

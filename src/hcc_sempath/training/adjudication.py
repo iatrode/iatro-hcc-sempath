@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from ..modeling.prototypes import PrototypeRegistry
@@ -147,6 +149,214 @@ def _diagnostics(
         f"zhcc_agreement_mean/{name}": zhcc.float().mean().detach(),
         f"rejected_fraction_alpha_lt_0.5/{name}": (effective < 0.5).float().mean().detach(),
     }
+
+
+@dataclass(frozen=True)
+class AttributeAdjudicationTarget:
+    target: torch.Tensor
+    gate: torch.Tensor
+    negative_weight: torch.Tensor
+    reliability_by_teacher: dict[str, torch.Tensor]
+    diagnostics: dict[str, torch.Tensor]
+
+
+def _weighted_teacher_variance(
+    responses: torch.Tensor,
+    weights: torch.Tensor,
+    mean: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    numerator = (weights * (responses - mean.unsqueeze(0)).square()).sum(dim=0)
+    denom = weights.sum(dim=0).clamp_min(eps)
+    variance = numerator / denom
+    bernoulli_ceiling = (mean * (1.0 - mean)).clamp_min(eps)
+    return (variance / bernoulli_ceiling).clamp(0.0, 1.0)
+
+
+def _normalized_binary_entropy(probability: torch.Tensor, *, eps: float) -> torch.Tensor:
+    p = probability.clamp(eps, 1.0 - eps)
+    return (-(p * torch.log(p) + (1.0 - p) * torch.log(1.0 - p)) / torch.log(p.new_tensor(2.0))).clamp(0.0, 1.0)
+
+
+def _prior_tensor_for_teacher(
+    *,
+    name: str,
+    attribute_names: list[str],
+    payload: dict[str, torch.Tensor | list[float] | tuple[float, ...] | dict[str, float]] | None,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if payload is None or name not in payload:
+        return torch.ones(len(attribute_names), device=device, dtype=dtype)
+    value = payload[name]
+    if isinstance(value, dict):
+        missing = [attribute for attribute in attribute_names if attribute not in value]
+        if missing:
+            raise ValueError(f"teacher_attribute_prior[{name!r}] missing attributes: {missing}")
+        tensor = torch.tensor([float(value[attribute]) for attribute in attribute_names], device=device, dtype=dtype)
+    else:
+        tensor = torch.as_tensor(value, device=device, dtype=dtype)
+    if tensor.shape != (len(attribute_names),):
+        raise ValueError(
+            f"teacher_attribute_prior[{name!r}] must have shape=({len(attribute_names)},), got {tuple(tensor.shape)}"
+        )
+    return tensor.clamp(0.0, 1.0)
+
+
+@torch.no_grad()
+def attribute_adjudicated_level2_target(
+    *,
+    teacher_by_name: dict[str, torch.Tensor],
+    prototypes_by_teacher: dict[str, PrototypeRegistry],
+    target_registry: PrototypeRegistry,
+    teacher_weights: dict[str, float] | None = None,
+    teacher_attribute_prior: dict[str, torch.Tensor | list[float] | tuple[float, ...] | dict[str, float]] | None = None,
+    prototype_mask: torch.Tensor | None = None,
+    prototype_level2: torch.Tensor | None = None,
+    consensus_weight: float = 1.0,
+    prototype_label_weight: float = 1.0,
+    uncertainty_eta: float = 0.5,
+    negative_evidence_power: float = 2.0,
+    epsilon: float = 1e-6,
+    primary_temperature: float = 0.1,
+    attribute_temperature: float = 0.1,
+) -> AttributeAdjudicationTarget:
+    """Build an independently adjudicated multi-label Level-2 teacher target.
+
+    This path intentionally estimates teacher reliability per attribute. The
+    resulting weights are used only for the Level-2 semantic response target;
+    global tile-level alpha remains the feature/relation distillation contract.
+    """
+    if set(teacher_by_name) != set(prototypes_by_teacher):
+        raise ValueError(
+            f"teacher/prototype names differ: teacher={sorted(teacher_by_name)} "
+            f"prototypes={sorted(prototypes_by_teacher)}"
+        )
+    if not teacher_by_name:
+        raise ValueError("at least one teacher is required for Level-2 adjudication")
+    eta = float(uncertainty_eta)
+    if not 0.0 <= eta <= 1.0:
+        raise ValueError(f"uncertainty_eta must be in [0, 1], got {uncertainty_eta}")
+    neg_power = float(negative_evidence_power)
+    if neg_power <= 0:
+        raise ValueError(f"negative_evidence_power must be positive, got {negative_evidence_power}")
+    eps = float(epsilon)
+    if eps <= 0:
+        raise ValueError(f"epsilon must be positive, got {epsilon}")
+
+    primary_names = _prototype_names(target_registry, target_registry.primary_indices)
+    attribute_names = _prototype_names(target_registry, target_registry.attribute_indices)
+    first_teacher = next(iter(teacher_by_name.values()))
+    batch_size = int(first_teacher.shape[0])
+    device = first_teacher.device
+    if not attribute_names:
+        empty = first_teacher.new_zeros((batch_size, 0))
+        return AttributeAdjudicationTarget(empty, empty, empty, {}, {})
+
+    responses = {
+        name: _teacher_response(
+            features,
+            prototypes_by_teacher[name],
+            primary_names=primary_names,
+            attribute_names=attribute_names,
+            label=name,
+            primary_temperature=primary_temperature,
+            attribute_temperature=attribute_temperature,
+        )[1]
+        for name, features in teacher_by_name.items()
+    }
+    names = sorted(responses)
+    attribute_stack = torch.stack([responses[name] for name in names], dim=0)
+    if teacher_weights is None:
+        base_weights = attribute_stack.new_ones((len(names), 1, 1))
+    else:
+        base_weights = attribute_stack.new_tensor(
+            [float(teacher_weights.get(name, 1.0)) for name in names]
+        ).view(-1, 1, 1)
+    if bool((base_weights <= 0).all()):
+        raise ValueError("at least one teacher must have a positive loss weight")
+
+    if prototype_mask is None:
+        proto_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+    else:
+        proto_mask = prototype_mask.to(device=device, dtype=torch.bool)
+    if proto_mask.shape != (batch_size,):
+        raise ValueError(f"prototype_mask must have shape=({batch_size},), got {tuple(proto_mask.shape)}")
+    if prototype_level2 is None:
+        proto_l2 = first_teacher.new_zeros((batch_size, len(attribute_names)))
+    else:
+        proto_l2 = prototype_level2.to(device=device, dtype=attribute_stack.dtype)
+    if proto_l2.shape != (batch_size, len(attribute_names)):
+        raise ValueError(
+            f"prototype_level2 width mismatch: labels={tuple(proto_l2.shape)} "
+            f"expected=({batch_size}, {len(attribute_names)})"
+        )
+
+    reliability_by_teacher: dict[str, torch.Tensor] = {}
+    diagnostics: dict[str, torch.Tensor] = {}
+    weighted_response_sum = attribute_stack.new_zeros((batch_size, len(attribute_names)))
+    reliability_sum = attribute_stack.new_zeros((batch_size, len(attribute_names)))
+    consensus_w = max(float(consensus_weight), 0.0)
+    prototype_w = max(float(prototype_label_weight), 0.0)
+
+    for idx, name in enumerate(names):
+        attributes = responses[name]
+        if len(names) == 1:
+            consensus = torch.ones_like(attributes)
+        else:
+            mean_other = (attribute_stack.sum(dim=0) - attribute_stack[idx]) / float(len(names) - 1)
+            consensus = (1.0 - (attributes - mean_other).abs()).clamp(0.0, 1.0)
+        proto_agreement = (1.0 - (attributes - proto_l2).abs()).clamp(0.0, 1.0)
+        numerator = consensus_w * consensus
+        denominator = attributes.new_full(attributes.shape, consensus_w)
+        if prototype_w > 0:
+            numerator = numerator + prototype_w * proto_agreement * proto_mask[:, None].to(attributes.dtype)
+            denominator = denominator + prototype_w * proto_mask[:, None].to(attributes.dtype)
+        local_confidence = torch.where(
+            denominator > 0,
+            numerator / denominator.clamp_min(eps),
+            torch.ones_like(attributes),
+        ).clamp(0.0, 1.0)
+        prior = _prior_tensor_for_teacher(
+            name=name,
+            attribute_names=attribute_names,
+            payload=teacher_attribute_prior,
+            device=device,
+            dtype=attributes.dtype,
+        ).view(1, -1)
+        reliability = (eps + (1.0 - eps) * (prior * local_confidence).clamp(0.0, 1.0)).clamp(eps, 1.0)
+        reliability_by_teacher[name] = reliability
+        effective_weight = reliability * base_weights[idx].clamp_min(0.0)
+        weighted_response_sum = weighted_response_sum + effective_weight * attributes
+        reliability_sum = reliability_sum + effective_weight
+        diagnostics[f"l2_attr_reliability_mean/{name}"] = reliability.float().mean().detach()
+        diagnostics[f"l2_attr_reliability_min/{name}"] = reliability.float().min().detach()
+
+    target = (weighted_response_sum / reliability_sum.clamp_min(eps)).clamp(0.0, 1.0)
+    response_weights = base_weights.clamp_min(0.0) * torch.stack(
+        [reliability_by_teacher[name] for name in names],
+        dim=0,
+    )
+    variance = _weighted_teacher_variance(attribute_stack, response_weights, target, eps=eps)
+    uncertainty = _normalized_binary_entropy(target, eps=eps) * (1.0 - variance)
+    gate = (1.0 - eta * uncertainty).clamp(0.0, 1.0)
+    gate = torch.where(proto_mask[:, None], torch.ones_like(gate), gate)
+
+    negative_weight = ((1.0 - target).clamp(0.0, 1.0).pow(neg_power) * (1.0 - variance)).clamp(0.0, 1.0)
+    anchored_negative = proto_mask[:, None] & (proto_l2 <= 0.0)
+    negative_weight = torch.where(anchored_negative, torch.ones_like(negative_weight), negative_weight)
+    diagnostics["l2_attr_target_mean"] = target.float().mean().detach()
+    diagnostics["l2_attr_gate_mean"] = gate.float().mean().detach()
+    diagnostics["l2_attr_negative_weight_mean"] = negative_weight.float().mean().detach()
+    diagnostics["l2_attr_teacher_variance_mean"] = variance.float().mean().detach()
+    return AttributeAdjudicationTarget(
+        target=target.detach(),
+        gate=gate.detach(),
+        negative_weight=negative_weight.detach(),
+        reliability_by_teacher={name: value.detach() for name, value in reliability_by_teacher.items()},
+        diagnostics=diagnostics,
+    )
 
 
 @torch.no_grad()

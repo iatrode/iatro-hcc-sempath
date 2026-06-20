@@ -1,4 +1,9 @@
-# HCC-SemPath Scientific Design / HCC-SemPath 科学设计
+# HCC-SemPath V1 Scientific Design (DEPRECATED) / HCC-SemPath V1 科学设计（已弃用）
+
+> Historical V1 foundation retained only for traceability. It is not the implementation
+> specification for the ROI-guided Level-2 V2 upgrade.
+>
+> 本文档仅作为 V1 历史基线保留，不再作为 ROI 显式引导的 Level-2 V2 实现依据。
 
 This is the single scientific design document for HCC-SemPath. It is written to
 support the paper and public release narrative, not to document software

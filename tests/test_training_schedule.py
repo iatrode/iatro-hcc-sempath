@@ -49,6 +49,29 @@ def test_feature_loss_type_defaults_to_cosine() -> None:
     assert float(norm_mse[1]) > float(cosine[1])
 
 
+def test_roi_schedule_warms_head_before_backbone_and_consistency() -> None:
+    cfg = {
+        "loss": {
+            "relation_weight": 0.0,
+            "roi_weight": 0.1,
+            "roi_consistency_weight": 0.05,
+            "roi_start_step": 0,
+            "roi_ramp_steps": 100,
+            "roi_backbone_start_step": 100,
+            "roi_consistency_start_step": 100,
+        }
+    }
+    warmup = scheduled_loss_config(cfg, epoch=1, global_step=50, schedule_state={})
+    joint = scheduled_loss_config(cfg, epoch=1, global_step=150, schedule_state={})
+
+    assert warmup["roi_weight"] == pytest.approx(0.05)
+    assert warmup["roi_consistency_weight"] == 0.0
+    assert warmup["roi_detach_backbone"] is True
+    assert joint["roi_weight"] == pytest.approx(0.1)
+    assert joint["roi_consistency_weight"] == pytest.approx(0.025)
+    assert joint["roi_detach_backbone"] is False
+
+
 def test_cosine_scheduler_warms_up_and_decays() -> None:
     parameter = torch.nn.Parameter(torch.ones(()))
     optimizer = torch.optim.AdamW([parameter], lr=0.1)

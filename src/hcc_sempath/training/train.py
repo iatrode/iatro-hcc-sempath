@@ -36,6 +36,7 @@ from .engine import build_lr_scheduler, fit
 from .manifest import load_training_manifest
 from .prototype_images import PrototypeImageBank, load_prototype_image_bank
 from .prototype_labels import load_prototype_labels
+from .roi import build_roi_targets
 from .utils import seed_everything
 
 
@@ -57,6 +58,9 @@ class BatchBuffer:
     prototype_mask: torch.Tensor                 # (B,) bool
     prototype_level1: torch.Tensor               # (B,) long
     prototype_level2: torch.Tensor               # (B, L2) float32 (L2 may be 0)
+    roi_target: torch.Tensor                      # (B, K, Gh, Gw) float32
+    roi_valid: torch.Tensor                       # (B, K, Gh, Gw) bool
+    roi_consistency: torch.Tensor                 # (B, K) bool
     tile_id: list = field(default_factory=list)  # (B,) str
 
     def view(self, count: int) -> dict:
@@ -70,12 +74,16 @@ class BatchBuffer:
             "prototype_mask": self.prototype_mask[:count],
             "prototype_level1": self.prototype_level1[:count],
             "prototype_level2": self.prototype_level2[:count],
+            "roi_target": self.roi_target[:count],
+            "roi_valid": self.roi_valid[:count],
+            "roi_consistency": self.roi_consistency[:count],
         }
 
 
 def _alloc_batch_buffer(batch_size: int, spec: dict, pin: bool) -> BatchBuffer:
     h, w = spec["image_hw"]
     kw = {"pin_memory": True} if pin else {}
+    roi_k, roi_h, roi_w = spec.get("roi_shape", (0, 0, 0))
     return BatchBuffer(
         images=torch.empty((batch_size, h, w, 3), dtype=torch.uint8, **kw),
         teacher_features={
@@ -85,6 +93,9 @@ def _alloc_batch_buffer(batch_size: int, spec: dict, pin: bool) -> BatchBuffer:
         prototype_mask=torch.zeros((batch_size,), dtype=torch.bool),
         prototype_level1=torch.full((batch_size,), -1, dtype=torch.long),
         prototype_level2=torch.zeros((batch_size, int(spec["level2_dim"])), dtype=torch.float32, **kw),
+        roi_target=torch.zeros((batch_size, roi_k, roi_h, roi_w), dtype=torch.float32, **kw),
+        roi_valid=torch.zeros((batch_size, roi_k, roi_h, roi_w), dtype=torch.bool),
+        roi_consistency=torch.zeros((batch_size, roi_k), dtype=torch.bool),
         tile_id=[""] * batch_size,
     )
 
@@ -563,9 +574,16 @@ def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -
 def _load_zhcc_prototypes(cfg: dict, device: torch.device) -> PrototypeRegistry | None:
     prototype_path = cfg["data"].get("zhcc_prototype_path")
     if prototype_path is None:
-        if float(cfg["loss"].get("zhcc_response_weight", 0.0)) > 0 and not cfg["data"].get("zhcc_prototype_image_path"):
+        needs_global_l2 = (
+            float(cfg["loss"].get("zhcc_response_weight", 0.0)) > 0
+            or (
+                cfg["data"].get("roi_manifest_path")
+                and float(cfg["loss"].get("roi_consistency_weight", 0.05)) > 0
+            )
+        )
+        if needs_global_l2 and not cfg["data"].get("zhcc_prototype_image_path"):
             raise ValueError(
-                "data.zhcc_prototype_path or data.zhcc_prototype_image_path is required when loss.zhcc_response_weight > 0"
+                "data.zhcc_prototype_path or data.zhcc_prototype_image_path is required for global L2 supervision"
             )
         return None
     return load_prototype_registry(prototype_path, expected_dim=embedding_dim(cfg)).to(device)
@@ -692,6 +710,8 @@ def main() -> None:
         zhcc_prototypes=zhcc_prototypes,
         zhcc_image_bank=zhcc_image_bank,
     )
+    if cfg["data"].get("roi_manifest_path") and label_contract is None:
+        raise ValueError("ROI supervision requires an L2 prototype label contract")
     prototype_manifest_path = cfg["data"].get("prototype_supervision_manifest_path")
     prototype_label_required = (
         float(cfg["loss"].get("prototype_filter_weight", 0.0)) > 0
@@ -719,6 +739,34 @@ def main() -> None:
         candidate_size = (int(metadata["tile_height"]), int(metadata["tile_width"]))
         if candidate_size != image_size:
             raise ValueError(f"tile package size mismatch: {package_path} has {candidate_size}, expected {image_size}")
+    roi_manifest_path = cfg["data"].get("roi_manifest_path")
+    roi_attribute_names = (
+        [label_contract.names[idx] for idx in label_contract.attribute_indices]
+        if label_contract is not None
+        else []
+    )
+    patch_size = int(cfg["model"].get("roi_patch_size", 16))
+    roi_grid_size = (image_size[0] // patch_size, image_size[1] // patch_size) if roi_manifest_path else (0, 0)
+    if roi_manifest_path and (image_size[0] % patch_size or image_size[1] % patch_size):
+        raise ValueError(f"ROI patch size {patch_size} does not divide image size {image_size}")
+    train_roi_targets = build_roi_targets(
+        roi_manifest_path,
+        attribute_names=roi_attribute_names,
+        image_size=image_size,
+        grid_size=roi_grid_size,
+        allowed_splits=set(cfg["data"].get("roi_train_splits", ["train"])),
+    )
+    val_roi_targets = build_roi_targets(
+        roi_manifest_path,
+        attribute_names=roi_attribute_names,
+        image_size=image_size,
+        grid_size=roi_grid_size,
+        allowed_splits=set(cfg["data"].get("roi_val_splits", ["val"])),
+    )
+    roi_dataset_kwargs = {
+        "roi_attribute_count": len(roi_attribute_names) if roi_manifest_path else 0,
+        "roi_grid_size": roi_grid_size,
+    }
     dynamic_package_sampling = bool(cfg["data"].get("dynamic_package_sampling", False))
     if dynamic_package_sampling:
         tensor_collate = bool(cfg["data"].get("tensor_collate", device.type == "cuda"))
@@ -736,6 +784,8 @@ def main() -> None:
             seed=int(cfg["runtime"]["seed"]),
             expected_dims=dims,
             prototype_labels=train_prototype_labels,
+            roi_targets=train_roi_targets,
+            **roi_dataset_kwargs,
         )
         val_ds = PackageSampledDistillationDataset(
             val_tile_packages,
@@ -745,6 +795,8 @@ def main() -> None:
             seed=int(cfg["runtime"]["seed"]) + 1,
             expected_dims=dims,
             prototype_labels=val_prototype_labels,
+            roi_targets=val_roi_targets,
+            **roi_dataset_kwargs,
         )
     elif manifest_path or explicit_split_packages:
         train_records = read_packaged_tile_records(train_tile_packages)
@@ -776,12 +828,16 @@ def main() -> None:
             **common_dataset_kwargs,
             teacher_cache_package_paths=train_teacher_packages,
             prototype_labels=train_prototype_labels,
+            roi_targets=train_roi_targets,
+            **roi_dataset_kwargs,
         )
         val_ds = DistillationTileDataset(
             val_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=val_teacher_packages,
             prototype_labels=val_prototype_labels,
+            roi_targets=val_roi_targets,
+            **roi_dataset_kwargs,
         )
     else:
         records = read_packaged_tile_records(train_tile_packages)
@@ -819,12 +875,16 @@ def main() -> None:
             **common_dataset_kwargs,
             teacher_cache_package_paths=train_teacher_packages,
             prototype_labels=train_prototype_labels,
+            roi_targets=train_roi_targets,
+            **roi_dataset_kwargs,
         )
         val_ds = DistillationTileDataset(
             val_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=val_teacher_packages,
             prototype_labels=val_prototype_labels,
+            roi_targets=val_roi_targets,
+            **roi_dataset_kwargs,
         )
     num_workers = int(cfg["data"]["num_workers"])
     loader_kwargs = {
@@ -914,7 +974,18 @@ def main() -> None:
         projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
         teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),
         grad_checkpointing=bool(cfg["model"].get("grad_checkpointing", False)),
+        roi_l2_num_attributes=len(roi_attribute_names) if roi_manifest_path else 0,
+        roi_patch_dim=int(cfg["model"].get("roi_patch_dim", embedding_dim(cfg))),
+        roi_top_q=float(cfg["model"].get("roi_top_q", 0.1)),
+        roi_patch_temperature=float(cfg["model"].get("roi_patch_temperature", 0.1)),
     ).to(device)
+    if roi_manifest_path:
+        actual_grid = tuple(int(value) for value in model.encoder.backbone.patch_embed.grid_size)
+        if actual_grid != roi_grid_size:
+            raise ValueError(
+                f"ROI grid mismatch: configured patch size yields {roi_grid_size}, "
+                f"but backbone exposes {actual_grid}"
+            )
     resume_state = None
     if args.resume:
         resume_state = torch.load(args.resume, map_location=device, weights_only=False)
