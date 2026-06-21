@@ -55,6 +55,53 @@ L2_PROTOTYPES = [
     "ductular-portal-present",
 ]
 
+# V2 ROI taxonomy. V1 tile-level assets retain hyaline-change for historical
+# compatibility, but it is not part of the ROI branch or annotation quota.
+ROI_L2_PROTOTYPES = [name for name in L2_PROTOTYPES if name != "hyaline-change-present"]
+ROI_TARGET_PER_ATTRIBUTE = 100
+
+
+class RoiCandidateQueue:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        if payload.get("frozen") is not True:
+            raise ValueError("ROI candidate manifest is not frozen; close all class deficits first")
+        candidates = payload.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError("ROI candidate manifest requires a non-empty candidates list")
+        self.attributes = list(payload.get("l2_prototypes") or ROI_L2_PROTOTYPES)
+        if self.attributes != ROI_L2_PROTOTYPES:
+            raise ValueError(f"ROI candidate taxonomy must be {ROI_L2_PROTOTYPES}")
+        raw_targets = payload.get("target_per_attribute") or {}
+        self.targets = {
+            name: int(raw_targets.get(name, ROI_TARGET_PER_ATTRIBUTE)) for name in self.attributes
+        }
+        self.candidates: list[dict] = []
+        self.by_tile_id: dict[str, dict] = {}
+        for rank, item in enumerate(candidates):
+            tile_id = str(item.get("tile_id") or "").strip()
+            if not tile_id or tile_id in self.by_tile_id:
+                raise ValueError(f"invalid or duplicate ROI candidate tile_id: {tile_id!r}")
+            record = dict(item)
+            record["tile_id"] = tile_id
+            record["rank"] = int(item.get("rank", rank))
+            record["source_l2"] = [
+                name for name in item.get("source_l2", []) if name in self.attributes
+            ]
+            record["priority_attributes"] = [
+                name for name in item.get("priority_attributes", record["source_l2"])
+                if name in self.attributes
+            ]
+            self.candidates.append(record)
+            self.by_tile_id[tile_id] = record
+
+    def contains(self, tile_id: str) -> bool:
+        return tile_id in self.by_tile_id
+
+    def candidate(self, tile_id: str) -> dict | None:
+        return self.by_tile_id.get(tile_id)
+
 
 @dataclass(frozen=True)
 class AnnotationPackage:
@@ -198,7 +245,14 @@ def _state_prototypes(payload: dict, key: str, fallback: list[str], annotation_f
 
 
 class AnnotationState:
-    def __init__(self, state_path: str | Path, input_path: str | Path) -> None:
+    def __init__(
+        self,
+        state_path: str | Path,
+        input_path: str | Path,
+        *,
+        l2_prototypes: list[str] | None = None,
+        require_complete_roi: bool = False,
+    ) -> None:
         self.state_path = Path(state_path)
         self.input_path = str(Path(input_path).resolve())
         self.annotations: dict[str, dict] = {}
@@ -206,7 +260,8 @@ class AnnotationState:
         self.extra_payload: dict = {}
         self.last_iac = ""
         self.l1_prototypes = list(L1_PROTOTYPES)
-        self.l2_prototypes = list(L2_PROTOTYPES)
+        self.l2_prototypes = list(l2_prototypes or L2_PROTOTYPES)
+        self.require_complete_roi = bool(require_complete_roi)
         self.revision = 0
         if self.state_path.exists():
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -215,8 +270,14 @@ class AnnotationState:
             self.skipped = set(str(item) for item in payload.get("skipped", []))
             self.last_iac = str(payload.get("last_iac") or "")
             self.l1_prototypes = _state_prototypes(payload, "l1_prototypes", L1_PROTOTYPES, "l1")
-            self.l2_prototypes = _state_prototypes(payload, "l2_prototypes", L2_PROTOTYPES, "l2")
-            known_keys = {"version", "input_path", "l1_prototypes", "l2_prototypes", "annotations", "skipped", "last_iac"}
+            if l2_prototypes is None:
+                self.l2_prototypes = _state_prototypes(payload, "l2_prototypes", L2_PROTOTYPES, "l2")
+            else:
+                self.l2_prototypes = list(l2_prototypes)
+            known_keys = {
+                "version", "input_path", "l1_prototypes", "l2_prototypes",
+                "annotations", "skipped", "last_iac", "roi_mode",
+            }
             self.extra_payload = {key: value for key, value in payload.items() if key not in known_keys}
             LOG.info(
                 "state_load path=%s annotations=%d skipped=%d l1=%d l2=%d input=%s",
@@ -237,6 +298,27 @@ class AnnotationState:
     def is_annotated(self, package: AnnotationPackage, record: IacRecord) -> bool:
         key = _annotation_key(package, record)
         return key in self.annotations or key in self.skipped
+
+    def annotation_for(self, package: AnnotationPackage, record: IacRecord) -> dict | None:
+        value = self.annotations.get(_annotation_key(package, record))
+        return dict(value) if value is not None else None
+
+    def roi_positive_counts(self) -> dict[str, int]:
+        counts = {name: 0 for name in self.l2_prototypes}
+        expected = set(self.l2_prototypes)
+        for item in self.annotations.values():
+            roi = list(item.get("roi") or [])
+            complete = {str(entry.get("attribute")) for entry in roi if entry.get("review_complete")}
+            if self.require_complete_roi and complete != expected:
+                continue
+            positive = {
+                str(entry.get("attribute"))
+                for entry in roi
+                if entry.get("geometry") is not None and entry.get("state", "positive") == "positive"
+            }
+            for name in positive & expected:
+                counts[name] += 1
+        return counts
 
     def counts_for_package(self, package: AnnotationPackage, records: list[IacRecord]) -> dict:
         annotated = sum(1 for record in records if self.is_counted_record(package, record))
@@ -288,6 +370,22 @@ class AnnotationState:
                 raise ValueError("ROI item requires geometry or review_complete=true")
             if geometry is not None and geometry.get("type") not in {"point", "brush", "circle", "polygon"}:
                 raise ValueError(f"unsupported ROI geometry: {geometry.get('type')}")
+        if self.require_complete_roi:
+            complete = {str(item.get("attribute")) for item in roi if item.get("review_complete")}
+            expected = set(self.l2_prototypes)
+            if complete != expected:
+                missing = sorted(expected - complete)
+                raise ValueError(f"complete ROI review is required for all attributes; missing={missing}")
+            positive_roi = {
+                str(item.get("attribute"))
+                for item in roi
+                if item.get("geometry") is not None and item.get("state", "positive") == "positive"
+            }
+            if set(l2) != positive_roi:
+                raise ValueError(
+                    f"tile-level L2 selections must equal positive ROI attributes: "
+                    f"selected={sorted(l2)} roi={sorted(positive_roi)}"
+                )
         payload = {
             "dataset": package.dataset,
             "iac": package.rel_path,
@@ -301,6 +399,7 @@ class AnnotationState:
             "l1": l1,
             "l2": list(l2),
             "roi": roi,
+            "roi_complete_all": self.require_complete_roi,
         }
         key = _annotation_key(package, record)
         self.annotations[key] = payload
@@ -331,6 +430,7 @@ class AnnotationState:
             "last_iac": self.last_iac,
             "annotations": self.annotations,
             "skipped": sorted(self.skipped),
+            "roi_mode": self.require_complete_roi,
         })
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=self.state_path.parent) as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
@@ -360,17 +460,31 @@ class AnnotationState:
 
 
 class AnnotationData:
-    def __init__(self, input_path: str | Path, state_path: str | Path, *, async_scan: bool = False) -> None:
+    def __init__(
+        self,
+        input_path: str | Path,
+        state_path: str | Path,
+        *,
+        async_scan: bool = False,
+        roi_candidate_manifest: str | Path | None = None,
+    ) -> None:
         self.input_root = Path(input_path).resolve()
         self.cache_root = (self.input_root if self.input_root.is_dir() else self.input_root.parent) / ".hcc_sempath_annotation_cache"
         self.packages: list[AnnotationPackage] = []
-        self.state = AnnotationState(state_path, input_path)
+        self.roi_queue = RoiCandidateQueue(roi_candidate_manifest) if roi_candidate_manifest else None
+        self.state = AnnotationState(
+            state_path,
+            input_path,
+            l2_prototypes=self.roi_queue.attributes if self.roi_queue else None,
+            require_complete_roi=self.roi_queue is not None,
+        )
         self._viewers: OrderedDict[int, IacViewerData] = OrderedDict()
         self._lock = threading.RLock()
         self._scan_done = False
         self._scan_error = ""
         self._scan_thread: threading.Thread | None = None
         self._thumbnail_token = ""
+        self._review_cursor_by_package: dict[int, int] = {}
         if async_scan:
             self._scan_thread = threading.Thread(target=self._scan_packages, name="iac-scan", daemon=True)
             self._scan_thread.start()
@@ -467,12 +581,28 @@ class AnnotationData:
             return viewer
         raise RuntimeError("unreachable viewer cache state")
 
+    def annotation_records(self, index: int) -> list[IacRecord]:
+        records = self.viewer(index).records
+        if self.roi_queue is None:
+            return records
+        return [record for record in records if self.roi_queue.contains(record.tile_id)]
+
+    def annotation_json(self, index: int, row: int) -> dict:
+        package = self.package(index)
+        record = self.viewer(index)._by_row[row]
+        item = self.state.annotation_for(package, record)
+        return {
+            "annotation": item,
+            "candidate": self.roi_queue.candidate(record.tile_id) if self.roi_queue else None,
+        }
+
     def package_json(self) -> list[dict]:
         items = []
         with self._lock:
             packages = list(self.packages)
         for idx, package in enumerate(packages):
-            counts = self.state.lightweight_counts_for_package(package)
+            records = self.annotation_records(idx)
+            counts = self.state.counts_for_package(package, records)
             items.append(
                 {
                     "index": idx,
@@ -491,16 +621,25 @@ class AnnotationData:
         with self._lock:
             packages = list(self.packages)
             package = self.packages[index]
-        viewer = self.viewer(index)
-        counts = self.state.counts_for_package(package, viewer.records)
+        records = self.annotation_records(index)
+        counts = self.state.counts_for_package(package, records)
+        eligible_by_package = {
+            item.rel_path: self.annotation_records(package_idx)
+            for package_idx, item in enumerate(packages)
+        }
         overall = {
-            "annotated": sum(len(self.state.counted_annotations_for_package(item)) for item in packages),
-            "total": sum(item.total for item in packages),
+            "annotated": sum(
+                1
+                for item in packages
+                for record in eligible_by_package[item.rel_path]
+                if self.state.is_counted_record(item, record)
+            ),
+            "total": sum(len(value) for value in eligible_by_package.values()),
             "skipped": sum(
                 1
                 for item in packages
-                for key in self.state.skipped
-                if key.startswith(f"{item.rel_path}::")
+                for record in eligible_by_package[item.rel_path]
+                if _annotation_key(item, record) in self.state.skipped
             ),
         }
         overall["remaining"] = max(0, overall["total"] - overall["annotated"] - overall["skipped"])
@@ -526,23 +665,76 @@ class AnnotationData:
             overall["annotated"],
             overall["total"],
         )
-        return {"package": counts, "overall": overall, "l1": l1_counts, "l2": l2_counts, "package_l1": package_l1_counts, "package_l2": package_l2_counts}
+        roi_counts = self.state.roi_positive_counts() if self.roi_queue else {}
+        roi_targets = dict(self.roi_queue.targets) if self.roi_queue else {}
+        return {
+            "package": counts,
+            "overall": overall,
+            "l1": l1_counts,
+            "l2": l2_counts,
+            "package_l1": package_l1_counts,
+            "package_l2": package_l2_counts,
+            "roi_counts": roi_counts,
+            "roi_targets": roi_targets,
+        }
 
     def random_record(self, index: int) -> dict:
         with self._lock:
             package = self.packages[index]
         viewer = self.viewer(index)
-        remaining = [record for record in viewer.records if not self.state.is_annotated(package, record)]
+        remaining = [record for record in self.annotation_records(index) if not self.state.is_annotated(package, record)]
         if not remaining:
             LOG.info("random_tile_empty iac=%s", package.rel_path)
             return {"record": None}
-        record = random.choice(remaining)
+        if self.roi_queue is None:
+            record = random.choice(remaining)
+        else:
+            counts = self.state.roi_positive_counts()
+            deficits = {
+                name: max(0, self.roi_queue.targets[name] - counts.get(name, 0))
+                for name in self.roi_queue.attributes
+            }
+            record = min(
+                remaining,
+                key=lambda item: (
+                    -sum(
+                        deficits.get(name, 0) / max(1, self.roi_queue.targets[name])
+                        for name in self.roi_queue.candidate(item.tile_id)["priority_attributes"]
+                    ),
+                    self.roi_queue.candidate(item.tile_id)["rank"],
+                ),
+            )
         LOG.info("random_tile iac=%s row=%d tile_id=%s remaining=%d", package.rel_path, record.row, record.tile_id, len(remaining))
+        return {"record": viewer._record_json(record)}
+
+    def reviewed_record(self, index: int) -> dict:
+        package = self.package(index)
+        viewer = self.viewer(index)
+        reviewed = [
+            record for record in self.annotation_records(index)
+            if self.state.is_counted_record(package, record)
+        ]
+        if not reviewed:
+            return {"record": None}
+        reviewed.sort(key=lambda item: item.row)
+        cursor = self._review_cursor_by_package.get(index, 0) % len(reviewed)
+        record = reviewed[cursor]
+        self._review_cursor_by_package[index] = cursor + 1
         return {"record": viewer._record_json(record)}
 
     def select_nearest(self, index: int, x: float, y: float) -> dict:
         viewer = self.viewer(index)
-        result = viewer.nearest("__all__", x, y)
+        if self.roi_queue is None:
+            result = viewer.nearest("__all__", x, y)
+        else:
+            records = self.annotation_records(index)
+            if not records:
+                return {"record": None}
+            nearest = min(
+                records,
+                key=lambda record: (record.display_x - x) ** 2 + (record.display_y - y) ** 2,
+            )
+            result = {"record": viewer._record_json(nearest)}
         record = result.get("record")
         if record:
             with self._lock:
@@ -554,7 +746,7 @@ class AnnotationData:
         with self._lock:
             package = self.packages[index]
         viewer = self.viewer(index)
-        return {record.row for record in viewer.records if self.state.is_annotated(package, record)}
+        return {record.row for record in self.annotation_records(index) if self.state.is_annotated(package, record)}
 
     def thumbnail_jpg(self, index: int, token: str | None = None, selected_row: int | None = None) -> bytes:
         if token:
@@ -742,9 +934,9 @@ pre{white-space:pre-wrap;font-size:12px;background:#f1f3f4;padding:8px}
 <body><div id="authGate" class="authGate"><div class="authBox"><h3>Annotation token</h3><input id="authInput" autocomplete="off"><button id="authSubmit" class="primary" type="button">Open</button><div id="authStatus" class="status"></div></div></div>
 <div id="layout" class="layout"><aside><div class="panelHead"><div><div class="panelTitle">IAC packages</div><div id="packageSummary" class="muted"></div></div><button id="hideQueue" class="ghost" type="button">Hide</button></div><div id="packages" class="panelBody"></div></aside>
 <main><div class="topbar"><button id="toggleQueue" type="button">Tiles</button><button id="toggleLabels" type="button">Labels</button><button id="contextBtn" type="button">Context</button><div id="title" class="topbarTitle">Prototype annotation</div></div><section class="workspace"><div class="muted" id="recordMeta"></div>
-<p><div class="tileStage"><img id="tile" class="tile"><canvas id="roiCanvas" class="roiCanvas" width="224" height="224"></canvas></div></p><div class="roiTools"><button type="button" data-roi-tool="point">Point</button><button type="button" data-roi-tool="brush">Brush</button><button type="button" data-roi-tool="circle">Circle</button><button type="button" id="roiUndo">Undo</button><button type="button" id="roiClear">Clear</button><label><input id="roiComplete" type="checkbox"> all 10 L2 attributes completely reviewed</label></div><div id="roiStatus" class="muted">Select an L2 attribute, then annotate every visible focus. Complete review makes every unmarked attribute/token negative.</div><h3>Location overview</h3><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom"></div></section></main>
+<p><div class="tileStage"><img id="tile" class="tile"><canvas id="roiCanvas" class="roiCanvas" width="224" height="224"></canvas></div></p><div class="roiTools"><button type="button" data-roi-tool="point">Point</button><button type="button" data-roi-tool="brush">Brush</button><button type="button" data-roi-tool="circle">Circle</button><button type="button" id="roiUndo">Undo</button><button type="button" id="roiClear">Clear active attribute</button><label><input id="roiComplete" type="checkbox"> all ROI L2 attributes completely reviewed</label></div><div id="roiStatus" class="muted">Select an L2 attribute, then annotate every visible focus. Complete review makes every unmarked attribute/token negative.</div><h3>Location overview</h3><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom"></div></section></main>
 <section class="right"><div class="panelHead"><div class="panelTitle">Labels</div><button id="hideLabels" class="ghost" type="button">Hide</button></div><div class="panelBody labelBody"><h3>Progress</h3><div id="progress"></div><h3>L1 primary</h3><div id="l1" class="chips"></div>
-<h3>L2 attributes</h3><div id="l2" class="chips"></div></div><div class="labelActions"><div class="actions"><button onclick="save()" class="primary">Save + next</button><button onclick="nextRandom()">Skip / random</button></div><pre id="status"></pre></div></section>
+<h3>L2 attributes</h3><div id="l2" class="chips"></div></div><div class="labelActions"><div class="actions"><button onclick="save()" class="primary">Save + next</button><button onclick="nextRandom()">Next unreviewed</button><button onclick="reviewed()">Edit reviewed</button></div><pre id="status"></pre></div></section>
 </div>
 <div id="contextOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>5x5 context</b><div id="contextMeta" class="muted"></div></div><button id="contextClose" type="button">Close</button></div><div class="contextStage"><img id="contextImg" class="panzoom"></div></div>
 <script>
@@ -763,19 +955,21 @@ async function ensureAuth(){setAuthToken(tokenFromUrl()||localStorage.getItem('h
 async function submitAuth(){setAuthToken(document.getElementById('authInput').value.trim()); try{await api('/api/scan-status'); document.getElementById('authGate').style.display='none'; refreshPackage().catch(e=>document.getElementById('status').textContent=e.message||String(e));}catch(e){document.getElementById('authStatus').textContent='Invalid token.';}}
 function setupPanZoom(el,onClick){let scale=1,tx=0,ty=0,drag=false,sx=0,sy=0,stx=0,sty=0,moved=0; const apply=()=>{el.style.transform=`translate(${tx}px,${ty}px) scale(${scale})`;}; el.addEventListener('wheel',ev=>{ev.preventDefault(); const next=Math.min(12,Math.max(.25,scale*(ev.deltaY<0?1.15:.87))); scale=next; apply();},{passive:false}); el.addEventListener('pointerdown',ev=>{drag=true;moved=0;sx=ev.clientX;sy=ev.clientY;stx=tx;sty=ty;el.classList.add('dragging');el.setPointerCapture(ev.pointerId);}); el.addEventListener('pointermove',ev=>{if(!drag)return; const dx=ev.clientX-sx,dy=ev.clientY-sy; moved=Math.max(moved,Math.abs(dx)+Math.abs(dy)); tx=stx+dx; ty=sty+dy; apply();}); el.addEventListener('pointerup',ev=>{if(!drag)return; drag=false; el.classList.remove('dragging'); if(moved<6&&onClick)onClick(ev);}); el.addEventListener('dblclick',ev=>{ev.preventDefault(); scale=1;tx=0;ty=0;apply();}); el.resetPanZoom=()=>{scale=1;tx=0;ty=0;apply();};}
 function prototypeButton(name, selected, count, maxCount, onClick){const b=document.createElement('button'); const pct=maxCount?Math.round(count/maxCount*100):0; b.className='chip'+(selected?' selected':''); b.style.setProperty('--pct',pct+'%'); b.innerHTML=`<span class=chipRow><span>${name}</span><span class=chipCount>${count}</span></span>`; b.onclick=onClick; return b;}
-function renderLabels(){const a=document.getElementById('l1'); a.innerHTML=''; const l1Max=Math.max(1,...Object.values(l1Counts)); L1.forEach(x=>a.appendChild(prototypeButton(x,l1===x,l1Counts[x]||0,l1Max,()=>{l1=x;renderLabels()}))); const b=document.getElementById('l2'); b.innerHTML=''; const l2Max=Math.max(1,...Object.values(l2Counts)); L2.forEach(x=>b.appendChild(prototypeButton(x,l2.has(x),l2Counts[x]||0,l2Max,()=>{roiAttribute=x;l2.add(x);renderLabels();renderRoi()}))); document.getElementById('roiComplete').checked=roiAllComplete;document.getElementById('roiStatus').textContent=roiAttribute?`ROI attribute: ${roiAttribute}`:'Select an L2 attribute, then annotate every visible focus.';}
+function renderLabels(){const a=document.getElementById('l1'); a.innerHTML=''; const l1Max=Math.max(1,...Object.values(l1Counts)); L1.forEach(x=>a.appendChild(prototypeButton(x,l1===x,l1Counts[x]||0,l1Max,()=>{l1=x;renderLabels()}))); const b=document.getElementById('l2'); b.innerHTML=''; const l2Max=Math.max(1,...Object.values(l2Counts)); L2.forEach(x=>b.appendChild(prototypeButton(x,l2.has(x),l2Counts[x]||0,l2Max,()=>{if(ROI_MODE){roiAttribute=x}else if(l2.has(x)){l2.delete(x)}else{l2.add(x)}renderLabels();renderRoi()}))); document.getElementById('roiComplete').checked=roiAllComplete;document.getElementById('roiStatus').textContent=roiAttribute?`ROI attribute: ${roiAttribute}`:`Select one of ${L2.length} L2 attributes, then annotate every visible focus.`;}
 function roiPoint(ev){const r=document.getElementById('roiCanvas').getBoundingClientRect();return{x:(ev.clientX-r.left)/r.width,y:(ev.clientY-r.top)/r.height}}
 function renderRoi(){const c=document.getElementById('roiCanvas'),x=c.getContext('2d');x.clearRect(0,0,c.width,c.height);for(const item of roi){const g=item.geometry;x.strokeStyle=item.attribute===roiAttribute?'#ff1f1f':'#ffb000';x.fillStyle='rgba(255,31,31,.25)';x.lineWidth=3;if(g.type==='point'){x.beginPath();x.arc(g.point[0]*224,g.point[1]*224,5,0,Math.PI*2);x.fill();x.stroke()}else if(g.type==='circle'){x.beginPath();x.arc(g.center[0]*224,g.center[1]*224,g.radius*224,0,Math.PI*2);x.fill();x.stroke()}else if(g.type==='brush'){x.beginPath();g.points.forEach((p,i)=>i?x.lineTo(p[0]*224,p[1]*224):x.moveTo(p[0]*224,p[1]*224));x.stroke()}}}
-function setupRoi(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerdown',ev=>{if(!roiAttribute)return;if(roiTool==='point'){const p=roiPoint(ev);roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'point',coordinate_space:'normalized',point:[p.x,p.y],radius:.035}});renderRoi();return}const p=roiPoint(ev);roiDrawing={start:p,points:[[p.x,p.y]]};c.setPointerCapture(ev.pointerId)});c.addEventListener('pointermove',ev=>{if(!roiDrawing)return;const p=roiPoint(ev);roiDrawing.points.push([p.x,p.y])});c.addEventListener('pointerup',ev=>{if(!roiDrawing)return;const p=roiPoint(ev);if(roiTool==='circle'){const dx=p.x-roiDrawing.start.x,dy=p.y-roiDrawing.start.y;roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'circle',coordinate_space:'normalized',center:[roiDrawing.start.x,roiDrawing.start.y],radius:Math.sqrt(dx*dx+dy*dy)}})}else{roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'brush',coordinate_space:'normalized',points:roiDrawing.points,width:.035}})}roiDrawing=null;renderRoi()})}
+function syncPositiveLabels(){l2=new Set(roi.filter(item=>item.geometry&&item.state!=='negative').map(item=>item.attribute));renderLabels()}
+function setupRoi(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerdown',ev=>{if(!roiAttribute)return;if(roiTool==='point'){const p=roiPoint(ev);roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'point',coordinate_space:'normalized',point:[p.x,p.y],radius:.035}});syncPositiveLabels();renderRoi();return}const p=roiPoint(ev);roiDrawing={start:p,points:[[p.x,p.y]]};c.setPointerCapture(ev.pointerId)});c.addEventListener('pointermove',ev=>{if(!roiDrawing)return;const p=roiPoint(ev);roiDrawing.points.push([p.x,p.y])});c.addEventListener('pointerup',ev=>{if(!roiDrawing)return;const p=roiPoint(ev);if(roiTool==='circle'){const dx=p.x-roiDrawing.start.x,dy=p.y-roiDrawing.start.y;roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'circle',coordinate_space:'normalized',center:[roiDrawing.start.x,roiDrawing.start.y],radius:Math.sqrt(dx*dx+dy*dy)}})}else{roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'brush',coordinate_space:'normalized',points:roiDrawing.points,width:.035}})}roiDrawing=null;syncPositiveLabels();renderRoi()})}
 function setThumbnailSrc(){const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); const token=`${Date.now()}-${pkg}`; const row=current?`&row=${current.row}`:''; img.dataset.token=String(token); loading.style.display='block'; loading.textContent='Building overview...'; img.style.display='none'; img.onload=()=>{if(img.dataset.token!==String(token)) return; loading.style.display='none'; img.style.display='block'; if(img.resetPanZoom)img.resetPanZoom();}; img.onerror=()=>{if(img.dataset.token===String(token)) loading.textContent='Overview failed to load.';}; img.src=authed(`/api/thumbnail?package=${pkg}${row}&thumb_token=${encodeURIComponent(token)}&t=${Date.now()}`);}
 async function loadPackages(){packages=await api('/api/packages'); const scan=await api('/api/scan-status'); if(!restoredLastIac&&scan.last_iac){const found=packages.find(p=>p.rel_path===scan.last_iac); if(found)pkg=found.index; restoredLastIac=true;} document.getElementById('packageSummary').textContent=`${packages.length} IAC package${packages.length===1?'':'s'}${scan.done?'':' · scanning...'}`; if(scan.error){document.getElementById('status').textContent=scan.error;} const box=document.getElementById('packages'); box.innerHTML=''; packages.forEach(p=>{const pct=p.total?Math.round(p.annotated/p.total*100):0; const d=document.createElement('div'); d.className='pkg'+(p.index===pkg?' active':''); d.style.setProperty('--pct',pct+'%'); d.innerHTML=`<b>${p.name}</b><div class=muted>${p.dataset||'no dataset'} · ${p.annotated}/${p.total} · ${pct}%</div>`; d.onclick=()=>{pkg=p.index; restoredLastIac=true; if(isMobile())setQueueOpen(false); refreshPackage();}; box.appendChild(d)}); return scan;}
 async function refreshPackage(){const scan=await loadPackages(); if(!packages.length){document.getElementById('recordMeta').textContent=scan.done?'No image-tile IAC packages found.':'Scanning IAC packages...'; setTimeout(refreshPackage,1000); return;} if(pkg>=packages.length) pkg=0; setThumbnailSrc(); await progress(); await nextRandom();}
-async function progress(){const p=await api('/api/progress?package='+pkg); l1Counts=p.l1; l2Counts=p.l2; renderLabels(); const overallPct=p.overall.total?Math.round(p.overall.annotated/p.overall.total*100):0; const pkgPct=p.package.total?Math.round(p.package.annotated/p.package.total*100):0; document.getElementById('progress').innerHTML=`<div><b>${p.overall.annotated}/${p.overall.total}</b> tiles marked (${overallPct}%)</div><div class=bar><div style="width:${overallPct}%"></div></div><div class="muted">Skipped: ${p.overall.skipped} · Remaining: ${p.overall.remaining}</div><div class="muted">Current IAC: ${p.package.annotated}/${p.package.total} (${pkgPct}%) · skipped ${p.package.skipped}</div>`;}
-async function showRecord(rec){current=rec; l1=""; l2=new Set();roi=[];roiAttribute='';roiAllComplete=false;document.getElementById('roiComplete').checked=false;renderLabels();renderRoi(); if(!rec){document.getElementById('recordMeta').textContent='All tiles in this IAC are annotated.'; document.getElementById('tile').removeAttribute('src'); return;} document.getElementById('recordMeta').textContent=`${packages[pkg].rel_path} · ${rec.tile_id} · x=${rec.x} y=${rec.y} row=${rec.row}`; const tile=document.getElementById('tile'); tile.src=authed(`/api/tile?package=${pkg}&row=${rec.row}`); setThumbnailSrc();}
-async function nextRandom(){const r=await api('/api/random?package='+pkg); await showRecord(r.record);}
-async function save(){if(!current){await nextRandom(); return;} if(!l1){document.getElementById('status').textContent='Select one L1 primary prototype first.'; return;}const roiPayload=[...roi,...(roiAllComplete?L2.map(attribute=>({attribute,state:'negative',review_complete:true})):[])]; await api('/api/annotation',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({package:pkg,row:current.row,l1,l2:[...l2],roi:roiPayload})}); document.getElementById('status').textContent='Saved.'; setThumbnailSrc(); await progress(); await loadPackages(); await nextRandom();}
+async function progress(){const p=await api('/api/progress?package='+pkg); l1Counts=p.l1; l2Counts=p.roi_counts&&Object.keys(p.roi_counts).length?p.roi_counts:p.l2; renderLabels(); const overallPct=p.overall.total?Math.round(p.overall.annotated/p.overall.total*100):0; const pkgPct=p.package.total?Math.round(p.package.annotated/p.package.total*100):0; const quotas=p.roi_targets&&Object.keys(p.roi_targets).length?`<div class=muted>${L2.map(x=>`${x}: ${p.roi_counts[x]||0}/${p.roi_targets[x]}`).join('<br>')}</div>`:''; document.getElementById('progress').innerHTML=`<div><b>${p.overall.annotated}/${p.overall.total}</b> tiles reviewed (${overallPct}%)</div><div class=bar><div style="width:${overallPct}%"></div></div><div class="muted">Skipped: ${p.overall.skipped} · Remaining: ${p.overall.remaining}</div><div class="muted">Current IAC: ${p.package.annotated}/${p.package.total} (${pkgPct}%) · skipped ${p.package.skipped}</div>${quotas}`;}
+async function showRecord(rec){current=rec; l1=""; l2=new Set();roi=[];roiAttribute='';roiAllComplete=false;document.getElementById('roiComplete').checked=false;renderLabels();renderRoi(); if(!rec){document.getElementById('recordMeta').textContent='All candidate tiles in this IAC are annotated.'; document.getElementById('tile').removeAttribute('src'); return;}const saved=await api(`/api/annotation-state?package=${pkg}&row=${rec.row}`);if(saved.annotation){l1=saved.annotation.l1||'';l2=new Set(saved.annotation.l2||[]);roi=(saved.annotation.roi||[]).filter(item=>item.geometry);const complete=new Set((saved.annotation.roi||[]).filter(item=>item.review_complete).map(item=>item.attribute));roiAllComplete=L2.every(name=>complete.has(name))}renderLabels();renderRoi();const candidate=saved.candidate;const priority=candidate?` · rank=${candidate.rank} · priority=${(candidate.priority_attributes||[]).join(',')}`:''; document.getElementById('recordMeta').textContent=`${packages[pkg].rel_path} · ${rec.tile_id} · x=${rec.x} y=${rec.y} row=${rec.row}${priority}`; const tile=document.getElementById('tile'); tile.src=authed(`/api/tile?package=${pkg}&row=${rec.row}`); setThumbnailSrc();}
+async function nextRandom(){let r=await api('/api/random?package='+pkg);if(!r.record&&ROI_MODE){const next=packages.find(p=>p.remaining>0&&p.index!==pkg);if(next){pkg=next.index;await loadPackages();await progress();setThumbnailSrc();r=await api('/api/random?package='+pkg)}}await showRecord(r.record);}
+async function reviewed(){const r=await api('/api/reviewed?package='+pkg);await showRecord(r.record)}
+async function save(){if(!current){await nextRandom(); return;} if(!l1){document.getElementById('status').textContent='Select one L1 primary prototype first.'; return;}if(ROI_MODE&&!roiAllComplete){document.getElementById('status').textContent=`Complete review of all ${L2.length} ROI attributes is required.`;return}const roiPayload=ROI_MODE?[...roi,...L2.map(attribute=>({attribute,state:'negative',review_complete:true}))]:roi; await api('/api/annotation',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({package:pkg,row:current.row,l1,l2:[...l2],roi:roiPayload})}); document.getElementById('status').textContent='Saved.'; setThumbnailSrc(); await progress(); await loadPackages(); await nextRandom();}
 async function openContext(){if(!current){document.getElementById('status').textContent='No tile selected.'; return;} const overlay=document.getElementById('contextOverlay'); const img=document.getElementById('contextImg'); document.getElementById('contextMeta').textContent=`${packages[pkg].rel_path} · ${current.tile_id}`; overlay.classList.remove('hidden'); img.onload=()=>{if(img.resetPanZoom)img.resetPanZoom();}; img.src=authed(`/api/context?package=${pkg}&row=${current.row}&t=${Date.now()}`);}
-setupRoi();document.querySelectorAll('[data-roi-tool]').forEach(b=>b.addEventListener('click',()=>{roiTool=b.dataset.roiTool;document.querySelectorAll('[data-roi-tool]').forEach(x=>x.classList.toggle('selected',x===b))}));document.getElementById('roiUndo').onclick=()=>{roi.pop();renderRoi()};document.getElementById('roiClear').onclick=()=>{roi=roi.filter(x=>x.attribute!==roiAttribute);renderRoi()};document.getElementById('roiComplete').onchange=ev=>{roiAllComplete=ev.target.checked};document.querySelector('[data-roi-tool="point"]').classList.add('selected');
+setupRoi();document.querySelectorAll('[data-roi-tool]').forEach(b=>b.addEventListener('click',()=>{roiTool=b.dataset.roiTool;document.querySelectorAll('[data-roi-tool]').forEach(x=>x.classList.toggle('selected',x===b))}));document.getElementById('roiUndo').onclick=()=>{roi.pop();syncPositiveLabels();renderRoi()};document.getElementById('roiClear').onclick=()=>{roi=roi.filter(x=>x.attribute!==roiAttribute);syncPositiveLabels();renderRoi()};document.getElementById('roiComplete').onchange=ev=>{roiAllComplete=ev.target.checked};document.querySelector('[data-roi-tool="point"]').classList.add('selected');
 setupPanZoom(document.getElementById('contextImg'));
 setupPanZoom(document.getElementById('thumb'),async ev=>{const img=ev.target, r=img.getBoundingClientRect(); const x=(ev.clientX-r.left)/r.width, y=(ev.clientY-r.top)/r.height; const rec=await api(`/api/nearest?package=${pkg}&rx=${x}&ry=${y}`); await showRecord(rec.record);});
 document.getElementById('toggleQueue').addEventListener('click',()=>setQueueOpen(document.getElementById('layout').classList.contains('queue-collapsed')));
@@ -786,7 +980,7 @@ document.getElementById('contextBtn').addEventListener('click',openContext);
 document.getElementById('contextClose').addEventListener('click',()=>document.getElementById('contextOverlay').classList.add('hidden'));
 document.getElementById('authSubmit').addEventListener('click',submitAuth);
 document.getElementById('authInput').addEventListener('keydown',ev=>{if(ev.key==='Enter')submitAuth();});
-const L1=%L1_JSON%; const L2=%L2_JSON%; renderLabels(); if(isMobile()){setQueueOpen(false); setLabelsOpen(false);} ensureAuth().then(()=>refreshPackage()).catch(e=>{if(e.message)document.getElementById('status').textContent=e.message||String(e);});
+const L1=%L1_JSON%; const L2=%L2_JSON%; const ROI_MODE=%ROI_MODE_JSON%; renderLabels(); if(isMobile()){setQueueOpen(false); setLabelsOpen(false);} ensureAuth().then(()=>refreshPackage()).catch(e=>{if(e.message)document.getElementById('status').textContent=e.message||String(e);});
 </script></body></html>
 """
 
@@ -811,7 +1005,11 @@ def make_handler(data: AnnotationData, auth_token: str):
             try:
                 if parsed.path == "/":
                     LOG.info("ui_open path=/")
-                    html = HTML.replace("%L1_JSON%", json.dumps(data.state.l1_prototypes)).replace("%L2_JSON%", json.dumps(data.state.l2_prototypes))
+                    html = (
+                        HTML.replace("%L1_JSON%", json.dumps(data.state.l1_prototypes))
+                        .replace("%L2_JSON%", json.dumps(data.state.l2_prototypes))
+                        .replace("%ROI_MODE_JSON%", json.dumps(data.roi_queue is not None))
+                    )
                     body = html.encode("utf-8")
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -834,6 +1032,13 @@ def make_handler(data: AnnotationData, auth_token: str):
                     return
                 if parsed.path == "/api/random":
                     _json_response(self, data.random_record(index))
+                    return
+                if parsed.path == "/api/reviewed":
+                    _json_response(self, data.reviewed_record(index))
+                    return
+                if parsed.path == "/api/annotation-state":
+                    row = int(qs["row"][0])
+                    _json_response(self, data.annotation_json(index, row))
                     return
                 if parsed.path == "/api/nearest":
                     viewer = data.viewer(index)
@@ -896,6 +1101,8 @@ def make_handler(data: AnnotationData, auth_token: str):
                 viewer = data.viewer(index)
                 record = viewer._by_row[row]
                 package = data.package(index)
+                if data.roi_queue is not None and not data.roi_queue.contains(record.tile_id):
+                    raise ValueError(f"tile is not in the frozen ROI candidate queue: {record.tile_id}")
                 LOG.info("annotation_request iac=%s row=%d l1=%s l2=%s", package.rel_path, row, payload.get("l1"), payload.get("l2", []))
                 data.state.save_annotation(
                     package,
@@ -920,9 +1127,17 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765, help="Use 0 to pick a free port.")
     parser.add_argument("--token", default="", help="Annotation UI auth token; overrides the persisted state .auth-token when set.")
+    parser.add_argument(
+        "--roi-candidate-manifest",
+        help="Frozen V2 ROI candidate queue JSON; enables nine-class complete-review mode.",
+    )
     parser.add_argument("--no-open", action="store_true")
     args = parser.parse_args()
-    data = AnnotationData(args.input, args.state)
+    data = AnnotationData(
+        args.input,
+        args.state,
+        roi_candidate_manifest=args.roi_candidate_manifest,
+    )
     auth_token = _load_or_create_auth_token(args.state, args.token)
     port = _find_free_port(args.host, args.port)
     server = ThreadingHTTPServer((args.host, port), make_handler(data, auth_token))

@@ -106,12 +106,14 @@ v_roi[x,j,k] in {0,1}
 
 - positive ROI geometry: `y_roi=1`, `v_roi=1`;
 - explicit reviewed negative geometry: `y_roi=0`, `v_roi=1`;
-- completely reviewed tile: all ten attributes initially become valid negatives across the tile,
+- completely reviewed tile: all nine retained ROI attributes initially become valid negatives across the tile,
   then every annotated positive geometry is overlaid for its attribute;
 - unreviewed, ambiguous, out-of-tissue, or unmarked regions around partial point/brush
   annotations: `v_roi=0` and contribute no loss.
 
-The production asset uses complete tile review across all ten Level-2 attributes. If a tile is
+The production asset uses complete tile review across all nine retained Level-2 attributes. Hyaline
+change is removed from the V2 ROI taxonomy because its 35 tile-level positives do not justify a
+separate spatial objective. If a tile is
 saved as an incomplete draft, point or partial brush annotations never convert unmarked patches
 into negatives and that draft is excluded from training.
 
@@ -128,18 +130,18 @@ asset is annotated completely. There is no separately annotated validation or te
 training. Model selection does not consume an ROI validation score. After training is frozen,
 localization and representation quality are evaluated by independent external sampling.
 
-Every selected tile is reviewed once for all ten Level-2 attributes. All visible positive foci
+Every selected tile is reviewed once for all nine ROI Level-2 attributes. All visible positive foci
 are marked; an unmarked attribute is therefore a complete negative for that tile. Separate
 negative queues are neither needed nor permitted.
 
-Selection is quota-driven by positive attribute coverage, not by ten independent passes over
-every tile. The initial production target is 500 unique tiles sampled from the existing 3,000
-prototype tiles. Candidate selection aims for at least 100 positive ROI tiles per attribute;
-attributes with fewer than 100 existing positive candidates contribute all candidates. The
-current tile-level inventory contains 98 ductular/portal, 55 vascular, and 35 hyaline-positive
-tiles, so these three attributes are exhaustively sampled. A greedy multi-label cover reaches
-the raw quotas in approximately 427 tiles; the 500-tile budget provides slide-diversity and
-replacement margin.
+Selection is quota-driven by positive attribute coverage, not by nine independent passes over
+every tile and not by a fixed total tile count. The production target is 100 ROI-positive tiles
+per retained attribute. A deterministic multi-label cover of the existing 3,000 tile-level
+annotations yields 402 candidates: it covers at least 100 source-positive tiles for seven
+attributes, all 98 ductular/portal candidates, and all 55 vascular candidates. The queue must be
+supplemented with at least 2 ductular/portal-positive and 45 vascular-positive tiles before it is
+frozen. Supplemental tiles are still reviewed completely for all nine attributes, so one tile can
+close multiple class deficits.
 
 Selection prioritizes independent slides and caps repeated tiles from one slide for the same
 attribute. Per-attribute feasibility is reported by independent positive slide count. Attributes
@@ -339,7 +341,7 @@ The primary comparison is 1 versus 4. Model 5 is auxiliary and cannot replace th
 
 - geometry rendering matches source coordinates;
 - tri-state masks preserve ignore regions;
-- all selected tiles carry complete ten-attribute review state;
+- all selected tiles carry complete nine-attribute review state;
 - positive quotas and independent-slide coverage are documented.
 
 ### Gate R1 — optimization validity
@@ -384,7 +386,7 @@ Implemented:
 
 Pending real-data evidence:
 
-- 500-tile complete ROI annotation asset;
+- complete nine-class ROI annotation asset reaching 100 positive tiles per retained attribute;
 - annotation rendering audit and per-attribute independent-slide feasibility report;
 - gradient-norm instrumentation and budget audit;
 - multi-seed V1/V2 ablations;

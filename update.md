@@ -9,19 +9,20 @@ Historical baseline: [`docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md`](docs/HCC_SEMPA
 
 | Workstream | State | Evidence / next gate |
 | --- | --- | --- |
-| ROI annotation geometry and state schema | implemented | complete ten-attribute tile review; point/brush/circle UI; polygon backend |
+| ROI annotation geometry and state schema | implemented | complete nine-attribute tile review; point/brush/circle UI; polygon backend |
 | Tri-state geometry-to-token conversion | implemented and unit-tested | production coordinate audit pending |
 | Patch-token L2 branch | implemented and unit-tested | real ROI calibration pending |
 | Masked ROI token loss | implemented and unit-tested | gradient-budget audit pending |
 | Directional local-to-global transfer | implemented and unit-tested | matched V1/V2 experiment pending |
 | B0/B1 detach and ramp schedule | implemented and unit-tested | production schedule selection pending |
 | Attribute-wise teacher adjudication | implemented, optional, default off | cross-fitting and loss-scale match pending |
-| Training ROI asset | not started | 500 fully reviewed tiles; per-attribute positive quota and slide coverage |
+| ROI candidate queue and quota scheduler | implemented | 402 existing candidates; supplement vascular +45 and ductular +2, then freeze |
+| Training ROI asset | ready for annotation | complete review until every retained attribute reaches 100 ROI-positive tiles |
 | Post-training external localization evaluation | not run | Gate R2 after model freeze |
 | External L2 and retrieval non-degradation | not run | Gate R2 after model freeze |
 | Manuscript integration | not started for V2 | Gate R3 |
 
-Last code validation: 160 passed, 1 skipped; two pre-existing hanging package-shuffle tests were
+Last code validation: 163 passed, 1 skipped; two pre-existing hanging package-shuffle tests were
 deselected, while ROI package-scatter behavior was tested separately.
 
 ## Objective
@@ -35,6 +36,10 @@ ViT patch-token targets. The spatial evidence is transferred one-way into the de
 
 - ROI annotation UI supports point, brush, and circle input per L2 attribute, undo/clear, and
   attribute-wise completely-reviewed state. The backend also accepts polygon geometry.
+- V2 ROI mode excludes hyaline change, enforces all nine review markers on save, derives tile-level
+  L2 positives from drawn geometry, supports reopening reviewed tiles, and reports live class quotas.
+- `build-roi-queue` creates the deterministic quota-driven queue; `annotate-prototypes
+  --roi-candidate-manifest` restricts annotation to that frozen queue.
 - Annotation state records tile ID, split, attribute, geometry, state, and review completeness.
 - JSON, JSONL, and the annotation UI state JSON are accepted as ROI manifests.
 - Geometry is rasterized to the backbone patch grid (`14 x 14` for 224px/16px).
@@ -96,9 +101,29 @@ Example manifest record:
 }
 ```
 
+## Annotation commands
+
+```bash
+hcc-sempath build-roi-queue \
+  --annotations annotations/hcc_prototype_review.final_3000_inflammatory_stromal.json \
+  --annotations /path/to/vascular_ductular_supplement.json \
+  --output annotations/hcc_l2_roi_v2_candidates.json \
+  --overwrite
+
+hcc-sempath annotate-prototypes \
+  --input /path/to/tile-iac-root \
+  --state annotations/hcc_l2_roi_v2.json \
+  --roi-candidate-manifest annotations/hcc_l2_roi_v2_candidates.json
+```
+
+The current generated queue contains 402 candidates and explicitly reports unresolved source
+inventory deficits of vascular `45` and ductular/portal `2`. Add supplemental classified positives
+and regenerate once; after ROI annotation starts, do not overwrite that queue.
+
 ## Acceptance evidence still requiring real data
 
-- annotate 500 training-side prototype tiles completely across all ten L2 attributes;
+- annotate the frozen training-side queue completely across all nine ROI attributes until each
+  retained attribute has 100 confirmed ROI-positive tiles;
 - verify ROI rendering/coordinate mapping and report per-attribute independent-slide coverage;
 - compare V1, ROI local-only, and ROI local-to-global under matched fixed training budgets;
 - freeze training, then externally sample and report localization, L1/retrieval non-degradation,

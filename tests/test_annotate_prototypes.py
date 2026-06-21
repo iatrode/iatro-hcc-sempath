@@ -18,12 +18,15 @@ from hcc_sempath.cli.annotate_prototypes import (
     HTML,
     L1_PROTOTYPES,
     L2_PROTOTYPES,
+    ROI_L2_PROTOTYPES,
+    RoiCandidateQueue,
     _auth_ok,
     _annotation_key,
     _load_or_create_auth_token,
     discover_iac_packages,
     make_handler,
 )
+from hcc_sempath.cli.build_roi_queue import build_roi_candidate_queue
 from hcc_sempath.io.feature_cache import build_teacher_feature_package
 from hcc_sempath.io.manifests import TileRecord
 from hcc_sempath.io.tile_package import build_tile_package_from_records, encode_jxl_array
@@ -136,9 +139,94 @@ def test_auth_token_requires_exact_nonempty_match() -> None:
     assert not _auth_ok("other", "secret")
 
 
-def test_roi_ui_complete_review_emits_negative_contract_for_all_l2_attributes() -> None:
-    assert "all 10 L2 attributes completely reviewed" in HTML
-    assert "roiAllComplete?L2.map" in HTML
+def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> None:
+    assert "all ROI L2 attributes completely reviewed" in HTML
+    assert "ROI_MODE&&!roiAllComplete" in HTML
+    assert "%ROI_MODE_JSON%" in HTML
+
+
+def _write_roi_queue(path: Path, tile_ids: list[str]) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "frozen": True,
+                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "target_per_attribute": {name: 100 for name in ROI_L2_PROTOTYPES},
+                "candidates": [
+                    {
+                        "tile_id": tile_id,
+                        "rank": rank,
+                        "source_l2": [ROI_L2_PROTOTYPES[rank % len(ROI_L2_PROTOTYPES)]],
+                    }
+                    for rank, tile_id in enumerate(tile_ids)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_roi_mode_filters_queue_and_requires_complete_nine_class_review(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    state_path = tmp_path / "roi.json"
+    queue_path = tmp_path / "queue.json"
+    _write_iac(iac_path)
+    _write_roi_queue(queue_path, ["s1_0000000", "s1_0000002"])
+    data = AnnotationData(iac_path, state_path, roi_candidate_manifest=queue_path)
+    try:
+        assert data.state.l2_prototypes == ROI_L2_PROTOTYPES
+        assert len(data.annotation_records(0)) == 2
+        package = data.package(0)
+        record = data.annotation_records(0)[0]
+        geometry = {
+            "attribute": ROI_L2_PROTOTYPES[0],
+            "state": "positive",
+            "geometry": {"type": "point", "coordinate_space": "normalized", "point": [0.5, 0.5]},
+        }
+        with pytest.raises(ValueError, match="complete ROI review"):
+            data.state.save_annotation(package, record, L1_PROTOTYPES[0], [ROI_L2_PROTOTYPES[0]], [geometry])
+        complete = [
+            {"attribute": name, "state": "negative", "review_complete": True}
+            for name in ROI_L2_PROTOTYPES
+        ]
+        data.state.save_annotation(
+            package,
+            record,
+            L1_PROTOTYPES[0],
+            [ROI_L2_PROTOTYPES[0]],
+            [geometry, *complete],
+        )
+        assert data.progress(0)["roi_counts"][ROI_L2_PROTOTYPES[0]] == 1
+        assert data.annotation_json(0, record.row)["annotation"]["roi_complete_all"] is True
+    finally:
+        data.close()
+
+
+def test_build_roi_queue_excludes_hyaline_and_reports_true_deficits(tmp_path: Path) -> None:
+    source = tmp_path / "annotations.json"
+    source.write_text(
+        json.dumps(
+            {
+                "annotations": {
+                    "a": {"tile_id": "t1", "iac": "a.iac", "row": 1, "slide": "s1", "l2": [ROI_L2_PROTOTYPES[0], ROI_L2_PROTOTYPES[1]]},
+                    "b": {"tile_id": "t2", "iac": "a.iac", "row": 2, "slide": "s1", "l2": [ROI_L2_PROTOTYPES[1], "hyaline-change-present"]},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = build_roi_candidate_queue([source], target=2)
+    assert "hyaline-change-present" not in payload["l2_prototypes"]
+    assert payload["candidate_count"] == 2
+    assert payload["frozen"] is False
+    assert payload["source_positive_inventory"][ROI_L2_PROTOTYPES[0]] == 1
+    assert payload["unfilled_targets"][ROI_L2_PROTOTYPES[0]] == 1
+    assert payload["selected_source_coverage"][ROI_L2_PROTOTYPES[1]] == 2
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="not frozen"):
+        RoiCandidateQueue(queue_path)
 
 
 def test_auth_token_reuses_state_sidecar_and_creates_private_file(tmp_path: Path) -> None:
