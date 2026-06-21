@@ -18,7 +18,6 @@ data:
   # ROI JSON/JSONL supports point, brush, circle, and polygon geometries.
   # roi_manifest_path: /path/to/prototypes/hcc_l2_roi_annotations.json
   roi_train_splits: [train]
-  roi_val_splits: [val]
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
   num_workers: 8

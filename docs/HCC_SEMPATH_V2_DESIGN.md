@@ -106,12 +106,14 @@ v_roi[x,j,k] in {0,1}
 
 - positive ROI geometry: `y_roi=1`, `v_roi=1`;
 - explicit reviewed negative geometry: `y_roi=0`, `v_roi=1`;
-- completely reviewed attribute background: all tokens initially become valid negatives, then
-  positive geometries are overlaid;
+- completely reviewed tile: all ten attributes initially become valid negatives across the tile,
+  then every annotated positive geometry is overlaid for its attribute;
 - unreviewed, ambiguous, out-of-tissue, or unmarked regions around partial point/brush
   annotations: `v_roi=0` and contribute no loss.
 
-Point or partial brush annotations must never convert all unmarked patches into negatives.
+The production asset uses complete tile review across all ten Level-2 attributes. If a tile is
+saved as an incomplete draft, point or partial brush annotations never convert unmarked patches
+into negatives and that draft is excluded from training.
 
 ### 5.3 Coordinate-to-token conversion
 
@@ -119,15 +121,29 @@ Geometry is rasterized at patch centers on the actual backbone grid. At 224 px w
 16, the expected grid is `14 x 14`. Training aborts if the configured ROI grid differs from the
 backbone grid. Rendering overlays and token conversion are audited before a manifest is frozen.
 
-### 5.4 Data separation
+### 5.4 Training asset and annotation volume
 
-All ROI partitions are split by slide. No WSI contributes ROI-supervised tiles to more than one
-of train, validation, or held-out test. Institution is balanced or held out when cohort size
-permits.
+ROI annotation follows the existing Level-1 prototype workflow: one training-side prototype
+asset is annotated completely. There is no separately annotated validation or test subset during
+training. Model selection does not consume an ROI validation score. After training is frozen,
+localization and representation quality are evaluated by independent external sampling.
 
-Per-attribute feasibility is judged by independent positive slide count, reviewed negative slide
-count, and held-out positive regions. Attributes without adequate independent-slide coverage
-remain tile-level attributes and are excluded from confirmatory localization claims.
+Every selected tile is reviewed once for all ten Level-2 attributes. All visible positive foci
+are marked; an unmarked attribute is therefore a complete negative for that tile. Separate
+negative queues are neither needed nor permitted.
+
+Selection is quota-driven by positive attribute coverage, not by ten independent passes over
+every tile. The initial production target is 500 unique tiles sampled from the existing 3,000
+prototype tiles. Candidate selection aims for at least 100 positive ROI tiles per attribute;
+attributes with fewer than 100 existing positive candidates contribute all candidates. The
+current tile-level inventory contains 98 ductular/portal, 55 vascular, and 35 hyaline-positive
+tiles, so these three attributes are exhaustively sampled. A greedy multi-label cover reaches
+the raw quotas in approximately 427 tiles; the 500-tile budget provides slide-diversity and
+replacement margin.
+
+Selection prioritizes independent slides and caps repeated tiles from one slide for the same
+attribute. Per-attribute feasibility is reported by independent positive slide count. Attributes
+without adequate slide diversity remain exploratory even if their tile quota is exhausted.
 
 ## 6. Model Architecture
 
@@ -274,8 +290,8 @@ is fixed.
 
 ### 9.1 Controlled models
 
-Use the same train tiles, ROI split, optimizer budget, seeds, query/gallery, and model-selection
-policy:
+Use the same training tiles, optimizer budget, seeds, external query/gallery, and fixed training
+schedule:
 
 1. V1 global model;
 2. V2 ROI local head with detached backbone;
@@ -287,11 +303,11 @@ The primary comparison is 1 versus 4. Model 5 is auxiliary and cannot replace th
 
 ### 9.2 Spatial evidence
 
-- pointing accuracy for point annotations;
-- token F1 and soft IoU on completely reviewed regions;
+- pointing accuracy on an independently sampled external annotation set after training;
+- token F1 and soft IoU on externally sampled, completely reviewed regions;
 - per-attribute activation-area distribution;
 - all-zero, all-one, and full-map broadcast rates;
-- slide-clustered confidence intervals;
+- external slide-clustered confidence intervals;
 - qualitative overlays selected without using model identity or test performance.
 
 ### 9.3 Global Level-2 evidence
@@ -319,22 +335,23 @@ The primary comparison is 1 versus 4. Model 5 is auxiliary and cannot replace th
 
 ## 10. Decision Gates
 
-### Gate R0 — annotation contract
+### Gate R0 — training annotation contract
 
 - geometry rendering matches source coordinates;
 - tri-state masks preserve ignore regions;
-- split and annotation metadata are complete;
-- no slide leakage exists.
+- all selected tiles carry complete ten-attribute review state;
+- positive quotas and independent-slide coverage are documented.
 
-### Gate R1 — local head validity
+### Gate R1 — optimization validity
 
 - B0 is numerically stable;
-- held-out ROI localization exceeds frozen baselines;
-- maps are attribute-specific and non-degenerate.
+- training diagnostics remain finite and maps are non-degenerate;
+- no ROI validation metric is used for model selection.
 
-### Gate R2 — global transfer
+### Gate R2 — frozen external evaluation
 
-- full V2 improves external L2 evidence over V1 and local-head-only controls;
+- after training is frozen, full V2 improves external L2/localization evidence over V1 and
+  local-head-only controls;
 - L1 and blinded retrieval show no material degradation;
 - ROI gradients remain within the frozen budget.
 
@@ -367,10 +384,10 @@ Implemented:
 
 Pending real-data evidence:
 
-- annotation rendering audit on production tiles;
-- per-attribute independent-slide feasibility report;
+- 500-tile complete ROI annotation asset;
+- annotation rendering audit and per-attribute independent-slide feasibility report;
 - gradient-norm instrumentation and budget audit;
 - multi-seed V1/V2 ablations;
-- held-out localization and external L2 evaluation;
+- post-training external localization and L2 evaluation;
 - retrieval/L1 non-degradation analysis;
 - manuscript integration after Gate R3.

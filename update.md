@@ -9,15 +9,16 @@ Historical baseline: [`docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md`](docs/HCC_SEMPA
 
 | Workstream | State | Evidence / next gate |
 | --- | --- | --- |
-| ROI annotation geometry and state schema | implemented | point/brush/circle UI; polygon backend; production rendering audit pending |
+| ROI annotation geometry and state schema | implemented | complete ten-attribute tile review; point/brush/circle UI; polygon backend |
 | Tri-state geometry-to-token conversion | implemented and unit-tested | production coordinate audit pending |
 | Patch-token L2 branch | implemented and unit-tested | real ROI calibration pending |
 | Masked ROI token loss | implemented and unit-tested | gradient-budget audit pending |
 | Directional local-to-global transfer | implemented and unit-tested | matched V1/V2 experiment pending |
 | B0/B1 detach and ramp schedule | implemented and unit-tested | production schedule selection pending |
 | Attribute-wise teacher adjudication | implemented, optional, default off | cross-fitting and loss-scale match pending |
-| Held-out localization evaluation | not run | Gate R1 |
-| External L2 and retrieval non-degradation | not run | Gate R2 |
+| Training ROI asset | not started | 500 fully reviewed tiles; per-attribute positive quota and slide coverage |
+| Post-training external localization evaluation | not run | Gate R2 after model freeze |
+| External L2 and retrieval non-degradation | not run | Gate R2 after model freeze |
 | Manuscript integration | not started for V2 | Gate R3 |
 
 Last code validation: 160 passed, 1 skipped; two pre-existing hanging package-shuffle tests were
@@ -61,7 +62,6 @@ ViT patch-token targets. The spatial evidence is transferred one-way into the de
 data:
   roi_manifest_path: /path/to/hcc_l2_roi_annotations.json
   roi_train_splits: [train]
-  roi_val_splits: [val]
 
 model:
   roi_patch_size: 16
@@ -98,9 +98,10 @@ Example manifest record:
 
 ## Acceptance evidence still requiring real data
 
-- verify ROI rendering and coordinate-to-token alignment on sampled tiles;
-- report per-attribute independent-slide ROI coverage;
-- compare V1, ROI local-only, and ROI local-to-global under matched training budgets;
-- report localization metrics, L1/retrieval non-degradation, and per-objective gradient norms;
+- annotate 500 training-side prototype tiles completely across all ten L2 attributes;
+- verify ROI rendering/coordinate mapping and report per-attribute independent-slide coverage;
+- compare V1, ROI local-only, and ROI local-to-global under matched fixed training budgets;
+- freeze training, then externally sample and report localization, L1/retrieval non-degradation,
+  and per-objective gradient norms;
 - keep attribute-wise teacher adjudication disabled in the primary ROI experiment unless its
   independent ablation demonstrates added value without changing effective L2 loss scale.

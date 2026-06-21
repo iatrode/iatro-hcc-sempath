@@ -756,13 +756,10 @@ def main() -> None:
         grid_size=roi_grid_size,
         allowed_splits=set(cfg["data"].get("roi_train_splits", ["train"])),
     )
-    val_roi_targets = build_roi_targets(
-        roi_manifest_path,
-        attribute_names=roi_attribute_names,
-        image_size=image_size,
-        grid_size=roi_grid_size,
-        allowed_splits=set(cfg["data"].get("roi_val_splits", ["val"])),
-    )
+    # ROI supervision is a training-side prototype asset. Validation batches
+    # intentionally carry no ROI targets; localization is evaluated externally
+    # only after the training run is frozen.
+    val_roi_targets = {}
     roi_dataset_kwargs = {
         "roi_attribute_count": len(roi_attribute_names) if roi_manifest_path else 0,
         "roi_grid_size": roi_grid_size,

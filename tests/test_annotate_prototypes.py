@@ -15,6 +15,7 @@ from PIL import Image
 from hcc_sempath.cli.annotate_prototypes import (
     AnnotationData,
     AnnotationState,
+    HTML,
     L1_PROTOTYPES,
     L2_PROTOTYPES,
     _auth_ok,
@@ -133,6 +134,11 @@ def test_auth_token_requires_exact_nonempty_match() -> None:
     assert not _auth_ok("", "secret")
     assert not _auth_ok("secret ", "secret")
     assert not _auth_ok("other", "secret")
+
+
+def test_roi_ui_complete_review_emits_negative_contract_for_all_l2_attributes() -> None:
+    assert "all 10 L2 attributes completely reviewed" in HTML
+    assert "roiAllComplete?L2.map" in HTML
 
 
 def test_auth_token_reuses_state_sidecar_and_creates_private_file(tmp_path: Path) -> None:
