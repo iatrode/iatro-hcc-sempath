@@ -16,7 +16,7 @@ from .config import (
     teacher_names,
     validate_training_config,
 )
-from ..modeling.models import HCCSemPathModel
+from ..modeling.models import HCCSemPathModel, STUDENT_BACKBONE_NAME
 from .manifest import load_training_manifest
 
 
@@ -44,10 +44,10 @@ def main() -> None:
     validate_training_config(cfg, names)
     dims = teacher_dims(cfg, names)
     model = HCCSemPathModel(
-        cfg["model"]["backbone_name"],
+        STUDENT_BACKBONE_NAME,
         embedding_dim(cfg),
         dims,
-        cfg["model"]["pretrained"],
+        False,
     ).to(device).eval()
     payload = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(payload["model"])

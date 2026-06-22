@@ -10,9 +10,7 @@ data:
   num_workers: 0
 
 model:
-  backbone_name: vit_tiny_patch16_224
   teacher_dim: 256
-  pretrained: false
 
 loss:
   feature_loss_type: cosine

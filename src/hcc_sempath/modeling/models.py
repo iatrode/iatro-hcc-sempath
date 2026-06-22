@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
+from timm.models.vision_transformer import checkpoint_filter_fn
 
 
 # Soft ceiling applied to prototype/attribute logits before any softmax/sigmoid.
@@ -16,6 +18,31 @@ import timm
 # attribute sigmoids at ~0.982 and 4-class L1 softmax at ~0.999.
 LOGIT_LIMIT = 4.0
 PROB_EPS = 1e-4
+STUDENT_BACKBONE_NAME = "vit_small_patch14_dinov2"
+STUDENT_IMAGE_SIZE = 224
+STUDENT_PATCH_SIZE = 14
+STUDENT_PRETRAINED_PATH = (
+    Path(__file__).resolve().parents[3] / "artifacts" / "pretrained" / "dinov2_vits14_pretrain.pth"
+)
+STUDENT_PRETRAINED_SHA256 = "b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9"
+
+
+def _load_fixed_student_pretraining(backbone: nn.Module) -> None:
+    if not STUDENT_PRETRAINED_PATH.is_file():
+        raise FileNotFoundError(
+            f"fixed DINOv2-S/14 pretrained weight is missing: {STUDENT_PRETRAINED_PATH}"
+        )
+    with STUDENT_PRETRAINED_PATH.open("rb") as handle:
+        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    if digest != STUDENT_PRETRAINED_SHA256:
+        raise ValueError(
+            "fixed DINOv2-S/14 pretrained weight checksum mismatch: "
+            f"expected={STUDENT_PRETRAINED_SHA256} got={digest} path={STUDENT_PRETRAINED_PATH}"
+        )
+    state = torch.load(STUDENT_PRETRAINED_PATH, map_location="cpu", weights_only=True)
+    state = state.get("model", state)
+    state = checkpoint_filter_fn(state, backbone)
+    backbone.load_state_dict(state, strict=True)
 
 
 class StudentEncoder(nn.Module):
@@ -23,9 +50,9 @@ class StudentEncoder(nn.Module):
 
     def __init__(
         self,
-        backbone_name: str = "vit_tiny_patch16_224",
+        backbone_name: str = STUDENT_BACKBONE_NAME,
         embedding_dim: int = 256,
-        pretrained: bool = False,
+        pretrained: bool = True,
         projector_type: str = "linear",
         projector_hidden_dim: int = 2048,
         grad_checkpointing: bool = False,
@@ -33,10 +60,15 @@ class StudentEncoder(nn.Module):
         super().__init__()
         self.backbone = timm.create_model(
             backbone_name,
-            pretrained=pretrained,
+            pretrained=False,
             num_classes=0,
-            global_pool="avg",
+            global_pool="token",
+            img_size=STUDENT_IMAGE_SIZE,
         )
+        if pretrained:
+            if backbone_name != STUDENT_BACKBONE_NAME:
+                raise ValueError(f"pretraining is fixed to {STUDENT_BACKBONE_NAME}, got {backbone_name}")
+            _load_fixed_student_pretraining(self.backbone)
         if grad_checkpointing:
             self.backbone.set_grad_checkpointing(True)
         student_dim = int(self.backbone.num_features)
@@ -60,7 +92,9 @@ class StudentEncoder(nn.Module):
         features = self.backbone(images)
         return self.projector(features)
 
-    def forward_with_patch_tokens(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+    def forward_with_patch_tokens(
+        self, images: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
         """Return the unchanged global embedding plus spatial ViT patch tokens."""
         tokens = self.backbone.forward_features(images)
         if tokens.ndim != 3:
@@ -111,10 +145,10 @@ class HCCSemPathModel(nn.Module):
 
     def __init__(
         self,
-        backbone_name: str = "vit_tiny_patch16_224",
+        backbone_name: str = STUDENT_BACKBONE_NAME,
         embedding_dim: int = 256,
         teacher_dims: dict[str, int] | None = None,
-        pretrained: bool = False,
+        pretrained: bool = True,
         projector_type: str = "linear",
         projector_hidden_dim: int = 2048,
         teacher_head_type: str = "linear",
@@ -335,7 +369,7 @@ def load_hcc_sempath_release(
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     model_config = config["model"]
     model = HCCSemPathModel(
-        backbone_name=model_config["backbone_name"],
+        backbone_name=STUDENT_BACKBONE_NAME,
         embedding_dim=int(model_config["embedding_dim"]),
         teacher_dims={},
         pretrained=False,

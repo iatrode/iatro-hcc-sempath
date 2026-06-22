@@ -16,7 +16,7 @@ Historical baseline: [`docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md`](docs/HCC_SEMPA
 | Directional local-to-global transfer | implemented and unit-tested | matched V1/V2 experiment pending |
 | B0/B1 detach and ramp schedule | implemented and unit-tested | production schedule selection pending |
 | Attribute-wise teacher adjudication | implemented, optional, default off | cross-fitting and loss-scale match pending |
-| ROI candidate queue and quota scheduler | implemented | 402 existing candidates; supplement vascular +45 and ductular +2, then freeze |
+| ROI candidate pool and quota scheduler | implemented | old L2-positive tiles are prioritized; the UI falls back to unreviewed full-pool tiles until each retained attribute reaches 100 ROI positives |
 | Training ROI asset | ready for annotation | complete review until every retained attribute reaches 100 ROI-positive tiles |
 | Post-training external localization evaluation | not run | Gate R2 after model freeze |
 | External L2 and retrieval non-degradation | not run | Gate R2 after model freeze |
@@ -38,11 +38,12 @@ ViT patch-token targets. The spatial evidence is transferred one-way into the de
   attribute-wise completely-reviewed state. The backend also accepts polygon geometry.
 - V2 ROI mode excludes hyaline change, enforces all nine review markers on save, derives tile-level
   L2 positives from drawn geometry, supports reopening reviewed tiles, and reports live class quotas.
-- `build-roi-queue` creates the deterministic quota-driven queue; `annotate-prototypes
-  --roi-candidate-manifest` restricts annotation to that frozen queue.
+- `build-roi-queue` creates a deterministic quota-aware priority pool from existing L2 positives;
+  `annotate-prototypes --roi-candidate-manifest` uses that pool first, then falls back to
+  unreviewed full-pool tiles when the priority pool cannot close the remaining ROI quotas.
 - Annotation state records tile ID, split, attribute, geometry, state, and review completeness.
 - JSON, JSONL, and the annotation UI state JSON are accepted as ROI manifests.
-- Geometry is rasterized to the backbone patch grid (`14 x 14` for 224px/16px).
+- Geometry is rasterized to the fixed DINOv2-S/14 backbone grid (`16 x 16` for 224px/14px).
 - Token supervision is tri-state:
   - annotated positive geometry -> positive;
   - explicit negative geometry or completely reviewed background -> negative;
@@ -69,7 +70,6 @@ data:
   roi_train_splits: [train]
 
 model:
-  roi_patch_size: 16
   roi_patch_dim: 1536
   roi_top_q: 0.1
   roi_patch_temperature: 0.1
@@ -116,13 +116,14 @@ hcc-sempath annotate-prototypes \
   --roi-candidate-manifest annotations/hcc_l2_roi_v2_candidates.json
 ```
 
-The current generated queue contains 402 candidates and explicitly reports unresolved source
-inventory deficits of vascular `45` and ductular/portal `2`. Add supplemental classified positives
-and regenerate once; after ROI annotation starts, do not overwrite that queue.
+The current generated priority pool contains 402 old-L2-positive candidates. It is expected to be
+insufficient for vascular and ductular/portal by itself; the annotator therefore continues with
+unreviewed full-pool tiles after the priority pool is exhausted or no longer useful for the
+remaining ROI deficits.
 
 ## Acceptance evidence still requiring real data
 
-- annotate the frozen training-side queue completely across all nine ROI attributes until each
+- annotate the training-side ROI stream completely across all nine ROI attributes until each
   retained attribute has 100 confirmed ROI-positive tiles;
 - verify ROI rendering/coordinate mapping and report per-attribute independent-slide coverage;
 - compare V1, ROI local-only, and ROI local-to-global under matched fixed training budgets;

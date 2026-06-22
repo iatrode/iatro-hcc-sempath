@@ -28,7 +28,6 @@ data:
   package_chunk_size: 64
 
 model:
-  backbone_name: vit_small_patch16_224
   embedding_dim: 1536
   projector_type: linear
   projector_hidden_dim: 2048
@@ -38,8 +37,6 @@ model:
     h_optimus_1: 1536
     uni2_h: 1536
     virchow2: 2560
-  pretrained: false
-  roi_patch_size: 16
   roi_patch_dim: 1536
   roi_top_q: 0.1
   roi_patch_temperature: 0.1

@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 
 from hcc_sempath.training.config import teacher_dims, teacher_names, validate_training_config
-from hcc_sempath.training.engine import build_lr_scheduler, scheduled_loss_config
+from hcc_sempath.training.engine import (
+    _objective_gradient_diagnostics,
+    _should_stop_for_alignment,
+    build_lr_scheduler,
+    scheduled_loss_config,
+)
 from hcc_sempath.training.losses import feature_distillation_loss_per_sample
 import torch
 
@@ -89,6 +94,41 @@ def test_cosine_scheduler_warms_up_and_decays() -> None:
     assert lrs[-1] < lrs[2]
 
 
+def test_objective_gradient_diagnostics_measure_shared_signal() -> None:
+    shared = torch.tensor([1.0, 2.0], requires_grad=True)
+    diagnostics = _objective_gradient_diagnostics(
+        (shared.square()).sum(),
+        (3.0 * shared).sum(),
+        (shared,),
+    )
+
+    assert diagnostics["gradient_global_norm"] > 0
+    assert diagnostics["gradient_roi_norm"] > 0
+    assert 0 < diagnostics["gradient_roi_share"] < 1
+    assert -1 <= diagnostics["gradient_roi_global_cosine"] <= 1
+
+
+def test_alignment_early_stop_requires_small_global_and_per_teacher_gain() -> None:
+    history = [
+        {
+            "epoch": 60.0,
+            "teacher_alignment_score": 0.810,
+            "gigapath_feature_cosine": 0.780,
+            "uni2_h_feature_cosine": 0.760,
+        },
+        {
+            "epoch": 80.0,
+            "teacher_alignment_score": 0.811,
+            "gigapath_feature_cosine": 0.781,
+            "uni2_h_feature_cosine": 0.761,
+        },
+    ]
+    assert _should_stop_for_alignment(history) is True
+
+    history[-1]["uni2_h_feature_cosine"] = 0.764
+    assert _should_stop_for_alignment(history) is False
+
+
 def test_teacher_names_allows_h_optimus_1_teacher() -> None:
     cfg = {"data": {"teachers": ["gigapath", "h_optimus_1"]}, "model": {"teacher_dims": {"gigapath": 1536, "h_optimus_1": 1536}}}
 
@@ -132,6 +172,17 @@ def test_training_config_rejects_stale_teacher_entries() -> None:
 
     with pytest.raises(ValueError, match="model.teacher_dims contains unknown teacher entries"):
         validate_training_config(cfg, names)
+
+
+def test_training_config_rejects_backbone_configuration() -> None:
+    cfg = {
+        "data": {"teachers": ["teacher"]},
+        "model": {"teacher_dims": {"teacher": 8}, "pretrained": False},
+        "loss": {},
+    }
+
+    with pytest.raises(ValueError, match="fixed pretrained DINOv2-S/14"):
+        validate_training_config(cfg, ["teacher"])
 
 
 def test_teacher_dims_require_configured_teacher_entries() -> None:

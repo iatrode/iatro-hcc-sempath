@@ -91,3 +91,51 @@ def test_roi_guided_loss_routes_local_signal_only_toward_global() -> None:
     assert global_logits.grad is not None and global_logits.grad.abs().sum() > 0
     assert local_logits.grad is None
     assert diagnostics["roi_valid_tokens"].item() == 1
+    assert "roi_attr_0_activation_fraction" in diagnostics
+    assert "roi_attr_0_all_zero_rate" in diagnostics
+    assert "roi_attr_0_all_one_rate" in diagnostics
+    assert "roi_attr_0_broadcast_rate" in diagnostics
+
+
+def test_point_geometry_always_marks_its_patch_below_patch_radius() -> None:
+    # A sub-patch radius must still mark the patch the click lands in; otherwise
+    # off-center clicks on the DINOv2-S/14 grid silently rasterize to zero tokens.
+    common = {"image_size": (224, 224), "grid_size": (16, 16)}
+    for cx, cy in [(3, 3), (45, 7), (100, 100), (217, 9), (130, 200)]:
+        geometry = {
+            "type": "point",
+            "coordinate_space": "pixel",
+            "point": [cx, cy],
+            "radius": 0.5,
+        }
+        mask = geometry_token_mask(geometry, **common)
+        assert int(mask.sum()) >= 1
+        assert mask[int(cy / 14), int(cx / 14)]
+
+
+def test_degenerate_map_rates_count_only_roi_supervised_tiles() -> None:
+    # One supervised tile with a healthy map; many unsupervised tiles pinned to an
+    # all-zero/broadcast map must not pollute the degenerate-map diagnostics.
+    patch_logits = torch.full((8, 1, 4, 4), -6.0)
+    patch_logits[0] = torch.tensor([5.0, -5.0]).repeat(8).reshape(1, 4, 4)
+    local_logits = torch.zeros((8, 1))
+    global_logits = torch.zeros((8, 1))
+    target = torch.zeros_like(patch_logits)
+    valid = torch.zeros_like(patch_logits, dtype=torch.bool)
+    valid[0] = True
+    consistency = torch.zeros((8, 1), dtype=torch.bool)
+    consistency[0] = True
+
+    _, _, diagnostics = roi_guided_level2_loss(
+        patch_logits=patch_logits,
+        local_logits=local_logits,
+        global_logits=global_logits,
+        roi_target=target,
+        roi_valid=valid,
+        roi_consistency=consistency,
+    )
+    # The single supervised tile is non-degenerate, so all degenerate rates are 0
+    # even though 7/8 unsupervised tiles look all-zero and broadcast.
+    assert diagnostics["roi_attr_0_all_zero_rate"].item() == 0.0
+    assert diagnostics["roi_attr_0_broadcast_rate"].item() == 0.0
+

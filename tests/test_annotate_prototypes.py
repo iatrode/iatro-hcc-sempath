@@ -140,9 +140,31 @@ def test_auth_token_requires_exact_nonempty_match() -> None:
 
 
 def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> None:
-    assert "all ROI L2 attributes completely reviewed" in HTML
-    assert "ROI_MODE&&!roiAllComplete" in HTML
+    assert "Unmarked classes stay unknown/ignored unless explicitly toggled negative." in HTML
+    assert "ROI conflict: marked negative but has ROI annotation" in HTML
+    assert "Positive or uncertain by default" in HTML
     assert "%ROI_MODE_JSON%" in HTML
+    assert 'id="roiClassBar"' in HTML
+    assert "prototypeLabels').style.display=ROI_MODE?'none':'block'" in HTML
+    assert "All ROI classes visible. Select one L2 class before drawing." in HTML
+    assert "✓ " in HTML
+    assert "overflow-x:auto" in HTML
+    assert 'id="tileZoomIn"' in HTML
+    assert 'id="roiRedo"' in HTML
+    assert "undoRoi()" in HTML
+    assert "redoRoi()" in HTML
+    assert "roiPreview" in HTML
+    assert "ev.key.toLowerCase()==='z'" in HTML
+    assert "ev.key.toLowerCase()==='y'" in HTML
+    assert 'id="brushWidth"' in HTML
+    assert 'type="range"' in HTML
+    assert 'id="brushDot"' in HTML
+    assert 'max="0.500"' in HTML
+    assert "updateBrushDot()" in HTML
+    assert "brushWidth()" in HTML
+    assert "roiCursor" in HTML
+    assert "updateRoiCursor" in HTML
+    assert "exclude_row" in HTML
 
 
 def _write_roi_queue(path: Path, tile_ids: list[str]) -> None:
@@ -150,7 +172,7 @@ def _write_roi_queue(path: Path, tile_ids: list[str]) -> None:
         json.dumps(
             {
                 "version": 1,
-                "frozen": True,
+                "complete": False,
                 "l2_prototypes": ROI_L2_PROTOTYPES,
                 "target_per_attribute": {name: 100 for name in ROI_L2_PROTOTYPES},
                 "candidates": [
@@ -167,38 +189,48 @@ def _write_roi_queue(path: Path, tile_ids: list[str]) -> None:
     )
 
 
-def test_roi_mode_filters_queue_and_requires_complete_nine_class_review(tmp_path: Path) -> None:
+def test_roi_mode_prioritizes_queue_without_filtering_full_tile_pool(tmp_path: Path) -> None:
     iac_path = tmp_path / "tiles.iac"
     state_path = tmp_path / "roi.json"
     queue_path = tmp_path / "queue.json"
     _write_iac(iac_path)
-    _write_roi_queue(queue_path, ["s1_0000000", "s1_0000002"])
+    _write_roi_queue(queue_path, ["s1_0000000"])
     data = AnnotationData(iac_path, state_path, roi_candidate_manifest=queue_path)
     try:
         assert data.state.l2_prototypes == ROI_L2_PROTOTYPES
-        assert len(data.annotation_records(0)) == 2
+        assert len(data.annotation_records(0)) == 4
         package = data.package(0)
-        record = data.annotation_records(0)[0]
+        record = data.random_record(0)["record"]
+        assert record["tile_id"] == "s1_0000000"
+        iac_record = data.viewer(0)._by_row[record["row"]]
         geometry = {
             "attribute": ROI_L2_PROTOTYPES[0],
             "state": "positive",
             "geometry": {"type": "point", "coordinate_space": "normalized", "point": [0.5, 0.5]},
         }
-        with pytest.raises(ValueError, match="complete ROI review"):
-            data.state.save_annotation(package, record, L1_PROTOTYPES[0], [ROI_L2_PROTOTYPES[0]], [geometry])
-        complete = [
-            {"attribute": name, "state": "negative", "review_complete": True}
-            for name in ROI_L2_PROTOTYPES
-        ]
         data.state.save_annotation(
             package,
-            record,
+            iac_record,
             L1_PROTOTYPES[0],
             [ROI_L2_PROTOTYPES[0]],
-            [geometry, *complete],
+            [geometry],
         )
+        fallback = data.random_record(0)["record"]
+        assert fallback is not None
+        assert fallback["tile_id"] != "s1_0000000"
         assert data.progress(0)["roi_counts"][ROI_L2_PROTOTYPES[0]] == 1
-        assert data.annotation_json(0, record.row)["annotation"]["roi_complete_all"] is True
+        saved = data.annotation_json(0, iac_record.row)["annotation"]
+        assert saved["roi_reviewed"] is True
+        assert saved["roi_complete_all"] is False
+
+        with pytest.raises(ValueError, match="both positive and negative"):
+            data.state.save_annotation(
+                package,
+                iac_record,
+                L1_PROTOTYPES[0],
+                [ROI_L2_PROTOTYPES[0]],
+                [geometry, {"attribute": ROI_L2_PROTOTYPES[0], "state": "negative", "review_complete": True}],
+            )
     finally:
         data.close()
 
@@ -219,14 +251,36 @@ def test_build_roi_queue_excludes_hyaline_and_reports_true_deficits(tmp_path: Pa
     payload = build_roi_candidate_queue([source], target=2)
     assert "hyaline-change-present" not in payload["l2_prototypes"]
     assert payload["candidate_count"] == 2
-    assert payload["frozen"] is False
+    assert payload["complete"] is False
     assert payload["source_positive_inventory"][ROI_L2_PROTOTYPES[0]] == 1
     assert payload["unfilled_targets"][ROI_L2_PROTOTYPES[0]] == 1
     assert payload["selected_source_coverage"][ROI_L2_PROTOTYPES[1]] == 2
     queue_path = tmp_path / "queue.json"
     queue_path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="not frozen"):
-        RoiCandidateQueue(queue_path)
+    assert RoiCandidateQueue(queue_path).contains("t1")
+
+
+def test_package_list_and_progress_do_not_open_iac_viewers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "iac"
+    (root / "a").mkdir(parents=True)
+    (root / "b").mkdir(parents=True)
+    _write_iac(root / "a" / "tiles.iac")
+    _write_iac(root / "b" / "tiles.iac")
+    state_path = tmp_path / "annotations.json"
+    data = AnnotationData(root, state_path)
+    try:
+        def fail_viewer(_index: int):
+            raise AssertionError("package list/progress must not open IAC viewers")
+
+        monkeypatch.setattr(data, "viewer", fail_viewer)
+        packages = data.package_json()
+        assert len(packages) == 2
+        assert packages[0]["total"] == 4
+        progress = data.progress(0)
+        assert progress["overall"]["total"] == 8
+        assert progress["package"]["total"] == 4
+    finally:
+        data.close()
 
 
 def test_auth_token_reuses_state_sidecar_and_creates_private_file(tmp_path: Path) -> None:
@@ -562,6 +616,9 @@ def test_random_record_skips_annotated_tiles_and_overview_is_jpg(tmp_path: Path)
 
         seen_rows = {data.random_record(0)["record"]["row"] for _ in range(30)}
         assert first.row not in seen_rows
+        current = data.viewer(0).records[1]
+        excluded_rows = {data.random_record(0, exclude_row=current.row)["record"]["row"] for _ in range(30)}
+        assert current.row not in excluded_rows
         assert data.thumbnail_jpg(0).startswith(b"\xff\xd8")
         assert data.overview_cache_path(package).exists()
     finally:
@@ -596,3 +653,117 @@ def test_overview_uses_fixed_cell_grid_for_spatial_layout(tmp_path: Path) -> Non
         assert image.getpixel((2, 2)) != (255, 255, 255)
     finally:
         data.close()
+
+
+def test_save_skip_persists_state(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    state_path = tmp_path / "annotations.json"
+    _write_iac(iac_path)
+
+    data = AnnotationData(iac_path, state_path)
+    try:
+        package = data.packages[0]
+        record0 = data.viewer(0).records[0]
+        record1 = data.viewer(0).records[1]
+
+        # 1. Save annotation on record0
+        data.state.save_annotation(package, record0, L1_PROTOTYPES[0], [])
+        assert _annotation_key(package, record0) in data.state.annotations
+
+        # 2. Skip record0 (should be a no-op because it's annotated)
+        data.state.save_skip(package, record0)
+        assert _annotation_key(package, record0) not in data.state.skipped
+
+        # 3. Skip record1 (should succeed)
+        data.state.save_skip(package, record1)
+        assert _annotation_key(package, record1) in data.state.skipped
+
+        # Verify persisted state on disk
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        assert _annotation_key(package, record1) in payload["skipped"]
+        assert _annotation_key(package, record0) not in payload["skipped"]
+    finally:
+        data.close()
+
+
+def test_skip_via_http_post(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    state_path = tmp_path / "annotations.json"
+    _write_iac(iac_path)
+    data = AnnotationData(iac_path, state_path)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(data, "secret"))
+    except PermissionError:
+        data.close()
+        pytest.skip("local socket bind is blocked in this sandbox")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    root_url = f"http://127.0.0.1:{server.server_address[1]}/"
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"{root_url}api/skip?token=secret",
+            data=json.dumps({"package": 0, "row": 1}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            assert response.status == 200
+            res_payload = json.loads(response.read().decode("utf-8"))
+            assert res_payload == {"ok": True}
+
+        package = data.packages[0]
+        record = data.viewer(0).records[1]
+        assert _annotation_key(package, record) in data.state.skipped
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+        data.close()
+
+
+def test_endpoints_via_http_get(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    state_path = tmp_path / "annotations.json"
+    _write_iac(iac_path)
+    data = AnnotationData(iac_path, state_path)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(data, "secret"))
+    except PermissionError:
+        data.close()
+        pytest.skip("local socket bind is blocked in this sandbox")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    root_url = f"http://127.0.0.1:{server.server_address[1]}/"
+    try:
+        import urllib.request
+
+        # 1. Test /api/random with package=all
+        with urllib.request.urlopen(f"{root_url}api/random?token=secret&package=all", timeout=5) as response:
+            assert response.status == 200
+            res = json.loads(response.read().decode("utf-8"))
+            assert "record" in res
+            assert res["package_index"] == 0
+
+        # 2. Test /api/progress with package=0
+        with urllib.request.urlopen(f"{root_url}api/progress?token=secret&package=0", timeout=5) as response:
+            assert response.status == 200
+            res = json.loads(response.read().decode("utf-8"))
+            assert "package" in res
+
+        # 3. Test /api/annotation-state with package=0 and row=0
+        with urllib.request.urlopen(f"{root_url}api/annotation-state?token=secret&package=0&row=0", timeout=5) as response:
+            assert response.status == 200
+            res = json.loads(response.read().decode("utf-8"))
+            assert "candidate" in res
+
+        # 4. Test /api/tile with package=0 and row=0
+        with urllib.request.urlopen(f"{root_url}api/tile?token=secret&package=0&row=0", timeout=5) as response:
+            assert response.status == 200
+            assert len(response.read()) > 0
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+        data.close()
+

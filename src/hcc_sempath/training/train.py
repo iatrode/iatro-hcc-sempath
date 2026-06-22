@@ -13,7 +13,14 @@ from . import _pipeline_probe as _probe
 
 from ..io.tile_package import read_package_metadata
 from ..modeling.prototypes import PrototypeRegistry, load_prototype_registry
-from ..modeling.models import HCCSemPathModel
+from ..modeling.models import (
+    HCCSemPathModel,
+    STUDENT_BACKBONE_NAME,
+    STUDENT_IMAGE_SIZE,
+    STUDENT_PATCH_SIZE,
+    STUDENT_PRETRAINED_PATH,
+    STUDENT_PRETRAINED_SHA256,
+)
 from .config import (
     embedding_dim,
     image_tile_package_paths,
@@ -671,6 +678,14 @@ def main() -> None:
     parser.add_argument("--resume", default="")
     args = parser.parse_args()
     cfg = load_config(args.config)
+    cfg["research_contract"] = {
+        "student_backbone": STUDENT_BACKBONE_NAME,
+        "student_pretrained": True,
+        "student_image_size": STUDENT_IMAGE_SIZE,
+        "student_patch_size": STUDENT_PATCH_SIZE,
+        "student_pretrained_file": STUDENT_PRETRAINED_PATH.name,
+        "student_pretrained_sha256": STUDENT_PRETRAINED_SHA256,
+    }
     _cap_compute_threads(int(cfg["data"].get("num_workers", 0)))
     seed_everything(int(cfg["runtime"]["seed"]))
     device = torch.device(cfg["runtime"]["device"])
@@ -734,6 +749,9 @@ def main() -> None:
     all_tile_packages = sorted(set(train_tile_packages + val_tile_packages))
     tile_metadata = read_package_metadata(all_tile_packages[0])
     image_size = (int(tile_metadata["tile_height"]), int(tile_metadata["tile_width"]))
+    expected_image_size = (STUDENT_IMAGE_SIZE, STUDENT_IMAGE_SIZE)
+    if image_size != expected_image_size:
+        raise ValueError(f"fixed student expects native tiles {expected_image_size}, got {image_size}")
     for package_path in all_tile_packages[1:]:
         metadata = read_package_metadata(package_path)
         candidate_size = (int(metadata["tile_height"]), int(metadata["tile_width"]))
@@ -745,7 +763,7 @@ def main() -> None:
         if label_contract is not None
         else []
     )
-    patch_size = int(cfg["model"].get("roi_patch_size", 16))
+    patch_size = STUDENT_PATCH_SIZE
     roi_grid_size = (image_size[0] // patch_size, image_size[1] // patch_size) if roi_manifest_path else (0, 0)
     if roi_manifest_path and (image_size[0] % patch_size or image_size[1] % patch_size):
         raise ValueError(f"ROI patch size {patch_size} does not divide image size {image_size}")
@@ -963,10 +981,10 @@ def main() -> None:
             **loader_kwargs,
         )
     model = HCCSemPathModel(
-        backbone_name=cfg["model"]["backbone_name"],
+        backbone_name=STUDENT_BACKBONE_NAME,
         embedding_dim=embedding_dim(cfg),
         teacher_dims=dims,
-        pretrained=cfg["model"]["pretrained"],
+        pretrained=not bool(args.resume),
         projector_type=cfg["model"].get("projector_type", "linear"),
         projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
         teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),

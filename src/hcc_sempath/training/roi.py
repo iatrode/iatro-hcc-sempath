@@ -98,12 +98,19 @@ def geometry_token_mask(
     patch_radius = 0.5 * min(image_w / grid_w, image_h / grid_h)
     mask = torch.zeros((grid_h, grid_w), dtype=torch.bool)
 
+    point_center: tuple[float, float] | None = None
     if kind in {"point", "circle"}:
         center = _xy(geometry.get("point", geometry.get("center", geometry)), image_size, normalized)
         radius = float(geometry.get("radius", patch_radius))
         if normalized:
             radius *= min(image_w, image_h)
         predicate = lambda x, y: math.hypot(x - center[0], y - center[1]) <= max(radius, patch_radius * 0.5)
+        if kind == "point":
+            # A point must always mark the patch it lands in. With the DINOv2-S/14
+            # grid a patch spans 14 px; a sub-patch radius would otherwise rasterize
+            # to zero tokens whenever the click misses a patch center, silently
+            # discarding the annotation.
+            point_center = center
     elif kind in {"brush", "polyline"}:
         points = [_xy(item, image_size, normalized) for item in geometry.get("points", [])]
         if not points:
@@ -132,6 +139,10 @@ def geometry_token_mask(
         for col in range(grid_w):
             x = (col + 0.5) * image_w / grid_w
             mask[row, col] = bool(predicate(x, y))
+    if point_center is not None and not mask.any():
+        col = min(grid_w - 1, max(0, int(point_center[0] * grid_w / image_w)))
+        row = min(grid_h - 1, max(0, int(point_center[1] * grid_h / image_h)))
+        mask[row, col] = True
     return mask
 
 

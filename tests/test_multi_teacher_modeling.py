@@ -5,6 +5,7 @@ import torch
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 from hcc_sempath.training.losses import multi_teacher_distillation_loss
+from hcc_sempath.training.engine import _objective_gradient_diagnostics
 
 
 def test_hcc_sempath_model_returns_shared_embedding_and_teacher_outputs() -> None:
@@ -57,6 +58,30 @@ def test_roi_head_warmup_detaches_patch_gradient_from_backbone() -> None:
 
     assert any(parameter.grad is not None for parameter in model.roi_patch_projector.parameters())
     assert all(parameter.grad is None for parameter in model.encoder.backbone.parameters())
+
+
+def test_roi_gradient_diagnostic_uses_real_shared_backbone_tokens() -> None:
+    model = HCCSemPathModel(
+        backbone_name="vit_tiny_patch16_224",
+        embedding_dim=11,
+        teacher_dims={},
+        pretrained=False,
+        roi_l2_num_attributes=2,
+        roi_patch_dim=13,
+    )
+    outputs = model(torch.randn(1, 3, 224, 224))
+    global_objective = outputs["embedding"].square().mean()
+    roi_objective = outputs["roi_patch_logits"].square().mean()
+    diagnostics = _objective_gradient_diagnostics(
+        global_objective,
+        roi_objective,
+        tuple(model.encoder.backbone.blocks[-1].parameters()),
+    )
+
+    assert diagnostics["gradient_global_norm"] > 0
+    assert diagnostics["gradient_roi_norm"] > 0
+    (global_objective + roi_objective).backward()
+    assert any(parameter.grad is not None for parameter in model.encoder.backbone.parameters())
 
 
 def test_hcc_sempath_model_uses_same_class_for_release_prototype_outputs() -> None:

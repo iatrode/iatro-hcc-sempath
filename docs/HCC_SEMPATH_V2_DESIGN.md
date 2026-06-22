@@ -105,13 +105,17 @@ v_roi[x,j,k] in {0,1}
 ```
 
 - positive ROI geometry: `y_roi=1`, `v_roi=1`;
-- explicit reviewed negative geometry: `y_roi=0`, `v_roi=1`;
-- completely reviewed tile: all nine retained ROI attributes initially become valid negatives across the tile,
-  then every annotated positive geometry is overlaid for its attribute;
+- attribute explicitly toggled negative for the tile: the whole tile becomes `y_roi=0`,
+  `v_roi=1` for that attribute (a tile-wide reviewed negative);
+- explicit reviewed negative geometry: `y_roi=0`, `v_roi=1` on the marked region;
+- every attribute not marked positive and not explicitly toggled negative: `v_roi=0`,
+  contributing no loss, because mixed or unclear tissue cannot be reliably declared negative;
 - unreviewed, ambiguous, out-of-tissue, or unmarked regions around partial point/brush
   annotations: `v_roi=0` and contribute no loss.
 
-The production asset uses complete tile review across all nine retained Level-2 attributes. Hyaline
+Negative supervision is opt-in per attribute, not a side effect of reviewing a tile. An attribute
+becomes a tile-wide negative only when the annotator explicitly toggles that ROI class to negative,
+which is the only way an unmarked attribute leaves the ignore state. Hyaline
 change is removed from the V2 ROI taxonomy because its 35 tile-level positives do not justify a
 separate spatial objective. If a tile is
 saved as an incomplete draft, point or partial brush annotations never convert unmarked patches
@@ -119,9 +123,14 @@ into negatives and that draft is excluded from training.
 
 ### 5.3 Coordinate-to-token conversion
 
-Geometry is rasterized at patch centers on the actual backbone grid. At 224 px with patch size
-16, the expected grid is `14 x 14`. Training aborts if the configured ROI grid differs from the
-backbone grid. Rendering overlays and token conversion are audited before a manifest is frozen.
+Geometry is rasterized at patch centers on the actual backbone grid. The fixed student is
+pretrained DINOv2-S/14 at the native `224 x 224` tile size, producing a `16 x 16` patch grid.
+The patch size is an implementation invariant rather than a configuration option. Training aborts
+if the ROI grid differs from the backbone grid. Rendering overlays and token conversion are audited
+before ROI annotations are used for training.
+
+The global path uses DINOv2's native CLS-token pooling. The official pretrained checkpoint is a
+local fixed asset with a pinned SHA-256 checksum; training performs no network download.
 
 ### 5.4 Training asset and annotation volume
 
@@ -130,18 +139,22 @@ asset is annotated completely. There is no separately annotated validation or te
 training. Model selection does not consume an ROI validation score. After training is frozen,
 localization and representation quality are evaluated by independent external sampling.
 
-Every selected tile is reviewed once for all nine ROI Level-2 attributes. All visible positive foci
-are marked; an unmarked attribute is therefore a complete negative for that tile. Separate
-negative queues are neither needed nor permitted.
+Every selected tile is reviewed once for the ROI Level-2 attributes that are confidently
+classifiable. All visible positive foci for the selected attribute are marked. Unmarked attributes
+remain unknown/ignored by default, because mixed or unclear tissue can be impossible to separate
+reliably. An attribute becomes a negative training signal only when the annotator explicitly
+toggles that ROI class to negative for the tile. Separate negative queues are neither needed nor
+permitted.
 
-Selection is quota-driven by positive attribute coverage, not by nine independent passes over
-every tile and not by a fixed total tile count. The production target is 100 ROI-positive tiles
-per retained attribute. A deterministic multi-label cover of the existing 3,000 tile-level
-annotations yields 402 candidates: it covers at least 100 source-positive tiles for seven
-attributes, all 98 ductular/portal candidates, and all 55 vascular candidates. The queue must be
-supplemented with at least 2 ductular/portal-positive and 45 vascular-positive tiles before it is
-frozen. Supplemental tiles are still reviewed completely for all nine attributes, so one tile can
-close multiple class deficits.
+Selection is quota-driven by confirmed ROI-positive attribute counts, not by nine independent
+passes over every tile and not by a fixed total tile count. The production target is 100
+ROI-positive tiles per retained attribute. A deterministic multi-label cover of the existing
+3,000 tile-level annotations yields a 402-tile priority pool: it covers at least 100
+source-positive tiles for seven attributes, all 98 ductular/portal source-positive tiles, and all
+55 vascular source-positive tiles. This old-L2-positive pool is a scheduling accelerator, not a
+hard boundary. The annotator serves priority-pool tiles first while their source labels match
+remaining ROI deficits, then falls back to unreviewed tiles from the full IAC input until the ROI
+positive counts reach the target.
 
 Selection prioritizes independent slides and caps repeated tiles from one slide for the same
 attribute. Per-attribute feasibility is reported by independent positive slide count. Attributes
@@ -238,9 +251,11 @@ lambda_roi = 0.10
 lambda_lg  = 0.05
 ```
 
-They are ramps, not immediate constants. Confirmatory runs must log per-objective gradient norms
-on the shared backbone. A V2 run is invalid if ROI-related gradient norm persistently dominates
-the combined teacher/global objective or materially degrades L1/retrieval.
+They are ramps, not immediate constants. Runs log global and ROI objective gradient norms and their
+cosine on the final shared Transformer block. These diagnostics certify mechanism activity but do
+not dynamically reweight objectives or stop training when an objective naturally saturates. A run
+is invalid only when the ROI path is disconnected or non-finite, persistently dominates the
+combined teacher/global objective, or materially degrades L1/retrieval.
 
 ### 7.3 Attribute-wise teacher adjudication
 
@@ -349,6 +364,9 @@ The primary comparison is 1 versus 4. Model 5 is auxiliary and cannot replace th
 - B0 is numerically stable;
 - training diagnostics remain finite and maps are non-degenerate;
 - no ROI validation metric is used for model selection.
+- training runs for at most 100 epochs and is stopped only after epoch 60 when fixed validation
+  teacher alignment improves by less than 0.002 over 20 epochs and no individual teacher cosine
+  improves by at least 0.003; training loss and dynamic-prototype loss never trigger stopping.
 
 ### Gate R2 — frozen external evaluation
 

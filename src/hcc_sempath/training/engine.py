@@ -29,6 +29,80 @@ from .zhcc_losses import (
 from .zhcc_metrics import evaluate_zhcc_prototypes
 
 
+GRADIENT_DIAGNOSTIC_INTERVAL_STEPS = 1000
+EARLY_STOP_MIN_EPOCH = 60
+EARLY_STOP_CHECK_INTERVAL_EPOCHS = 10
+EARLY_STOP_WINDOW_EPOCHS = 20
+EARLY_STOP_ALIGNMENT_GAIN = 0.002
+EARLY_STOP_PER_TEACHER_GAIN = 0.003
+
+
+def _objective_gradient_diagnostics(
+    global_objective: torch.Tensor,
+    roi_objective: torch.Tensor,
+    shared_parameters: tuple[torch.Tensor, ...],
+) -> dict[str, float]:
+    """Measure objective interaction on the final shared Transformer block."""
+    global_grads = torch.autograd.grad(
+        global_objective,
+        shared_parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    roi_grads = torch.autograd.grad(
+        roi_objective,
+        shared_parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    device = shared_parameters[0].device
+    global_sq = torch.zeros((), device=device)
+    roi_sq = torch.zeros((), device=device)
+    dot = torch.zeros((), device=device)
+    for global_grad, roi_grad in zip(global_grads, roi_grads, strict=True):
+        if global_grad is not None:
+            global_grad = global_grad.detach().float()
+            global_sq = global_sq + global_grad.square().sum()
+        if roi_grad is not None:
+            roi_grad = roi_grad.detach().float()
+            roi_sq = roi_sq + roi_grad.square().sum()
+        if global_grad is not None and roi_grad is not None:
+            dot = dot + (global_grad * roi_grad).sum()
+    global_norm = global_sq.sqrt()
+    roi_norm = roi_sq.sqrt()
+    if not torch.isfinite(global_norm) or not torch.isfinite(roi_norm):
+        raise FloatingPointError("non-finite objective gradient diagnostic")
+    denominator = global_norm + roi_norm
+    cosine = torch.tensor(0.0, device=device)
+    if global_norm > 0 and roi_norm > 0:
+        cosine = dot / (global_norm * roi_norm)
+    return {
+        "gradient_global_norm": float(global_norm.cpu()),
+        "gradient_roi_norm": float(roi_norm.cpu()),
+        "gradient_roi_share": float((roi_norm / denominator.clamp_min(1e-12)).cpu()),
+        "gradient_roi_global_cosine": float(cosine.cpu()),
+    }
+
+
+def _should_stop_for_alignment(history: list[dict[str, float]]) -> bool:
+    if not history or int(history[-1]["epoch"]) < EARLY_STOP_MIN_EPOCH:
+        return False
+    if int(history[-1]["epoch"]) % EARLY_STOP_CHECK_INTERVAL_EPOCHS != 0:
+        return False
+    current = history[-1]
+    baseline_epoch = int(current["epoch"]) - EARLY_STOP_WINDOW_EPOCHS
+    baseline = next((row for row in reversed(history[:-1]) if int(row["epoch"]) <= baseline_epoch), None)
+    if baseline is None:
+        return False
+    if current["teacher_alignment_score"] - baseline["teacher_alignment_score"] >= EARLY_STOP_ALIGNMENT_GAIN:
+        return False
+    teacher_keys = sorted(key for key in current if key.endswith("_feature_cosine"))
+    return bool(teacher_keys) and all(
+        current[key] - baseline.get(key, float("-inf")) < EARLY_STOP_PER_TEACHER_GAIN
+        for key in teacher_keys
+    )
+
+
 def _move_teachers(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
     return {
         name: value.to(device, non_blocking=device.type == "cuda")
@@ -502,6 +576,9 @@ def run_epoch(
         "roi": 0.0,
         "roi_consistency": 0.0,
     }
+    gradient_diagnostic_totals: dict[str, float] = {}
+    gradient_diagnostic_count = 0
+    last_gradient_diagnostic_step = global_step - GRADIENT_DIAGNOSTIC_INTERVAL_STEPS
     n_batches = 0
     n_tiles = 0
     start = time.perf_counter()
@@ -726,12 +803,32 @@ def run_epoch(
                             roi_valid=roi_valid,
                             roi_consistency=roi_consistency,
                         )
-                    loss = (
-                        loss
-                        + float(loss_cfg["zhcc_proto_weight"]) * zhcc_loss
-                        + float(loss_cfg["roi_weight"]) * roi_loss
+                    global_objective = loss + float(loss_cfg["zhcc_proto_weight"]) * zhcc_loss
+                    roi_objective = (
+                        float(loss_cfg["roi_weight"]) * roi_loss
                         + float(loss_cfg["roi_consistency_weight"]) * roi_consistency_loss
                     )
+                    loss = global_objective + roi_objective
+                    should_measure_gradients = (
+                        train
+                        and not bool(loss_cfg["roi_detach_backbone"])
+                        and roi_valid.numel() > 0
+                        and global_step - last_gradient_diagnostic_step >= GRADIENT_DIAGNOSTIC_INTERVAL_STEPS
+                        and bool(roi_valid.any())
+                    )
+                    if should_measure_gradients:
+                        shared_parameters = tuple(roi_model.encoder.backbone.blocks[-1].parameters())
+                        gradient_diagnostics = _objective_gradient_diagnostics(
+                            global_objective,
+                            roi_objective,
+                            shared_parameters,
+                        )
+                        for key, value in gradient_diagnostics.items():
+                            gradient_diagnostic_totals[key] = gradient_diagnostic_totals.get(key, 0.0) + value
+                            if summary_writer is not None:
+                                summary_writer.add_scalar(f"diagnostics/{key}", value, global_step)
+                        gradient_diagnostic_count += 1
+                        last_gradient_diagnostic_step = global_step
                 if train:
                     optimizer.zero_grad(set_to_none=True)
                     if scaler is not None and scaler.is_enabled():
@@ -828,6 +925,9 @@ def run_epoch(
             result[key] = float(mean_value.detach().cpu())
         else:
             result[key] = float(mean_value)
+    for key, value in gradient_diagnostic_totals.items():
+        result[key] = value / max(1, gradient_diagnostic_count)
+    result["gradient_diagnostic_count"] = float(gradient_diagnostic_count)
     result["lr"] = float(optimizer.param_groups[0]["lr"])
     result["tiles_per_sec"] = n_tiles / elapsed
     result["tiles"] = float(n_tiles)
@@ -926,6 +1026,7 @@ def fit(
     best_teacher_alignment = float((resume_state or {}).get("best_teacher_alignment", float("-inf")))
     best_scientific_score = float((resume_state or {}).get("best_scientific_score", float("-inf")))
     best_metrics = dict((resume_state or {}).get("best_metrics", {}))
+    alignment_history = list((resume_state or {}).get("alignment_history", []))
     start_epoch = int((resume_state or {}).get("epoch", 0)) + 1
     global_step = int((resume_state or {}).get("global_step", 0))
     schedule_state = _ensure_schedule_state((resume_state or {}).get("schedule_state"))
@@ -1108,6 +1209,17 @@ def fit(
                 **zhcc_metrics,
                 **prototype_bank_metrics,
             }
+            alignment_history.append(
+                {
+                    "epoch": float(epoch),
+                    "teacher_alignment_score": float(row["teacher_alignment_score"]),
+                    **{
+                        key: float(value)
+                        for key, value in embedding_metrics.items()
+                        if key.endswith("_feature_cosine")
+                    },
+                }
+            )
             append_csv(output_dir / "metrics.csv", row)
             _write_tensorboard_scalars(writer, row, epoch)
             checkpoint = {
@@ -1121,6 +1233,7 @@ def fit(
                 "best_teacher_alignment": best_teacher_alignment,
                 "best_scientific_score": best_scientific_score,
                 "best_metrics": best_metrics,
+                "alignment_history": alignment_history,
                 "rng_state": _rng_state(),
                 "schedule_state": schedule_state,
                 "zhcc_dynamic_prototype_step": zhcc_prototype_state.get("last_refresh_step"),
@@ -1153,6 +1266,14 @@ def fit(
                     checkpoint,
                     checkpoints / "best_scientific_score.pt",
                 )
+            if _should_stop_for_alignment(alignment_history):
+                _log(
+                    "early_stop "
+                    f"epoch={epoch} window={EARLY_STOP_WINDOW_EPOCHS} "
+                    f"alignment_gain_threshold={EARLY_STOP_ALIGNMENT_GAIN} "
+                    f"per_teacher_gain_threshold={EARLY_STOP_PER_TEACHER_GAIN}"
+                )
+                break
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             _release_host_memory()

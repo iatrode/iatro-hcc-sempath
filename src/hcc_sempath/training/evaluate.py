@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 
 from ..io.tile_package import read_package_metadata
 from ..modeling.prototypes import PrototypeRegistry, load_prototype_registry
-from ..modeling.models import HCCSemPathModel
+from ..modeling.models import HCCSemPathModel, STUDENT_BACKBONE_NAME
 from .config import (
     embedding_dim,
     image_tile_package_paths,
@@ -120,10 +120,10 @@ def main() -> None:
     )
     loader = DataLoader(dataset, batch_size=cfg["train"]["batch_size"], shuffle=False, num_workers=cfg["data"]["num_workers"], collate_fn=collate_distillation)
     model = HCCSemPathModel(
-        backbone_name=cfg["model"]["backbone_name"],
+        backbone_name=STUDENT_BACKBONE_NAME,
         embedding_dim=embedding_dim(cfg),
         teacher_dims=dims,
-        pretrained=cfg["model"]["pretrained"],
+        pretrained=False,
         projector_type=cfg["model"].get("projector_type", "linear"),
         projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
         teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),

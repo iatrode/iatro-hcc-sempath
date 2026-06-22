@@ -202,11 +202,36 @@ def roi_guided_level2_loss(
     consistency_loss = torch.where(
         consistency_count > 0, consistency_loss, global_logits.sum() * 0.0
     )
+    probabilities = torch.sigmoid(patch_logits.detach())
+    activation = probabilities >= 0.5
+    # Degenerate-map rates must reflect ROI-supervised tiles only. A batch is mostly
+    # unsupervised tiles (valid==0) whose untrained maps look all-zero/broadcast; if
+    # those were counted, the diagnostics would mask the health of the supervised maps
+    # that Gate R1 actually certifies.
+    supervised_tile = valid.bool().flatten(2).any(dim=2)  # [B, K] per (tile, attribute)
     diagnostics = {
         "roi_valid_tokens": valid_count.detach(),
         "roi_supervised_attributes": consistency_count.detach(),
-        "roi_activation_fraction": (torch.sigmoid(patch_logits) >= 0.5).float().mean().detach(),
+        "roi_activation_fraction": activation.float().mean(),
     }
+    for attribute_idx in range(patch_logits.shape[1]):
+        attribute_activation = activation[:, attribute_idx]
+        attribute_probability = probabilities[:, attribute_idx]
+        supervised = supervised_tile[:, attribute_idx]
+        supervised_count = supervised.sum().clamp_min(1)
+        per_tile_all_zero = (~attribute_activation).all(dim=(-2, -1))
+        per_tile_all_one = attribute_activation.all(dim=(-2, -1))
+        per_tile_broadcast = attribute_probability.var(dim=(-2, -1), unbiased=False) < 1e-8
+        diagnostics[f"roi_attr_{attribute_idx}_activation_fraction"] = attribute_activation.float().mean()
+        diagnostics[f"roi_attr_{attribute_idx}_all_zero_rate"] = (
+            (per_tile_all_zero & supervised).sum() / supervised_count
+        )
+        diagnostics[f"roi_attr_{attribute_idx}_all_one_rate"] = (
+            (per_tile_all_one & supervised).sum() / supervised_count
+        )
+        diagnostics[f"roi_attr_{attribute_idx}_broadcast_rate"] = (
+            (per_tile_broadcast & supervised).sum() / supervised_count
+        )
     return roi_loss, consistency_loss, diagnostics
 
 

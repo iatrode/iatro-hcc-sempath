@@ -259,6 +259,14 @@ def _existing_merged_feature_package_for_tile(
 def validate_training_config(cfg: dict, names: list[str]) -> None:
     validate_teacher_names(names)
     expected = set(names)
+    obsolete_model_keys = sorted(
+        key for key in ("backbone_name", "pretrained", "roi_patch_size") if key in cfg.get("model", {})
+    )
+    if obsolete_model_keys:
+        raise ValueError(
+            "student backbone is a fixed pretrained DINOv2-S/14 research invariant; "
+            f"remove model keys: {obsolete_model_keys}"
+        )
     _unexpected_keys(cfg.get("model", {}).get("teacher_dims"), expected, "model.teacher_dims")
     _unexpected_keys(cfg.get("loss", {}).get("teacher_weights"), expected, "loss.teacher_weights")
 

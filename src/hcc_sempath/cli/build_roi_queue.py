@@ -74,12 +74,11 @@ def build_roi_candidate_queue(
         priority = [name for name in best["source_l2"] if useful[name]]
         selected.append({**best, "priority_attributes": priority, "rank": len(selected)})
         counts.update(best["source_l2"])
-
     targets = {name: target for name in attributes}
     unfilled = {name: max(0, target - available[name]) for name in attributes}
     return {
         "version": 1,
-        "frozen": not any(unfilled.values()),
+        "complete": not any(unfilled.values()),
         "l2_prototypes": attributes,
         "target_per_attribute": targets,
         "source_positive_inventory": {name: available[name] for name in attributes},
@@ -91,15 +90,15 @@ def build_roi_candidate_queue(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a frozen quota-driven V2 ROI candidate queue.")
-    parser.add_argument("--annotations", action="append", required=True, help="Tile-level annotation JSON or supplemental candidate JSON; repeatable.")
+    parser = argparse.ArgumentParser(description="Build a quota-aware V2 ROI candidate pool.")
+    parser.add_argument("--annotations", action="append", required=True, help="Tile-level annotation JSON or supplemental candidate JSON; repeatable. Existing L2 labels are optional and only affect priority.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--target", type=int, default=ROI_TARGET_PER_ATTRIBUTE)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     output = Path(args.output)
     if output.exists() and not args.overwrite:
-        raise FileExistsError(f"refusing to replace frozen queue without --overwrite: {output}")
+        raise FileExistsError(f"refusing to replace ROI candidate pool without --overwrite: {output}")
     payload = build_roi_candidate_queue(args.annotations, target=args.target)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
