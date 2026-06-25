@@ -190,4 +190,8 @@ clinical endpoint benchmark.
 
 ## Documentation
 
+- `docs/HCC_SEMPATH_V2_DESIGN.md`: active V2 scientific and implementation design.
+- `docs/HCC_SEMPATH_V2_AUDIT.md`: V2 design-versus-implementation audit.
+- `docs/HCC_SEMPATH_DOWNSTREAM_TOKEN_INTERFACE_ROADMAP.md`: public post-V2 roadmap for a frozen
+  pathology feature contract and downstream continuous-token adapters.
 - `docs/HCC_SEMPATH_DESIGN_V1_DEPRECATED.md`: deprecated V1 scientific design retained for traceability.
