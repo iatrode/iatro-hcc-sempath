@@ -59,8 +59,14 @@ patch_grid           [2]
 l1_scores            [B, K_l1]
 l2_scores            [B, K_l2]
 l2_spatial_evidence  [B, K_l2, H_patch, W_patch]
-input_validity       [B]
+input_validity       [B]   # INTERNAL diagnostic only — NOT exported to the CAMoE expert record
 ```
+
+This package is the **internal** frozen feature package consumed by the downstream adapter; it is
+not the CAMoE-facing contract. In particular `input_validity` stays internal: under the CAMoE
+contract (root `plan.md §1.5`) validity is not an expert output — it belongs to the data filter
+(structurally empty input), the router (relevance gating), and the core (query-conditioned quality).
+The expert record exposed to the core must not carry any validity field.
 
 The export metadata should include:
 
@@ -83,10 +89,26 @@ The reference downstream adapter is a small learned-query module:
 learned pathology queries
     -> cross-attention over frozen patch features
     -> conditioning by z_hcc and semantic readouts
-    -> projection to downstream hidden size
-    -> pathology_tokens [B, K_token, D_target]
+    -> projection to the CAMoE evidence plane (D = 1024)
+    -> pathology_tokens [B, K_token, 1024]
+    -> pathology_h      [B, 1024]            # summary, synthesized from z_hcc + L1 + L2
     -> pathology_mask   [B, K_token]
 ```
+
+CAMoE contract alignment (root `plan.md §1.5`):
+
+- `D = 1024` is the shared evidence-plane dim, decoupled from the core hidden_size. Since V2 is
+  retrained, the adapter targets 1024 directly — no post-hoc up-projection is needed (unlike
+  ClinTrace, which up-projects its frozen 768 compressor output).
+- `pathology_h [1024]` is a required field. It is synthesized from `z_hcc` + Level-1 (dominant
+  tissue state) + Level-2 (morphology composition) readouts — a semantically grounded summary, not
+  a blind pooled vector. This does not contradict the "no single pooled vector" caution above: the
+  caution forbids replacing the K tokens with one pooled vector, not adding a grounded summary
+  alongside them.
+- `K_token` is sempath's own token count (per-expert; need not equal ClinTrace's K=16). The core is
+  insensitive to per-expert token count.
+- The exposed expert record is `{expert_name, tokens [K_token,1024], h [1024], mask [K_token],
+  provenance}` and carries no `input_validity`.
 
 The adapter is not part of the HCC-SemPath encoder checkpoint. It may be implemented as a linear
 or MLP baseline followed by a query-based cross-attention model. The query model is the primary
@@ -179,7 +201,11 @@ multi-expert systems while retaining a clear evidence boundary.
 
 - train the pooled baseline and query adapter from cached frozen features;
 - verify Level-1, Level-2, spatial, and non-collapse constraints;
-- select token count and target dimension before downstream evaluation.
+- select `K_token` before downstream evaluation; target dimension is fixed at `D = 1024` by the
+  CAMoE evidence-plane contract (root `plan.md §1.5`), not a free choice;
+- a passing interface check at this stage is a **tensor interface smoke** only (shapes
+  `[B,K_token,1024]` / `[B,1024]`); the full expert-record contract smoke (incl. provenance fields)
+  is verified at T3 once the record assembler exists.
 
 ### Gate T3 — downstream integration
 
