@@ -17,3 +17,25 @@ Current local layout:
 - `hcc_l2_roi_v2.json`: V2 nine-class complete-review ROI annotation state (created by the UI).
 - `reviews/teacher_disagreement/exval_1000/review.json`: completed 1000-tile repeated review state.
 - `reviews/teacher_disagreement/exval_1000/review.csv`: CSV export of the completed repeated review.
+
+
+
+  L1（4 类，互斥）：
+
+1. HCC-tumor
+2. Background-liver
+3. Inflammatory-stromal
+4. Degenerative-material
+
+  L2（10 类，可并存）：
+
+1. hepatocellular-parenchyma-present
+2. necrosis-present
+3. hemorrhage-present
+4. bile-pigment-present
+5. inflammatory-cell-present
+6. fibrous-stroma-present
+7. steatosis-vacuolation-present
+8. hyaline-change-present
+9. vascular-structure-present
+10. ductular-portal-present
