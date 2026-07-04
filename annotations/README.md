@@ -23,9 +23,9 @@ Current local layout:
   L1（4 类，互斥）：
 
 1. HCC-tumor
-2. Background-liver
-3. Inflammatory-stromal
-4. Degenerative-material
+3. Background-liver
+4. Inflammatory-stromal
+5. Degenerative-material
 
   L2（10 类，可并存）：
 
@@ -39,3 +39,24 @@ Current local layout:
 8. hyaline-change-present
 9. vascular-structure-present
 10. ductular-portal-present
+
+L1 expansion:
+HCC-tumor further classification
+
+WHO grading system (3 tiered system)
+Well differentiated: tumor cells resemble mature hepatocytes; minimal to mild nuclear atypia
+Moderately differentiated: tumor cells appear malignant on H&E and morphology suggests hepatocellular differentiation; moderate nuclear atypia
+Poorly differentiated: tumor cells appear malignant on H&E and often cannot be distinguished from other poorly differentiated neoplasms; marked nuclear atypia
+
+Modified Edmondson-Steiner grading system (4 tiered system) (Cancer 1954;7:462)
+Grade I: tumor cells are difficult to differentiate from hyperplastic liver cells
+Grade II: tumor cells resemble mature hepatocytes with slightly larger and more hyperchromatic nuclei; sharp and clear cut cell borders; frequent acini formation
+Grade III: tumor cells are larger and have more hyperchromatic nuclei with less acidophilic cytoplasms; trabecular distortion; numerous tumor giant cells
+Grade IV: tumor cells are intensely hyperchromatic, with scant and less granular cytoplasm; tumor cells appear less cohesive and can appear giant, spindled or short and plump; medullary growth pattern with loss of trabeculation; less acini
+
+Background-liver
+Further expansion
+hepatocyte
+Portal triad / portal tract
+Central vein
+
