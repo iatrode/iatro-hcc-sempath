@@ -1,14 +1,14 @@
-"""Compatibility shim — moved to the shared ``iatro_iac`` package.
+"""Compatibility shim — moved to the shared ``iatro.iac`` package.
 
-The WSI tile / JXL pipeline now lives in ``iatro_iac.adapters.tiles`` and is
-re-exported from ``iatro_iac``. This module keeps existing
+The WSI tile / JXL pipeline now lives in ``iatro.iac.adapters.tiles`` and is
+re-exported from ``iatro.iac``. This module keeps existing
 ``hcc_sempath.io.tile_package`` imports working. New code should import from
-``iatro_iac`` directly.
+``iatro.iac`` directly.
 """
 
 from __future__ import annotations
 
-from iatro_iac.adapters.tiles import (  # noqa: F401
+from iatro.iac.adapters.tiles import (  # noqa: F401
     TilePackageReader,
     build_tile_package,
     build_tile_package_from_records,

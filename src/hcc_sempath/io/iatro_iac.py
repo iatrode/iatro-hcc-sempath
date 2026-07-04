@@ -1,12 +1,12 @@
 """Compatibility shim.
 
 The IatroCache container format has been extracted to the standalone
-``iatro_iac`` package (../../iatro-iac), so it can be shared across the
+``iatro-base-iac`` package (../../iatro-base-iac), so it can be shared across the
 HCC-CAMoE projects (SemPath image/feature caches, Course clinical-text caches).
 
 This module re-exports the format layer unchanged. Project adapters
 (``tile_package``, ``feature_cache``) keep importing from here, so no call
-sites changed. New code may import from ``iatro_iac`` directly.
+sites changed. New code may import from ``iatro.iac`` directly.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from iatro_iac import (  # noqa: F401
+from iatro.iac import (  # noqa: F401
     FORMAT_VERSION,
     HEADER_BYTES,
     MAGIC,
@@ -30,10 +30,10 @@ from iatro_iac import (  # noqa: F401
     build_pack_streaming,
     iter_payloads,
 )
-from iatro_iac import PackReader as _V2PackReader
-from iatro_iac import read_header as _read_v2_header
-from iatro_iac import read_payload as _read_v2_payload
-from iatro_iac import read_tables as _read_v2_tables
+from iatro.iac import PackReader as _V2PackReader
+from iatro.iac import read_header as _read_v2_header
+from iatro.iac import read_payload as _read_v2_payload
+from iatro.iac import read_tables as _read_v2_tables
 
 
 LEGACY_MAGIC = b"IATROC\x00\x01"
