@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import random
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +15,7 @@ from PIL import Image
 
 from hcc_sempath.cli.annotate_prototypes import (
     AnnotationData,
+    AnnotationArchive,
     AnnotationState,
     HTML,
     L1_PROTOTYPES,
@@ -145,7 +147,13 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "Positive or uncertain by default" in HTML
     assert "%ROI_MODE_JSON%" in HTML
     assert 'id="roiClassBar"' in HTML
-    assert "prototypeLabels').style.display=ROI_MODE?'none':'block'" in HTML
+    assert "function applyModeLayout()" in HTML
+    assert "document.getElementById('roiCanvas').style.display=l1Mode?'none':'block'" in HTML
+    assert "document.getElementById('roiTools').style.display=l1Mode?'none':'flex'" in HTML
+    assert "document.getElementById('prototypeLabels').style.display=l1Mode?'block':'none'" in HTML
+    assert "document.getElementById('l1Section').style.display=l1Mode?'block':'none'" in HTML
+    assert "document.getElementById('l2Section').style.display='none'" in HTML
+    assert "MODE==='l1'?'L1 classification':'L2 ROI annotation'" in HTML
     assert "All ROI classes visible. Select one L2 class before drawing." in HTML
     assert "✓ " in HTML
     assert "overflow-x:auto" in HTML
@@ -736,30 +744,13 @@ def test_endpoints_via_http_get(tmp_path: Path) -> None:
     thread.start()
     root_url = f"http://127.0.0.1:{server.server_address[1]}/"
     try:
-        import urllib.request
-
-        # 1. Test /api/random with package=all
-        with urllib.request.urlopen(f"{root_url}api/random?token=secret&package=all", timeout=5) as response:
-            assert response.status == 200
-            res = json.loads(response.read().decode("utf-8"))
-            assert "record" in res
-            assert res["package_index"] == 0
-
-        # 2. Test /api/progress with package=0
-        with urllib.request.urlopen(f"{root_url}api/progress?token=secret&package=0", timeout=5) as response:
-            assert response.status == 200
-            res = json.loads(response.read().decode("utf-8"))
-            assert "package" in res
-
-        # 3. Test /api/annotation-state with package=0 and row=0
-        with urllib.request.urlopen(f"{root_url}api/annotation-state?token=secret&package=0&row=0", timeout=5) as response:
-            assert response.status == 200
-            res = json.loads(response.read().decode("utf-8"))
-            assert "candidate" in res
-
-        # 4. Test /api/tile with package=0 and row=0
-        with urllib.request.urlopen(f"{root_url}api/tile?token=secret&package=0&row=0", timeout=5) as response:
-            assert response.status == 200
+        with urlopen(f"{root_url}api/random?token=secret&package=all", timeout=5) as response:
+            assert "record" in json.loads(response.read().decode("utf-8"))
+        with urlopen(f"{root_url}api/progress?token=secret&package=0", timeout=5) as response:
+            assert "package" in json.loads(response.read().decode("utf-8"))
+        with urlopen(f"{root_url}api/annotation-state?token=secret&package=0&row=0", timeout=5) as response:
+            assert "candidate" in json.loads(response.read().decode("utf-8"))
+        with urlopen(f"{root_url}api/tile?token=secret&package=0&row=0", timeout=5) as response:
             assert len(response.read()) > 0
     finally:
         server.shutdown()
@@ -767,3 +758,121 @@ def test_endpoints_via_http_get(tmp_path: Path) -> None:
         server.server_close()
         data.close()
 
+
+def test_label_lifecycle_preserves_stable_ids_and_referenced_labels(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    state_path = tmp_path / "annotations.json"
+    _write_iac(iac_path)
+    data = AnnotationData(iac_path, state_path)
+    try:
+        package = data.package(0)
+        record = data.viewer(0).records[0]
+        label_id = L1_PROTOTYPES[0]
+        data.state.save_annotation(package, record, label_id, [])
+        data.state.change_label("l1", "rename", label_id=label_id, name="HCC tumor custom")
+        assert data.state.annotations[_annotation_key(package, record)]["l1"] == label_id
+        with pytest.raises(ValueError, match="archive it instead"):
+            data.state.change_label("l1", "delete", label_id=label_id)
+        data.state.change_label("l1", "archive", label_id=label_id)
+        data.state.save_annotation(package, record, label_id, [])
+        result = data.state.change_label("l1", "add", name="New morphology")
+        added = next(item for item in result["levels"]["l1"] if item["name"] == "New morphology")
+        data.state.change_label("l1", "delete", label_id=added["id"])
+    finally:
+        data.close()
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["version"] == 2
+    assert "label_definitions" in payload
+    assert "l1_name" in state_path.with_suffix(".csv").read_text(encoding="utf-8").splitlines()[0]
+
+
+def test_unified_handler_exposes_navigation_and_versions(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    queue_path = tmp_path / "queue.json"
+    _write_iac(iac_path)
+    _write_roi_queue(queue_path, ["s1_0000000"])
+    l1_data = AnnotationData(iac_path, tmp_path / "l1.json")
+    l2_data = AnnotationData(iac_path, tmp_path / "l2.json", roi_candidate_manifest=queue_path)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler({"l1": l1_data, "l2": l2_data}, "secret"))
+    except PermissionError:
+        l1_data.close()
+        l2_data.close()
+        pytest.skip("local socket bind is blocked in this sandbox")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    root_url = f"http://127.0.0.1:{server.server_address[1]}/"
+    try:
+        with urlopen(f"{root_url}?mode=l2&version=main", timeout=5) as response:
+            html = response.read().decode("utf-8")
+        assert 'const MODE="l2"' in html
+        assert 'const MODES=["l1", "l2"]' in html
+        assert 'const VERSION="main"' in html
+        assert "%VERSIONS_JSON%" not in html
+        with urlopen(f"{root_url}api/versions?token=secret&mode=l1&version=main", timeout=5) as response:
+            versions = json.loads(response.read().decode("utf-8"))
+        assert versions["versions"][0]["id"] == "main"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+        l1_data.close()
+        l2_data.close()
+
+
+def test_annotation_versions_are_independent_and_reloadable(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    main_path = tmp_path / "l1.json"
+    _write_iac(iac_path)
+    initial = AnnotationData(iac_path, main_path, min_tissue_fraction=0)
+    archive = AnnotationArchive(initial, input_path=iac_path, min_tissue_fraction=0)
+    package = initial.package(0)
+    initial.state.save_annotation(package, initial.viewer(0).records[0], L1_PROTOTYPES[0], [])
+    created = archive.create_version("Second review")
+    version_id = created["created"]
+    second = archive.data(version_id)
+    assert second.state.annotations == {}
+    assert second.state.label_definitions == initial.state.label_definitions
+    second.state.save_annotation(second.package(0), second.viewer(0).records[1], L1_PROTOTYPES[1], [])
+    assert len(initial.state.annotations) == len(second.state.annotations) == 1
+    assert set(initial.state.annotations) != set(second.state.annotations)
+    archive.close()
+    reloaded = AnnotationArchive(AnnotationData(iac_path, main_path, min_tissue_fraction=0), input_path=iac_path, min_tissue_fraction=0)
+    try:
+        assert {item["id"] for item in reloaded.versions_json()["versions"]} == {"main", version_id}
+        assert len(reloaded.data("main").state.annotations) == 1
+        assert len(reloaded.data(version_id).state.annotations) == 1
+    finally:
+        reloaded.close()
+
+
+def test_random_record_filters_low_tissue_without_marking_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    state_path = tmp_path / "annotations.json"
+    _write_iac(iac_path)
+    data = AnnotationData(iac_path, state_path, min_tissue_fraction=0.30)
+    monkeypatch.setattr(random, "shuffle", lambda values: None)
+    monkeypatch.setattr(data, "tissue_fraction", lambda _index, record: 0.05 if record.row == 0 else 0.75)
+    try:
+        result = data.random_record(0)
+        assert result["record"]["row"] == 1
+        assert ("tiles.iac", 0) in data._auto_filtered
+        assert data.state.skipped == set()
+        assert data.progress(0)["auto_filtered"] == 1
+    finally:
+        data.close()
+
+
+def test_random_record_reports_when_all_tiles_are_below_tissue_threshold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    state_path = tmp_path / "annotations.json"
+    _write_iac(iac_path)
+    data = AnnotationData(iac_path, state_path, min_tissue_fraction=0.30)
+    monkeypatch.setattr(data, "tissue_fraction", lambda _index, _record: 0.0)
+    try:
+        result = data.random_record(0)
+        assert result == {"record": None, "done": "no_tissue_candidates"}
+        assert len(data._auto_filtered) == 4
+        assert data.state.skipped == set()
+    finally:
+        data.close()

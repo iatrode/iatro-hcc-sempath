@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+import re
 import secrets
 import socket
 import tempfile
@@ -244,6 +245,41 @@ def _state_prototypes(payload: dict, key: str, fallback: list[str], annotation_f
     return _ordered_unique(values)
 
 
+def _default_label_definitions(level: str, values: list[str]) -> list[dict]:
+    return [
+        {"id": value, "name": value, "level": level, "active": True, "order": index}
+        for index, value in enumerate(values)
+    ]
+
+
+def _normalized_label_definitions(level: str, values: list[str], raw: object) -> list[dict]:
+    definitions: list[dict] = []
+    seen: set[str] = set()
+    if isinstance(raw, list):
+        for index, item in enumerate(raw):
+            if not isinstance(item, dict):
+                continue
+            label_id = str(item.get("id") or "").strip()
+            if not label_id or label_id in seen:
+                continue
+            definitions.append({
+                "id": label_id,
+                "name": str(item.get("name") or label_id).strip() or label_id,
+                "level": level,
+                "active": bool(item.get("active", True)),
+                "order": int(item.get("order", index)),
+            })
+            seen.add(label_id)
+    for value in values:
+        if value not in seen:
+            definitions.append({
+                "id": value, "name": value, "level": level,
+                "active": True, "order": len(definitions),
+            })
+            seen.add(value)
+    return sorted(definitions, key=lambda item: (item["order"], item["id"]))
+
+
 class AnnotationState:
     def __init__(
         self,
@@ -262,6 +298,10 @@ class AnnotationState:
         self.l1_prototypes = list(L1_PROTOTYPES)
         self.l2_prototypes = list(l2_prototypes or L2_PROTOTYPES)
         self.require_complete_roi = bool(require_complete_roi)
+        self.label_definitions = {
+            "l1": _default_label_definitions("l1", self.l1_prototypes),
+            "l2": _default_label_definitions("l2", self.l2_prototypes),
+        }
         self.revision = 0
         if self.state_path.exists():
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -274,9 +314,15 @@ class AnnotationState:
                 self.l2_prototypes = _state_prototypes(payload, "l2_prototypes", L2_PROTOTYPES, "l2")
             else:
                 self.l2_prototypes = list(l2_prototypes)
+            raw_definitions = payload.get("label_definitions") or {}
+            self.label_definitions = {
+                "l1": _normalized_label_definitions("l1", self.l1_prototypes, raw_definitions.get("l1")),
+                "l2": _normalized_label_definitions("l2", self.l2_prototypes, raw_definitions.get("l2")),
+            }
+            self._sync_active_prototypes()
             known_keys = {
                 "version", "input_path", "l1_prototypes", "l2_prototypes",
-                "annotations", "skipped", "last_iac", "roi_mode",
+                "annotations", "skipped", "last_iac", "roi_mode", "label_definitions",
             }
             self.extra_payload = {key: value for key, value in payload.items() if key not in known_keys}
             LOG.info(
@@ -290,6 +336,67 @@ class AnnotationState:
             )
         else:
             LOG.info("state_new path=%s input=%s", self.state_path, self.input_path)
+
+    def _sync_active_prototypes(self) -> None:
+        self.l1_prototypes = [item["id"] for item in self.label_definitions["l1"] if item["active"]]
+        self.l2_prototypes = [item["id"] for item in self.label_definitions["l2"] if item["active"]]
+
+    def labels_json(self) -> dict:
+        return {"revision": self.revision, "levels": self.label_definitions}
+
+    def _label_references(self, level: str, label_id: str) -> int:
+        if level == "l1":
+            return sum(1 for item in self.annotations.values() if item.get("l1") == label_id)
+        return sum(1 for item in self.annotations.values() if label_id in item.get("l2", []))
+
+    def change_label(self, level: str, operation: str, *, label_id: str = "", name: str = "") -> dict:
+        level = level.lower()
+        if level not in {"l1", "l2"}:
+            raise ValueError("label level must be l1 or l2")
+        definitions = self.label_definitions[level]
+        current = next((item for item in definitions if item["id"] == label_id), None)
+        clean_name = name.strip()
+        if operation == "add":
+            if not clean_name:
+                raise ValueError("label name is required")
+            if any(item["name"].casefold() == clean_name.casefold() for item in definitions):
+                raise ValueError(f"duplicate {level.upper()} label name: {clean_name}")
+            slug = re.sub(r"[^a-z0-9]+", "-", clean_name.lower()).strip("-") or "label"
+            base = f"{level}_{slug}"
+            label_id = base
+            suffix = 2
+            known = {item["id"] for item in definitions}
+            while label_id in known:
+                label_id = f"{base}-{suffix}"
+                suffix += 1
+            definitions.append({"id": label_id, "name": clean_name, "level": level, "active": True, "order": len(definitions)})
+        elif current is None:
+            raise ValueError(f"unknown {level.upper()} label: {label_id}")
+        elif operation == "rename":
+            if not clean_name:
+                raise ValueError("label name is required")
+            if any(item["id"] != label_id and item["name"].casefold() == clean_name.casefold() for item in definitions):
+                raise ValueError(f"duplicate {level.upper()} label name: {clean_name}")
+            current["name"] = clean_name
+        elif operation == "archive":
+            if level == "l1" and sum(bool(item["active"]) for item in definitions) <= 1 and current["active"]:
+                raise ValueError("L1 requires at least one active label")
+            current["active"] = False
+        elif operation == "restore":
+            current["active"] = True
+        elif operation == "delete":
+            references = self._label_references(level, label_id)
+            if references:
+                raise ValueError(f"label has {references} annotation reference(s); archive it instead")
+            if level == "l1" and current["active"] and sum(bool(item["active"]) for item in definitions) <= 1:
+                raise ValueError("L1 requires at least one active label")
+            definitions.remove(current)
+        else:
+            raise ValueError(f"unknown label operation: {operation}")
+        self._sync_active_prototypes()
+        self.revision += 1
+        self.flush()
+        return self.labels_json()
 
     @property
     def csv_path(self) -> Path:
@@ -351,14 +458,16 @@ class AnnotationState:
         l2: list[str],
         roi: list[dict] | None = None,
     ) -> None:
-        if l1 not in self.l1_prototypes:
+        known_l1 = {item["id"] for item in self.label_definitions["l1"]}
+        known_l2 = {item["id"] for item in self.label_definitions["l2"]}
+        if l1 not in known_l1:
             raise ValueError(f"unknown L1 prototype: {l1}")
-        unknown_l2 = sorted(set(l2) - set(self.l2_prototypes))
+        unknown_l2 = sorted(set(l2) - known_l2)
         if unknown_l2:
             raise ValueError(f"unknown L2 prototype(s): {unknown_l2}")
         roi = list(roi or [])
         for item in roi:
-            if item.get("attribute") not in self.l2_prototypes:
+            if item.get("attribute") not in known_l2:
                 raise ValueError(f"unknown ROI L2 attribute: {item.get('attribute')}")
             if item.get("state", "positive") not in {"positive", "negative"}:
                 raise ValueError(f"unknown ROI state: {item.get('state')}")
@@ -444,7 +553,7 @@ class AnnotationState:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = dict(self.extra_payload)
         payload.update({
-            "version": 1,
+            "version": 2,
             "input_path": self.input_path,
             "l1_prototypes": self.l1_prototypes,
             "l2_prototypes": self.l2_prototypes,
@@ -452,6 +561,7 @@ class AnnotationState:
             "annotations": self.annotations,
             "skipped": sorted(self.skipped),
             "roi_mode": self.require_complete_roi,
+            "label_definitions": self.label_definitions,
         })
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=self.state_path.parent) as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
@@ -461,7 +571,7 @@ class AnnotationState:
         LOG.info("state_flush json=%s csv=%s annotations=%d", self.state_path, self.csv_path, len(self.annotations))
 
     def _write_csv(self) -> None:
-        base_fields = ["dataset", "iac", "iac_path", "tile_id", "row", "slide", "split", "x", "y", "l1", "l2"]
+        base_fields = ["dataset", "iac", "iac_path", "tile_id", "row", "slide", "split", "x", "y", "l1", "l1_name", "l2", "l2_names"]
         extra_fields = sorted(
             {
                 key
@@ -476,6 +586,10 @@ class AnnotationState:
             writer.writeheader()
             for item in sorted(self.annotations.values(), key=lambda value: (value["iac"], value["row"])):
                 row = dict(item)
+                l1_names = {entry["id"]: entry["name"] for entry in self.label_definitions["l1"]}
+                l2_names = {entry["id"]: entry["name"] for entry in self.label_definitions["l2"]}
+                row["l1_name"] = l1_names.get(row.get("l1", ""), row.get("l1", ""))
+                row["l2_names"] = ";".join(l2_names.get(value, value) for value in row.get("l2", []))
                 row["l2"] = ";".join(row.get("l2", []))
                 writer.writerow(row)
 
@@ -488,11 +602,17 @@ class AnnotationData:
         *,
         async_scan: bool = False,
         roi_candidate_manifest: str | Path | None = None,
+        min_tissue_fraction: float = 0.30,
     ) -> None:
         self.input_root = Path(input_path).resolve()
         self.cache_root = (self.input_root if self.input_root.is_dir() else self.input_root.parent) / ".hcc_sempath_annotation_cache"
         self.packages: list[AnnotationPackage] = []
         self.roi_queue = RoiCandidateQueue(roi_candidate_manifest) if roi_candidate_manifest else None
+        if not 0.0 <= min_tissue_fraction <= 1.0:
+            raise ValueError("min_tissue_fraction must be between 0 and 1")
+        self.min_tissue_fraction = float(min_tissue_fraction)
+        self._tissue_fraction_cache: dict[tuple[str, int], float] = {}
+        self._auto_filtered: set[tuple[str, int]] = set()
         self.state = AnnotationState(
             state_path,
             input_path,
@@ -605,6 +725,58 @@ class AnnotationData:
     def annotation_records(self, index: int) -> list[IacRecord]:
         return self.viewer(index).records
 
+    def tissue_fraction(self, index: int, record: IacRecord) -> float:
+        package = self.package(index)
+        key = (package.rel_path, record.row)
+        cached = self._tissue_fraction_cache.get(key)
+        if cached is not None:
+            return cached
+        viewer = self.viewer(index)
+        offsets = viewer.record_table.column("offset")
+        lengths = viewer.record_table.column("length")
+        payload = read_payload(
+            package.path,
+            viewer.header,
+            offsets[record.row].as_py(),
+            lengths[record.row].as_py(),
+        )
+        image = decode_jxl(payload).convert("RGB")
+        image.thumbnail((64, 64), Image.Resampling.BILINEAR)
+        pixels = list(image.get_flattened_data())
+        tissue = sum(
+            1
+            for red, green, blue in pixels
+            if min(red, green, blue) < 220 and max(red, green, blue) > 35
+        )
+        fraction = tissue / max(1, len(pixels))
+        self._tissue_fraction_cache[key] = fraction
+        LOG.info(
+            "tile_tissue_fraction iac=%s row=%d tile_id=%s fraction=%.4f threshold=%.4f",
+            package.rel_path,
+            record.row,
+            record.tile_id,
+            fraction,
+            self.min_tissue_fraction,
+        )
+        return fraction
+
+    def _is_random_candidate(self, index: int, record: IacRecord) -> bool:
+        package = self.package(index)
+        key = (package.rel_path, record.row)
+        if key in self._auto_filtered:
+            return False
+        if self.min_tissue_fraction <= 0 or self.tissue_fraction(index, record) >= self.min_tissue_fraction:
+            return True
+        self._auto_filtered.add(key)
+        LOG.info("random_tile_auto_filter iac=%s row=%d tile_id=%s", package.rel_path, record.row, record.tile_id)
+        return False
+
+    def _first_random_candidate(self, index: int, records: list[IacRecord]) -> IacRecord | None:
+        for record in records:
+            if self._is_random_candidate(index, record):
+                return record
+        return None
+
     def annotation_json(self, index: int, row: int) -> dict:
         package = self.package(index)
         record = self.viewer(index)._by_row[row]
@@ -620,6 +792,9 @@ class AnnotationData:
             packages = list(self.packages)
         for idx, package in enumerate(packages):
             counts = self.state.lightweight_counts_for_package(package)
+            auto_filtered = sum(1 for rel_path, _row in self._auto_filtered if rel_path == package.rel_path)
+            counts["total"] = max(0, counts["total"] - auto_filtered)
+            counts["remaining"] = max(0, counts["remaining"] - auto_filtered)
             items.append(
                 {
                     "index": idx,
@@ -629,6 +804,7 @@ class AnnotationData:
                     "total": counts["total"],
                     "annotated": counts["annotated"],
                     "remaining": counts["remaining"],
+                    "auto_filtered": auto_filtered,
                 }
             )
         LOG.info("api_packages count=%d", len(items))
@@ -639,10 +815,20 @@ class AnnotationData:
             packages = list(self.packages)
             package = self.packages[index]
         counts = self.state.lightweight_counts_for_package(package)
+        auto_filtered_by_package = {
+            item.rel_path: sum(1 for rel_path, _row in self._auto_filtered if rel_path == item.rel_path)
+            for item in packages
+        }
+        counts["total"] = max(0, counts["total"] - auto_filtered_by_package[package.rel_path])
+        counts["remaining"] = max(0, counts["remaining"] - auto_filtered_by_package[package.rel_path])
         lightweight_by_package = {
             item.rel_path: self.state.lightweight_counts_for_package(item)
             for item in packages
         }
+        for item in packages:
+            filtered = auto_filtered_by_package[item.rel_path]
+            lightweight_by_package[item.rel_path]["total"] = max(0, lightweight_by_package[item.rel_path]["total"] - filtered)
+            lightweight_by_package[item.rel_path]["remaining"] = max(0, lightweight_by_package[item.rel_path]["remaining"] - filtered)
         overall = {
             "annotated": sum(item["annotated"] for item in lightweight_by_package.values()),
             "total": sum(item["total"] for item in lightweight_by_package.values()),
@@ -687,6 +873,7 @@ class AnnotationData:
             "roi_counts": roi_counts,
             "roi_targets": roi_targets,
             "roi_deficits": roi_deficits,
+            "auto_filtered": sum(auto_filtered_by_package.values()),
         }
 
     def _find_package_for_tile(self, tile_id: str, candidate_dict: dict, packages: list[AnnotationPackage]) -> tuple[int, AnnotationPackage] | None:
@@ -760,7 +947,8 @@ class AnnotationData:
                 LOG.info("random_tile_empty iac=%s", target_package.rel_path)
                 return {"record": None}
             if self.roi_queue is None:
-                record = random.choice(remaining)
+                random.shuffle(remaining)
+                record = self._first_random_candidate(pkg_idx, remaining)
             else:
                 counts = self.state.roi_positive_counts()
                 deficits = {
@@ -778,8 +966,7 @@ class AnnotationData:
                     if any(deficits.get(name, 0) > 0 for name in self.roi_queue.candidate(item.tile_id)["priority_attributes"])
                 ]
                 if useful_candidates:
-                    record = min(
-                        useful_candidates,
+                    useful_candidates.sort(
                         key=lambda item: (
                             -sum(
                                 deficits.get(name, 0) / max(1, self.roi_queue.targets[name])
@@ -788,8 +975,13 @@ class AnnotationData:
                             random.random(),
                         ),
                     )
+                    record = self._first_random_candidate(pkg_idx, useful_candidates)
                 else:
-                    record = random.choice(remaining)
+                    random.shuffle(remaining)
+                    record = self._first_random_candidate(pkg_idx, remaining)
+            if record is None:
+                LOG.info("random_tile_no_tissue iac=%s threshold=%.3f", target_package.rel_path, self.min_tissue_fraction)
+                return {"record": None, "done": "no_tissue_candidates"}
             LOG.info("random_tile iac=%s row=%d tile_id=%s remaining=%d", target_package.rel_path, record.row, record.tile_id, len(remaining))
             return {"record": viewer._record_json(record), "package_index": pkg_idx}
         else:
@@ -822,8 +1014,7 @@ class AnnotationData:
                     if any(deficits.get(name, 0) > 0 for name in item["priority_attributes"])
                 ]
                 if useful_candidates:
-                    chosen_candidate = min(
-                        useful_candidates,
+                    useful_candidates.sort(
                         key=lambda entry: (
                             -sum(
                                 deficits.get(name, 0) / max(1, self.roi_queue.targets[name])
@@ -832,17 +1023,19 @@ class AnnotationData:
                             random.random(),
                         ),
                     )
-                    found = self._find_package_for_tile(chosen_candidate["tile_id"], chosen_candidate, packages)
-                    if found is not None:
+                    for chosen_candidate in useful_candidates:
+                        found = self._find_package_for_tile(chosen_candidate["tile_id"], chosen_candidate, packages)
+                        if found is None:
+                            continue
                         p_idx, pkg = found
                         viewer = self.viewer(p_idx)
                         if chosen_candidate["row"] in viewer._by_row:
                             record = viewer._by_row[chosen_candidate["row"]]
-                            if record.tile_id == chosen_candidate["tile_id"]:
+                            if record.tile_id == chosen_candidate["tile_id"] and self._is_random_candidate(p_idx, record):
                                 LOG.info("random_tile_global_roi iac=%s row=%d tile_id=%s", pkg.rel_path, record.row, record.tile_id)
                                 return {"record": viewer._record_json(record), "package_index": p_idx}
                         for record in viewer.records:
-                            if record.tile_id == chosen_candidate["tile_id"]:
+                            if record.tile_id == chosen_candidate["tile_id"] and self._is_random_candidate(p_idx, record):
                                 LOG.info("random_tile_global_roi_search iac=%s row=%d tile_id=%s", pkg.rel_path, record.row, record.tile_id)
                                 return {"record": viewer._record_json(record), "package_index": p_idx}
 
@@ -866,19 +1059,22 @@ class AnnotationData:
             if not available_packages:
                 return {"record": None}
 
-            chosen_idx = random.choices(range(len(available_packages)), weights=weights)[0]
-            p_idx, pkg = available_packages[chosen_idx]
-            viewer = self.viewer(p_idx)
-            remaining_records = [
-                record for record in viewer.records
-                if not self.state.is_annotated(pkg, record)
-                and (exclude_tile_id is None or record.tile_id != exclude_tile_id)
-            ]
-            if not remaining_records:
-                return {"record": None}
-            record = random.choice(remaining_records)
-            LOG.info("random_tile_global_fallback iac=%s row=%d tile_id=%s", pkg.rel_path, record.row, record.tile_id)
-            return {"record": viewer._record_json(record), "package_index": p_idx}
+            package_order = random.choices(range(len(available_packages)), weights=weights, k=len(available_packages) * 2)
+            package_order.extend(index for index in range(len(available_packages)) if index not in package_order)
+            for chosen_idx in package_order:
+                p_idx, pkg = available_packages[chosen_idx]
+                viewer = self.viewer(p_idx)
+                remaining_records = [
+                    record for record in viewer.records
+                    if not self.state.is_annotated(pkg, record)
+                    and (exclude_tile_id is None or record.tile_id != exclude_tile_id)
+                ]
+                random.shuffle(remaining_records)
+                record = self._first_random_candidate(p_idx, remaining_records)
+                if record is not None:
+                    LOG.info("random_tile_global_fallback iac=%s row=%d tile_id=%s", pkg.rel_path, record.row, record.tile_id)
+                    return {"record": viewer._record_json(record), "package_index": p_idx}
+            return {"record": None, "done": "no_tissue_candidates"}
 
     def reviewed_record(self, index: int) -> dict:
         package = self.package(index)
@@ -1070,6 +1266,125 @@ class AnnotationData:
         return buffer.getvalue()
 
 
+class AnnotationArchive:
+    def __init__(
+        self,
+        initial: AnnotationData,
+        *,
+        input_path: str | Path,
+        roi_candidate_manifest: str | Path | None = None,
+        min_tissue_fraction: float = 0.30,
+    ) -> None:
+        self.input_path = str(Path(input_path).resolve())
+        self.roi_candidate_manifest = str(roi_candidate_manifest) if roi_candidate_manifest else None
+        self.min_tissue_fraction = float(min_tissue_fraction)
+        self.base_state_path = initial.state.state_path
+        self.manifest_path = self.base_state_path.with_name(f"{self.base_state_path.stem}.versions.json")
+        self.version_dir = self.base_state_path.with_name(f"{self.base_state_path.stem}.versions")
+        self._data: dict[str, AnnotationData] = {"main": initial}
+        self._names: dict[str, str] = {"main": "Main"}
+        if self.manifest_path.exists():
+            payload = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+            for item in payload.get("versions", []):
+                version_id = str(item.get("id") or "").strip()
+                if not version_id or version_id == "main" or version_id in self._data:
+                    continue
+                state_path = Path(str(item.get("state_path") or ""))
+                if not state_path.is_absolute():
+                    state_path = self.manifest_path.parent / state_path
+                self._data[version_id] = AnnotationData(
+                    self.input_path,
+                    state_path,
+                    roi_candidate_manifest=self.roi_candidate_manifest,
+                    min_tissue_fraction=self.min_tissue_fraction,
+                )
+                self._names[version_id] = str(item.get("name") or version_id)
+
+    def data(self, version_id: str | None = None) -> AnnotationData:
+        selected = str(version_id or "main")
+        if selected not in self._data:
+            raise ValueError(f"annotation version is not configured: {selected}")
+        return self._data[selected]
+
+    def versions_json(self) -> dict:
+        return {
+            "versions": [
+                {
+                    "id": version_id,
+                    "name": self._names[version_id],
+                    "state_path": str(item.state.state_path),
+                    "annotations": len(item.state.annotations),
+                }
+                for version_id, item in self._data.items()
+            ]
+        }
+
+    def create_version(self, name: str, source_version: str = "main") -> dict:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("version name is required")
+        slug = re.sub(r"[^a-z0-9]+", "-", clean_name.lower()).strip("-") or "version"
+        version_id = slug
+        suffix = 2
+        while version_id in self._data:
+            version_id = f"{slug}-{suffix}"
+            suffix += 1
+        source = self.data(source_version)
+        state_path = self.version_dir / f"{version_id}.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 2,
+            "input_path": self.input_path,
+            "l1_prototypes": list(source.state.l1_prototypes),
+            "l2_prototypes": list(source.state.l2_prototypes),
+            "label_definitions": source.state.label_definitions,
+            "annotations": {},
+            "skipped": [],
+            "last_iac": "",
+            "roi_mode": source.state.require_complete_roi,
+            "annotation_version": {"id": version_id, "name": clean_name, "source": source_version},
+        }
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=state_path.parent) as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            tmp_path = Path(handle.name)
+        tmp_path.replace(state_path)
+        self._data[version_id] = AnnotationData(
+            self.input_path,
+            state_path,
+            roi_candidate_manifest=self.roi_candidate_manifest,
+            min_tissue_fraction=self.min_tissue_fraction,
+        )
+        self._names[version_id] = clean_name
+        self._flush_manifest()
+        LOG.info("annotation_version_create id=%s name=%s state=%s", version_id, clean_name, state_path)
+        result = self.versions_json()
+        result["created"] = version_id
+        return result
+
+    def _flush_manifest(self) -> None:
+        payload = {
+            "version": 1,
+            "base_state": str(self.base_state_path),
+            "versions": [
+                {
+                    "id": version_id,
+                    "name": self._names[version_id],
+                    "state_path": os.path.relpath(item.state.state_path, self.manifest_path.parent),
+                }
+                for version_id, item in self._data.items()
+                if version_id != "main"
+            ],
+        }
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=self.manifest_path.parent) as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            tmp_path = Path(handle.name)
+        tmp_path.replace(self.manifest_path)
+
+    def close(self) -> None:
+        for item in self._data.values():
+            item.close()
+
+
 HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -1080,10 +1395,11 @@ HTML = r"""<!doctype html>
 :root{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--line:#d7dce2;--text:#202124;--muted:#687381;--blue:#1a73e8;--blue-soft:#e8f0fe;--green-soft:#dff3eb;--danger:#b42318}
 *{box-sizing:border-box}body{margin:0;font:14px system-ui,-apple-system,Segoe UI,sans-serif;color:var(--text);background:var(--bg);height:100svh;overflow:hidden}
 button,input{font:inherit}button{min-height:40px;border:1px solid var(--line);background:var(--panel);color:var(--text);cursor:pointer}button.primary{background:var(--blue);border-color:var(--blue);color:#fff}button.ghost{background:transparent}button:disabled{opacity:.55;cursor:default}
-.layout{display:grid;grid-template-columns:300px minmax(0,1fr) 320px;height:100svh}.layout.queue-collapsed{grid-template-columns:0 minmax(0,1fr) 320px}.layout.labels-collapsed{grid-template-columns:300px minmax(0,1fr) 0}.layout.queue-collapsed.labels-collapsed{grid-template-columns:0 minmax(0,1fr) 0}
-aside,.right{overflow:hidden;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column}.right{border-left:1px solid var(--line);border-right:0}.layout.queue-collapsed aside,.layout.labels-collapsed .right{border:0}.layout.queue-collapsed aside>*,.layout.labels-collapsed .right>*{display:none}
+.layout{display:grid;grid-template-columns:300px minmax(0,1fr);height:100svh}.layout.queue-collapsed{grid-template-columns:0 minmax(0,1fr)}
+.modeNav{display:flex;align-items:center;gap:2px;padding:2px;border:1px solid var(--line);background:#f5f7f9}.modeNav button{min-height:32px;padding:4px 12px;border:0;background:transparent}.modeNav button.active{background:#202124;color:#fff}.versionSelect{min-height:32px;border:1px solid var(--line);background:#fff;padding:0 8px}.compactButton{min-height:32px;padding:4px 9px}.labelManage{min-height:32px;padding:4px 10px}
+aside{overflow:hidden;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column}.layout.queue-collapsed aside{border:0}.layout.queue-collapsed aside>*{display:none}
 .panelHead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px;border-bottom:1px solid var(--line)}.panelTitle{font-weight:650}.panelBody{overflow:auto;padding:12px}.labelBody{min-height:0;flex:1}.labelActions{border-top:1px solid var(--line);padding:10px 12px;background:var(--panel)}
-main{min-width:0;display:grid;grid-template-rows:auto minmax(0,1fr);height:100svh}.topbar{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--panel)}.topbarTitle{min-width:0;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+main{min-width:0;display:grid;grid-template-rows:auto auto minmax(0,1fr);height:100svh}.topbar{display:grid;grid-template-columns:auto auto minmax(160px,1fr) auto;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel)}.topbarTitle{min-width:0;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.topTools{display:flex;align-items:center;gap:6px}.topTools button{min-height:32px;padding:4px 10px}.subbar{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:42px;padding:5px 12px;border-bottom:1px solid var(--line);background:#fafbfc}.versionGroup{display:flex;align-items:center;gap:6px;min-width:0}.versionLabel{color:var(--muted);font-size:12px}.topProgress{min-width:300px;text-align:right;font-size:12px;color:var(--muted)}.topProgress b{color:var(--text)}
 .workspace{min-height:0;overflow:auto;padding:12px}.pkg{position:relative;padding:8px;border:1px solid var(--line);margin-bottom:6px;cursor:pointer;background:#fff;overflow:hidden}.pkg.active{border-color:var(--blue);background:var(--blue-soft)}
 .pkg>*{position:relative;z-index:1}.pkg::before{content:"";position:absolute;inset:0 auto 0 0;width:var(--pct,0%);background:#dff3eb;z-index:0}
 .muted{color:var(--muted);font-size:12px}.thumbWrap{min-height:220px;border:1px solid #c7cbd1;background:white;overflow:auto}
@@ -1091,27 +1407,27 @@ main{min-width:0;display:grid;grid-template-rows:auto minmax(0,1fr);height:100sv
 .tileViewport{width:min(100%,680px);height:520px;overflow:auto;border:1px solid #c7cbd1;background:#f8fafc}.tileStage{position:relative;width:224px;height:224px;background:#fff;transform-origin:0 0}.tile{position:absolute;inset:0;width:224px;height:224px;object-fit:contain;background:#fff}.roiCanvas{position:absolute;inset:0;width:224px;height:224px;touch-action:none;cursor:crosshair}.roiClassBar{display:flex;flex-wrap:nowrap;gap:6px;margin:8px 0;max-width:min(100%,760px);overflow-x:auto;padding-bottom:14px}.roiClassButton{min-height:32px;padding:4px 8px;border-left-width:8px;white-space:nowrap;flex:0 0 auto}.roiClassButton.selected{background:#111827;color:#fff}.roiTools{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin:8px 0}.roiTools button{min-height:32px;padding:4px 8px}.roiTools button.selected{background:var(--blue);color:#fff}.brushWidthControl{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:#fff;padding:4px 8px;min-height:32px}.brushWidthControl input{width:130px}.brushDot{display:inline-block;border-radius:999px;background:#111827;border:2px solid #fff;box-shadow:0 0 0 1px #111827}.chips{display:grid;grid-template-columns:1fr;gap:6px;margin:8px 0 16px}
 .panzoom{touch-action:none;transform-origin:0 0;will-change:transform;cursor:grab}.panzoom.dragging{cursor:grabbing}
 button.chip{position:relative;text-align:left;border:1px solid #c7cbd1;background:#fff;padding:8px;cursor:pointer;overflow:hidden}button.chip::before{content:"";position:absolute;inset:0 auto 0 0;width:var(--pct,0%);background:#eef4ff;z-index:0}button.chip.selected{background:#1a73e8;color:white;border-color:#1a73e8}button.chip.selected::before{background:rgba(255,255,255,.18)}button.chip span{position:relative;z-index:1}.chipRow{display:flex;justify-content:space-between;gap:8px}.chipCount{font-variant-numeric:tabular-nums;color:#374151}button.chip.selected .chipCount{color:white}
-.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.actions button{padding:8px 10px}.bar{height:8px;background:#e5e7eb;margin:6px 0 10px}.bar>div{height:8px;background:#18865b}
+.annotationControls{width:min(100%,760px);border-top:1px solid var(--line);margin-top:10px;padding-top:10px}.annotationControls .chips{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.actions button{padding:8px 12px}.bar{height:6px;background:#e5e7eb;margin:4px 0}.bar>div{height:6px;background:#18865b}.statusLine{min-height:20px;margin-top:6px;color:var(--muted);font-size:12px;white-space:pre-wrap}
 pre{white-space:pre-wrap;font-size:12px;background:#f1f3f4;padding:8px}
 .authGate{position:fixed;inset:0;background:rgba(244,246,248,.96);z-index:10;display:none;align-items:center;justify-content:center;padding:18px}.authBox{width:min(420px,100%);background:#fff;border:1px solid var(--line);padding:16px;box-shadow:0 14px 40px rgba(15,23,42,.18)}.authBox h3{margin:0 0 10px}.authBox input{width:100%;min-height:42px;border:1px solid var(--line);padding:0 10px;margin-bottom:10px}.authBox .status{min-height:18px;color:var(--danger);font-size:12px}
 .contextOverlay{position:fixed;inset:0;background:rgba(15,23,42,.86);z-index:9;display:flex;flex-direction:column}.contextBar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;background:#fff}.contextStage{min-height:0;flex:1;overflow:hidden;display:flex;align-items:center;justify-content:center}.contextStage img{max-width:none;max-height:none;background:#fff;border:1px solid rgba(255,255,255,.5)}
+.labelDialog{width:min(700px,calc(100% - 24px));max-height:80svh;border:1px solid var(--line);padding:0}.dialogHead{display:flex;align-items:center;justify-content:space-between;padding:12px;border-bottom:1px solid var(--line)}.dialogBody{padding:12px;overflow:auto;max-height:60svh}.labelEditorRow{display:grid;grid-template-columns:70px minmax(0,1fr) auto auto auto;gap:6px;align-items:center;margin-bottom:6px}.labelEditorRow input{min-height:36px;border:1px solid var(--line);padding:0 8px}.labelEditorRow button{min-height:36px;padding:4px 8px}.addLabelRow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;margin-top:12px}.addLabelRow input{min-height:38px;border:1px solid var(--line);padding:0 8px}
 .hidden{display:none!important}
 @media(max-width:760px){
-  body{height:100svh;overflow:hidden}.layout,.layout.queue-collapsed,.layout.labels-collapsed,.layout.queue-collapsed.labels-collapsed{display:block;height:100svh}
+  body{height:100svh;overflow:hidden}.layout,.layout.queue-collapsed{display:block;height:100svh}
   aside{position:fixed;inset:0 0 auto 0;z-index:5;max-height:45svh;border-right:0;border-bottom:1px solid var(--line);box-shadow:0 8px 24px rgba(15,23,42,.16)}.layout.queue-collapsed aside{display:none}
-  .right{position:fixed;inset:auto 0 0 0;z-index:4;max-height:48svh;border-left:0;border-top:1px solid var(--line);box-shadow:0 -8px 24px rgba(15,23,42,.12)}.layout.labels-collapsed .right{display:none}
-  main{height:100svh;grid-template-rows:auto minmax(0,1fr)}.topbar{position:sticky;top:0;z-index:3}.workspace{padding:8px}.tileViewport{height:360px}.thumbWrap{max-height:calc(100svh - 310px);min-height:160px}.actions{grid-template-columns:1fr 1fr}.panelBody{padding:10px}.labelActions{padding:8px 10px}.chips{gap:6px;margin-bottom:10px}button.chip{min-height:38px;padding:7px}
+  main{height:100svh;grid-template-rows:auto auto minmax(0,1fr)}.topbar{position:sticky;top:0;z-index:3;grid-template-columns:auto minmax(0,1fr) auto;gap:6px;padding:7px 8px}.topbarTitle{grid-column:1/-1;grid-row:1}.topbar>#toggleQueue{grid-column:1;grid-row:2}.topbar>.modeNav{grid-column:2;grid-row:2;justify-self:start}.topbar>.topTools{grid-column:3;grid-row:2}.subbar{align-items:flex-start;flex-direction:column;gap:5px;padding:6px 8px}.versionGroup{width:100%}.versionSelect{min-width:0;flex:1}.topProgress{width:100%;min-width:0;text-align:left}.workspace{padding:8px}.tileViewport{height:360px}.thumbWrap{max-height:calc(100svh - 310px);min-height:160px}.panelBody{padding:10px}.chips{gap:6px;margin-bottom:10px}button.chip{min-height:38px;padding:7px}
 }
 </style>
 </head>
 <body><div id="authGate" class="authGate"><div class="authBox"><h3>Annotation token</h3><input id="authInput" autocomplete="off"><button id="authSubmit" class="primary" type="button">Open</button><div id="authStatus" class="status"></div></div></div>
 <div id="layout" class="layout"><aside><div class="panelHead"><div><div class="panelTitle">IAC packages</div><div id="packageSummary" class="muted"></div></div><button id="hideQueue" class="ghost" type="button">Hide</button></div><div id="packages" class="panelBody"></div></aside>
-<main><div class="topbar"><button id="toggleQueue" type="button">Tiles</button><button id="toggleLabels" type="button">Panel</button><button id="contextBtn" type="button">Context</button><div id="title" class="topbarTitle">Prototype annotation</div></div><section class="workspace"><div class="muted" id="recordMeta"></div>
-<div id="roiClassBar" class="roiClassBar"></div><div id="roiStatus" class="muted">Select an ROI class, then draw on the tile. All shows existing ROI only. Mouse wheel zooms; double-click resets.</div><p><div id="tileViewport" class="tileViewport"><div id="tileStage" class="tileStage"><img id="tile" class="tile"><canvas id="roiCanvas" class="roiCanvas" width="224" height="224"></canvas></div></div></p><div class="roiTools"><button type="button" data-roi-tool="point">Point</button><button type="button" data-roi-tool="brush">Brush</button><button type="button" data-roi-tool="circle">Circle</button><label class="brushWidthControl">Brush width <input id="brushWidth" type="range" min="0.012" max="0.500" step="0.002" value="0.035"><span id="brushDot" class="brushDot"></span></label><button type="button" id="roiUndo">Undo</button><button type="button" id="roiRedo">Redo</button><button type="button" id="roiClear">Clear selected class</button><button type="button" id="tileZoomIn">Zoom +</button><button type="button" id="tileZoomOut">Zoom -</button><button type="button" id="tileZoomReset">Reset zoom</button><button type="button" id="tileGridToggle">Grid</button><span class="muted">Save marks this tile reviewed. Unmarked classes stay unknown/ignored unless explicitly toggled negative.</span></div><h3>Location overview</h3><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom"></div></section></main>
-<section class="right"><div class="panelHead"><div class="panelTitle">Review panel</div><button id="hideLabels" class="ghost" type="button">Hide</button></div><div class="panelBody labelBody"><h3>Progress</h3><div id="progress"></div><div id="prototypeLabels"><h3>L1 primary</h3><div id="l1" class="chips"></div>
-<h3>L2 attributes</h3><div id="l2" class="chips"></div></div></div><div class="labelActions"><div class="actions"><button onclick="save()" class="primary">Save + next</button><button onclick="nextRandom(true)">Next unreviewed</button><button onclick="reviewed()">Edit reviewed</button></div><pre id="status"></pre></div></section>
+<main><div class="topbar"><button id="toggleQueue" type="button">Tiles</button><div id="modeNav" class="modeNav"></div><div id="title" class="topbarTitle">Prototype annotation</div><div class="topTools"><button id="contextBtn" type="button">Context</button><button id="manageLabels" class="labelManage" type="button">Labels</button></div></div><div class="subbar"><div class="versionGroup"><span class="versionLabel">Version</span><select id="versionSelect" class="versionSelect" title="Annotation version"></select><button id="newVersion" class="compactButton" type="button">New</button></div><div id="progress" class="topProgress"></div></div><section class="workspace"><div class="muted" id="recordMeta"></div>
+<p><div id="tileViewport" class="tileViewport"><div id="tileStage" class="tileStage"><img id="tile" class="tile"><canvas id="roiCanvas" class="roiCanvas" width="224" height="224"></canvas></div></div></p><div class="annotationControls"><div id="prototypeLabels"><div id="l1Section"><div id="l1" class="chips"></div></div><div id="l2Section"><div id="l2" class="chips"></div></div></div><div id="roiClassBar" class="roiClassBar"></div><div id="roiStatus" class="muted">Select an ROI class, then draw on the tile.</div><details id="quotaDetails" class="muted"><summary>ROI quota progress</summary><div id="quotaProgress"></div></details><div id="roiTools" class="roiTools"><button type="button" data-roi-tool="point">Point</button><button type="button" data-roi-tool="brush">Brush</button><button type="button" data-roi-tool="circle">Circle</button><label class="brushWidthControl">Brush width <input id="brushWidth" type="range" min="0.012" max="0.500" step="0.002" value="0.035"><span id="brushDot" class="brushDot"></span></label><button type="button" id="roiUndo">Undo</button><button type="button" id="roiRedo">Redo</button><button type="button" id="roiClear">Clear selected class</button><button type="button" id="tileZoomIn">Zoom +</button><button type="button" id="tileZoomOut">Zoom -</button><button type="button" id="tileZoomReset">Reset zoom</button><button type="button" id="tileGridToggle">Grid</button></div><div class="actions"><button onclick="save()" class="primary">Save + next</button><button onclick="nextRandom(true)">Skip + next</button><button onclick="reviewed()">Edit reviewed</button></div><div id="status" class="statusLine"></div></div><h3>Location overview</h3><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom"></div></section></main>
 </div>
 <div id="contextOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>5x5 context</b><div id="contextMeta" class="muted"></div></div><button id="contextClose" type="button">Close</button></div><div class="contextStage"><img id="contextImg" class="panzoom"></div></div>
+<dialog id="labelDialog" class="labelDialog"><div class="dialogHead"><b id="labelDialogTitle">Label management</b><button id="closeLabels" type="button">Close</button></div><div class="dialogBody"><div id="labelEditor"></div><div class="addLabelRow"><input id="newLabelName" placeholder="New label name"><button id="addLabel" class="primary" type="button">Add</button></div><div id="labelStatus" class="muted"></div></div></dialog>
+<dialog id="versionDialog" class="labelDialog"><div class="dialogHead"><b>Create annotation version</b><button id="closeVersion" type="button">Close</button></div><div class="dialogBody"><div class="addLabelRow"><input id="newVersionName" placeholder="Version name"><button id="createVersion" class="primary" type="button">Create</button></div><div id="versionStatus" class="muted">The new version starts with no annotations and keeps the current label configuration.</div></div></dialog>
 <script>
 let packages=[], pkg=0, current=null, currentCandidate=null, l1="", l2=new Set(), l1Counts={}, l2Counts={}, restoredLastIac=false, showGrid=false, navigationMode='global';
 let roi=[],roiTool='point',roiAttribute='__all__',roiDrawing=null,roiPreview=null,roiCursor=null,roiAllComplete=true;
@@ -1125,14 +1441,16 @@ let AUTH_TOKEN='';
 function tokenFromUrl(){const params=new URLSearchParams(location.search); for(const key of TOKEN_KEYS){const value=params.get(key); if(value)return value;} return '';}
 function setAuthToken(token){AUTH_TOKEN=token||''; if(AUTH_TOKEN)localStorage.setItem('hcc_sempath_annotation_token',AUTH_TOKEN);}
 function authed(path){return path+(path.includes('?')?'&':'?')+'token='+encodeURIComponent(AUTH_TOKEN);}
-async function api(path, opts){const r=await fetch(authed(path), opts); if(!r.ok) throw new Error(await r.text()); return r.headers.get('content-type')?.includes('json')?r.json():r.blob();}
+function scoped(path){return path+(path.includes('?')?'&':'?')+'mode='+encodeURIComponent(MODE)+'&version='+encodeURIComponent(VERSION)}
+async function api(path, opts){const r=await fetch(authed(scoped(path)), opts); if(!r.ok) throw new Error(await r.text()); return r.headers.get('content-type')?.includes('json')?r.json():r.blob();}
 function setQueueOpen(open){document.getElementById('layout').classList.toggle('queue-collapsed',!open);}
-function setLabelsOpen(open){document.getElementById('layout').classList.toggle('labels-collapsed',!open);}
 function isMobile(){return window.matchMedia('(max-width:760px)').matches;}
+function applyModeLayout(){const l1Mode=MODE==='l1';document.getElementById('roiClassBar').style.display=l1Mode?'none':'flex';document.getElementById('roiStatus').style.display=l1Mode?'none':'block';document.getElementById('quotaDetails').style.display=l1Mode?'none':'block';document.getElementById('roiTools').style.display=l1Mode?'none':'flex';document.getElementById('roiCanvas').style.display=l1Mode?'none':'block';document.getElementById('prototypeLabels').style.display=l1Mode?'block':'none';document.getElementById('l1Section').style.display=l1Mode?'block':'none';document.getElementById('l2Section').style.display='none';document.getElementById('tileViewport').style.cursor=l1Mode?'default':'crosshair';}
 async function ensureAuth(){setAuthToken(tokenFromUrl()||localStorage.getItem('hcc_sempath_annotation_token')||''); if(!AUTH_TOKEN){document.getElementById('authGate').style.display='flex'; throw new Error('');}}
 async function submitAuth(){setAuthToken(document.getElementById('authInput').value.trim()); try{await api('/api/scan-status'); document.getElementById('authGate').style.display='none'; refreshPackage().catch(e=>document.getElementById('status').textContent=e.message||String(e));}catch(e){document.getElementById('authStatus').textContent='Invalid token.';}}
 function setupPanZoom(el,onClick){let scale=1,tx=0,ty=0,drag=false,sx=0,sy=0,stx=0,sty=0,moved=0; const apply=()=>{el.style.transform=`translate(${tx}px,${ty}px) scale(${scale})`;}; el.addEventListener('wheel',ev=>{ev.preventDefault(); const next=Math.min(12,Math.max(.25,scale*(ev.deltaY<0?1.15:.87))); scale=next; apply();},{passive:false}); el.addEventListener('pointerdown',ev=>{drag=true;moved=0;sx=ev.clientX;sy=ev.clientY;stx=tx;sty=ty;el.classList.add('dragging');el.setPointerCapture(ev.pointerId);}); el.addEventListener('pointermove',ev=>{if(!drag)return; const dx=ev.clientX-sx,dy=ev.clientY-sy; moved=Math.max(moved,Math.abs(dx)+Math.abs(dy)); tx=stx+dx; ty=sty+dy; apply();}); el.addEventListener('pointerup',ev=>{if(!drag)return; drag=false; el.classList.remove('dragging'); if(moved<6&&onClick)onClick(ev);}); el.addEventListener('dblclick',ev=>{ev.preventDefault(); scale=1;tx=0;ty=0;apply();}); el.resetPanZoom=()=>{scale=1;tx=0;ty=0;apply();};}
-function prototypeButton(name, selected, count, maxCount, onClick){const b=document.createElement('button'); const pct=maxCount?Math.round(count/maxCount*100):0; b.className='chip'+(selected?' selected':''); b.style.setProperty('--pct',pct+'%'); b.innerHTML=`<span class=chipRow><span>${name}</span><span class=chipCount>${count}</span></span>`; b.onclick=onClick; return b;}
+function labelName(level,id){const item=(LABELS.levels[level]||[]).find(x=>x.id===id);return item?item.name:id}
+function prototypeButton(level,id, selected, count, maxCount, onClick){const b=document.createElement('button'); const pct=maxCount?Math.round(count/maxCount*100):0; b.className='chip'+(selected?' selected':''); b.style.setProperty('--pct',pct+'%'); b.innerHTML=`<span class=chipRow><span>${labelName(level,id)}</span><span class=chipCount>${count}</span></span>`; b.onclick=onClick; return b;}
 function roiColor(attribute){const i=L2.indexOf(attribute);return ROI_COLORS[(i<0?0:i)%ROI_COLORS.length]}
 function snapshotRoi(){return JSON.stringify({roi,roiClassState})}
 function restoreRoi(snapshot){const state=JSON.parse(snapshot);roi=state.roi||[];roiClassState=state.roiClassState||{};syncPositiveLabels();renderRoi()}
@@ -1140,8 +1458,8 @@ function pushUndo(){undoStack.push(snapshotRoi()); if(undoStack.length>100)undoS
 function undoRoi(){if(!undoStack.length)return;redoStack.push(snapshotRoi());restoreRoi(undoStack.pop());document.getElementById('status').textContent='Undone.'}
 function redoRoi(){if(!redoStack.length)return;undoStack.push(snapshotRoi());restoreRoi(redoStack.pop());document.getElementById('status').textContent='Redone.'}
 function toggleRoiClass(name){pushUndo();if(roiAttribute===name){roiClassState[name]=roiClassState[name]==='negative'?'open':'negative'}else{roiAttribute=name;if(!roiClassState[name])roiClassState[name]='open'}renderLabels();renderRoi()}
-function renderRoiClassBar(){const bar=document.getElementById('roiClassBar'); if(!bar)return; bar.style.display=ROI_MODE?'flex':'none'; bar.innerHTML=''; if(!ROI_MODE)return; const oldL2=new Set((currentCandidate&&currentCandidate.source_l2)||[]); const all=document.createElement('button'); all.type='button'; all.className='roiClassButton'+(roiAttribute===ROI_ALL?' selected':''); all.style.borderLeftColor='#111827'; all.textContent='All'; all.onclick=()=>{roiAttribute=ROI_ALL;renderLabels();renderRoi()}; bar.appendChild(all); L2.forEach(x=>{const state=roiClassState[x]||'open';const b=document.createElement('button'); b.type='button'; b.className='roiClassButton'+(roiAttribute===x?' selected':''); b.style.borderLeftColor=state==='negative'?'#111827':roiColor(x); b.textContent=`${state==='negative'?'−':'○'} ${oldL2.has(x)?'✓ ':''}${x}`; b.title=(oldL2.has(x)?'Existing L2 label on this tile. ':'')+(state==='negative'?'Explicit negative; click again to return to positive/uncertain.':'Positive or uncertain by default; click selected class again to mark explicit negative.'); b.onclick=()=>toggleRoiClass(x); bar.appendChild(b)})}
-function renderLabels(){renderRoiClassBar();document.getElementById('prototypeLabels').style.display=ROI_MODE?'none':'block'; const a=document.getElementById('l1'); a.innerHTML=''; const b=document.getElementById('l2'); b.innerHTML=''; if(!ROI_MODE){const l1Max=Math.max(1,...Object.values(l1Counts)); L1.forEach(x=>a.appendChild(prototypeButton(x,l1===x,l1Counts[x]||0,l1Max,()=>{l1=x;renderLabels()}))); const l2Max=Math.max(1,...Object.values(l2Counts)); L2.forEach(x=>b.appendChild(prototypeButton(x,l2.has(x),l2Counts[x]||0,l2Max,()=>{if(l2.has(x)){l2.delete(x)}else{l2.add(x)}renderLabels();renderRoi()})))} document.getElementById('roiStatus').textContent=ROI_MODE?(roiAttribute===ROI_ALL?'All ROI classes visible. Select one L2 class before drawing.':`Drawing ROI for: ${roiAttribute}`):(roiAttribute?`ROI attribute: ${roiAttribute}`:`Select one of ${L2.length} L2 attributes, then annotate every visible focus.`);}
+function renderRoiClassBar(){const bar=document.getElementById('roiClassBar'); if(!bar)return; bar.style.display=ROI_MODE?'flex':'none'; bar.innerHTML=''; if(!ROI_MODE)return; const oldL2=new Set((currentCandidate&&currentCandidate.source_l2)||[]); const all=document.createElement('button'); all.type='button'; all.className='roiClassButton'+(roiAttribute===ROI_ALL?' selected':''); all.style.borderLeftColor='#111827'; all.textContent='All'; all.onclick=()=>{roiAttribute=ROI_ALL;renderLabels();renderRoi()}; bar.appendChild(all); L2.forEach(x=>{const state=roiClassState[x]||'open';const b=document.createElement('button'); b.type='button'; b.className='roiClassButton'+(roiAttribute===x?' selected':''); b.style.borderLeftColor=state==='negative'?'#111827':roiColor(x); b.textContent=`${state==='negative'?'−':'○'} ${oldL2.has(x)?'✓ ':''}${labelName('l2',x)}`; b.title=(oldL2.has(x)?'Existing L2 label on this tile. ':'')+(state==='negative'?'Explicit negative; click again to return to positive/uncertain.':'Positive or uncertain by default; click selected class again to mark explicit negative.'); b.onclick=()=>toggleRoiClass(x); bar.appendChild(b)})}
+function renderLabels(){renderRoiClassBar();const a=document.getElementById('l1');a.innerHTML='';document.getElementById('l2').innerHTML='';if(MODE==='l1'){const l1Max=Math.max(1,...Object.values(l1Counts));L1.forEach(x=>a.appendChild(prototypeButton('l1',x,l1===x,l1Counts[x]||0,l1Max,()=>{l1=x;renderLabels()})))}document.getElementById('roiStatus').textContent=ROI_MODE?(roiAttribute===ROI_ALL?'All ROI classes visible. Select one L2 class before drawing. Unmarked classes stay unknown/ignored unless explicitly toggled negative.':`Drawing ROI for: ${labelName('l2',roiAttribute)}. Unmarked classes stay unknown/ignored unless explicitly toggled negative.`):'';applyModeLayout();}
 function roiPoint(ev){const r=document.getElementById('roiCanvas').getBoundingClientRect();return{x:(ev.clientX-r.left)/r.width,y:(ev.clientY-r.top)/r.height}}
 function applyTileZoom(){const stage=document.getElementById('tileStage'); if(!stage)return; stage.style.transform=`scale(${tileScale})`; stage.style.marginRight=(224*(tileScale-1))+'px'; stage.style.marginBottom=(224*(tileScale-1))+'px'}
 function setTileZoom(scale){tileScale=Math.min(6,Math.max(1,scale));applyTileZoom()}
@@ -1151,7 +1469,7 @@ function renderRoi(){const c=document.getElementById('roiCanvas'),x=c.getContext
 function syncPositiveLabels(){l2=new Set(roi.filter(item=>item.geometry&&item.state!=='negative').map(item=>item.attribute));renderLabels()}
 function updateRoiCursor(ev){const p=roiPoint(ev);roiCursor=(roiTool==='brush'&&roiAttribute!==ROI_ALL&&roiClassState[roiAttribute]!=='negative')?p:null;renderRoi()}
 function setupRoi(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerenter',ev=>updateRoiCursor(ev));c.addEventListener('pointerleave',()=>{roiCursor=null;renderRoi()});c.addEventListener('pointerdown',ev=>{if(ROI_MODE&&roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one L2 ROI class before drawing.';return}if(!roiAttribute)return;if(roiClassState[roiAttribute]==='negative'){document.getElementById('status').textContent='This ROI class is marked negative. Toggle it back before drawing.';return}if(roiTool==='point'){pushUndo();const p=roiPoint(ev);roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'point',coordinate_space:'normalized',point:[p.x,p.y],radius:.018}});syncPositiveLabels();renderRoi();return}const p=roiPoint(ev);roiDrawing={start:p,points:[[p.x,p.y]],width:brushWidth()};roiPreview=null;c.setPointerCapture(ev.pointerId)});c.addEventListener('pointermove',ev=>{updateRoiCursor(ev);if(!roiDrawing)return;const p=roiPoint(ev);if(roiTool==='circle'){const dx=p.x-roiDrawing.start.x,dy=p.y-roiDrawing.start.y;roiPreview={attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'circle',coordinate_space:'normalized',center:[roiDrawing.start.x,roiDrawing.start.y],radius:Math.sqrt(dx*dx+dy*dy)}}}else{roiDrawing.points.push([p.x,p.y]);roiPreview={attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'brush',coordinate_space:'normalized',points:roiDrawing.points,width:roiDrawing.width}}}renderRoi()});c.addEventListener('pointerup',ev=>{if(!roiDrawing)return;const p=roiPoint(ev);pushUndo();if(roiTool==='circle'){const dx=p.x-roiDrawing.start.x,dy=p.y-roiDrawing.start.y;roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'circle',coordinate_space:'normalized',center:[roiDrawing.start.x,roiDrawing.start.y],radius:Math.sqrt(dx*dx+dy*dy)}})}else{roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'brush',coordinate_space:'normalized',points:roiDrawing.points,width:roiDrawing.width}})}roiDrawing=null;roiPreview=null;syncPositiveLabels();renderRoi()})}
-function setThumbnailSrc(){const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); const token=`${Date.now()}-${pkg}`; const row=current?`&row=${current.row}`:''; img.dataset.token=String(token); loading.style.display='block'; loading.textContent='Building overview...'; img.style.display='none'; img.onload=()=>{if(img.dataset.token!==String(token)) return; loading.style.display='none'; img.style.display='block'; if(img.resetPanZoom)img.resetPanZoom();}; img.onerror=()=>{if(img.dataset.token===String(token)) loading.textContent='Overview failed to load.';}; img.src=authed(`/api/thumbnail?package=${pkg}${row}&thumb_token=${encodeURIComponent(token)}&t=${Date.now()}`);}
+function setThumbnailSrc(){const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); const token=`${Date.now()}-${pkg}`; const row=current?`&row=${current.row}`:''; img.dataset.token=String(token); loading.style.display='block'; loading.textContent='Building overview...'; img.style.display='none'; img.onload=()=>{if(img.dataset.token!==String(token)) return; loading.style.display='none'; img.style.display='block'; if(img.resetPanZoom)img.resetPanZoom();}; img.onerror=()=>{if(img.dataset.token===String(token)) loading.textContent='Overview failed to load.';}; img.src=authed(scoped(`/api/thumbnail?package=${pkg}${row}&thumb_token=${encodeURIComponent(token)}&t=${Date.now()}`));}
 async function loadPackages(){
     packages=await api('/api/packages');
     const scan=await api('/api/scan-status');
@@ -1218,8 +1536,8 @@ async function refreshPackage(){
         console.error(e);
     }
 }
-async function progress(){const p=await api('/api/progress?package='+pkg); l1Counts=p.l1; l2Counts=p.roi_counts&&Object.keys(p.roi_counts).length?p.roi_counts:p.l2; renderLabels(); const overallPct=p.overall.total?Math.round(p.overall.annotated/p.overall.total*100):0; const pkgPct=p.package.total?Math.round(p.package.annotated/p.package.total*100):0; const quotas=p.roi_targets&&Object.keys(p.roi_targets).length?`<div class=muted>${L2.map(x=>`${x}: ${p.roi_counts[x]||0}/${p.roi_targets[x]}`).join('<br>')}</div>`:''; document.getElementById('progress').innerHTML=`<div><b>${p.overall.annotated}/${p.overall.total}</b> tiles reviewed (${overallPct}%)</div><div class=bar><div style="width:${overallPct}%"></div></div><div class="muted">Skipped: ${p.overall.skipped} · Remaining: ${p.overall.remaining}</div><div class="muted">Current IAC: ${p.package.annotated}/${p.package.total} (${pkgPct}%) · skipped ${p.package.skipped}</div>${quotas}`;}
-async function showRecord(rec){current=rec; currentCandidate=null; l1=""; l2=new Set();roi=[];roiClassState={};undoStack=[];redoStack=[];roiPreview=null;roiCursor=null;roiAttribute=ROI_MODE?ROI_ALL:'';roiAllComplete=true;renderLabels();renderRoi(); if(!rec){document.getElementById('recordMeta').textContent='No unreviewed tile to show, or ROI target counts are reached.'; document.getElementById('tile').removeAttribute('src'); return;}const saved=await api(`/api/annotation-state?package=${pkg}&row=${rec.row}`);currentCandidate=saved.candidate||null;if(saved.annotation){l1=saved.annotation.l1||'';l2=new Set(saved.annotation.l2||[]);roi=(saved.annotation.roi||[]).filter(item=>item.geometry);(saved.annotation.roi||[]).filter(item=>item.review_complete&&item.state==='negative'&&!item.geometry).forEach(item=>{roiClassState[item.attribute]='negative'});const complete=new Set((saved.annotation.roi||[]).filter(item=>item.review_complete).map(item=>item.attribute));roiAllComplete=L2.every(name=>complete.has(name))}renderLabels();renderRoi();const oldL2=currentCandidate&&currentCandidate.source_l2&&currentCandidate.source_l2.length?` · old L2: ${currentCandidate.source_l2.join(', ')}`:''; document.getElementById('recordMeta').textContent=`${packages[pkg].rel_path} · ${rec.tile_id} · x=${rec.x} y=${rec.y} row=${rec.row}${oldL2}`; const tile=document.getElementById('tile'); tile.src=authed(`/api/tile?package=${pkg}&row=${rec.row}`); applyTileZoom(); setThumbnailSrc();}
+async function progress(){const p=await api('/api/progress?package='+pkg);l1Counts=p.l1;l2Counts=p.roi_counts&&Object.keys(p.roi_counts).length?p.roi_counts:p.l2;renderLabels();const overallPct=p.overall.total?Math.round(p.overall.annotated/p.overall.total*100):0;const filtered=p.auto_filtered?` · ${p.auto_filtered} blank filtered`:'';document.getElementById('progress').innerHTML=`<b>${p.overall.annotated}/${p.overall.total}</b> reviewed · ${p.overall.remaining} remaining · ${p.overall.skipped} skipped${filtered}<div class=bar><div style="width:${overallPct}%"></div></div>`;document.getElementById('quotaProgress').innerHTML=p.roi_targets?Object.keys(p.roi_targets).map(x=>`${labelName('l2',x)}: ${p.roi_counts[x]||0}/${p.roi_targets[x]}`).join('<br>'):'';}
+async function showRecord(rec){current=rec; currentCandidate=null; l1=""; l2=new Set();roi=[];roiClassState={};undoStack=[];redoStack=[];roiPreview=null;roiCursor=null;roiAttribute=ROI_MODE?ROI_ALL:'';roiAllComplete=true;renderLabels();renderRoi(); if(!rec){document.getElementById('recordMeta').textContent='No unreviewed tile to show, or ROI target counts are reached.'; document.getElementById('tile').removeAttribute('src'); return;}const saved=await api(`/api/annotation-state?package=${pkg}&row=${rec.row}`);currentCandidate=saved.candidate||null;if(saved.annotation){l1=saved.annotation.l1||'';l2=new Set(saved.annotation.l2||[]);roi=(saved.annotation.roi||[]).filter(item=>item.geometry);(saved.annotation.roi||[]).filter(item=>item.review_complete&&item.state==='negative'&&!item.geometry).forEach(item=>{roiClassState[item.attribute]='negative'});const complete=new Set((saved.annotation.roi||[]).filter(item=>item.review_complete).map(item=>item.attribute));roiAllComplete=L2.every(name=>complete.has(name))}renderLabels();renderRoi();const oldL2=currentCandidate&&currentCandidate.source_l2&&currentCandidate.source_l2.length?` · old L2: ${currentCandidate.source_l2.join(', ')}`:''; document.getElementById('recordMeta').textContent=`${packages[pkg].rel_path} · ${rec.tile_id} · x=${rec.x} y=${rec.y} row=${rec.row}${oldL2}`; const tile=document.getElementById('tile'); tile.src=authed(scoped(`/api/tile?package=${pkg}&row=${rec.row}`)); applyTileZoom(); setThumbnailSrc();}
 async function nextRandom(isSkip=false){
     try {
         if(isSkip&&current){
@@ -1247,6 +1565,7 @@ async function nextRandom(isSkip=false){
             }
         }
         if(r.done==='roi_targets_met')document.getElementById('status').textContent='ROI target counts reached.';
+        if(r.done==='no_tissue_candidates')document.getElementById('status').textContent='No remaining tile meets the tissue threshold.';
         await showRecord(r.record);
     } catch(e) {
         document.getElementById('status').textContent = 'Error in nextRandom: ' + (e.message || String(e));
@@ -1276,7 +1595,12 @@ async function save(){
         console.error(e);
     }
 }
-async function openContext(){if(!current){document.getElementById('status').textContent='No tile selected.'; return;} const overlay=document.getElementById('contextOverlay'); const img=document.getElementById('contextImg'); document.getElementById('contextMeta').textContent=`${packages[pkg].rel_path} · ${current.tile_id}`; overlay.classList.remove('hidden'); img.onload=()=>{if(img.resetPanZoom)img.resetPanZoom();}; img.src=authed(`/api/context?package=${pkg}&row=${current.row}&t=${Date.now()}`);}
+async function openContext(){if(!current){document.getElementById('status').textContent='No tile selected.'; return;} const overlay=document.getElementById('contextOverlay'); const img=document.getElementById('contextImg'); document.getElementById('contextMeta').textContent=`${packages[pkg].rel_path} · ${current.tile_id}`; overlay.classList.remove('hidden'); img.onload=()=>{if(img.resetPanZoom)img.resetPanZoom();}; img.src=authed(scoped(`/api/context?package=${pkg}&row=${current.row}&t=${Date.now()}`));}
+function renderModeNav(){const nav=document.getElementById('modeNav');nav.innerHTML='';MODES.forEach(mode=>{const b=document.createElement('button');b.type='button';b.textContent=mode.toUpperCase();b.classList.toggle('active',mode===MODE);b.disabled=mode===MODE;b.onclick=()=>{const url=new URL(location.href);url.searchParams.set('mode',mode);url.searchParams.set('version','main');if(AUTH_TOKEN)url.searchParams.set('token',AUTH_TOKEN);location.href=url.toString()};nav.appendChild(b)});document.getElementById('title').textContent=MODE==='l1'?'L1 classification':'L2 ROI annotation';}
+function renderVersions(){const select=document.getElementById('versionSelect');select.innerHTML='';VERSIONS.forEach(item=>{const option=document.createElement('option');option.value=item.id;option.textContent=`${item.name} (${item.annotations})`;option.selected=item.id===VERSION;select.appendChild(option)});}
+async function createVersion(){const name=document.getElementById('newVersionName').value.trim();const status=document.getElementById('versionStatus');if(!name){status.textContent='Enter a version name.';return}try{const result=await api('/api/versions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:MODE,name,source_version:VERSION})});const url=new URL(location.href);url.searchParams.set('version',result.created);if(AUTH_TOKEN)url.searchParams.set('token',AUTH_TOKEN);location.href=url.toString()}catch(e){status.textContent=e.message||String(e)}}
+function renderLabelEditor(){const level=MODE;document.getElementById('labelDialogTitle').textContent=`${level.toUpperCase()} label management`;const root=document.getElementById('labelEditor');root.innerHTML='';(LABELS.levels[level]||[]).forEach(item=>{const row=document.createElement('div');row.className='labelEditorRow';const badge=document.createElement('span');badge.className='muted';badge.textContent=item.active?'Active':'Archived';const input=document.createElement('input');input.value=item.name;input.disabled=!item.active;const rename=document.createElement('button');rename.type='button';rename.textContent='Rename';rename.disabled=!item.active;rename.onclick=()=>changeLabel(level,'rename',item.id,input.value);const state=document.createElement('button');state.type='button';state.textContent=item.active?'Archive':'Restore';state.onclick=()=>changeLabel(level,item.active?'archive':'restore',item.id,'');const remove=document.createElement('button');remove.type='button';remove.textContent='Delete';remove.onclick=()=>{if(window.confirm(`Delete label "${item.name}"?`))changeLabel(level,'delete',item.id,'')};row.append(badge,input,rename,state,remove);root.appendChild(row)});}
+async function changeLabel(level,operation,labelId,name){const status=document.getElementById('labelStatus');try{LABELS=await api('/api/labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:MODE,level,operation,label_id:labelId,name})});L1=LABELS.levels.l1.filter(x=>x.active).map(x=>x.id);L2=LABELS.levels.l2.filter(x=>x.active).map(x=>x.id);renderLabelEditor();renderLabels();status.textContent='Saved.'}catch(e){status.textContent=e.message||String(e)}}
 setupRoi();document.querySelectorAll('[data-roi-tool]').forEach(b=>b.addEventListener('click',()=>{roiTool=b.dataset.roiTool;document.querySelectorAll('[data-roi-tool]').forEach(x=>x.classList.toggle('selected',x===b))}));document.getElementById('roiUndo').onclick=undoRoi;document.getElementById('roiRedo').onclick=redoRoi;document.getElementById('roiClear').onclick=()=>{if(roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one L2 ROI class before clearing.';return}pushUndo();roi=roi.filter(x=>x.attribute!==roiAttribute);syncPositiveLabels();renderRoi()};document.querySelector('[data-roi-tool="point"]').classList.add('selected');
 document.getElementById('brushWidth').addEventListener('input',updateBrushDot);updateBrushDot();
 document.getElementById('tileZoomIn').onclick=()=>setTileZoom(tileScale*1.25);document.getElementById('tileZoomOut').onclick=()=>setTileZoom(tileScale/1.25);document.getElementById('tileZoomReset').onclick=()=>setTileZoom(2);document.getElementById('tileGridToggle').onclick=()=>{showGrid=!showGrid;document.getElementById('tileGridToggle').classList.toggle('selected',showGrid);renderRoi();};document.getElementById('tileViewport').addEventListener('wheel',ev=>{if(!ROI_MODE)return;ev.preventDefault();setTileZoom(tileScale*(ev.deltaY<0?1.15:.87))},{passive:false});document.getElementById('tileViewport').addEventListener('dblclick',()=>setTileZoom(2));
@@ -1284,14 +1608,19 @@ setupPanZoom(document.getElementById('contextImg'));
 setupPanZoom(document.getElementById('thumb'),async ev=>{const img=ev.target, r=img.getBoundingClientRect(); const x=(ev.clientX-r.left)/r.width, y=(ev.clientY-r.top)/r.height; const rec=await api(`/api/nearest?package=${pkg}&rx=${x}&ry=${y}`); await showRecord(rec.record);});
 document.getElementById('toggleQueue').addEventListener('click',()=>setQueueOpen(document.getElementById('layout').classList.contains('queue-collapsed')));
 document.getElementById('hideQueue').addEventListener('click',()=>setQueueOpen(false));
-document.getElementById('toggleLabels').addEventListener('click',()=>setLabelsOpen(document.getElementById('layout').classList.contains('labels-collapsed')));
-document.getElementById('hideLabels').addEventListener('click',()=>setLabelsOpen(false));
 document.getElementById('contextBtn').addEventListener('click',openContext);
 document.getElementById('contextClose').addEventListener('click',()=>document.getElementById('contextOverlay').classList.add('hidden'));
+document.getElementById('versionSelect').addEventListener('change',ev=>{const url=new URL(location.href);url.searchParams.set('version',ev.target.value);if(AUTH_TOKEN)url.searchParams.set('token',AUTH_TOKEN);location.href=url.toString()});
+document.getElementById('newVersion').addEventListener('click',()=>document.getElementById('versionDialog').showModal());
+document.getElementById('closeVersion').addEventListener('click',()=>document.getElementById('versionDialog').close());
+document.getElementById('createVersion').addEventListener('click',createVersion);
+document.getElementById('manageLabels').addEventListener('click',()=>{renderLabelEditor();document.getElementById('labelDialog').showModal()});
+document.getElementById('closeLabels').addEventListener('click',()=>document.getElementById('labelDialog').close());
+document.getElementById('addLabel').addEventListener('click',async()=>{const input=document.getElementById('newLabelName');await changeLabel(MODE,'add','',input.value);input.value=''});
 document.getElementById('authSubmit').addEventListener('click',submitAuth);
 document.getElementById('authInput').addEventListener('keydown',ev=>{if(ev.key==='Enter')submitAuth();});
 document.addEventListener('keydown',ev=>{const mod=ev.metaKey||ev.ctrlKey;if(!mod)return;if(ev.key.toLowerCase()==='z'){ev.preventDefault();if(ev.shiftKey)redoRoi();else undoRoi()}else if(ev.key.toLowerCase()==='y'){ev.preventDefault();redoRoi()}});
-const L1=%L1_JSON%; const L2=%L2_JSON%; const ROI_MODE=%ROI_MODE_JSON%; renderLabels(); if(isMobile()){setQueueOpen(false); setLabelsOpen(false);} ensureAuth().then(()=>refreshPackage()).catch(e=>{if(e.message)document.getElementById('status').textContent=e.message||String(e);});
+let L1=%L1_JSON%; let L2=%L2_JSON%; let LABELS=%LABELS_JSON%; const ROI_MODE=%ROI_MODE_JSON%; const MODE=%MODE_JSON%; const MODES=%MODES_JSON%; const VERSION=%VERSION_JSON%; let VERSIONS=%VERSIONS_JSON%; renderModeNav(); renderVersions(); renderLabels(); if(isMobile())setQueueOpen(false); ensureAuth().then(()=>refreshPackage()).catch(e=>{if(e.message)document.getElementById('status').textContent=e.message||String(e);});
 </script></body></html>
 """
 
@@ -1305,7 +1634,29 @@ def _json_response(handler: BaseHTTPRequestHandler, payload: dict | list) -> Non
     handler.wfile.write(body)
 
 
-def make_handler(data: AnnotationData, auth_token: str):
+def make_handler(
+    data: AnnotationData | AnnotationArchive | dict[str, AnnotationData | AnnotationArchive],
+    auth_token: str,
+):
+    raw_datasets = data if isinstance(data, dict) else ({"l2" if isinstance(data, AnnotationData) and data.roi_queue else "l1": data})
+    archives = {
+        mode: item if isinstance(item, AnnotationArchive) else AnnotationArchive(
+            item,
+            input_path=item.input_root,
+            roi_candidate_manifest=item.roi_queue.path if item.roi_queue else None,
+            min_tissue_fraction=item.min_tissue_fraction,
+        )
+        for mode, item in raw_datasets.items()
+    }
+    default_mode = next(iter(archives))
+
+    def select_data(mode: str | None, version: str | None = None) -> tuple[str, str, AnnotationData]:
+        selected = (mode or default_mode).lower()
+        if selected not in archives:
+            raise ValueError(f"annotation mode is not configured: {selected}")
+        selected_version = str(version or "main")
+        return selected, selected_version, archives[selected].data(selected_version)
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):  # noqa: A003
             return
@@ -1316,10 +1667,18 @@ def make_handler(data: AnnotationData, auth_token: str):
             try:
                 if parsed.path == "/":
                     LOG.info("ui_open path=/")
+                    mode = qs.get("mode", [default_mode])[0]
+                    version = qs.get("version", ["main"])[0]
+                    mode, version, selected_data = select_data(mode, version)
                     html = (
-                        HTML.replace("%L1_JSON%", json.dumps(data.state.l1_prototypes))
-                        .replace("%L2_JSON%", json.dumps(data.state.l2_prototypes))
-                        .replace("%ROI_MODE_JSON%", json.dumps(data.roi_queue is not None))
+                        HTML.replace("%L1_JSON%", json.dumps(selected_data.state.l1_prototypes))
+                        .replace("%L2_JSON%", json.dumps(selected_data.state.l2_prototypes))
+                        .replace("%LABELS_JSON%", json.dumps(selected_data.state.labels_json()))
+                        .replace("%ROI_MODE_JSON%", json.dumps(selected_data.roi_queue is not None))
+                        .replace("%MODE_JSON%", json.dumps(mode))
+                        .replace("%MODES_JSON%", json.dumps(list(archives)))
+                        .replace("%VERSION_JSON%", json.dumps(version))
+                        .replace("%VERSIONS_JSON%", json.dumps(archives[mode].versions_json()["versions"]))
                     )
                     body = html.encode("utf-8")
                     self.send_response(HTTPStatus.OK)
@@ -1331,42 +1690,51 @@ def make_handler(data: AnnotationData, auth_token: str):
                 if not _auth_ok(_request_auth_token(qs), auth_token):
                     self.send_error(HTTPStatus.FORBIDDEN, "invalid annotation token")
                     return
+                mode, version, selected_data = select_data(
+                    qs.get("mode", [default_mode])[0], qs.get("version", ["main"])[0]
+                )
                 if parsed.path == "/api/packages":
-                    _json_response(self, data.package_json())
+                    _json_response(self, selected_data.package_json())
                     return
                 if parsed.path == "/api/scan-status":
-                    _json_response(self, data.scan_status())
+                    _json_response(self, selected_data.scan_status())
+                    return
+                if parsed.path == "/api/labels":
+                    _json_response(self, selected_data.state.labels_json())
+                    return
+                if parsed.path == "/api/versions":
+                    _json_response(self, archives[mode].versions_json())
                     return
                 pkg_val = qs.get("package", ["0"])[0]
                 index = int(pkg_val) if pkg_val != "all" else 0
                 if parsed.path == "/api/progress":
-                    _json_response(self, data.progress(int(pkg_val)))
+                    _json_response(self, selected_data.progress(int(pkg_val)))
                     return
                 if parsed.path == "/api/random":
                     exclude_row = int(qs["exclude_row"][0]) if "exclude_row" in qs else None
                     exclude_tile_id = qs["exclude_tile_id"][0] if "exclude_tile_id" in qs else None
-                    _json_response(self, data.random_record(pkg_val, exclude_row=exclude_row, exclude_tile_id=exclude_tile_id))
+                    _json_response(self, selected_data.random_record(pkg_val, exclude_row=exclude_row, exclude_tile_id=exclude_tile_id))
                     return
                 if parsed.path == "/api/reviewed":
-                    _json_response(self, data.reviewed_record(index))
+                    _json_response(self, selected_data.reviewed_record(index))
                     return
                 if parsed.path == "/api/annotation-state":
                     row = int(qs["row"][0])
-                    _json_response(self, data.annotation_json(index, row))
+                    _json_response(self, selected_data.annotation_json(index, row))
                     return
                 if parsed.path == "/api/nearest":
-                    viewer = data.viewer(index)
+                    viewer = selected_data.viewer(index)
                     rx = float(qs.get("rx", ["0"])[0])
                     ry = float(qs.get("ry", ["0"])[0])
                     bounds = viewer._bounds(viewer.records)
                     x = bounds[0] + rx * max(1, bounds[1] - bounds[0] + viewer.stride_x)
                     y = bounds[2] + ry * max(1, bounds[3] - bounds[2] + viewer.stride_y)
-                    _json_response(self, data.select_nearest(index, x, y))
+                    _json_response(self, selected_data.select_nearest(index, x, y))
                     return
                 if parsed.path == "/api/thumbnail":
                     token = qs.get("thumb_token", [""])[0]
                     selected_row = int(qs["row"][0]) if "row" in qs else None
-                    body = data.thumbnail_jpg(index, token=token, selected_row=selected_row)
+                    body = selected_data.thumbnail_jpg(index, token=token, selected_row=selected_row)
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "image/jpeg")
                     self.send_header("Content-Length", str(len(body)))
@@ -1375,7 +1743,7 @@ def make_handler(data: AnnotationData, auth_token: str):
                     return
                 if parsed.path == "/api/context":
                     row = int(qs["row"][0])
-                    body = data.context_jpg(index, row)
+                    body = selected_data.context_jpg(index, row)
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "image/jpeg")
                     self.send_header("Content-Length", str(len(body)))
@@ -1384,9 +1752,9 @@ def make_handler(data: AnnotationData, auth_token: str):
                     return
                 if parsed.path == "/api/tile":
                     row = int(qs["row"][0])
-                    package = data.package(index)
+                    package = selected_data.package(index)
                     LOG.info("tile_read iac=%s row=%d", package.rel_path, row)
-                    body = data.viewer(index).read_tile_png(row)
+                    body = selected_data.viewer(index).read_tile_png(row)
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "image/png")
                     self.send_header("Content-Length", str(len(body)))
@@ -1408,13 +1776,17 @@ def make_handler(data: AnnotationData, auth_token: str):
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    mode, version, selected_data = select_data(
+                        str(payload.get("mode") or qs.get("mode", [default_mode])[0]),
+                        str(payload.get("version") or qs.get("version", ["main"])[0]),
+                    )
                     index = int(payload["package"])
                     row = int(payload["row"])
-                    viewer = data.viewer(index)
+                    viewer = selected_data.viewer(index)
                     record = viewer._by_row[row]
-                    package = data.package(index)
+                    package = selected_data.package(index)
                     LOG.info("annotation_request iac=%s row=%d l1=%s l2=%s", package.rel_path, row, payload.get("l1"), payload.get("l2", []))
-                    data.state.save_annotation(
+                    selected_data.state.save_annotation(
                         package,
                         record,
                         str(payload["l1"]),
@@ -1429,16 +1801,52 @@ def make_handler(data: AnnotationData, auth_token: str):
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    mode, version, selected_data = select_data(
+                        str(payload.get("mode") or qs.get("mode", [default_mode])[0]),
+                        str(payload.get("version") or qs.get("version", ["main"])[0]),
+                    )
                     index = int(payload["package"])
                     row = int(payload["row"])
-                    viewer = data.viewer(index)
+                    viewer = selected_data.viewer(index)
                     record = viewer._by_row[row]
-                    package = data.package(index)
+                    package = selected_data.package(index)
                     LOG.info("skip_request iac=%s row=%d", package.rel_path, row)
-                    data.state.save_skip(package, record)
+                    selected_data.state.save_skip(package, record)
                     _json_response(self, {"ok": True})
                 except Exception as exc:
                     LOG.exception("api_skip_failed path=%s", parsed.path)
+                    self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+            elif parsed.path == "/api/labels":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    _mode, _version, selected_data = select_data(
+                        str(payload.get("mode") or qs.get("mode", [default_mode])[0]),
+                        str(payload.get("version") or qs.get("version", ["main"])[0]),
+                    )
+                    result = selected_data.state.change_label(
+                        str(payload["level"]), str(payload["operation"]),
+                        label_id=str(payload.get("label_id") or ""),
+                        name=str(payload.get("name") or ""),
+                    )
+                    _json_response(self, result)
+                except Exception as exc:
+                    LOG.exception("api_labels_failed")
+                    self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+            elif parsed.path == "/api/versions":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    mode = str(payload.get("mode") or qs.get("mode", [default_mode])[0]).lower()
+                    if mode not in archives:
+                        raise ValueError(f"annotation mode is not configured: {mode}")
+                    result = archives[mode].create_version(
+                        str(payload.get("name") or ""),
+                        str(payload.get("source_version") or "main"),
+                    )
+                    _json_response(self, result)
+                except Exception as exc:
+                    LOG.exception("api_versions_failed")
                     self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
@@ -1450,28 +1858,74 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Open a browser UI for L1/L2 prototype tile annotation.")
     parser.add_argument("--input", required=True, help="IAC file or directory containing image-tile IAC packages.")
-    parser.add_argument("--state", required=True, help="JSON annotation state file; CSV is exported next to it.")
+    parser.add_argument("--state", help="Legacy single-mode JSON state file; CSV is exported next to it.")
+    parser.add_argument("--l1-state", help="L1 JSON state file for the unified workspace.")
+    parser.add_argument("--l2-state", help="L2 ROI JSON state file for the unified workspace.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765, help="Use 0 to pick a free port.")
     parser.add_argument("--token", default="", help="Annotation UI auth token; overrides the persisted state .auth-token when set.")
+    parser.add_argument(
+        "--min-tissue-fraction",
+        type=float,
+        default=0.30,
+        help="Exclude random candidates below this approximate tissue fraction (default: 0.30).",
+    )
     parser.add_argument(
         "--roi-candidate-manifest",
         help="V2 ROI candidate pool JSON; enables nine-class complete-review mode.",
     )
     parser.add_argument("--no-open", action="store_true")
     args = parser.parse_args()
-    data = AnnotationData(
-        args.input,
-        args.state,
-        roi_candidate_manifest=args.roi_candidate_manifest,
-    )
-    auth_token = _load_or_create_auth_token(args.state, args.token)
+    if not args.state and not args.l1_state and not args.l2_state:
+        parser.error("one of --state, --l1-state, or --l2-state is required")
+    if args.state and (args.l1_state or args.l2_state):
+        parser.error("--state cannot be combined with --l1-state/--l2-state")
+    if args.l2_state and not args.roi_candidate_manifest:
+        parser.error("--l2-state requires --roi-candidate-manifest")
+    datasets: dict[str, AnnotationArchive] = {}
+    if args.state:
+        legacy_mode = "l2" if args.roi_candidate_manifest else "l1"
+        initial = AnnotationData(
+            args.input,
+            args.state,
+            roi_candidate_manifest=args.roi_candidate_manifest,
+            min_tissue_fraction=args.min_tissue_fraction,
+        )
+        datasets[legacy_mode] = AnnotationArchive(
+            initial,
+            input_path=args.input,
+            roi_candidate_manifest=args.roi_candidate_manifest,
+            min_tissue_fraction=args.min_tissue_fraction,
+        )
+        token_state = args.state
+    else:
+        if args.l1_state:
+            initial = AnnotationData(args.input, args.l1_state, min_tissue_fraction=args.min_tissue_fraction)
+            datasets["l1"] = AnnotationArchive(
+                initial, input_path=args.input, min_tissue_fraction=args.min_tissue_fraction
+            )
+        if args.l2_state:
+            initial = AnnotationData(
+                args.input,
+                args.l2_state,
+                roi_candidate_manifest=args.roi_candidate_manifest,
+                min_tissue_fraction=args.min_tissue_fraction,
+            )
+            datasets["l2"] = AnnotationArchive(
+                initial,
+                input_path=args.input,
+                roi_candidate_manifest=args.roi_candidate_manifest,
+                min_tissue_fraction=args.min_tissue_fraction,
+            )
+        token_state = args.l1_state or args.l2_state
+    auth_token = _load_or_create_auth_token(token_state, args.token)
     port = _find_free_port(args.host, args.port)
-    server = ThreadingHTTPServer((args.host, port), make_handler(data, auth_token))
+    server = ThreadingHTTPServer((args.host, port), make_handler(datasets, auth_token))
     base_url = f"http://{args.host}:{port}/"
     url = f"{base_url}?token={auth_token}"
-    LOG.info("server_start url=%s state=%s csv=%s", base_url, args.state, data.state.csv_path)
-    print(f"annotation_ui url={url} state={args.state} csv={data.state.csv_path}", flush=True)
+    states = ",".join(f"{mode}:{item.data().state.state_path}" for mode, item in datasets.items())
+    LOG.info("server_start url=%s states=%s", base_url, states)
+    print(f"annotation_ui url={url} states={states}", flush=True)
     if not args.no_open:
         LOG.info("browser_open url=%s", url)
         webbrowser.open(url)
@@ -1480,7 +1934,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        data.close()
+        for item in datasets.values():
+            item.close()
         server.server_close()
 
 

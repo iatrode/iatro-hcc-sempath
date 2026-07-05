@@ -18,6 +18,32 @@ Current local layout:
 - `reviews/teacher_disagreement/exval_1000/review.json`: completed 1000-tile repeated review state.
 - `reviews/teacher_disagreement/exval_1000/review.csv`: CSV export of the completed repeated review.
 
+## Unified L1/L2 annotation workspace
+
+Run both annotation workflows behind one browser UI and switch with the L1/L2 navigation:
+
+```bash
+conda run -n hcc-camoe hcc-sempath annotate-prototypes \
+  --input /path/to/image_tile_iac_root \
+  --l1-state annotations/hcc_prototype_review.json \
+  --l2-state annotations/hcc_l2_roi_v2.json \
+  --roi-candidate-manifest annotations/hcc_l2_roi_v2_candidates.json
+```
+
+`--state` remains supported for the original single-mode workflow. Label display names and active
+labels are stored in each state file. Stable label IDs remain unchanged when a label is renamed;
+referenced labels can be archived but cannot be deleted. CSV export retains the original `l1` and
+`l2` ID columns and adds `l1_name` and `l2_names` display-name columns.
+
+The `Main` annotation version uses the state path supplied on the command line. New versions are
+created from the UI with empty annotations under `<state-stem>.versions/<version-id>.json`; each
+version has its own JSON, CSV, skipped records, progress, and label configuration. The adjacent
+`<state-stem>.versions.json` file is the version index.
+
+Random navigation estimates tissue coverage from downsampled RGB values and excludes tiles below
+30% tissue without recording a human skip. Override the threshold with
+`--min-tissue-fraction`, or set it to `0` to disable automatic filtering.
+
 
 
   L1（4 类，互斥）：
@@ -59,4 +85,3 @@ Further expansion
 hepatocyte
 Portal triad / portal tract
 Central vein
-
