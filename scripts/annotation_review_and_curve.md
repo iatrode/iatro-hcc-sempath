@@ -1,88 +1,13 @@
 # Annotation Review and Prototype Information Curve
 
-This note documents two standalone research utilities under `scripts/`.
-They are intentionally not wired into the main `hcc-sempath` CLI.
+This note documents the prototype information-curve utility. Annotation is
+intentionally handled only by the main `hcc-sempath annotate-prototypes` UI.
 
-## Annotation review UI
+## Annotation
 
-Script:
-
-```bash
-scripts/annotation_review_ui.py
-```
-
-Purpose:
-
-- Review existing tile annotations with the tile image visible.
-- Save review state into JSON and a companion `.review.csv`.
-- Skip entries already marked with `reviewed: true`.
-- Resume from `--output-json` when that file already exists.
-
-### L1 review
-
-Use this when reviewing unstable L1 labels across all current classes.
-With teacher features, the UI shows a feature-center suggestion, but the user still makes the final decision.
-
-```bash
-python scripts/annotation_review_ui.py \
-  --annotation-json annotations/hcc_prototype_review.json \
-  --output-json annotations/hcc_prototype_review.l1_review.json \
-  --mode l1 \
-  --teachers gigapath,uni2_h,virchow2 \
-  --teacher-feature-root /path/to/teacher/features
-```
-
-Useful options:
-
-```text
---unstable-l1 Degenerative-material
---no-open
---host 127.0.0.1
---port 0
-```
-
-### Pair review
-
-Use this when only two L1 classes should be shown and each tile is assigned to one of them.
-The two classes are arbitrary.
-
-```bash
-python scripts/annotation_review_ui.py \
-  --annotation-json annotations/hcc_prototype_review.json \
-  --output-json annotations/hcc_prototype_review.pair_review.json \
-  --mode binary \
-  --class-a HCC-tumor \
-  --class-b Inflammatory-stromal
-```
-
-Change `--class-a` and `--class-b` for other two-class reviews.
-
-### UI behavior
-
-- Desktop: the tile list is open by default and stays open when selecting a tile.
-- Mobile: the tile list is folded by default; the screen is split into tile image and controls.
-- After a decision, the UI advances to the next remaining tile.
-- During save, controls are disabled to avoid duplicate clicks.
-- L1 mode actions are three-way: accept suggested, keep current, or use selected.
-- Pair mode actions are the two class buttons.
-
-### Teacher-disagreement review
-
-Use the existing `val` and `exval` top-500 caches as one fixed 1,000-tile
-blinded L1 adjudication queue:
-
-```bash
-python scripts/annotation_review_ui.py \
-  --mode disagreement \
-  --disagreement-csv artifacts/caches/local_cache/teacher_disagreement/val/teacher_disagreement_top500.csv \
-  --disagreement-csv artifacts/caches/local_cache/teacher_disagreement/exval/teacher_disagreement_top500.csv \
-  --output-json artifacts/caches/local_cache/teacher_disagreement/top1000_l1_review.json
-```
-
-The reviewer sees only a randomized `TD-####` identifier and the tile image.
-Teacher names, votes, confidence, split, and disagreement rank remain hidden in
-the browser. The output JSON and companion `.review.csv` retain those fields for
-post-review analysis and support resume.
+The former standalone review UI was removed. Use the single main UI with
+`--review-existing` for the fixed joint L1/L2 review queue; see
+`annotations/README.md` for the launch command and version semantics.
 
 ## PrototypeSample information curve
 

@@ -1,5 +1,5 @@
 [submodule "manuscript"]
 	path = manuscript
-	url = https://github.com/iWiley/iatro-hcc-sempath-manuscript.git
+	url = https://github.com/iatrode/iatro-hcc-sempath-manuscript.git
 	branch = develop
 	ignore = untracked

@@ -770,6 +770,8 @@ def test_label_lifecycle_preserves_stable_ids_and_referenced_labels(tmp_path: Pa
         label_id = L1_PROTOTYPES[0]
         data.state.save_annotation(package, record, label_id, [])
         data.state.change_label("l1", "rename", label_id=label_id, name="HCC tumor custom")
+        recycled = data.state.change_label("l1", "add", name=L1_PROTOTYPES[0])
+        assert any(item["name"] == L1_PROTOTYPES[0] for item in recycled["levels"]["l1"])
         assert data.state.annotations[_annotation_key(package, record)]["l1"] == label_id
         with pytest.raises(ValueError, match="archive it instead"):
             data.state.change_label("l1", "delete", label_id=label_id)
@@ -784,6 +786,57 @@ def test_label_lifecycle_preserves_stable_ids_and_referenced_labels(tmp_path: Pa
     assert payload["version"] == 2
     assert "label_definitions" in payload
     assert "l1_name" in state_path.with_suffix(".csv").read_text(encoding="utf-8").splitlines()[0]
+
+
+def test_label_definitions_are_independent_between_versions_after_reload(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    state_path = tmp_path / "annotations.json"
+    _write_iac(iac_path)
+    main = AnnotationData(iac_path, state_path)
+    archive = AnnotationArchive(main, input_path=iac_path)
+    try:
+        version_id = archive.create_version("marking")["created"]
+        archive.data(version_id).state.change_label("l1", "rename", label_id=L1_PROTOTYPES[0], name="G1")
+    finally:
+        archive.close()
+
+    reopened = AnnotationData(iac_path, state_path)
+    reloaded_archive = AnnotationArchive(reopened, input_path=iac_path)
+    try:
+        assert reloaded_archive.default_version == version_id
+        assert reloaded_archive.data("main").state.label_definitions["l1"][0]["name"] == L1_PROTOTYPES[0]
+        assert reloaded_archive.data(version_id).state.label_definitions["l1"][0]["name"] == "G1"
+    finally:
+        reloaded_archive.close()
+
+
+def test_label_editor_has_explicit_version_scoped_submit() -> None:
+    assert 'id="saveLabels"' in HTML
+    assert "Save label configuration" in HTML
+    assert "Saved to this version." in HTML
+    assert "input.dataset.labelId=item.id" in HTML
+    assert "label management · ${VERSION}" in HTML
+    assert "function labelDrafts()" in HTML
+    assert "async function savePendingLabelNames()" in HTML
+    assert "let pendingLabelAdds=[];" in HTML
+    assert "Added as a draft. Save label configuration to commit." in HTML
+    assert "for(const name of pendingLabelAdds)await changeLabel(MODE,'add','',name,true);" in HTML
+    assert "renderLabelEditor(drafts)" in HTML
+
+
+def test_previous_tile_uses_session_history_not_row_order() -> None:
+    assert "tileHistory=[]" in HTML
+    assert "if(current)tileHistory.push({package:pkg,record:current});" in HTML
+    assert "const previous=tileHistory.pop();" in HTML
+    assert "No previous tile in this session." in HTML
+    assert "textContent='Previous tile'" in HTML
+
+
+def test_annotation_ui_remembers_the_selected_version() -> None:
+    assert "function versionStorageKey()" in HTML
+    assert "hcc_sempath_annotation_version:${MODE}" in HTML
+    assert "localStorage.setItem(versionStorageKey(),ev.target.value)" in HTML
+    assert "localStorage.setItem(`hcc_sempath_annotation_version:${MODE}`,VERSION)" in HTML
 
 
 def test_unified_handler_exposes_navigation_and_versions(tmp_path: Path) -> None:
