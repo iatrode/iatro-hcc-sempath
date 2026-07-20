@@ -1,4 +1,4 @@
-from hcc_sempath.io.validate_package import main
+from iatro.iac.adapters.validate import main
 
 
 if __name__ == "__main__":

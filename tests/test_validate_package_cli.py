@@ -4,10 +4,10 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from hcc_sempath.io.feature_cache import build_teacher_feature_package_from_tile_package
-from hcc_sempath.io.manifests import write_tile_manifest
-from hcc_sempath.io.tile_package import build_tile_package
-from hcc_sempath.io.validate_package import main, validate_package
+from iatro.iac.adapters.features import build_teacher_feature_package_from_tile_package
+from iatro.iac.adapters.manifests import write_tile_manifest
+from iatro.iac.adapters.tiles import build_tile_package
+from iatro.iac.adapters.validate import main, validate_package
 
 
 def _write_tile_and_feature_packages(root):

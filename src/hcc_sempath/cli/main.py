@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 COMMANDS: dict[str, tuple[str, str]] = {
     "build-tile-cache": ("hcc_sempath.cli.tile_cache", "Build image-tile IAC packages from a WSI file or directory."),
-    "validate-package": ("hcc_sempath.io.validate_package", "Validate one IAC package or a directory of IAC packages."),
+    "validate-package": ("iatro.iac.adapters.validate", "Validate one IAC package or a directory of IAC packages."),
     "view-iac": ("hcc_sempath.cli.view_iac", "Open a local browser UI for inspecting an IAC package."),
     "annotate-prototypes": ("hcc_sempath.cli.annotate_prototypes", "Open browser UI for L1/L2 prototype tile annotation."),
     "build-roi-queue": ("hcc_sempath.cli.build_roi_queue", "Build a quota-aware V2 ROI candidate pool."),

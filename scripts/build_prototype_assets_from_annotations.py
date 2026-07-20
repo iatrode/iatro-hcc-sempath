@@ -11,8 +11,8 @@ import numpy as np
 import torch
 import yaml
 
-from hcc_sempath.io.feature_cache import FeatureCacheReader
-from hcc_sempath.io.tile_package import TilePackageReader
+from iatro.iac.adapters.features import FeatureCacheReader
+from iatro.iac.adapters.tiles import TilePackageReader
 
 
 TILE_SUFFIX = ".tiles.iac"

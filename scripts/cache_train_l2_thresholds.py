@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from hcc_sempath.io.tile_package import TilePackageReader
+from iatro.iac.adapters.tiles import TilePackageReader
 from hcc_sempath.modeling.models import load_hcc_sempath_release
 from hcc_sempath.training.config import load_config, manifest_data_paths
 from hcc_sempath.training.engine import _prepare_images

@@ -6,9 +6,9 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from hcc_sempath.io.manifests import write_tile_manifest
+from iatro.iac.adapters.manifests import write_tile_manifest
 from hcc_sempath.io.qc import render_tile_package_qc
-from hcc_sempath.io.tile_package import build_tile_package
+from iatro.iac.adapters.tiles import build_tile_package
 
 
 def test_render_tile_package_qc_outputs_nonblank_contact_sheet() -> None:

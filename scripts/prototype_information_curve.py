@@ -369,7 +369,7 @@ def _redundancy_values(
 
 class FeatureStore:
     def __init__(self, teacher_paths: dict[str, list[Path]]) -> None:
-        from hcc_sempath.io.feature_cache import FeatureCacheReader
+        from iatro.iac.adapters.features import FeatureCacheReader
 
         self._reader_cls = FeatureCacheReader
         self._paths = teacher_paths

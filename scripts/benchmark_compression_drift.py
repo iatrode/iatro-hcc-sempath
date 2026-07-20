@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from timm.data import create_transform, resolve_model_data_config
 
-from hcc_sempath.io.tile_package import TilePackageReader, read_package_manifest, read_package_metadata
+from iatro.iac.adapters.tiles import TilePackageReader, read_package_manifest, read_package_metadata
 from hcc_sempath.teacher.cache import TimmTeacherEncoder
 
 

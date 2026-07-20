@@ -8,10 +8,10 @@ import pytest
 from PIL import Image
 import torch
 
-from hcc_sempath.io.feature_cache import build_teacher_feature_package_from_feature_map
-from hcc_sempath.io.iatro_iac import read_header
-from hcc_sempath.io.manifests import write_tile_manifest
-from hcc_sempath.io.tile_package import build_tile_package, read_package_metadata
+from iatro.iac.adapters.features import build_teacher_feature_package_from_feature_map
+from iatro.iac import read_header
+from iatro.iac.adapters.manifests import write_tile_manifest
+from iatro.iac.adapters.tiles import build_tile_package, read_package_metadata
 from hcc_sempath.training.config import manifest_data_paths
 from hcc_sempath.training.datasets import (
     DistillationTileDataset,

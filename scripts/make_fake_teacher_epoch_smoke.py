@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from hcc_sempath.io.feature_cache import build_teacher_feature_package_from_tile_package
-from hcc_sempath.io.tile_package import read_package_manifest
+from iatro.iac.adapters.features import build_teacher_feature_package_from_tile_package
+from iatro.iac.adapters.tiles import read_package_manifest
 
 
 DEFAULT_TEACHER_DIMS = {

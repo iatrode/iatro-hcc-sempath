@@ -19,7 +19,7 @@ from PIL import Image
 REPO = Path("<LOCAL_WORKSPACE_VOLUME>/Dev/2026-CT-WSI/hcc-sempath")
 sys.path.insert(0, str(REPO / "src"))
 
-from hcc_sempath.io.tile_package import TilePackageReader
+from iatro.iac.adapters.tiles import TilePackageReader
 from hcc_sempath.modeling.models import load_hcc_sempath_release
 
 WORK_DIR = Path("/tmp/hcc_sempath_exval_selector")

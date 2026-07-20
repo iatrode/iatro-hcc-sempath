@@ -6,9 +6,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-from hcc_sempath.io.feature_cache import build_teacher_feature_package_from_feature_map
-from hcc_sempath.io.manifests import write_tile_manifest
-from hcc_sempath.io.tile_package import build_tile_package
+from iatro.iac.adapters.features import build_teacher_feature_package_from_feature_map
+from iatro.iac.adapters.manifests import write_tile_manifest
+from iatro.iac.adapters.tiles import build_tile_package
 from hcc_sempath.io.tiling import tile_raster_image
 
 
@@ -43,7 +43,7 @@ def main() -> None:
     manifest_path = root / "tile_manifest.csv"
     write_tile_manifest(manifest_path, rows)
     build_tile_package(manifest_path, root / "tiles.iac", overwrite=True)
-    from hcc_sempath.io.manifests import read_tile_manifest
+    from iatro.iac.adapters.manifests import read_tile_manifest
 
     build_teacher_feature_package_from_feature_map(
         read_tile_manifest(manifest_path),

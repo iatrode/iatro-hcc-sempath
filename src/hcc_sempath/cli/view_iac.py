@@ -11,8 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from hcc_sempath.io.iatro_iac import PackReader
-from hcc_sempath.io.tile_package import decode_jxl
+from iatro.iac import PackReader
+from iatro.iac.adapters.tiles import decode_jxl
 
 
 MAP_BINS = 256

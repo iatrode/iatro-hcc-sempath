@@ -106,7 +106,7 @@ def load_student_features(rows: list[dict], batch_size: int = 64) -> np.ndarray:
     Reads tile images directly from each tile's IatroCache package via the same
     PackReader the training dataset uses, so preprocessing matches training."""
     import torch
-    from hcc_sempath.io.tile_package import TilePackageReader, read_package_metadata
+    from iatro.iac.adapters.tiles import TilePackageReader, read_package_metadata
     from hcc_sempath.training.config import embedding_dim, load_config, teacher_dims, teacher_names
     from hcc_sempath.training.datasets import _build_image_transform
     from hcc_sempath.modeling.models import HCCSemPathModel

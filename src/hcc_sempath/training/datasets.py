@@ -15,10 +15,10 @@ from . import _pipeline_probe as _probe
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from ..io.feature_cache import FeatureCacheReader
-from ..io.iatro_iac import read_header, read_tables
-from ..io.manifests import TileRecord
-from ..io.tile_package import TilePackageReader
+from iatro.iac.adapters.features import FeatureCacheReader
+from iatro.iac import read_header, read_tables
+from iatro.iac.adapters.manifests import TileRecord
+from iatro.iac.adapters.tiles import TilePackageReader
 from .feature_pack_merge import (
     MERGED_FEATURE_PAYLOAD_TYPE,
     MERGED_FEATURE_SUFFIX,
@@ -97,7 +97,7 @@ def _record_package_path(record: TileRecord | PackagedTileRecord) -> Path | None
 
 
 def read_packaged_tile_records(package_paths: list[str | Path]) -> list[PackagedTileRecord]:
-    from ..io.tile_package import read_package_manifest
+    from iatro.iac.adapters.tiles import read_package_manifest
 
     records: list[PackagedTileRecord] = []
     seen: set[str] = set()

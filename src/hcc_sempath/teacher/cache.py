@@ -20,11 +20,11 @@ from safetensors.torch import load_file as load_safetensors_file
 from timm.data import create_transform, resolve_model_data_config
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from ..io.feature_cache import build_teacher_feature_package, build_teacher_feature_package_from_tile_package
-from ..io.iatro_iac import read_tables
-from ..io.manifests import TileRecord
-from ..io.tile_package import TilePackageReader, read_package_manifest, read_package_metadata
-from ..io.validate_package import _validate_common, _validate_teacher_features
+from iatro.iac.adapters.features import build_teacher_feature_package, build_teacher_feature_package_from_tile_package
+from iatro.iac import read_tables
+from iatro.iac.adapters.manifests import TileRecord
+from iatro.iac.adapters.tiles import TilePackageReader, read_package_manifest, read_package_metadata
+from iatro.iac.adapters.validate import validate_package
 
 
 _THREAD_LOCAL = threading.local()
@@ -624,18 +624,8 @@ def _default_output_path(package_path: Path, output_dir: Path, teacher_name: str
 
 def _validate_feature_output(package_path: str | Path, expected_teacher: str = "", full: bool = False) -> dict:
     path = Path(package_path)
-    header, slide_table, record_table = read_tables(path)
-    _validate_common(header, slide_table, record_table)
-    if full:
-        _validate_teacher_features(str(path), header, record_table, max_payload=0)
-    else:
-        if header.get("payload_type") != "teacher_features":
-            raise ValueError(f"not a teacher feature package: {path}")
-        if not header.get("teacher"):
-            raise ValueError("teacher_features header requires non-empty teacher")
-        if int(header.get("feature_dim", 0)) <= 0:
-            raise ValueError(f"invalid feature_dim: {header.get('feature_dim')}")
-        np.dtype(header["dtype"])
+    header, _, _ = read_tables(path)
+    validate_package(path, max_decode=0 if full else 1)
     if expected_teacher and header.get("teacher") != expected_teacher:
         raise ValueError(f"teacher mismatch: got={header.get('teacher')} expected={expected_teacher}")
     return {

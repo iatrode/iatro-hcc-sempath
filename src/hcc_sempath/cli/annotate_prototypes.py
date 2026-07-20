@@ -27,8 +27,8 @@ from urllib.parse import parse_qs, urlparse
 from PIL import Image, ImageDraw
 
 from hcc_sempath.cli.view_iac import IacRecord, IacViewerData
-from hcc_sempath.io.iatro_iac import read_header, read_payload
-from hcc_sempath.io.tile_package import decode_jxl
+from iatro.iac import read_header
+from iatro.iac.adapters.tiles import decode_jxl
 
 
 LOG = logging.getLogger("hcc_sempath.annotate_prototypes")
@@ -740,9 +740,7 @@ class AnnotationData:
         viewer = self.viewer(index)
         offsets = viewer.record_table.column("offset")
         lengths = viewer.record_table.column("length")
-        payload = read_payload(
-            package.path,
-            viewer.header,
+        payload = viewer.reader.read_data_span(
             offsets[record.row].as_py(),
             lengths[record.row].as_py(),
         )
@@ -1161,7 +1159,10 @@ class AnnotationData:
             if not self.thumbnail_token_active(token):
                 return None
             try:
-                payload = read_payload(package.path, viewer.header, offsets[record.row].as_py(), lengths[record.row].as_py())
+                payload = viewer.reader.read_data_span(
+                    offsets[record.row].as_py(),
+                    lengths[record.row].as_py(),
+                )
                 if not self.thumbnail_token_active(token):
                     return None
                 tile = decode_jxl(payload).convert("RGB")

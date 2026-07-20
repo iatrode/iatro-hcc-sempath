@@ -6,10 +6,10 @@ from pathlib import Path
 
 from PIL import Image
 
-from hcc_sempath.io.iatro_iac import read_payload, read_tables
-from hcc_sempath.io.manifests import write_tile_manifest
-from hcc_sempath.io.tile_package import build_tile_package, read_package_manifest
-from hcc_sempath.io.validate_package import _validate_common, _validate_image_tiles, _validate_record_payload_spans
+from iatro.iac import PackReader, read_tables
+from iatro.iac.adapters.manifests import write_tile_manifest
+from iatro.iac.adapters.tiles import build_tile_package, read_package_manifest
+from iatro.iac.adapters.validate import validate_package
 
 
 def _write_manifest_with_tiles(root: Path, coords: tuple[tuple[int, int], ...]) -> tuple[Path, list[dict]]:
@@ -52,19 +52,21 @@ def test_package_defaults_to_tile_size_stride_and_writes_crc() -> None:
         assert record_table.column("tile_x").to_pylist() == [0, 1, 0, 1]
         assert record_table.column("tile_y").to_pylist() == [0, 0, 1, 1]
 
-        for row in range(len(record_table)):
-            offset = record_table.column("offset")[row].as_py()
-            length = record_table.column("length")[row].as_py()
-            expected_crc = record_table.column("crc32")[row].as_py()
-            payload = read_payload(package_path, header, offset, length)
-            assert zlib.crc32(payload) & 0xFFFFFFFF == expected_crc
+        reader = PackReader(package_path)
+        try:
+            for row in range(len(record_table)):
+                expected_crc = record_table.column("crc32")[row].as_py()
+                payload = reader.read_payload(row)
+                assert zlib.crc32(payload) & 0xFFFFFFFF == expected_crc
+        finally:
+            reader.close()
 
         restored = read_package_manifest(package_path)
         assert [(r.tile_id, r.x, r.y) for r in restored] == [(r["tile_id"], r["x"], r["y"]) for r in rows]
 
-        _validate_common(header, _, record_table)
-        crc_checked = _validate_record_payload_spans(str(package_path), header, record_table, max_crc=0)
-        decoded = _validate_image_tiles(str(package_path), header, record_table, max_decode=8)
+        validation = validate_package(package_path, max_decode=8, max_crc=0)
+        crc_checked = validation["crc_checked"]
+        decoded = validation["decoded"]
         assert crc_checked == 4
         assert decoded == 4
 

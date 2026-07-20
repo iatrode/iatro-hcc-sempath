@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from hcc_sempath.io.tile_package import TilePackageReader
+from iatro.iac.adapters.tiles import TilePackageReader
 from hcc_sempath.modeling.prototypes import load_prototype_registry
 from hcc_sempath.training.config import load_config, manifest_data_paths, teacher_names
 from hcc_sempath.training.datasets import _open_feature_source

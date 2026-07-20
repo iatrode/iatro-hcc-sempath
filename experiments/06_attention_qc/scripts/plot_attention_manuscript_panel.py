@@ -7,7 +7,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from PIL import Image
 
-from hcc_sempath.io.tile_package import TilePackageReader
+from iatro.iac.adapters.tiles import TilePackageReader
 
 
 PANEL_REVIEW_IDS = ("TD-0864", "TD-0477", "TD-0459", "TD-0363")

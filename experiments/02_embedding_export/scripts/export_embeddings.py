@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from hcc_sempath.io.tile_package import read_package_metadata
+from iatro.iac.adapters.tiles import read_package_metadata
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.training.config import (
     embedding_dim,

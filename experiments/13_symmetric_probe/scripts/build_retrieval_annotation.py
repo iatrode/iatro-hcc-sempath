@@ -103,7 +103,7 @@ def build(rng: np.random.Generator) -> dict:
 
 
 def export_images(rows: list[dict], tile_indices: set[int]) -> int:
-    from hcc_sempath.io.tile_package import TilePackageReader
+    from iatro.iac.adapters.tiles import TilePackageReader
     TILES.mkdir(parents=True, exist_ok=True)
     readers: dict[str, "TilePackageReader"] = {}
     n = 0

@@ -7,7 +7,7 @@ from tempfile import NamedTemporaryFile
 import numpy as np
 import pyarrow as pa
 
-from ..io.iatro_iac import PackReader, build_pack_data_segment_from_file, read_header, read_tables
+from iatro.iac import PackReader, build_pack_data_segment_from_file, read_header, read_tables
 
 
 MERGED_FEATURE_PAYLOAD_TYPE = "merged_teacher_features"
@@ -537,7 +537,7 @@ def _delete_source_packages(source_paths: dict[str, Path], *, keep_path: Path) -
 
 class _SourceFeatureReader:
     def __init__(self, path: Path) -> None:
-        from ..io.feature_cache import FeatureCacheReader
+        from iatro.iac.adapters.features import FeatureCacheReader
 
         self._reader = FeatureCacheReader(path)
 

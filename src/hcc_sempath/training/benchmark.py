@@ -5,7 +5,7 @@ import time
 
 import torch
 
-from ..io.tile_package import read_package_metadata
+from iatro.iac.adapters.tiles import read_package_metadata
 from .config import (
     embedding_dim,
     image_tile_package_paths,

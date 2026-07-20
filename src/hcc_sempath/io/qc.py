@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from .tile_package import iter_package_tiles
+from iatro.iac.adapters.tiles import iter_package_tiles
 
 
 def render_tile_package_qc(

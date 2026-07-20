@@ -5,7 +5,7 @@ import argparse
 import torch
 from torch.utils.data import DataLoader
 
-from ..io.tile_package import read_package_metadata
+from iatro.iac.adapters.tiles import read_package_metadata
 from ..modeling.prototypes import PrototypeRegistry, load_prototype_registry
 from ..modeling.models import HCCSemPathModel, STUDENT_BACKBONE_NAME
 from .config import (

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from ..io.tile_package import read_package_manifest
+from iatro.iac.adapters.tiles import read_package_manifest
 
 
 TILE_SUFFIX = ".tiles.iac"

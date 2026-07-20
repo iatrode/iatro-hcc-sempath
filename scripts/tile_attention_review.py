@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import yaml
 from PIL import Image
 
-from hcc_sempath.io.tile_package import TilePackageReader
+from iatro.iac.adapters.tiles import TilePackageReader
 from hcc_sempath.modeling.models import HCCSemPathModel, normalized_prototype_logits
 from hcc_sempath.modeling.prototypes import PrototypeRegistry, load_prototype_registry
 from hcc_sempath.training.config import embedding_dim, manifest_data_paths, teacher_dims, teacher_names

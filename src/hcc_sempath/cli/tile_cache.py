@@ -11,7 +11,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from hcc_sempath.cli.wsi_to_iac import _default_workers, _format_bytes, build_wsi_iac
-from hcc_sempath.io.tile_package import read_package_metadata
+from iatro.iac.adapters.tiles import read_package_metadata
 
 
 WSI_SUFFIXES = {".svs", ".mrxs", ".ndpi", ".scn", ".tif", ".tiff"}

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from hcc_sempath.io.tile_package import TilePackageReader
+from iatro.iac.adapters.tiles import TilePackageReader
 
 
 def main() -> None:

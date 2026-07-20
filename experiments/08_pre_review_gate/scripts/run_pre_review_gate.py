@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from hcc_sempath.io.feature_cache import FeatureCacheReader
+from iatro.iac.adapters.features import FeatureCacheReader
 from hcc_sempath.training.config import load_config, manifest_data_paths, teacher_names
 from hcc_sempath.training.datasets import _open_feature_source, _read_teacher_features_at
 from hcc_sempath.training.manifest import load_training_manifest

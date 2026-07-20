@@ -16,7 +16,7 @@ if SRC_ROOT.exists() and str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from hcc_sempath.modeling.models import HCCSemPathModel
-from hcc_sempath.io.tile_package import TilePackageReader
+from iatro.iac.adapters.tiles import TilePackageReader
 
 def _resolve_device() -> torch.device:
     if torch.cuda.is_available():

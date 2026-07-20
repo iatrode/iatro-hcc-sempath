@@ -9,8 +9,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from hcc_sempath.io.feature_cache import build_teacher_feature_package
-from hcc_sempath.io.tile_package import TilePackageReader, read_package_manifest, read_package_metadata
+from iatro.iac.adapters.features import build_teacher_feature_package
+from iatro.iac.adapters.tiles import TilePackageReader, read_package_manifest, read_package_metadata
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.training.config import embedding_dim, load_config, manifest_data_paths, teacher_dims, teacher_names
 from hcc_sempath.training.engine import _prepare_images
