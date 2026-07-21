@@ -220,7 +220,10 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "async function generateRoiPlan()" in HTML
     assert "function acceptRoiPlan()" in HTML
     assert "function restartRoiFromScratch()" in HTML
-    assert "Dashed marks are not saved yet." in HTML
+    assert "High-contrast outlined marks are not saved yet." in HTML
+    assert "function drawPlannedPoint(x,g,color)" in HTML
+    assert "function drawPlannedCircle(x,g,color)" in HTML
+    assert "[[7,'rgba(15,23,42,.9)'],[5,'#fff'],[2.5,color]]" in HTML
     assert "Choose Continue from plan or Start from scratch before saving." in HTML
 
 

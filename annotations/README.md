@@ -58,7 +58,7 @@ Random navigation estimates tissue coverage from downsampled RGB values and excl
 
 In L2 mode, **Preview suggested plan** runs the configured release classifier once, derives
 class-specific spatial evidence by backpropagating through its feature readout, and combines that
-evidence with H&E hematoxylin peaks for cell-center proposals. Dashed preview marks are never written
+evidence with H&E hematoxylin peaks for cell-center proposals. High-contrast outlined preview marks are never written
 to the annotation state. **Continue from plan** converts them to ordinary editable ROI marks;
 **Start from scratch** discards the preview and clears the current tile. Override the default release
 assets with `--roi-plan-config`, `--roi-plan-checkpoint`, and `--roi-plan-device`.
