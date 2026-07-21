@@ -128,6 +128,44 @@ class MergedTeacherFeatureCacheReader:
             result[name] = feature.astype(np.float32, copy=True)
         return result
 
+    def read_features_many_at(
+        self,
+        rows: list[int] | tuple[int, ...] | np.ndarray,
+        teacher_names: list[str] | tuple[str, ...],
+    ) -> dict[str, np.ndarray]:
+        """Read multiple merged rows with one IAC gather, preserving row order."""
+        self._ensure_index()
+        assert self._teacher_offsets is not None
+        assert self._teacher_record_bytes is not None
+        assert self._teacher_dtypes is not None
+        assert self._teacher_dims is not None
+        assert self._merged_record_bytes is not None
+        rows = [int(row) for row in rows]
+        record_count = int(self._reader.header["num_records"])
+        for row in rows:
+            if row < 0 or row >= record_count:
+                raise IndexError(f"feature row out of range: {row}")
+        payload = self._reader.read_data_spans(
+            (row * self._merged_record_bytes, self._merged_record_bytes) for row in rows
+        )
+        expected_bytes = len(rows) * self._merged_record_bytes
+        if len(payload) != expected_bytes:
+            raise ValueError(
+                f"invalid merged feature batch size: bytes={len(payload)} expected={expected_bytes}"
+            )
+        byte_matrix = np.frombuffer(payload, dtype=np.uint8).reshape(len(rows), self._merged_record_bytes)
+        result: dict[str, np.ndarray] = {}
+        for raw_name in teacher_names:
+            name = str(raw_name)
+            if name not in self._teacher_offsets:
+                raise KeyError(f"merged feature package does not contain teacher={name}")
+            start = self._teacher_offsets[name]
+            end = start + self._teacher_record_bytes[name]
+            packed = np.ascontiguousarray(byte_matrix[:, start:end])
+            feature = packed.view(self._teacher_dtypes[name]).reshape(len(rows), self._teacher_dims[name])
+            result[name] = feature.astype(np.float32, copy=True)
+        return result
+
     def tile_id_at(self, row: int) -> str:
         self._ensure_index()
         assert self._tile_ids is not None

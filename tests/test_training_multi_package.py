@@ -22,7 +22,11 @@ from hcc_sempath.training.datasets import (
     validate_teacher_feature_package_pairs,
     validate_teacher_cache,
 )
-from hcc_sempath.training.feature_pack_merge import _build_merged_package, maybe_prepare_merged_teacher_feature_packages
+from hcc_sempath.training.feature_pack_merge import (
+    MergedTeacherFeatureCacheReader,
+    _build_merged_package,
+    maybe_prepare_merged_teacher_feature_packages,
+)
 from hcc_sempath.training.feature_pack_shuffle import maybe_prepare_shuffled_iac_packages
 from hcc_sempath.training.manifest import build_training_manifest
 from hcc_sempath.training.manifest import validate_manifest_artifacts
@@ -597,6 +601,29 @@ def test_package_sampled_tensor_collate_defers_image_preprocess_to_device(tmp_pa
     assert images.shape == (4, 3, 32, 32)
 
 
+def test_package_sampled_batch_reads_match_scalar_behavior(tmp_path: Path) -> None:
+    tile_path, feature_path = _write_package(tmp_path, "slide_a", 10, count=4)
+    dataset = PackageSampledDistillationDataset(
+        [tile_path],
+        {"toy": [feature_path]},
+        image_size=(32, 32),
+        max_records=4,
+        seed=13,
+        expected_dims={"toy": 4},
+    )
+    indices = [3, 0, 2]
+    scalar = [dataset[index] for index in indices]
+    batched = dataset.__getitems__(indices)
+
+    assert [item["tile_id"] for item in batched] == [item["tile_id"] for item in scalar]
+    for observed, expected in zip(batched, scalar):
+        np.testing.assert_array_equal(observed["image"], expected["image"])
+        np.testing.assert_array_equal(
+            observed["teacher_features"]["toy"],
+            expected["teacher_features"]["toy"],
+        )
+
+
 def test_auto_merge_teacher_feature_packages_replaces_sources(tmp_path: Path) -> None:
     tile_path, feature_a = _write_package(tmp_path, "slide_a", 10, count=4)
     records = read_packaged_tile_records([tile_path])
@@ -651,6 +678,17 @@ def test_auto_merge_teacher_feature_packages_replaces_sources(tmp_path: Path) ->
     sample = dataset[0]
     np.testing.assert_allclose(sample["teacher_features"]["toy"], np.full((4,), 10, dtype=np.float32))
     np.testing.assert_allclose(sample["teacher_features"]["other"], np.full((4,), 100, dtype=np.float32))
+
+    merged_reader = MergedTeacherFeatureCacheReader(merged["toy"][0])
+    try:
+        rows = [3, 0, 2]
+        batch = merged_reader.read_features_many_at(rows, ["toy", "other"])
+        for index, row in enumerate(rows):
+            scalar = merged_reader.read_features_at(row, ["toy", "other"])
+            np.testing.assert_array_equal(batch["toy"][index], scalar["toy"])
+            np.testing.assert_array_equal(batch["other"][index], scalar["other"])
+    finally:
+        merged_reader.close()
 
 
 def test_auto_merge_allows_source_teacher_header_aliases(tmp_path: Path) -> None:

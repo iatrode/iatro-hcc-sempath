@@ -236,7 +236,14 @@ class PackageTeacherTileDataset(Dataset):
         return self._read_item(index)
 
     def __getitems__(self, indices: list[int]) -> list[dict]:
-        return [self._read_item(index) for index in indices]
+        images = self._ensure_reader().read_images_at(indices)
+        return [
+            {
+                "tile_id": self.tile_ids[index],
+                "image": self.transform(image.convert("RGB")),
+            }
+            for index, image in zip(indices, images)
+        ]
 
     def _read_item(self, index: int) -> dict:
         image = self._ensure_reader().read_image_at(index)
@@ -299,16 +306,14 @@ def _read_teacher_tile_sample(package_path: Path, tile_ids: list[str], transform
 
 def _read_teacher_tile_chunk(package_path: Path, tile_ids: list[str], transform, indices: list[int]) -> list[dict]:
     reader = _thread_tile_reader(package_path)
-    samples = []
-    for index in indices:
-        image = reader.read_image_at(index)
-        samples.append(
-            {
-                "tile_id": tile_ids[index],
-                "image": transform(image.convert("RGB")),
-            }
-        )
-    return samples
+    images = reader.read_images_at(indices)
+    return [
+        {
+            "tile_id": tile_ids[index],
+            "image": transform(image.convert("RGB")),
+        }
+        for index, image in zip(indices, images)
+    ]
 
 
 def _chunk_indices(indices: list[int], num_workers: int) -> list[list[int]]:

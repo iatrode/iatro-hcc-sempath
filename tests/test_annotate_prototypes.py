@@ -22,6 +22,7 @@ from hcc_sempath.cli.annotate_prototypes import (
     L2_PROTOTYPES,
     ROI_L2_PROTOTYPES,
     RoiCandidateQueue,
+    _annotation_parser,
     _auth_ok,
     _annotation_key,
     _load_or_create_auth_token,
@@ -141,6 +142,22 @@ def test_auth_token_requires_exact_nonempty_match() -> None:
     assert not _auth_ok("other", "secret")
 
 
+def test_annotation_cli_always_requires_l1_and_l2_roi_workspaces() -> None:
+    parser = _annotation_parser()
+    args = parser.parse_args([
+        "--input", "tiles",
+        "--l1-state", "l1.json",
+        "--l2-state", "l2.json",
+        "--roi-candidate-manifest", "roi.json",
+    ])
+    assert (args.l1_state, args.l2_state, args.roi_candidate_manifest) == (
+        "l1.json", "l2.json", "roi.json",
+    )
+    assert not any("--state" in action.option_strings for action in parser._actions)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--input", "tiles", "--l1-state", "l1.json"])
+
+
 def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> None:
     assert "Unmarked classes stay unknown/ignored unless explicitly toggled negative." in HTML
     assert "ROI conflict: marked negative but has ROI annotation" in HTML
@@ -156,6 +173,10 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "MODE==='l1'?'L1 classification':'L2 ROI annotation'" in HTML
     assert "All ROI classes visible. Select one L2 class before drawing." in HTML
     assert "✓ " in HTML
+    assert "function hasPositiveRoi(attribute)" in HTML
+    assert "function roiClassIcon(attribute,state)" in HTML
+    assert "hasPositiveRoi(attribute)?'●':'○'" in HTML
+    assert "Positive ROI present" in HTML
     assert "overflow-x:auto" in HTML
     assert 'id="tileZoomIn"' in HTML
     assert 'id="roiRedo"' in HTML
@@ -633,6 +654,29 @@ def test_random_record_skips_annotated_tiles_and_overview_is_jpg(tmp_path: Path)
         data.close()
 
 
+def test_reviewed_records_lists_saved_annotations_but_not_skips(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    state_path = tmp_path / "annotations.json"
+    _write_iac(iac_path)
+    data = AnnotationData(iac_path, state_path)
+    try:
+        package = data.packages[0]
+        records = data.viewer(0).records
+        data.state.save_annotation(package, records[0], L1_PROTOTYPES[0], [])
+        data.state.save_skip(package, records[1])
+        data.state.save_annotation(
+            package, records[2], L1_PROTOTYPES[1], [L2_PROTOTYPES[0]]
+        )
+
+        result = data.reviewed_records("all")
+
+        assert result["total"] == 2
+        assert [item["record"]["row"] for item in result["items"]] == [0, 2]
+        assert result["items"][1]["l2"] == [L2_PROTOTYPES[0]]
+    finally:
+        data.close()
+
+
 def test_context_jpg_renders_half_resolution_5x5_grid(tmp_path: Path) -> None:
     iac_path = tmp_path / "tiles.iac"
     state_path = tmp_path / "annotations.json"
@@ -750,6 +794,8 @@ def test_endpoints_via_http_get(tmp_path: Path) -> None:
             assert "package" in json.loads(response.read().decode("utf-8"))
         with urlopen(f"{root_url}api/annotation-state?token=secret&package=0&row=0", timeout=5) as response:
             assert "candidate" in json.loads(response.read().decode("utf-8"))
+        with urlopen(f"{root_url}api/reviewed-list?token=secret&package=all", timeout=5) as response:
+            assert json.loads(response.read().decode("utf-8")) == {"items": [], "total": 0}
         with urlopen(f"{root_url}api/tile?token=secret&package=0&row=0", timeout=5) as response:
             assert len(response.read()) > 0
     finally:
@@ -830,6 +876,28 @@ def test_previous_tile_uses_session_history_not_row_order() -> None:
     assert "const previous=tileHistory.pop();" in HTML
     assert "No previous tile in this session." in HTML
     assert "textContent='Previous tile'" in HTML
+
+
+def test_marked_tile_list_is_collapsed_and_loaded_on_demand() -> None:
+    assert '<details id="reviewedDetails" class="reviewedPanel">' in HTML
+    assert '<details id="reviewedDetails" class="reviewedPanel" open>' not in HTML
+    assert "/api/reviewed-list?package=all" in HTML
+    assert "async function openReviewed(item)" in HTML
+    assert "if(ev.target.open)loadReviewedList()" in HTML
+    assert "let reviewedReturn=null;" in HTML
+    assert "async function returnFromReviewed()" in HTML
+    assert "else returnFromReviewed()" in HTML
+    assert "height:min(36svh,360px);max-height:min(36svh,360px)" in HTML
+    assert "overflow-x:hidden;overflow-y:scroll" in HTML
+    assert "touch-action:pan-y" in HTML
+
+
+def test_clear_selected_roi_class_clears_geometry_negative_and_preview_state() -> None:
+    assert "function clearSelectedRoiClass()" in HTML
+    assert "roi=roi.filter(x=>x.attribute!==cleared)" in HTML
+    assert "delete roiClassState[cleared]" in HTML
+    assert "roiDrawing=null;roiPreview=null;roiCursor=null" in HTML
+    assert "document.getElementById('roiClear').onclick=clearSelectedRoiClass" in HTML
 
 
 def test_annotation_ui_remembers_the_selected_version() -> None:

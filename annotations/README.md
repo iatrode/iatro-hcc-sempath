@@ -30,8 +30,9 @@ conda run -n hcc-camoe hcc-sempath annotate-prototypes \
   --roi-candidate-manifest annotations/hcc_l2_roi_v2_candidates.json
 ```
 
-`--state` remains supported for the original single-mode workflow. Label display names and active
-labels are stored in each state file. Stable label IDs remain unchanged when a label is renamed;
+Both state arguments and the ROI candidate manifest are required: the UI always exposes the L1
+classification and L2 ROI drawing workspaces. Label display names and active labels are stored in
+each state file. Stable label IDs remain unchanged when a label is renamed;
 referenced labels can be archived but cannot be deleted. CSV export retains the original `l1` and
 `l2` ID columns and adds `l1_name` and `l2_names` display-name columns.
 

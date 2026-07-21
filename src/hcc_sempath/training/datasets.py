@@ -227,6 +227,25 @@ def _read_teacher_features_at(feature_sources: dict[Path, object], teacher_paths
     return result
 
 
+def _read_teacher_features_many_at(
+    feature_sources: dict[Path, object],
+    teacher_paths: dict[str, Path],
+    rows: list[int],
+) -> dict[str, np.ndarray]:
+    result: dict[str, np.ndarray] = {}
+    merged_groups: dict[Path, list[str]] = {}
+    for name, path in teacher_paths.items():
+        source = feature_sources[path]
+        if isinstance(source, MergedTeacherFeatureCacheReader):
+            merged_groups.setdefault(path, []).append(name)
+        else:
+            result[name] = source.read_features_at(rows)
+    for path, names in merged_groups.items():
+        source = feature_sources[path]
+        result.update(source.read_features_many_at(rows, names))
+    return result
+
+
 class _TeacherFeatureStore:
     def __init__(self, package_paths_by_teacher: dict[str, list[Path]]) -> None:
         unique_paths = sorted({path for paths in package_paths_by_teacher.values() for path in paths})
@@ -751,16 +770,18 @@ class PackageSampledDistillationDataset(Dataset):
             path: self._cached_thread_reader("feature", path, _open_feature_source)
             for path in set(teacher_paths.values())
         }
+        sorted_rows = sorted(int(row) for row in rows)
+        images = tile_reader.read_arrays_at(sorted_rows)
+        feature_batches = _read_teacher_features_many_at(feature_sources, teacher_paths, sorted_rows)
         samples = []
-        for row in sorted(int(row) for row in rows):
+        for index, row in enumerate(sorted_rows):
             tile_id = tile_reader.tile_id_at(row)
-            image = tile_reader.read_array_at(row)
             samples.append(
                 {
                     "_package_idx": package_idx,
                     "tile_id": tile_id,
-                    "image": image,
-                    "teacher_features": _read_teacher_features_at(feature_sources, teacher_paths, row),
+                    "image": images[index],
+                    "teacher_features": {name: values[index] for name, values in feature_batches.items()},
                     **_prototype_payload(tile_id, self.prototype_labels),
                 }
             )
@@ -826,6 +847,13 @@ class PackageSampledDistillationDataset(Dataset):
         l2_dim = int(buf.prototype_level2.shape[1])
         teacher_names = list(buf.teacher_features.keys())
 
+        sorted_rows = [int(rows[k]) for k in order]
+        with _probe.section("decode_image"):
+            tile_ids = [tile_reader.tile_id_at(row) for row in sorted_rows]
+            images = tile_reader.read_arrays_at(sorted_rows)
+        with _probe.section("read_feats"):
+            feature_batches = _read_teacher_features_many_at(feature_sources, teacher_paths, sorted_rows)
+
         # Local staging arrays (no GIL contention — plain numpy in this thread).
         img_stage = np.empty((n, h, w, 3), dtype=np.uint8)
         feat_stage = {name: np.empty((n, buf.teacher_features[name].shape[1]), dtype=np.float32) for name in teacher_names}
@@ -836,15 +864,11 @@ class PackageSampledDistillationDataset(Dataset):
         tid_stage: list = [None] * n
 
         for i, k in enumerate(order):
-            row = int(rows[k])
             pos_stage[i] = positions[k].pos
-            with _probe.section("decode_image"):
-                tile_id = tile_reader.tile_id_at(row)
-                img_stage[i] = tile_reader.read_array_at(row)  # HWC uint8
-            with _probe.section("read_feats"):
-                feats = _read_teacher_features_at(feature_sources, teacher_paths, row)
-            for name, feat in feats.items():
-                feat_stage[name][i] = np.asarray(feat, dtype=np.float32)
+            tile_id = tile_ids[i]
+            img_stage[i] = images[i]
+            for name, features in feature_batches.items():
+                feat_stage[name][i] = features[i]
             with _probe.section("proto"):
                 proto = _prototype_payload(tile_id, self.prototype_labels)
                 roi = roi_payload(
@@ -953,13 +977,16 @@ class PackageSampledDistillationDataset(Dataset):
                 path: self._cached_thread_reader("feature", path, _open_feature_source)
                 for path in set(teacher_paths.values())
             }
-            for out_idx, row in sorted(items, key=lambda item: item[1]):
+            ordered_items = sorted(items, key=lambda item: item[1])
+            rows = [row for _, row in ordered_items]
+            images = tile_reader.read_arrays_at(rows)
+            feature_batches = _read_teacher_features_many_at(feature_sources, teacher_paths, rows)
+            for index, (out_idx, row) in enumerate(ordered_items):
                 tile_id = tile_reader.tile_id_at(row)
-                image = tile_reader.read_array_at(row)
                 results[out_idx] = {
                     "tile_id": tile_id,
-                    "image": image,
-                    "teacher_features": _read_teacher_features_at(feature_sources, teacher_paths, row),
+                    "image": images[index],
+                    "teacher_features": {name: values[index] for name, values in feature_batches.items()},
                     **_prototype_payload(tile_id, self.prototype_labels),
                     **roi_payload(
                         tile_id,

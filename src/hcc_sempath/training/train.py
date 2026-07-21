@@ -218,6 +218,18 @@ class _PackageShuffleBatchLoader:
             }
         return batch
 
+    def _draw_batch(self, buffer: list[dict], rng: np.random.Generator) -> list[dict]:
+        take = min(self.batch_size, len(buffer))
+        if bool(getattr(self.dataset, "sequential_iac_rows", False)):
+            batch = buffer[:take]
+            del buffer[:take]
+            return batch
+        chosen = rng.choice(len(buffer), size=take, replace=False)
+        chosen_set = set(chosen)
+        batch = [buffer[index] for index in chosen]
+        buffer[:] = [item for index, item in enumerate(buffer) if index not in chosen_set]
+        return batch
+
     @staticmethod
     def _teardown(active: dict) -> None:
         """Signal stop and join all threads of one iteration. Idempotent."""
@@ -305,6 +317,17 @@ class _PackageShuffleBatchLoader:
         )
         num_tasks = len(tasks)
         if num_tasks == 0:
+            return
+
+        if self.num_workers == 0:
+            rng = np.random.default_rng(epoch_seed)
+            sample_buffer: list[dict] = []
+            for package_idx, rows in tasks:
+                sample_buffer.extend(self.dataset.read_package_rows(package_idx, rows))
+                while len(sample_buffer) >= self.batch_size:
+                    yield self._maybe_pin(self.collate_fn(self._draw_batch(sample_buffer, rng)))
+            if sample_buffer:
+                yield self._maybe_pin(self.collate_fn(self._draw_batch(sample_buffer, rng)))
             return
 
         # If a previous iteration's threads are still alive (e.g. a consumer

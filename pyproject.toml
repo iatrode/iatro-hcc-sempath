@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "hcc-sempath"
 version = "0.1.0"
 description = "Lightweight vertical pathology representation model for HCC"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
   "torch",
   "torchvision",
