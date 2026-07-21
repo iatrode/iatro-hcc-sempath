@@ -59,10 +59,12 @@ Random navigation estimates tissue coverage from downsampled RGB values and excl
 In L2 mode, select one class and add one to three reliable point or circle marks as local seeds.
 **Find similar marks** compares same-tile image patches with those seeds using spatial student tokens
 and local stain/color statistics. The similarity slider controls the visible relative matches;
-high-contrast outlined preview marks are never written to the annotation state. **Accept visible
-matches** converts only the current visible subset to ordinary editable ROI points; **Start from
-scratch** discards the preview and clears the current tile. This is local appearance propagation, not
-semantic inference from the global L2 classifier. Override the feature backbone assets with
+preview points use the same compact marker size as manual points and are never written to the
+annotation state. Candidate spacing is estimated independently from the selected class's seed
+morphology, and candidates exclude all point/circle centers already marked by the user. **Accept
+visible matches** converts only the current visible subset to ordinary editable ROI points; **Start
+from scratch** discards the preview and clears the current tile. This is local appearance propagation,
+not semantic inference from the global L2 classifier. Override the feature backbone assets with
 `--roi-plan-config`, `--roi-plan-checkpoint`, and `--roi-plan-device`.
 
 

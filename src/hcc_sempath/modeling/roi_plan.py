@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from scipy.ndimage import maximum_filter
+from scipy.ndimage import label, maximum_filter
 
 from .models import load_hcc_sempath_release
 
@@ -31,15 +31,19 @@ def _normalize_map(values: np.ndarray) -> np.ndarray:
     return np.clip((values - low) / (high - low), 0.0, 1.0)
 
 
-def detect_hematoxylin_centers(image: Image.Image, *, max_candidates: int = 240) -> list[dict]:
-    """Return stain-derived nucleus centers without assigning a semantic class."""
-    rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+def _hematoxylin_map(rgb: np.ndarray) -> np.ndarray:
     optical_density = -np.log((rgb + 1.0) / 256.0)
-    hematoxylin = (
+    return (
         0.650 * optical_density[..., 0]
         + 0.704 * optical_density[..., 1]
         + 0.286 * optical_density[..., 2]
     )
+
+
+def detect_hematoxylin_centers(image: Image.Image, *, max_candidates: int = 240) -> list[dict]:
+    """Return stain-derived nucleus centers without assigning a semantic class."""
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+    hematoxylin = _hematoxylin_map(rgb)
     tissue = rgb.mean(axis=-1) < 245.0
     if not tissue.any():
         return []
@@ -68,6 +72,56 @@ def detect_hematoxylin_centers(image: Image.Image, *, max_candidates: int = 240)
         if len(selected) >= max_candidates:
             break
     return selected
+
+
+def _estimate_seed_spacing(
+    image: Image.Image,
+    seeds: list[tuple[float, float]],
+    *,
+    fallback_pixels: float = 7.0,
+) -> tuple[float, float]:
+    """Estimate one-center-per-target spacing from this class's seed morphology."""
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+    height, width = rgb.shape[:2]
+    hematoxylin = _hematoxylin_map(rgb)
+    diameters: list[float] = []
+    window_radius = max(8, min(18, round(min(width, height) * 0.065)))
+
+    for x, y in seeds:
+        pixel_x = min(width - 1, max(0, int(x * width)))
+        pixel_y = min(height - 1, max(0, int(y * height)))
+        left, right = max(0, pixel_x - window_radius), min(width, pixel_x + window_radius + 1)
+        top, bottom = max(0, pixel_y - window_radius), min(height, pixel_y + window_radius + 1)
+        patch = hematoxylin[top:bottom, left:right]
+        local_x, local_y = pixel_x - left, pixel_y - top
+        near = patch[
+            max(0, local_y - 2) : min(patch.shape[0], local_y + 3),
+            max(0, local_x - 2) : min(patch.shape[1], local_x + 3),
+        ]
+        peak = float(near.max())
+        background = float(np.quantile(patch, 0.50))
+        high = float(np.quantile(patch, 0.95))
+        contrast = max(peak, high) - background
+        if contrast <= 1e-4:
+            continue
+        mask = patch >= background + 0.45 * contrast
+        components, _count = label(mask)
+        near_components = components[
+            max(0, local_y - 2) : min(components.shape[0], local_y + 3),
+            max(0, local_x - 2) : min(components.shape[1], local_x + 3),
+        ]
+        component_ids = near_components[near_components > 0]
+        if not component_ids.size:
+            continue
+        values, counts = np.unique(component_ids, return_counts=True)
+        component_id = int(values[np.argmax(counts)])
+        area = int(np.count_nonzero(components == component_id))
+        if area:
+            diameters.append(2.0 * float(np.sqrt(area / np.pi)))
+
+    spacing_pixels = float(np.median(diameters)) if diameters else float(fallback_pixels)
+    spacing_pixels = float(np.clip(spacing_pixels, 5.0, 18.0))
+    return spacing_pixels / min(width, height), spacing_pixels
 
 
 def _local_color_descriptor(rgb: np.ndarray, x: float, y: float, *, radius: int = 8) -> np.ndarray:
@@ -195,6 +249,7 @@ class RoiPlanGenerator:
         *,
         attribute: str,
         seeds: list[list[float] | tuple[float, float]],
+        occupied: list[list[float] | tuple[float, float]] | None = None,
     ) -> dict:
         if isinstance(image, bytes):
             image = Image.open(io.BytesIO(image))
@@ -204,6 +259,11 @@ class RoiPlanGenerator:
             raise ValueError("similarity propagation requires 1-20 seed centers")
         if any(not 0 <= value <= 1 for seed in normalized_seeds for value in seed):
             raise ValueError("seed centers must use normalized coordinates")
+        normalized_occupied = [
+            (float(point[0]), float(point[1])) for point in (occupied or [])
+        ]
+        if any(not 0 <= value <= 1 for point in normalized_occupied for value in point):
+            raise ValueError("occupied centers must use normalized coordinates")
 
         with self._lock:
             tokens, grid = self._patch_tokens(image)
@@ -232,7 +292,15 @@ class RoiPlanGenerator:
                 axis=1,
             )
             combined = _relative_scores(token_similarity) + _relative_scores(color_similarity)
-            ranked = _rank_similar_centers(centers, combined, normalized_seeds)
+            minimum_spacing, minimum_spacing_pixels = _estimate_seed_spacing(
+                image, normalized_seeds
+            )
+            ranked = _rank_similar_centers(
+                centers,
+                combined,
+                [*normalized_seeds, *normalized_occupied],
+                min_distance=minimum_spacing,
+            )
 
         suggestions = [
             {
@@ -258,7 +326,10 @@ class RoiPlanGenerator:
             "summary": {
                 "attribute": attribute,
                 "seed_count": len(normalized_seeds),
+                "occupied_count": len(normalized_occupied),
                 "candidate_count": len(centers),
                 "suggestion_count": len(suggestions),
+                "minimum_spacing": minimum_spacing,
+                "minimum_spacing_pixels": minimum_spacing_pixels,
             },
         }

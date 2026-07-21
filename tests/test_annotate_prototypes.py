@@ -222,10 +222,16 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "function acceptRoiPlan()" in HTML
     assert "function restartRoiFromScratch()" in HTML
     assert "function seedCentersForSelectedClass()" in HTML
+    assert "function occupiedRoiCenters()" in HTML
+    assert "occupied:occupiedRoiCenters()" in HTML
     assert "function visiblePlannedSuggestions()" in HTML
-    assert "Outlined marks are not saved yet." in HTML
+    assert "Preview marks are not saved yet." in HTML
+    assert "minimum_spacing_pixels" in HTML
     assert "'/api/roi-similar'" in HTML
     assert "function drawPlannedPoint(x,g,color)" in HTML
+    assert "function drawPointMark(x,point,color,alpha=1)" in HTML
+    assert "drawPointMark(x,g.point,color)" in HTML
+    assert "[[3.4,'#000'],[2.3,'#fff'],[1.2,color]]" in HTML
     assert "function drawPlannedCircle(x,g,color)" in HTML
     assert "[[7,'rgba(15,23,42,.9)'],[5,'#fff'],[2.5,color]]" in HTML
     assert "Choose Accept visible matches or Start from scratch before saving." in HTML
@@ -427,10 +433,18 @@ def test_l2_roi_similarity_endpoint_uses_seeds_without_saving(tmp_path: Path) ->
         def __init__(self) -> None:
             self.tile_bytes = b""
 
-        def generate_similar(self, tile_bytes: bytes, *, attribute: str, seeds: list) -> dict:
+        def generate_similar(
+            self,
+            tile_bytes: bytes,
+            *,
+            attribute: str,
+            seeds: list,
+            occupied: list,
+        ) -> dict:
             self.tile_bytes = tile_bytes
             assert attribute == ROI_L2_PROTOTYPES[0]
             assert seeds == [[0.4, 0.6]]
+            assert occupied == [[0.4, 0.6], [0.2, 0.3]]
             return {
                 "version": 1,
                 "suggestions": [{
@@ -466,6 +480,7 @@ def test_l2_roi_similarity_endpoint_uses_seeds_without_saving(tmp_path: Path) ->
             "row": 0,
             "attribute": ROI_L2_PROTOTYPES[0],
             "seeds": [[0.4, 0.6]],
+            "occupied": [[0.4, 0.6], [0.2, 0.3]],
         }).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",

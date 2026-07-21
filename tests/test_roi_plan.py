@@ -4,6 +4,7 @@ import numpy as np
 from PIL import Image
 
 from hcc_sempath.modeling.roi_plan import (
+    _estimate_seed_spacing,
     _local_color_descriptor,
     _rank_similar_centers,
     _relative_scores,
@@ -34,6 +35,36 @@ def test_local_similarity_ranks_centers_and_excludes_seed_neighbors() -> None:
     assert ranked[0][:2] == (0.80, 0.80)
     assert all(abs(x - 0.50) > 0.02 or abs(y - 0.50) > 0.02 for x, y, _ in ranked)
     assert ranked[0][2] == 1.0
+
+
+def test_seed_spacing_tracks_selected_class_target_size() -> None:
+    image = np.full((96, 96, 3), 235, dtype=np.uint8)
+    yy, xx = np.ogrid[:96, :96]
+    image[(xx - 24) ** 2 + (yy - 48) ** 2 <= 3**2] = [35, 20, 65]
+    image[(xx - 70) ** 2 + (yy - 48) ** 2 <= 7**2] = [35, 20, 65]
+    pil_image = Image.fromarray(image)
+
+    small_normalized, small_pixels = _estimate_seed_spacing(
+        pil_image, [(24 / 96, 48 / 96)]
+    )
+    large_normalized, large_pixels = _estimate_seed_spacing(
+        pil_image, [(70 / 96, 48 / 96)]
+    )
+
+    assert 5 <= small_pixels < large_pixels <= 18
+    assert small_normalized == small_pixels / 96
+    assert large_normalized == large_pixels / 96
+
+
+def test_local_similarity_uses_requested_class_spacing() -> None:
+    centers = [(0.40, 0.40), (0.43, 0.40), (0.60, 0.60)]
+    scores = np.asarray([3.0, 2.0, 1.0], dtype=np.float32)
+
+    ranked = _rank_similar_centers(
+        centers, scores, [], limit=3, min_distance=0.05
+    )
+
+    assert [item[:2] for item in ranked] == [(0.40, 0.40), (0.60, 0.60)]
 
 
 def test_local_color_descriptor_changes_with_patch_stain() -> None:
