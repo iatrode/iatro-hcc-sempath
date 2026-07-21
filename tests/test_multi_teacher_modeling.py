@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import torch
 
-from hcc_sempath.modeling.models import HCCSemPathModel
+from hcc_sempath.modeling.models import HCCSemPathModel, load_hcc_sempath_release
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 from hcc_sempath.training.losses import multi_teacher_distillation_loss
 from hcc_sempath.training.engine import _objective_gradient_diagnostics
@@ -101,6 +104,40 @@ def test_hcc_sempath_model_uses_same_class_for_release_prototype_outputs() -> No
     assert outputs["l2_centered_scores"].shape == (2, 3)
     assert outputs["l2_scores"].shape == (2, 3)
     assert "l2_probabilities" not in outputs
+
+
+def test_release_loader_uses_checkpoint_backbone_configuration(tmp_path: Path) -> None:
+    model = HCCSemPathModel(
+        backbone_name="vit_tiny_patch16_224",
+        embedding_dim=11,
+        teacher_dims={},
+        pretrained=False,
+        l1_num_classes=4,
+        l2_num_attributes=3,
+    )
+    checkpoint = tmp_path / "release.pt"
+    config = tmp_path / "config.json"
+    torch.save(model.state_dict(), checkpoint)
+    config.write_text(
+        json.dumps({
+            "model": {
+                "backbone_name": "vit_tiny_patch16_224",
+                "embedding_dim": 11,
+                "projector_type": "linear",
+                "l1_num_classes": 4,
+                "l2_num_attributes": 3,
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    loaded, _ = load_hcc_sempath_release(config, checkpoint)
+
+    assert loaded.encoder.backbone.patch_embed.patch_size == (16, 16)
+    torch.testing.assert_close(
+        loaded.encoder.projector[1].weight,
+        model.encoder.projector[1].weight,
+    )
 
 
 def test_multi_teacher_distillation_loss_aggregates_named_heads() -> None:

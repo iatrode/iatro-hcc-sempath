@@ -58,13 +58,14 @@ class StudentEncoder(nn.Module):
         grad_checkpointing: bool = False,
     ) -> None:
         super().__init__()
-        self.backbone = timm.create_model(
-            backbone_name,
-            pretrained=False,
-            num_classes=0,
-            global_pool="token",
-            img_size=STUDENT_IMAGE_SIZE,
-        )
+        backbone_kwargs = {
+            "pretrained": False,
+            "num_classes": 0,
+            "global_pool": "token" if backbone_name == STUDENT_BACKBONE_NAME else "avg",
+        }
+        if backbone_name == STUDENT_BACKBONE_NAME:
+            backbone_kwargs["img_size"] = STUDENT_IMAGE_SIZE
+        self.backbone = timm.create_model(backbone_name, **backbone_kwargs)
         if pretrained:
             if backbone_name != STUDENT_BACKBONE_NAME:
                 raise ValueError(f"pretraining is fixed to {STUDENT_BACKBONE_NAME}, got {backbone_name}")
@@ -369,7 +370,7 @@ def load_hcc_sempath_release(
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     model_config = config["model"]
     model = HCCSemPathModel(
-        backbone_name=STUDENT_BACKBONE_NAME,
+        backbone_name=model_config["backbone_name"],
         embedding_dim=int(model_config["embedding_dim"]),
         teacher_dims={},
         pretrained=False,

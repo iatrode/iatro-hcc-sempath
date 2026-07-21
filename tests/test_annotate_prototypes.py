@@ -22,6 +22,7 @@ from hcc_sempath.cli.annotate_prototypes import (
     L2_PROTOTYPES,
     ROI_L2_PROTOTYPES,
     RoiCandidateQueue,
+    SharedPriorityQueue,
     _annotation_parser,
     _auth_ok,
     _annotation_key,
@@ -29,6 +30,7 @@ from hcc_sempath.cli.annotate_prototypes import (
     discover_iac_packages,
     make_handler,
 )
+from hcc_sempath.cli.build_priority_list import build_priority_manifest
 from hcc_sempath.cli.build_roi_queue import build_roi_candidate_queue
 from iatro.iac.adapters.features import build_teacher_feature_package
 from iatro.iac.adapters.manifests import TileRecord
@@ -148,12 +150,13 @@ def test_annotation_cli_always_requires_l1_and_l2_roi_workspaces() -> None:
         "--input", "tiles",
         "--l1-state", "l1.json",
         "--l2-state", "l2.json",
-        "--roi-candidate-manifest", "roi.json",
+        "--priority-manifest", "priority.json",
     ])
-    assert (args.l1_state, args.l2_state, args.roi_candidate_manifest) == (
-        "l1.json", "l2.json", "roi.json",
+    assert (args.l1_state, args.l2_state, args.priority_manifest) == (
+        "l1.json", "l2.json", "priority.json",
     )
     assert not any("--state" in action.option_strings for action in parser._actions)
+    assert not any("--roi-candidate-manifest" in action.option_strings for action in parser._actions)
     with pytest.raises(SystemExit):
         parser.parse_args(["--input", "tiles", "--l1-state", "l1.json"])
 
@@ -172,13 +175,26 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "document.getElementById('l2Section').style.display='none'" in HTML
     assert "MODE==='l1'?'L1 classification':'L2 ROI annotation'" in HTML
     assert "All ROI classes visible. Select one L2 class before drawing." in HTML
-    assert "✓ " in HTML
+    assert "currentCandidate" not in HTML
+    assert "old L2" not in HTML
     assert "function hasPositiveRoi(attribute)" in HTML
     assert "function roiClassIcon(attribute,state)" in HTML
     assert "hasPositiveRoi(attribute)?'●':'○'" in HTML
     assert "Positive ROI present" in HTML
     assert "overflow-x:auto" in HTML
-    assert 'id="tileZoomIn"' in HTML
+    assert 'class="imageControlRow tileControlRow"' in HTML
+    assert 'class="primaryWorkspace"' in HTML
+    assert "grid-template-columns:minmax(420px,680px) minmax(300px,1fr)" in HTML
+    assert ".annotationControls{grid-column:2;grid-row:1/span 2" in HTML
+    assert "@media(max-width:1200px)" in HTML
+    assert ".primaryWorkspace{display:block}" in HTML
+    assert ".roiClassBar{display:flex;flex-wrap:wrap" in HTML
+    assert ".roiClassBar{flex-wrap:nowrap;max-width:min(100%,760px);overflow-x:auto" in HTML
+    assert 'id="tileZoom"' in HTML
+    assert 'class="imageControlRow overviewControlRow"' in HTML
+    assert '<h3>Location overview</h3><label class="rangeControl">Zoom' in HTML
+    assert 'id="overviewZoom"' in HTML
+    assert 'id="tileZoomIn"' not in HTML
     assert 'id="roiRedo"' in HTML
     assert "undoRoi()" in HTML
     assert "redoRoi()" in HTML
@@ -191,9 +207,21 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert 'max="0.500"' in HTML
     assert "updateBrushDot()" in HTML
     assert "brushWidth()" in HTML
+    assert "if(ROI_MODE)setBrushWidth(brushWidth()" in HTML
+    assert "wheelZoom:false,doubleClickReset:false,onScale:syncOverviewZoom" in HTML
+    assert "overviewZoom.addEventListener('input'" in HTML
     assert "roiCursor" in HTML
     assert "updateRoiCursor" in HTML
     assert "exclude_row" in HTML
+    assert "Priority list ${priority.reviewed}/${priority.total}" in HTML
+    assert 'id="roiPlanGenerate"' in HTML
+    assert 'id="roiPlanAccept"' in HTML
+    assert 'id="roiPlanRestart"' in HTML
+    assert "async function generateRoiPlan()" in HTML
+    assert "function acceptRoiPlan()" in HTML
+    assert "function restartRoiFromScratch()" in HTML
+    assert "Dashed marks are not saved yet." in HTML
+    assert "Choose Continue from plan or Start from scratch before saving." in HTML
 
 
 def _write_roi_queue(path: Path, tile_ids: list[str]) -> None:
@@ -218,13 +246,14 @@ def _write_roi_queue(path: Path, tile_ids: list[str]) -> None:
     )
 
 
-def test_roi_mode_prioritizes_queue_without_filtering_full_tile_pool(tmp_path: Path) -> None:
+def test_shared_priority_list_drives_roi_then_expands_to_fallback_tile(tmp_path: Path) -> None:
     iac_path = tmp_path / "tiles.iac"
     state_path = tmp_path / "roi.json"
-    queue_path = tmp_path / "queue.json"
+    priority_path = tmp_path / "priority.json"
     _write_iac(iac_path)
-    _write_roi_queue(queue_path, ["s1_0000000"])
-    data = AnnotationData(iac_path, state_path, roi_candidate_manifest=queue_path)
+    priority_path.write_text(json.dumps({"version": 1, "candidates": [{"tile_id": "s1_0000000", "iac": "tiles.iac", "row": 0, "slide": "s1"}]}), encoding="utf-8")
+    priority = SharedPriorityQueue(priority_path)
+    data = AnnotationData(iac_path, state_path, roi_mode=True, priority_queue=priority)
     try:
         assert data.state.l2_prototypes == ROI_L2_PROTOTYPES
         assert len(data.annotation_records(0)) == 4
@@ -247,7 +276,9 @@ def test_roi_mode_prioritizes_queue_without_filtering_full_tile_pool(tmp_path: P
         fallback = data.random_record(0)["record"]
         assert fallback is not None
         assert fallback["tile_id"] != "s1_0000000"
+        assert priority.contains(fallback["tile_id"])
         assert data.progress(0)["roi_counts"][ROI_L2_PROTOTYPES[0]] == 1
+        assert data.progress(0)["priority"] == {"reviewed": 1, "skipped": 0, "total": 2, "remaining": 1}
         saved = data.annotation_json(0, iac_record.row)["annotation"]
         assert saved["roi_reviewed"] is True
         assert saved["roi_complete_all"] is False
@@ -287,6 +318,25 @@ def test_build_roi_queue_excludes_hyaline_and_reports_true_deficits(tmp_path: Pa
     queue_path = tmp_path / "queue.json"
     queue_path.write_text(json.dumps(payload), encoding="utf-8")
     assert RoiCandidateQueue(queue_path).contains("t1")
+
+
+def test_build_priority_manifest_keeps_only_tile_identity_and_deduplicates(tmp_path: Path) -> None:
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(
+        json.dumps({"annotations": {"a": {"tile_id": "t1", "iac": "a.iac", "row": 1, "slide": "s1", "l1": "x", "l2": ["legacy"]}}}),
+        encoding="utf-8",
+    )
+    second.write_text(
+        json.dumps({"annotations": {"a2": {"tile_id": "t1", "iac": "a.iac", "row": 1, "slide": "s1"}, "b": {"tile_id": "t2", "iac": "b.iac", "row": 2, "slide": "s2"}}}),
+        encoding="utf-8",
+    )
+
+    payload = build_priority_manifest([first, second])
+
+    assert payload["candidate_count"] == 2
+    assert [item["tile_id"] for item in payload["candidates"]] == ["t1", "t2"]
+    assert all("l1" not in item and "l2" not in item for item in payload["candidates"])
 
 
 def test_package_list_and_progress_do_not_open_iac_viewers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -353,6 +403,59 @@ def test_annotation_http_requires_auth_token(tmp_path: Path) -> None:
             assert response.status == 200
         with urlopen(f"{url}?auth_token=secret", timeout=5) as response:
             assert response.status == 200
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+        data.close()
+
+
+def test_l2_roi_plan_endpoint_uses_preview_generator_without_saving(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    state_path = tmp_path / "annotations.json"
+    _write_iac(iac_path)
+    data = AnnotationData(iac_path, state_path, roi_mode=True)
+
+    class FakePlanGenerator:
+        def __init__(self) -> None:
+            self.tile_bytes = b""
+
+        def generate(self, tile_bytes: bytes) -> dict:
+            self.tile_bytes = tile_bytes
+            return {
+                "version": 1,
+                "suggestions": [{
+                    "attribute": ROI_L2_PROTOTYPES[0],
+                    "state": "positive",
+                    "geometry": {
+                        "type": "point",
+                        "coordinate_space": "normalized",
+                        "point": [0.5, 0.5],
+                    },
+                }],
+                "summary": {"suggestion_count": 1, "counts": {ROI_L2_PROTOTYPES[0]: 1}},
+            }
+
+    generator = FakePlanGenerator()
+    try:
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), make_handler(data, "secret", generator)
+        )
+    except PermissionError:
+        data.close()
+        pytest.skip("local socket bind is blocked in this sandbox")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = (
+        f"http://127.0.0.1:{server.server_address[1]}"
+        "/api/roi-plan?token=secret&mode=l2&package=0&row=0"
+    )
+    try:
+        with urlopen(url, timeout=5) as response:
+            payload = json.load(response)
+        assert payload["summary"]["suggestion_count"] == 1
+        assert generator.tile_bytes.startswith(b"\x89PNG")
+        assert data.state.annotations == {}
     finally:
         server.shutdown()
         thread.join(timeout=5)

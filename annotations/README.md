@@ -13,12 +13,20 @@ code, schemas, or documentation unless a dataset release is explicitly planned.
 Current local layout:
 
 - `hcc_prototype_review.final_3000_inflammatory_stromal.json`: final prototype annotation state.
-- `hcc_l2_roi_v2_candidates.json`: local V2 ROI priority pool from existing L2 positives (generated; not committed).
+- `hcc_shared_priority_tiles.json`: shared mutable L1/L2 tile boundary seeded from the stable 3000-tile L1 review (generated; not committed).
 - `hcc_l2_roi_v2.json`: V2 nine-class complete-review ROI annotation state (created by the UI).
 - `reviews/teacher_disagreement/exval_1000/review.json`: completed 1000-tile repeated review state.
 - `reviews/teacher_disagreement/exval_1000/review.csv`: CSV export of the completed repeated review.
 
 ## Unified L1/L2 annotation workspace
+
+Seed the shared boundary from the stable L1 review once:
+
+```bash
+conda run -n hcc-camoe hcc-sempath build-priority-list \
+  --annotations annotations/hcc_prototype_review.final_3000_inflammatory_stromal.json \
+  --output annotations/hcc_shared_priority_tiles.json
+```
 
 Run both annotation workflows behind one browser UI and switch with the L1/L2 navigation:
 
@@ -27,11 +35,14 @@ conda run -n hcc-camoe hcc-sempath annotate-prototypes \
   --input /path/to/image_tile_iac_root \
   --l1-state annotations/hcc_prototype_review.json \
   --l2-state annotations/hcc_l2_roi_v2.json \
-  --roi-candidate-manifest annotations/hcc_l2_roi_v2_candidates.json
+  --priority-manifest annotations/hcc_shared_priority_tiles.json
 ```
 
-Both state arguments and the ROI candidate manifest are required: the UI always exposes the L1
-classification and L2 ROI drawing workspaces. Label display names and active labels are stored in
+Both state arguments and the shared priority manifest are required: the UI always exposes the L1
+classification and L2 ROI drawing workspaces. Both modes exhaust the same priority tile boundary
+before sampling the full corpus. A newly sampled or manually saved out-of-boundary tile is appended
+atomically so the other mode prioritizes it too. The former tile-level L2 classification is not an
+annotation task and does not seed labels in the ROI workspace. Label display names and active labels are stored in
 each state file. Stable label IDs remain unchanged when a label is renamed;
 referenced labels can be archived but cannot be deleted. CSV export retains the original `l1` and
 `l2` ID columns and adds `l1_name` and `l2_names` display-name columns.
@@ -45,6 +56,13 @@ Random navigation estimates tissue coverage from downsampled RGB values and excl
 30% tissue without recording a human skip. Override the threshold with
 `--min-tissue-fraction`, or set it to `0` to disable automatic filtering.
 
+In L2 mode, **Preview suggested plan** runs the configured release classifier once, derives
+class-specific spatial evidence by backpropagating through its feature readout, and combines that
+evidence with H&E hematoxylin peaks for cell-center proposals. Dashed preview marks are never written
+to the annotation state. **Continue from plan** converts them to ordinary editable ROI marks;
+**Start from scratch** discards the preview and clears the current tile. Override the default release
+assets with `--roi-plan-config`, `--roi-plan-checkpoint`, and `--roi-plan-device`.
+
 
 
   L1（4 类，互斥）：
@@ -54,7 +72,7 @@ Random navigation estimates tissue coverage from downsampled RGB values and excl
 4. Inflammatory-stromal
 5. Degenerative-material
 
-  L2（10 类，可并存）：
+  L2 ROI（9 类，可并存）：
 
 1. hepatocellular-parenchyma-present
 2. necrosis-present
@@ -63,9 +81,10 @@ Random navigation estimates tissue coverage from downsampled RGB values and excl
 5. inflammatory-cell-present
 6. fibrous-stroma-present
 7. steatosis-vacuolation-present
-8. hyaline-change-present
-9. vascular-structure-present
-10. ductular-portal-present
+8. vascular-structure-present
+9. ductular-portal-present
+
+`hyaline-change-present` is retained only in legacy tile-level L2 assets and is not an ROI task.
 
 L1 expansion:
 HCC-tumor further classification
