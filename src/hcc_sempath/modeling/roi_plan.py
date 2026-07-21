@@ -13,12 +13,6 @@ from scipy.ndimage import maximum_filter
 from .models import load_hcc_sempath_release
 
 
-POINT_ATTRIBUTES = {
-    "hepatocellular-parenchyma-present": 16,
-    "inflammatory-cell-present": 10,
-}
-
-
 def _auto_device() -> str:
     if torch.backends.mps.is_available():
         return "mps"
@@ -76,60 +70,70 @@ def detect_hematoxylin_centers(image: Image.Image, *, max_candidates: int = 240)
     return selected
 
 
-def _rank_nucleus_points(
-    candidates: list[dict],
-    saliency: np.ndarray,
+def _local_color_descriptor(rgb: np.ndarray, x: float, y: float, *, radius: int = 8) -> np.ndarray:
+    height, width = rgb.shape[:2]
+    pixel_x = min(width - 1, max(0, int(x * width)))
+    pixel_y = min(height - 1, max(0, int(y * height)))
+    crop = rgb[
+        max(0, pixel_y - radius) : min(height, pixel_y + radius + 1),
+        max(0, pixel_x - radius) : min(width, pixel_x + radius + 1),
+    ]
+    scaled = crop / 255.0
+    optical_density = -np.log((crop + 1.0) / 256.0)
+    hematoxylin = (
+        0.650 * optical_density[..., 0]
+        + 0.704 * optical_density[..., 1]
+        + 0.286 * optical_density[..., 2]
+    )
+    return np.concatenate(
+        (
+            scaled.mean(axis=(0, 1)),
+            scaled.std(axis=(0, 1)),
+            np.quantile(scaled, 0.25, axis=(0, 1)),
+            np.quantile(scaled, 0.75, axis=(0, 1)),
+            np.asarray([hematoxylin.mean(), hematoxylin.std()]),
+        )
+    ).astype(np.float32)
+
+
+def _relative_scores(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    median = float(np.median(values))
+    scale = float(np.median(np.abs(values - median))) * 1.4826
+    if scale <= 1e-6:
+        scale = float(values.std())
+    return (values - median) / max(scale, 1e-6)
+
+
+def _rank_similar_centers(
+    centers: list[tuple[float, float]],
+    scores: np.ndarray,
+    seeds: list[tuple[float, float]],
     *,
-    limit: int,
-    stain_weight: float,
-) -> list[dict]:
-    if not candidates:
-        return []
-    height, width = saliency.shape
-    ranked = []
-    for item in candidates:
-        x = min(width - 1, max(0, int(item["x"] * width)))
-        y = min(height - 1, max(0, int(item["y"] * height)))
-        score = stain_weight * item["stain"] + (1.0 - stain_weight) * float(saliency[y, x])
-        ranked.append((score, item))
-    ranked.sort(key=lambda pair: pair[0], reverse=True)
-    chosen: list[dict] = []
-    min_distance_sq = 0.025**2
-    for score, item in ranked:
-        if any((item["x"] - old["x"]) ** 2 + (item["y"] - old["y"]) ** 2 < min_distance_sq for old in chosen):
-            continue
-        chosen.append({"x": item["x"], "y": item["y"], "confidence": float(np.clip(score, 0.0, 1.0))})
-        if len(chosen) >= limit:
-            break
-    return chosen
-
-
-def _saliency_regions(saliency: np.ndarray, *, limit: int = 3) -> list[dict]:
-    peaks = saliency == maximum_filter(saliency, size=3)
-    ys, xs = np.nonzero(peaks)
-    order = np.argsort(saliency[ys, xs])[::-1]
-    height, width = saliency.shape
-    chosen: list[dict] = []
+    limit: int = 120,
+    min_distance: float = 7 / 224,
+) -> list[tuple[float, float, float]]:
+    order = np.argsort(scores)[::-1]
+    selected: list[tuple[float, float]] = []
+    minimum_sq = min_distance**2
     for index in order:
-        confidence = float(saliency[ys[index], xs[index]])
-        if confidence < 0.35:
-            break
-        x, y = (xs[index] + 0.5) / width, (ys[index] + 0.5) / height
-        if any((x - old["x"]) ** 2 + (y - old["y"]) ** 2 < 0.14**2 for old in chosen):
+        x, y = centers[int(index)]
+        if any((x - sx) ** 2 + (y - sy) ** 2 < minimum_sq for sx, sy in seeds):
             continue
-        chosen.append({"x": x, "y": y, "confidence": confidence})
-        if len(chosen) >= limit:
+        if any((x - old_x) ** 2 + (y - old_y) ** 2 < minimum_sq for old_x, old_y in selected):
+            continue
+        selected.append((x, y))
+        if len(selected) >= limit:
             break
-    return chosen
+    denominator = max(1, len(selected) - 1)
+    return [
+        (x, y, 1.0 - rank / denominator)
+        for rank, (x, y) in enumerate(selected)
+    ]
 
 
 class RoiPlanGenerator:
-    """Lazy, thread-safe ROI proposal generator for the annotation UI.
-
-    The release classifier supplies class-specific feature-gradient maps. H&E
-    stain peaks supply candidate cell centers. The result remains a preview;
-    the UI decides whether it becomes annotation state.
-    """
+    """Find same-tile image centers similar to user-confirmed seed marks."""
 
     def __init__(
         self,
@@ -152,131 +156,109 @@ class RoiPlanGenerator:
             )
         return self._model, self._config
 
-    def _feature_gradient_maps(self, image: Image.Image) -> tuple[dict[str, float], dict[str, np.ndarray]]:
+    def _patch_tokens(self, image: Image.Image) -> tuple[np.ndarray, tuple[int, int]]:
         model, config = self._load()
-        names = list(config["l2_names"])
         preprocessing = config["preprocessing"]
         rgb = np.asarray(image.convert("RGB").resize((224, 224)), dtype=np.float32) / 255.0
         tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(self.device)
         mean = torch.tensor(preprocessing["mean"], device=self.device).view(1, 3, 1, 1)
         std = torch.tensor(preprocessing["std"], device=self.device).view(1, 3, 1, 1)
-        tensor = (tensor - mean) / std
+        with torch.no_grad():
+            features = model.encoder.backbone.forward_features((tensor - mean) / std)
+        prefix = int(getattr(model.encoder.backbone, "num_prefix_tokens", 1))
+        tokens = F.normalize(features[0, prefix:].float(), dim=-1).cpu().numpy()
+        grid = tuple(int(value) for value in model.encoder.backbone.patch_embed.grid_size)
+        return tokens, grid
 
-        with torch.enable_grad():
-            features = model.encoder.backbone.forward_features(tensor).detach().requires_grad_(True)
-            pooled = model.encoder.backbone.forward_head(features, pre_logits=True)
-            embedding = model.encoder.projector(pooled)
-            scores = F.normalize(embedding, dim=-1) @ model.l2_prototypes.T
-            prefix = int(getattr(model.encoder.backbone, "num_prefix_tokens", 1))
-            patch_tokens = features[:, prefix:]
-            grid = tuple(int(value) for value in model.encoder.backbone.patch_embed.grid_size)
-            maps: dict[str, np.ndarray] = {}
-            for index, name in enumerate(names):
-                gradient = torch.autograd.grad(
-                    scores[0, index], features, retain_graph=index < len(names) - 1
-                )[0][:, prefix:]
-                contribution = (gradient * patch_tokens).sum(dim=-1).reshape(1, 1, *grid)
-                contribution = F.relu(contribution)
-                if float(contribution.detach().max()) <= 1e-8:
-                    contribution = (gradient * patch_tokens).abs().sum(dim=-1).reshape(1, 1, *grid)
-                upsampled = F.interpolate(
-                    contribution, size=image.size[::-1], mode="bilinear", align_corners=False
-                )[0, 0]
-                maps[name] = _normalize_map(upsampled.detach().float().cpu().numpy())
-        score_values = scores.detach().float().cpu().numpy()[0]
-        return dict(zip(names, (float(value) for value in score_values))), maps
+    @staticmethod
+    def _token_at(tokens: np.ndarray, grid: tuple[int, int], x: float, y: float) -> np.ndarray:
+        grid_y = min(grid[0] - 1, max(0, int(y * grid[0])))
+        grid_x = min(grid[1] - 1, max(0, int(x * grid[1])))
+        return tokens[grid_y * grid[1] + grid_x]
 
-    def generate(self, image: Image.Image | bytes) -> dict:
+    @staticmethod
+    def _candidate_centers(image: Image.Image) -> list[tuple[float, float]]:
+        width, height = image.size
+        centers = [(item["x"], item["y"]) for item in detect_hematoxylin_centers(image)]
+        # A dense fallback retains pigment, hemorrhage, and vacuolation patterns
+        # that are not reliably represented by hematoxylin maxima.
+        centers.extend(
+            ((x + 0.5) / width, (y + 0.5) / height)
+            for y in range(4, height, 7)
+            for x in range(4, width, 7)
+        )
+        return centers
+
+    def generate_similar(
+        self,
+        image: Image.Image | bytes,
+        *,
+        attribute: str,
+        seeds: list[list[float] | tuple[float, float]],
+    ) -> dict:
         if isinstance(image, bytes):
             image = Image.open(io.BytesIO(image))
         image = image.convert("RGB")
+        normalized_seeds = [(float(seed[0]), float(seed[1])) for seed in seeds]
+        if not normalized_seeds or len(normalized_seeds) > 20:
+            raise ValueError("similarity propagation requires 1-20 seed centers")
+        if any(not 0 <= value <= 1 for seed in normalized_seeds for value in seed):
+            raise ValueError("seed centers must use normalized coordinates")
+
         with self._lock:
-            scores, maps = self._feature_gradient_maps(image)
-            assert self._config is not None
-            thresholds = dict(zip(self._config["l2_names"], self._config["l2_decision_thresholds"]))
-            nuclei = detect_hematoxylin_centers(image)
+            tokens, grid = self._patch_tokens(image)
+            rgb = np.asarray(image, dtype=np.float32)
+            centers = self._candidate_centers(image)
+            seed_tokens = np.stack(
+                [self._token_at(tokens, grid, x, y) for x, y in normalized_seeds]
+            )
+            token_centroid = seed_tokens.mean(axis=0)
+            token_centroid /= max(float(np.linalg.norm(token_centroid)), 1e-8)
+            seed_colors = np.stack(
+                [_local_color_descriptor(rgb, x, y) for x, y in normalized_seeds]
+            )
+            color_centroid = seed_colors.mean(axis=0)
 
-            suggestions: list[dict] = []
-            class_scores: dict[str, dict] = {}
-            for attribute, score in scores.items():
-                threshold = float(thresholds[attribute])
-                predicted_positive = score >= threshold
-                class_scores[attribute] = {
-                    "score": score,
-                    "threshold": threshold,
-                    "predicted_positive": predicted_positive,
-                }
-            planned_attributes = {
-                attribute
-                for _margin, attribute in sorted(
-                    (
-                        (item["score"] - item["threshold"], attribute)
-                        for attribute, item in class_scores.items()
-                        if item["predicted_positive"] and attribute != "hyaline-change-present"
-                    ),
-                    reverse=True,
-                )[:4]
+            candidate_tokens = np.stack(
+                [self._token_at(tokens, grid, x, y) for x, y in centers]
+            )
+            candidate_colors = np.stack(
+                [_local_color_descriptor(rgb, x, y) for x, y in centers]
+            )
+            color_scale = candidate_colors.std(axis=0) + 1e-4
+            token_similarity = candidate_tokens @ token_centroid
+            color_similarity = -np.mean(
+                ((candidate_colors - color_centroid) / color_scale) ** 2,
+                axis=1,
+            )
+            combined = _relative_scores(token_similarity) + _relative_scores(color_similarity)
+            ranked = _rank_similar_centers(centers, combined, normalized_seeds)
+
+        suggestions = [
+            {
+                "attribute": attribute,
+                "state": "positive",
+                "review_complete": False,
+                "confidence": confidence,
+                "source": "same-tile-seed-similarity",
+                "geometry": {
+                    "type": "point",
+                    "coordinate_space": "normalized",
+                    "point": [x, y],
+                    "radius": 0.018,
+                },
             }
-            for attribute, score in scores.items():
-                if attribute not in planned_attributes:
-                    continue
-                if attribute in POINT_ATTRIBUTES:
-                    stain_weight = 0.65 if attribute == "inflammatory-cell-present" else 0.35
-                    points = _rank_nucleus_points(
-                        nuclei,
-                        maps[attribute],
-                        limit=POINT_ATTRIBUTES[attribute],
-                        stain_weight=stain_weight,
-                    )
-                    for point in points:
-                        suggestions.append(
-                            {
-                                "attribute": attribute,
-                                "state": "positive",
-                                "review_complete": False,
-                                "confidence": point["confidence"],
-                                "source": "feature-gradient+hematoxylin",
-                                "geometry": {
-                                    "type": "point",
-                                    "coordinate_space": "normalized",
-                                    "point": [point["x"], point["y"]],
-                                    "radius": 0.018,
-                                },
-                            }
-                        )
-                else:
-                    for region in _saliency_regions(maps[attribute]):
-                        suggestions.append(
-                            {
-                                "attribute": attribute,
-                                "state": "positive",
-                                "review_complete": False,
-                                "confidence": region["confidence"],
-                                "source": "feature-gradient",
-                                "geometry": {
-                                    "type": "circle",
-                                    "coordinate_space": "normalized",
-                                    "center": [region["x"], region["y"]],
-                                    "radius": 0.07,
-                                },
-                            }
-                        )
-
-        counts: dict[str, int] = {}
-        for item in suggestions:
-            counts[item["attribute"]] = counts.get(item["attribute"], 0) + 1
+            for x, y, confidence in ranked
+        ]
         return {
             "version": 1,
-            "method": "release-feature-gradient+he-nuclei-v1",
+            "method": "same-tile-local-seed-centroid-v1",
             "device": self.device,
             "suggestions": suggestions,
-            "class_scores": class_scores,
             "summary": {
+                "attribute": attribute,
+                "seed_count": len(normalized_seeds),
+                "candidate_count": len(centers),
                 "suggestion_count": len(suggestions),
-                "counts": counts,
-                "predicted_positive": [
-                    name for name, item in class_scores.items() if item["predicted_positive"]
-                ],
-                "planned_positive": sorted(planned_attributes),
             },
         }

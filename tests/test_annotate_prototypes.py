@@ -7,7 +7,7 @@ import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pytest
@@ -217,14 +217,18 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert 'id="roiPlanGenerate"' in HTML
     assert 'id="roiPlanAccept"' in HTML
     assert 'id="roiPlanRestart"' in HTML
+    assert 'id="roiSimilarity"' in HTML
     assert "async function generateRoiPlan()" in HTML
     assert "function acceptRoiPlan()" in HTML
     assert "function restartRoiFromScratch()" in HTML
-    assert "High-contrast outlined marks are not saved yet." in HTML
+    assert "function seedCentersForSelectedClass()" in HTML
+    assert "function visiblePlannedSuggestions()" in HTML
+    assert "Outlined marks are not saved yet." in HTML
+    assert "'/api/roi-similar'" in HTML
     assert "function drawPlannedPoint(x,g,color)" in HTML
     assert "function drawPlannedCircle(x,g,color)" in HTML
     assert "[[7,'rgba(15,23,42,.9)'],[5,'#fff'],[2.5,color]]" in HTML
-    assert "Choose Continue from plan or Start from scratch before saving." in HTML
+    assert "Choose Accept visible matches or Start from scratch before saving." in HTML
 
 
 def _write_roi_queue(path: Path, tile_ids: list[str]) -> None:
@@ -413,7 +417,7 @@ def test_annotation_http_requires_auth_token(tmp_path: Path) -> None:
         data.close()
 
 
-def test_l2_roi_plan_endpoint_uses_preview_generator_without_saving(tmp_path: Path) -> None:
+def test_l2_roi_similarity_endpoint_uses_seeds_without_saving(tmp_path: Path) -> None:
     iac_path = tmp_path / "tiles.iac"
     state_path = tmp_path / "annotations.json"
     _write_iac(iac_path)
@@ -423,8 +427,10 @@ def test_l2_roi_plan_endpoint_uses_preview_generator_without_saving(tmp_path: Pa
         def __init__(self) -> None:
             self.tile_bytes = b""
 
-        def generate(self, tile_bytes: bytes) -> dict:
+        def generate_similar(self, tile_bytes: bytes, *, attribute: str, seeds: list) -> dict:
             self.tile_bytes = tile_bytes
+            assert attribute == ROI_L2_PROTOTYPES[0]
+            assert seeds == [[0.4, 0.6]]
             return {
                 "version": 1,
                 "suggestions": [{
@@ -436,7 +442,7 @@ def test_l2_roi_plan_endpoint_uses_preview_generator_without_saving(tmp_path: Pa
                         "point": [0.5, 0.5],
                     },
                 }],
-                "summary": {"suggestion_count": 1, "counts": {ROI_L2_PROTOTYPES[0]: 1}},
+                "summary": {"suggestion_count": 1, "seed_count": 1},
             }
 
     generator = FakePlanGenerator()
@@ -451,10 +457,21 @@ def test_l2_roi_plan_endpoint_uses_preview_generator_without_saving(tmp_path: Pa
     thread.start()
     url = (
         f"http://127.0.0.1:{server.server_address[1]}"
-        "/api/roi-plan?token=secret&mode=l2&package=0&row=0"
+        "/api/roi-similar?token=secret&mode=l2"
+    )
+    request = Request(
+        url,
+        data=json.dumps({
+            "package": 0,
+            "row": 0,
+            "attribute": ROI_L2_PROTOTYPES[0],
+            "seeds": [[0.4, 0.6]],
+        }).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
     try:
-        with urlopen(url, timeout=5) as response:
+        with urlopen(request, timeout=5) as response:
             payload = json.load(response)
         assert payload["summary"]["suggestion_count"] == 1
         assert generator.tile_bytes.startswith(b"\x89PNG")

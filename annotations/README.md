@@ -56,12 +56,14 @@ Random navigation estimates tissue coverage from downsampled RGB values and excl
 30% tissue without recording a human skip. Override the threshold with
 `--min-tissue-fraction`, or set it to `0` to disable automatic filtering.
 
-In L2 mode, **Preview suggested plan** runs the configured release classifier once, derives
-class-specific spatial evidence by backpropagating through its feature readout, and combines that
-evidence with H&E hematoxylin peaks for cell-center proposals. High-contrast outlined preview marks are never written
-to the annotation state. **Continue from plan** converts them to ordinary editable ROI marks;
-**Start from scratch** discards the preview and clears the current tile. Override the default release
-assets with `--roi-plan-config`, `--roi-plan-checkpoint`, and `--roi-plan-device`.
+In L2 mode, select one class and add one to three reliable point or circle marks as local seeds.
+**Find similar marks** compares same-tile image patches with those seeds using spatial student tokens
+and local stain/color statistics. The similarity slider controls the visible relative matches;
+high-contrast outlined preview marks are never written to the annotation state. **Accept visible
+matches** converts only the current visible subset to ordinary editable ROI points; **Start from
+scratch** discards the preview and clears the current tile. This is local appearance propagation, not
+semantic inference from the global L2 classifier. Override the feature backbone assets with
+`--roi-plan-config`, `--roi-plan-checkpoint`, and `--roi-plan-device`.
 
 
 

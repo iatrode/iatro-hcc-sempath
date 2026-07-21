@@ -4,8 +4,9 @@ import numpy as np
 from PIL import Image
 
 from hcc_sempath.modeling.roi_plan import (
-    _rank_nucleus_points,
-    _saliency_regions,
+    _local_color_descriptor,
+    _rank_similar_centers,
+    _relative_scores,
     detect_hematoxylin_centers,
 )
 
@@ -24,18 +25,23 @@ def test_hematoxylin_detector_finds_dark_nucleus_like_centers() -> None:
     assert any(abs(item["x"] - 72 / 96) < 0.05 and abs(item["y"] - 67 / 96) < 0.05 for item in centers)
 
 
-def test_feature_saliency_ranks_nuclei_and_spatial_regions() -> None:
-    saliency = np.zeros((16, 16), dtype=np.float32)
-    saliency[4, 5] = 1.0
-    saliency[12, 13] = 0.8
-    candidates = [
-        {"x": 5.5 / 16, "y": 4.5 / 16, "stain": 0.8},
-        {"x": 1.5 / 16, "y": 1.5 / 16, "stain": 0.9},
-    ]
+def test_local_similarity_ranks_centers_and_excludes_seed_neighbors() -> None:
+    centers = [(0.10, 0.10), (0.50, 0.50), (0.80, 0.80), (0.82, 0.82)]
+    scores = _relative_scores(np.asarray([0.2, 0.9, 0.7, 0.6], dtype=np.float32))
 
-    points = _rank_nucleus_points(candidates, saliency, limit=1, stain_weight=0.25)
-    regions = _saliency_regions(saliency, limit=2)
+    ranked = _rank_similar_centers(centers, scores, [(0.49, 0.49)], limit=3)
 
-    assert points[0]["x"] == candidates[0]["x"]
-    assert len(regions) == 2
-    assert regions[0]["confidence"] == 1.0
+    assert ranked[0][:2] == (0.80, 0.80)
+    assert all(abs(x - 0.50) > 0.02 or abs(y - 0.50) > 0.02 for x, y, _ in ranked)
+    assert ranked[0][2] == 1.0
+
+
+def test_local_color_descriptor_changes_with_patch_stain() -> None:
+    image = np.full((64, 64, 3), 230, dtype=np.float32)
+    image[8:25, 8:25] = [45, 30, 80]
+
+    dark = _local_color_descriptor(image, 16 / 64, 16 / 64)
+    pale = _local_color_descriptor(image, 48 / 64, 48 / 64)
+
+    assert dark.shape == pale.shape == (14,)
+    assert not np.allclose(dark, pale)
