@@ -2,76 +2,36 @@ from __future__ import annotations
 
 import io
 import threading
-from pathlib import Path
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 from PIL import Image
-from scipy.ndimage import label, maximum_filter
-
-from .models import load_hcc_sempath_release
+from scipy.ndimage import correlate, gaussian_filter, label, maximum_filter, uniform_filter
 
 
-def _auto_device() -> str:
-    if torch.backends.mps.is_available():
-        return "mps"
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
+_RGB_FROM_HED = np.asarray(
+    (
+        (0.650, 0.700, 0.290),
+        (0.070, 0.990, 0.110),
+        (0.270, 0.570, 0.780),
+    ),
+    dtype=np.float32,
+)
+_HED_FROM_RGB = np.linalg.inv(_RGB_FROM_HED).astype(np.float32)
+_NUCLEUS_MATCH_SIGMA = {
+    "hepatocellular-parenchyma-present": 2.0,
+    "inflammatory-cell-present": 0.0,
+}
 
 
-def _normalize_map(values: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float32)
-    low, high = np.quantile(values, [0.05, 0.95])
-    if high <= low + 1e-8:
-        low, high = float(values.min()), float(values.max())
-    if high <= low + 1e-8:
-        return np.zeros_like(values)
-    return np.clip((values - low) / (high - low), 0.0, 1.0)
+def _stain_channels(rgb: np.ndarray) -> np.ndarray:
+    """Separate H&E-like optical density into HED stain channels."""
+    scaled = np.clip((rgb.astype(np.float32) + 1.0) / 256.0, 1e-6, 1.0)
+    optical_density = -np.log(scaled)
+    return (optical_density @ _HED_FROM_RGB).astype(np.float32)
 
 
 def _hematoxylin_map(rgb: np.ndarray) -> np.ndarray:
-    optical_density = -np.log((rgb + 1.0) / 256.0)
-    return (
-        0.650 * optical_density[..., 0]
-        + 0.704 * optical_density[..., 1]
-        + 0.286 * optical_density[..., 2]
-    )
-
-
-def detect_hematoxylin_centers(image: Image.Image, *, max_candidates: int = 240) -> list[dict]:
-    """Return stain-derived nucleus centers without assigning a semantic class."""
-    rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
-    hematoxylin = _hematoxylin_map(rgb)
-    tissue = rgb.mean(axis=-1) < 245.0
-    if not tissue.any():
-        return []
-    threshold = float(np.quantile(hematoxylin[tissue], 0.96))
-    peaks = tissue & (hematoxylin >= threshold) & (hematoxylin == maximum_filter(hematoxylin, size=5))
-    ys, xs = np.nonzero(peaks)
-    if not len(xs):
-        return []
-    strengths = _normalize_map(hematoxylin)[ys, xs]
-    order = np.argsort(strengths)[::-1]
-    selected: list[dict] = []
-    min_distance_sq = 5.0**2
-    for index in order:
-        x, y = int(xs[index]), int(ys[index])
-        if any((x - item["pixel_x"]) ** 2 + (y - item["pixel_y"]) ** 2 < min_distance_sq for item in selected):
-            continue
-        selected.append(
-            {
-                "x": (x + 0.5) / rgb.shape[1],
-                "y": (y + 0.5) / rgb.shape[0],
-                "pixel_x": x,
-                "pixel_y": y,
-                "stain": float(strengths[index]),
-            }
-        )
-        if len(selected) >= max_candidates:
-            break
-    return selected
+    return _stain_channels(rgb)[..., 0]
 
 
 def _estimate_seed_spacing(
@@ -124,124 +84,199 @@ def _estimate_seed_spacing(
     return spacing_pixels / min(width, height), spacing_pixels
 
 
-def _local_color_descriptor(rgb: np.ndarray, x: float, y: float, *, radius: int = 8) -> np.ndarray:
-    height, width = rgb.shape[:2]
-    pixel_x = min(width - 1, max(0, int(x * width)))
-    pixel_y = min(height - 1, max(0, int(y * height)))
-    crop = rgb[
-        max(0, pixel_y - radius) : min(height, pixel_y + radius + 1),
-        max(0, pixel_x - radius) : min(width, pixel_x + radius + 1),
-    ]
-    scaled = crop / 255.0
-    optical_density = -np.log((crop + 1.0) / 256.0)
-    hematoxylin = (
-        0.650 * optical_density[..., 0]
-        + 0.704 * optical_density[..., 1]
-        + 0.286 * optical_density[..., 2]
-    )
-    return np.concatenate(
-        (
-            scaled.mean(axis=(0, 1)),
-            scaled.std(axis=(0, 1)),
-            np.quantile(scaled, 0.25, axis=(0, 1)),
-            np.quantile(scaled, 0.75, axis=(0, 1)),
-            np.asarray([hematoxylin.mean(), hematoxylin.std()]),
-        )
-    ).astype(np.float32)
-
-
-def _relative_scores(values: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float32)
-    median = float(np.median(values))
-    scale = float(np.median(np.abs(values - median))) * 1.4826
-    if scale <= 1e-6:
-        scale = float(values.std())
-    return (values - median) / max(scale, 1e-6)
-
-
-def _rank_similar_centers(
-    centers: list[tuple[float, float]],
-    scores: np.ndarray,
+def _estimate_seed_exclusion_distance(
+    image: Image.Image,
     seeds: list[tuple[float, float]],
     *,
-    limit: int = 120,
-    min_distance: float = 7 / 224,
-) -> list[tuple[float, float, float]]:
-    order = np.argsort(scores)[::-1]
-    selected: list[tuple[float, float]] = []
-    minimum_sq = min_distance**2
-    for index in order:
-        x, y = centers[int(index)]
-        if any((x - sx) ** 2 + (y - sy) ** 2 < minimum_sq for sx, sy in seeds):
+    fallback_pixels: float,
+) -> tuple[float, float]:
+    """Estimate a safe default from user-confirmed center-to-center distances."""
+    width, height = image.size
+    if len(seeds) < 2:
+        exclusion_pixels = float(fallback_pixels)
+    else:
+        points = np.asarray(
+            [(x * width, y * height) for x, y in seeds], dtype=np.float32
+        )
+        differences = points[:, None, :] - points[None, :, :]
+        distances = np.sqrt(np.sum(differences**2, axis=-1))
+        np.fill_diagonal(distances, np.inf)
+        nearest_distances = distances.min(axis=1)
+        # Half the typical nearest-neighbor distance stays below the spacing
+        # that the user has already judged to represent two separate cells.
+        exclusion_pixels = min(
+            0.5 * float(np.median(nearest_distances)),
+            float(fallback_pixels) * 1.25,
+        )
+    exclusion_pixels = float(np.clip(exclusion_pixels, 3.0, 40.0))
+    return exclusion_pixels / min(width, height), exclusion_pixels
+
+
+def _image_matching_channels(rgb: np.ndarray) -> np.ndarray:
+    """Build stain-aware channels directly from pixels, without learned features."""
+    return _stain_channels(rgb)
+
+
+def _extract_centered_patch(
+    channels: np.ndarray,
+    x: float,
+    y: float,
+    *,
+    radius: int,
+) -> np.ndarray:
+    height, width = channels.shape[:2]
+    pixel_x = min(width - 1, max(0, int(round(x * (width - 1)))))
+    pixel_y = min(height - 1, max(0, int(round(y * (height - 1)))))
+    padded = np.pad(channels, ((radius, radius), (radius, radius), (0, 0)), mode="reflect")
+    return padded[
+        pixel_y : pixel_y + 2 * radius + 1,
+        pixel_x : pixel_x + 2 * radius + 1,
+    ]
+
+
+def _normalized_template_response(channels: np.ndarray, template: np.ndarray) -> np.ndarray:
+    """Return channel-wise zero-mean normalized cross-correlation."""
+    template = np.asarray(template, dtype=np.float32)
+    height, width, channel_count = template.shape
+    sample_count = float(height * width)
+    response_sum = np.zeros(channels.shape[:2], dtype=np.float32)
+    response_count = np.zeros_like(response_sum)
+    for channel in range(channel_count):
+        values = channels[..., channel]
+        centered_template = template[..., channel] - float(template[..., channel].mean())
+        template_norm = float(np.sqrt(np.sum(centered_template**2)))
+        if template_norm <= 1e-8:
             continue
-        if any((x - old_x) ** 2 + (y - old_y) ** 2 < minimum_sq for old_x, old_y in selected):
+        numerator = correlate(
+            values,
+            centered_template,
+            mode="reflect",
+        )
+        local_sum = uniform_filter(values, size=(height, width), mode="reflect") * sample_count
+        local_sum_sq = uniform_filter(values**2, size=(height, width), mode="reflect") * sample_count
+        local_variance_sum = np.maximum(local_sum_sq - local_sum**2 / sample_count, 0.0)
+        denominator = template_norm * np.sqrt(local_variance_sum)
+        valid = denominator > 1e-8
+        channel_response = np.divide(
+            numerator,
+            denominator,
+            out=np.zeros_like(numerator),
+            where=valid,
+        ).clip(-1.0, 1.0)
+        response_sum += channel_response
+        response_count += valid
+    return np.divide(
+        response_sum,
+        response_count,
+        out=np.full_like(response_sum, -1.0),
+        where=response_count > 0,
+    ).clip(-1.0, 1.0)
+
+
+def _seed_template_response(
+    channels: np.ndarray,
+    seed: tuple[float, float],
+    *,
+    radius: int,
+) -> np.ndarray:
+    """Match one seed independently, allowing the local pattern to rotate."""
+    template = _extract_centered_patch(channels, *seed, radius=radius)
+    responses = [
+        _normalized_template_response(channels, np.rot90(template, turns, axes=(0, 1)))
+        for turns in range(4)
+    ]
+    return np.maximum.reduce(responses)
+
+
+def _detect_nucleus_centers(
+    hematoxylin: np.ndarray,
+    *,
+    nucleus_spacing_pixels: float,
+    border: int,
+    limit: int = 360,
+) -> list[tuple[int, int]]:
+    """Return one stain-derived center for each nucleus-sized response peak."""
+    height, width = hematoxylin.shape
+    smoothed = gaussian_filter(hematoxylin, sigma=1.0)
+    window = max(3, int(round(nucleus_spacing_pixels * 0.75)))
+    if window % 2 == 0:
+        window += 1
+    threshold = float(np.quantile(smoothed, 0.55))
+    local_maxima = (
+        (smoothed >= threshold)
+        & (smoothed >= maximum_filter(smoothed, size=window, mode="nearest") - 1e-7)
+    )
+    components, component_count = label(local_maxima)
+    candidates: list[tuple[int, int, float]] = []
+    for component_id in range(1, component_count + 1):
+        ys, xs = np.nonzero(components == component_id)
+        if not len(xs):
             continue
-        selected.append((x, y))
+        values = smoothed[ys, xs]
+        best = int(np.argmax(values))
+        pixel_x, pixel_y = int(xs[best]), int(ys[best])
+        if not border <= pixel_x < width - border or not border <= pixel_y < height - border:
+            continue
+        candidates.append((pixel_x, pixel_y, float(values[best])))
+    candidates.sort(key=lambda item: item[2], reverse=True)
+
+    minimum_distance_sq = max(3.0, nucleus_spacing_pixels * 0.65) ** 2
+    selected: list[tuple[int, int]] = []
+    for pixel_x, pixel_y, _strength in candidates:
+        if any(
+            (pixel_x - old_x) ** 2 + (pixel_y - old_y) ** 2 < minimum_distance_sq
+            for old_x, old_y in selected
+        ):
+            continue
+        selected.append((pixel_x, pixel_y))
         if len(selected) >= limit:
             break
-    denominator = max(1, len(selected) - 1)
-    return [
-        (x, y, 1.0 - rank / denominator)
-        for rank, (x, y) in enumerate(selected)
-    ]
+    return selected
+
+
+def _rank_nucleus_matches(
+    centers: list[tuple[int, int]],
+    response: np.ndarray,
+    *,
+    occupied: list[tuple[float, float]],
+    occupied_distance_pixels: float,
+    limit: int = 240,
+) -> list[tuple[float, float, float]]:
+    height, width = response.shape
+    occupied_pixels = [(x * width, y * height) for x, y in occupied]
+    occupied_distance_sq = max(2.0, occupied_distance_pixels) ** 2
+    ranked = sorted(
+        (
+            (pixel_x, pixel_y, float(response[pixel_y, pixel_x]))
+            for pixel_x, pixel_y in centers
+        ),
+        key=lambda item: item[2],
+        reverse=True,
+    )
+    selected: list[tuple[float, float, float]] = []
+    for pixel_x, pixel_y, score in ranked:
+        if any(
+            (pixel_x - known_x) ** 2 + (pixel_y - known_y) ** 2 < occupied_distance_sq
+            for known_x, known_y in occupied_pixels
+        ):
+            continue
+        selected.append(
+            (
+                (pixel_x + 0.5) / width,
+                (pixel_y + 0.5) / height,
+                float(np.clip(score, 0.0, 1.0)),
+            )
+        )
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 class RoiPlanGenerator:
-    """Find same-tile image centers similar to user-confirmed seed marks."""
+    """Find same-tile centers using only local image-template similarity."""
 
-    def __init__(
-        self,
-        config_path: str | Path,
-        checkpoint_path: str | Path,
-        *,
-        device: str = "auto",
-    ) -> None:
-        self.config_path = Path(config_path)
-        self.checkpoint_path = Path(checkpoint_path)
-        self.device = _auto_device() if device == "auto" else device
-        self._model = None
-        self._config: dict | None = None
+    def __init__(self) -> None:
         self._lock = threading.Lock()
-
-    def _load(self):
-        if self._model is None:
-            self._model, self._config = load_hcc_sempath_release(
-                self.config_path, self.checkpoint_path, self.device
-            )
-        return self._model, self._config
-
-    def _patch_tokens(self, image: Image.Image) -> tuple[np.ndarray, tuple[int, int]]:
-        model, config = self._load()
-        preprocessing = config["preprocessing"]
-        rgb = np.asarray(image.convert("RGB").resize((224, 224)), dtype=np.float32) / 255.0
-        tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        mean = torch.tensor(preprocessing["mean"], device=self.device).view(1, 3, 1, 1)
-        std = torch.tensor(preprocessing["std"], device=self.device).view(1, 3, 1, 1)
-        with torch.no_grad():
-            features = model.encoder.backbone.forward_features((tensor - mean) / std)
-        prefix = int(getattr(model.encoder.backbone, "num_prefix_tokens", 1))
-        tokens = F.normalize(features[0, prefix:].float(), dim=-1).cpu().numpy()
-        grid = tuple(int(value) for value in model.encoder.backbone.patch_embed.grid_size)
-        return tokens, grid
-
-    @staticmethod
-    def _token_at(tokens: np.ndarray, grid: tuple[int, int], x: float, y: float) -> np.ndarray:
-        grid_y = min(grid[0] - 1, max(0, int(y * grid[0])))
-        grid_x = min(grid[1] - 1, max(0, int(x * grid[1])))
-        return tokens[grid_y * grid[1] + grid_x]
-
-    @staticmethod
-    def _candidate_centers(image: Image.Image) -> list[tuple[float, float]]:
-        width, height = image.size
-        centers = [(item["x"], item["y"]) for item in detect_hematoxylin_centers(image)]
-        # A dense fallback retains pigment, hemorrhage, and vacuolation patterns
-        # that are not reliably represented by hematoxylin maxima.
-        centers.extend(
-            ((x + 0.5) / width, (y + 0.5) / height)
-            for y in range(4, height, 7)
-            for x in range(4, width, 7)
-        )
-        return centers
 
     def generate_similar(
         self,
@@ -264,42 +299,62 @@ class RoiPlanGenerator:
         ]
         if any(not 0 <= value <= 1 for point in normalized_occupied for value in point):
             raise ValueError("occupied centers must use normalized coordinates")
+        if attribute not in _NUCLEUS_MATCH_SIGMA:
+            raise ValueError(
+                "image-only nucleus matching currently supports only "
+                "hepatocellular-parenchyma-present and inflammatory-cell-present"
+            )
 
         with self._lock:
-            tokens, grid = self._patch_tokens(image)
             rgb = np.asarray(image, dtype=np.float32)
-            centers = self._candidate_centers(image)
-            seed_tokens = np.stack(
-                [self._token_at(tokens, grid, x, y) for x, y in normalized_seeds]
-            )
-            token_centroid = seed_tokens.mean(axis=0)
-            token_centroid /= max(float(np.linalg.norm(token_centroid)), 1e-8)
-            seed_colors = np.stack(
-                [_local_color_descriptor(rgb, x, y) for x, y in normalized_seeds]
-            )
-            color_centroid = seed_colors.mean(axis=0)
-
-            candidate_tokens = np.stack(
-                [self._token_at(tokens, grid, x, y) for x, y in centers]
-            )
-            candidate_colors = np.stack(
-                [_local_color_descriptor(rgb, x, y) for x, y in centers]
-            )
-            color_scale = candidate_colors.std(axis=0) + 1e-4
-            token_similarity = candidate_tokens @ token_centroid
-            color_similarity = -np.mean(
-                ((candidate_colors - color_centroid) / color_scale) ** 2,
-                axis=1,
-            )
-            combined = _relative_scores(token_similarity) + _relative_scores(color_similarity)
-            minimum_spacing, minimum_spacing_pixels = _estimate_seed_spacing(
+            channels = _image_matching_channels(rgb)
+            _morphology_spacing, morphology_spacing_pixels = _estimate_seed_spacing(
                 image, normalized_seeds
             )
-            ranked = _rank_similar_centers(
+            minimum_spacing, minimum_spacing_pixels = _estimate_seed_exclusion_distance(
+                image,
+                normalized_seeds,
+                fallback_pixels=morphology_spacing_pixels,
+            )
+            template_radius_pixels = int(
+                np.clip(round(morphology_spacing_pixels * 0.75), 4, 10)
+            )
+            match_sigma = _NUCLEUS_MATCH_SIGMA[attribute]
+            matching_map = channels[..., 0]
+            if match_sigma > 0:
+                matching_map = gaussian_filter(matching_map, sigma=match_sigma)
+            seed_responses = [
+                maximum_filter(
+                    _seed_template_response(
+                        matching_map[..., None],
+                        seed,
+                        radius=template_radius_pixels,
+                    ),
+                    size=5,
+                    mode="nearest",
+                )
+                for seed in normalized_seeds
+            ]
+            # Each seed remains an independent example. Requiring agreement from
+            # up to three seeds suppresses accidental one-template background hits
+            # without averaging the seed images into a synthetic morphology.
+            consensus_seed_count = min(3, len(seed_responses))
+            response_stack = np.stack(seed_responses, axis=0)
+            response = np.sort(response_stack, axis=0)[-consensus_seed_count:].mean(axis=0)
+            # Nucleus centers may be a couple of pixels away from the user's
+            # exact click. Keep the similarity local while tolerating that offset.
+            nucleus_spacing_pixels = max(5.0, morphology_spacing_pixels)
+            centers = _detect_nucleus_centers(
+                channels[..., 0],
+                nucleus_spacing_pixels=nucleus_spacing_pixels,
+                border=template_radius_pixels,
+            )
+            ranked = _rank_nucleus_matches(
                 centers,
-                combined,
-                [*normalized_seeds, *normalized_occupied],
-                min_distance=minimum_spacing,
+                response,
+                occupied=[*normalized_seeds, *normalized_occupied],
+                occupied_distance_pixels=max(2.0, nucleus_spacing_pixels * 0.5),
+                limit=240,
             )
 
         suggestions = [
@@ -318,10 +373,20 @@ class RoiPlanGenerator:
             }
             for x, y, confidence in ranked
         ]
+        ranked_scores = [confidence for _x, _y, confidence in ranked]
+        if ranked_scores:
+            preview_target = max(1, min(80, 4 * len(normalized_seeds)))
+            recommended_index = min(preview_target - 1, len(ranked_scores) - 1)
+            recommended_similarity = float(
+                np.clip(ranked_scores[recommended_index], 0.20, 0.85)
+            )
+            maximum_similarity = float(ranked_scores[0])
+        else:
+            recommended_similarity = 0.20
+            maximum_similarity = 0.0
         return {
             "version": 1,
-            "method": "same-tile-local-seed-centroid-v1",
-            "device": self.device,
+            "method": "same-tile-nucleus-image-match-v4",
             "suggestions": suggestions,
             "summary": {
                 "attribute": attribute,
@@ -329,7 +394,15 @@ class RoiPlanGenerator:
                 "occupied_count": len(normalized_occupied),
                 "candidate_count": len(centers),
                 "suggestion_count": len(suggestions),
+                "maximum_similarity": maximum_similarity,
+                "recommended_similarity": recommended_similarity,
+                "preview_target": max(1, min(80, 4 * len(normalized_seeds))),
                 "minimum_spacing": minimum_spacing,
                 "minimum_spacing_pixels": minimum_spacing_pixels,
+                "morphology_spacing_pixels": morphology_spacing_pixels,
+                "template_radius_pixels": template_radius_pixels,
+                "peak_spacing_pixels": nucleus_spacing_pixels,
+                "consensus_seed_count": consensus_seed_count,
+                "match_sigma": match_sigma,
             },
         }

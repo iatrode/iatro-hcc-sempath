@@ -157,6 +157,9 @@ def test_annotation_cli_always_requires_l1_and_l2_roi_workspaces() -> None:
     )
     assert not any("--state" in action.option_strings for action in parser._actions)
     assert not any("--roi-candidate-manifest" in action.option_strings for action in parser._actions)
+    assert not any("--roi-plan-config" in action.option_strings for action in parser._actions)
+    assert not any("--roi-plan-checkpoint" in action.option_strings for action in parser._actions)
+    assert not any("--roi-plan-device" in action.option_strings for action in parser._actions)
     with pytest.raises(SystemExit):
         parser.parse_args(["--input", "tiles", "--l1-state", "l1.json"])
 
@@ -184,6 +187,9 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "overflow-x:auto" in HTML
     assert 'class="imageControlRow tileControlRow"' in HTML
     assert 'class="primaryWorkspace"' in HTML
+    assert ".tileViewport,.tileStage,.tile,.roiCanvas{-webkit-user-select:none;user-select:none" in HTML
+    assert "-webkit-user-drag:none" in HTML
+    assert '<img id="tile" class="tile" draggable="false">' in HTML
     assert "grid-template-columns:minmax(420px,680px) minmax(300px,1fr)" in HTML
     assert ".annotationControls{grid-column:2;grid-row:1/span 2" in HTML
     assert "@media(max-width:1200px)" in HTML
@@ -203,11 +209,31 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "ev.key.toLowerCase()==='y'" in HTML
     assert 'id="brushWidth"' in HTML
     assert 'type="range"' in HTML
-    assert 'id="brushDot"' in HTML
+    assert 'id="brushDot"' not in HTML
     assert 'max="0.500"' in HTML
-    assert "updateBrushDot()" in HTML
+    assert "updateBrushWidth()" in HTML
     assert "brushWidth()" in HTML
     assert "if(ROI_MODE)setBrushWidth(brushWidth()" in HTML
+    assert "function selectRoiTool(tool,remember=true)" in HTML
+    assert 'data-roi-tool="eraser">Eraser' in HTML
+    assert "['point','brush','eraser','circle']" in HTML
+    assert "roiToolByClass[roiAttribute]=roiTool" in HTML
+    assert "selectRoiTool(roiToolByClass[name]||'point',false)" in HTML
+    assert "Brush / eraser width" in HTML
+    assert "function densifyPath(points,maxStep)" in HTML
+    assert "function eraseBrushGeometry(item,center,eraserRadius)" in HTML
+    assert "function eraseCurrentClassAt(center,eraserRadius)" in HTML
+    assert "function eraseCurrentClassAlong(start,end,eraserRadius)" in HTML
+    assert "function setupEraser()" in HTML
+    assert "function setupTileUndo()" in HTML
+    assert "getElementById('tileStage').addEventListener('contextmenu'" in HTML
+    assert "ev.preventDefault();ev.stopPropagation();undoRoi()" in HTML
+    assert "if(ev.button!==0)return" in HTML
+    assert "if(ev.button!==0||roiTool!=='eraser')return" in HTML
+    assert "setupEraser();setupRoi();setupTileUndo()" in HTML
+    assert "item.attribute!==roiAttribute" in HTML
+    assert "pushUndo();roiPlan=null;roiDrawing={tool:'eraser'" in HTML
+    assert "syncPositiveLabels();renderRoi()" in HTML
     assert "wheelZoom:false,doubleClickReset:false,onScale:syncOverviewZoom" in HTML
     assert "overviewZoom.addEventListener('input'" in HTML
     assert "roiCursor" in HTML
@@ -218,6 +244,12 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert 'id="roiPlanAccept"' in HTML
     assert 'id="roiPlanRestart"' in HTML
     assert 'id="roiSimilarity"' in HTML
+    assert 'min="0.20" max="0.99" step="0.01" value="0.70"' in HTML
+    assert "const NUCLEUS_MATCH_CLASSES=new Set" in HTML
+    assert "Image-only nucleus matching is not validated for this ROI class." in HTML
+    assert "setRoiSimilarityThreshold(result.summary?.recommended_similarity" in HTML
+    assert 'id="roiExclusion"' in HTML
+    assert 'min="3" max="40" step="1" value="7"' in HTML
     assert "async function generateRoiPlan()" in HTML
     assert "function acceptRoiPlan()" in HTML
     assert "function restartRoiFromScratch()" in HTML
@@ -225,13 +257,26 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "function occupiedRoiCenters()" in HTML
     assert "occupied:occupiedRoiCenters()" in HTML
     assert "function visiblePlannedSuggestions()" in HTML
+    assert "target=roiPlan?.summary?.preview_target??suggestions.length" in HTML
+    assert "if(selected.length>=target)break" in HTML
+    assert "function roiExclusionDistance()" in HTML
+    assert "function plannedCenter(item)" in HTML
+    assert "roiExclusionOverrides[roiAttribute]" in HTML
+    assert "occupied.some(point=>" in HTML
+    assert "selectedCenters.some(point=>" in HTML
+    assert "roiExclusion').addEventListener('input'" in HTML
     assert "Preview marks are not saved yet." in HTML
+    assert "Matching each selected seed as an independent local image template." in HTML
+    assert "Nucleus-image preview" in HTML
     assert "minimum_spacing_pixels" in HTML
     assert "'/api/roi-similar'" in HTML
     assert "function drawPlannedPoint(x,g,color)" in HTML
     assert "function drawPointMark(x,point,color,alpha=1)" in HTML
-    assert "drawPointMark(x,g.point,color)" in HTML
     assert "[[3.4,'#000'],[2.3,'#fff'],[1.2,color]]" in HTML
+    assert "x.globalAlpha=.5" in HTML
+    assert "x.moveTo(px-3.5,py);x.lineTo(px+3.5,py)" in HTML
+    assert "x.moveTo(px,py-3.5);x.lineTo(px,py+3.5)" in HTML
+    assert "[[2.5,'rgba(15,23,42,.9)'],[1.5,'#fff'],[.7,color]]" in HTML
     assert "function drawPlannedCircle(x,g,color)" in HTML
     assert "[[7,'rgba(15,23,42,.9)'],[5,'#fff'],[2.5,color]]" in HTML
     assert "Choose Accept visible matches or Start from scratch before saving." in HTML
