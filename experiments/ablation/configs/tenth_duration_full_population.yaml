@@ -1,0 +1,23 @@
+# Shared V2 ablation overlay.
+#
+# "One-tenth" refers to training duration, not cohort sampling. Every condition
+# consumes the full population stream and the complete fixed L1/L2 expert union
+# so the gradient comparison is not confounded by a changed cohort.
+
+data:
+  train_tile_fraction: 1.0
+  val_tile_fraction: 1.0
+
+loss:
+  prototype_filter_start_step: 200
+  prototype_filter_ramp_steps: 100
+  zhcc_response_start_step: 200
+  zhcc_response_ramp_steps: 100
+  spatial_ramp_steps: 100
+  spatial_backbone_start_step: 100
+
+train:
+  epochs: 10
+  warmup_epochs: 1
+  max_val_batches: 256
+  max_eval_batches: 64

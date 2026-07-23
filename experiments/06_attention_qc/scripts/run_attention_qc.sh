@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "V1 historical workflow only: tile_attention_review.py was removed from the active HCC-SemPath V2 route." >&2
+exit 2
+
 export PYTHONPATH="${PYTHONPATH:-}:src"
 
 mkdir -p experiments/06_attention_qc/results experiments/06_attention_qc/logs experiments/06_attention_qc/reports

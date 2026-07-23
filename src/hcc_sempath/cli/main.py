@@ -11,7 +11,7 @@ COMMANDS: dict[str, tuple[str, str]] = {
     "view-iac": ("hcc_sempath.cli.view_iac", "Open a local browser UI for inspecting an IAC package."),
     "annotate-prototypes": ("hcc_sempath.cli.annotate_prototypes", "Open browser UI for L1/L2 prototype tile annotation."),
     "build-priority-list": ("hcc_sempath.cli.build_priority_list", "Build a shared mutable L1/L2 tile-priority manifest."),
-    "build-roi-queue": ("hcc_sempath.cli.build_roi_queue", "Build a quota-aware V2 ROI candidate pool."),
+    "build-roi-queue": ("hcc_sempath.cli.build_roi_queue", "Build an old-L2 navigation-hint pool for V2 ROI annotation."),
     "build-teacher-cache": ("hcc_sempath.teacher.cache", "Run a teacher model and write <teacher-name>.features.iac directly."),
     "build-prototypes": ("hcc_sempath.modeling.build_prototypes", "Build semantic prototypes from concept feature arrays."),
     "build-train-manifest": ("hcc_sempath.training.manifest", "Build a training manifest from per-WSI IAC packages."),

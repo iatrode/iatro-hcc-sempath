@@ -10,23 +10,16 @@ import time
 import numpy as np
 import torch
 
-from ..modeling.prototypes import PrototypeRegistry
-from .adjudication import attribute_adjudicated_level2_target, prototype_adjudicated_teacher_weights
+from ..modeling.models import bounded_logits
 from .losses import multi_teacher_distillation_loss
 from .metrics import evaluate_teacher_outputs
-from .prototype_images import (
-    PrototypeImageBank,
-    build_student_prototype_registry,
-    collect_student_prototype_image_embeddings,
+from .pamtd import (
+    prototype_adjudicated_teacher_target,
+    prototype_response_distillation_loss,
 )
+from .prototype_labels import DEFAULT_L1_CLASSES
+from .spatial_losses import l1_classification_loss, spatial_morphometry_loss
 from .utils import append_csv, ensure_dir, write_json
-from .zhcc_losses import (
-    global_attribute_logits,
-    roi_guided_level2_loss,
-    teacher_semantic_response_target,
-    zhcc_response_distillation_loss,
-)
-from .zhcc_metrics import evaluate_zhcc_prototypes
 
 
 GRADIENT_DIAGNOSTIC_INTERVAL_STEPS = 1000
@@ -39,48 +32,49 @@ EARLY_STOP_PER_TEACHER_GAIN = 0.003
 
 def _objective_gradient_diagnostics(
     global_objective: torch.Tensor,
-    roi_objective: torch.Tensor,
+    spatial_objective: torch.Tensor,
     shared_parameters: tuple[torch.Tensor, ...],
 ) -> dict[str, float]:
-    """Measure objective interaction on the final shared Transformer block."""
+    """Measure global/spatial interaction on the final shared Transformer block."""
+
     global_grads = torch.autograd.grad(
         global_objective,
         shared_parameters,
         retain_graph=True,
         allow_unused=True,
     )
-    roi_grads = torch.autograd.grad(
-        roi_objective,
+    spatial_grads = torch.autograd.grad(
+        spatial_objective,
         shared_parameters,
         retain_graph=True,
         allow_unused=True,
     )
     device = shared_parameters[0].device
     global_sq = torch.zeros((), device=device)
-    roi_sq = torch.zeros((), device=device)
+    spatial_sq = torch.zeros((), device=device)
     dot = torch.zeros((), device=device)
-    for global_grad, roi_grad in zip(global_grads, roi_grads, strict=True):
+    for global_grad, spatial_grad in zip(global_grads, spatial_grads, strict=True):
         if global_grad is not None:
             global_grad = global_grad.detach().float()
             global_sq = global_sq + global_grad.square().sum()
-        if roi_grad is not None:
-            roi_grad = roi_grad.detach().float()
-            roi_sq = roi_sq + roi_grad.square().sum()
-        if global_grad is not None and roi_grad is not None:
-            dot = dot + (global_grad * roi_grad).sum()
+        if spatial_grad is not None:
+            spatial_grad = spatial_grad.detach().float()
+            spatial_sq = spatial_sq + spatial_grad.square().sum()
+        if global_grad is not None and spatial_grad is not None:
+            dot = dot + (global_grad * spatial_grad).sum()
     global_norm = global_sq.sqrt()
-    roi_norm = roi_sq.sqrt()
-    if not torch.isfinite(global_norm) or not torch.isfinite(roi_norm):
+    spatial_norm = spatial_sq.sqrt()
+    if not torch.isfinite(global_norm) or not torch.isfinite(spatial_norm):
         raise FloatingPointError("non-finite objective gradient diagnostic")
-    denominator = global_norm + roi_norm
+    denominator = global_norm + spatial_norm
     cosine = torch.tensor(0.0, device=device)
-    if global_norm > 0 and roi_norm > 0:
-        cosine = dot / (global_norm * roi_norm)
+    if global_norm > 0 and spatial_norm > 0:
+        cosine = dot / (global_norm * spatial_norm)
     return {
         "gradient_global_norm": float(global_norm.cpu()),
-        "gradient_roi_norm": float(roi_norm.cpu()),
-        "gradient_roi_share": float((roi_norm / denominator.clamp_min(1e-12)).cpu()),
-        "gradient_roi_global_cosine": float(cosine.cpu()),
+        "gradient_spatial_norm": float(spatial_norm.cpu()),
+        "gradient_spatial_share": float((spatial_norm / denominator.clamp_min(1e-12)).cpu()),
+        "gradient_spatial_global_cosine": float(cosine.cpu()),
     }
 
 
@@ -91,7 +85,10 @@ def _should_stop_for_alignment(history: list[dict[str, float]]) -> bool:
         return False
     current = history[-1]
     baseline_epoch = int(current["epoch"]) - EARLY_STOP_WINDOW_EPOCHS
-    baseline = next((row for row in reversed(history[:-1]) if int(row["epoch"]) <= baseline_epoch), None)
+    baseline = next(
+        (row for row in reversed(history[:-1]) if int(row["epoch"]) <= baseline_epoch),
+        None,
+    )
     if baseline is None:
         return False
     if current["teacher_alignment_score"] - baseline["teacher_alignment_score"] >= EARLY_STOP_ALIGNMENT_GAIN:
@@ -103,11 +100,72 @@ def _should_stop_for_alignment(history: list[dict[str, float]]) -> bool:
     )
 
 
+def _set_loader_epoch(loader, epoch: int) -> None:
+    """Select the deterministic data order for one training epoch."""
+
+    setter = getattr(loader, "set_epoch", None)
+    if callable(setter):
+        setter(int(epoch))
+        return
+    for name in ("batch_sampler", "sampler"):
+        candidate = getattr(loader, name, None)
+        setter = getattr(candidate, "set_epoch", None)
+        if callable(setter):
+            setter(int(epoch))
+            return
+
+
+def _optimizer_step(
+    *,
+    loss: torch.Tensor,
+    model,
+    optimizer,
+    scaler,
+    max_grad_norm: float,
+) -> bool:
+    """Backpropagate once and report whether the optimizer actually stepped."""
+
+    if loss.numel() != 1 or not bool(torch.isfinite(loss.detach())):
+        raise FloatingPointError(
+            "training loss must be one finite scalar before backward"
+        )
+    optimizer.zero_grad(set_to_none=True)
+    if scaler is not None and scaler.is_enabled():
+        scale_before = float(scaler.get_scale())
+        scaler.scale(loss).backward()
+        if max_grad_norm > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_grad_norm,
+            )
+        scaler.step(optimizer)
+        scaler.update()
+        return float(scaler.get_scale()) >= scale_before
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(
+        model.parameters(),
+        max_grad_norm if max_grad_norm > 0 else float("inf"),
+        error_if_nonfinite=True,
+    )
+    optimizer.step()
+    return True
+
+
 def _move_teachers(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
-    return {
-        name: value.to(device, non_blocking=device.type == "cuda")
-        for name, value in batch["teacher_features"].items()
-    }
+    result: dict[str, torch.Tensor] = {}
+    for name, value in batch["teacher_features"].items():
+        feature = value.to(
+            device,
+            non_blocking=device.type == "cuda",
+        )
+        if not bool(torch.isfinite(feature).all()):
+            raise FloatingPointError(
+                f"teacher cache contains non-finite values: teacher={name}"
+            )
+        result[name] = feature
+    return result
 
 
 def _prepare_images(batch: dict, cfg: dict, device: torch.device) -> torch.Tensor:
@@ -115,30 +173,41 @@ def _prepare_images(batch: dict, cfg: dict, device: torch.device) -> torch.Tenso
     if not bool(batch.get("images_uint8", False)):
         return images
     if bool(batch.get("images_hwc", False)):
-        # Scatter loader delivers pinned HWC uint8; do the NHWC->NCHW permute on
-        # the GPU (cheap) rather than spending CPU on it during collation.
         images = images.permute(0, 3, 1, 2)
     images = images.to(torch.float32).div_(255.0)
-    mean = torch.tensor(cfg["data"].get("mean", [0.0, 0.0, 0.0]), dtype=torch.float32, device=device).view(1, 3, 1, 1)
-    std = torch.tensor(cfg["data"].get("std", [1.0, 1.0, 1.0]), dtype=torch.float32, device=device).view(1, 3, 1, 1)
+    mean = torch.tensor(
+        cfg["data"].get("mean", [0.0, 0.0, 0.0]),
+        dtype=torch.float32,
+        device=device,
+    ).view(1, 3, 1, 1)
+    std = torch.tensor(
+        cfg["data"].get("std", [1.0, 1.0, 1.0]),
+        dtype=torch.float32,
+        device=device,
+    ).view(1, 3, 1, 1)
     return images.sub_(mean).div_(std)
 
 
-def _move_prototype_batch(batch: dict, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return (
-        batch.get("prototype_mask", torch.zeros(len(batch["tile_id"]), dtype=torch.bool)).to(device),
-        batch.get("prototype_level1", torch.full((len(batch["tile_id"]),), -1, dtype=torch.long)).to(device),
-        batch.get("prototype_level2", torch.zeros((len(batch["tile_id"]), 0), dtype=torch.float32)).to(device),
-    )
-
-
-def _move_roi_batch(batch: dict, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _move_l1_batch(
+    batch: dict,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
     size = len(batch["tile_id"])
     return (
-        batch.get("roi_target", torch.zeros((size, 0, 0, 0))).to(device),
-        batch.get("roi_valid", torch.zeros((size, 0, 0, 0), dtype=torch.bool)).to(device),
-        batch.get("roi_consistency", torch.zeros((size, 0), dtype=torch.bool)).to(device),
+        batch.get("prototype_mask", torch.zeros(size, dtype=torch.bool)).to(device),
+        batch.get("prototype_level1", torch.full((size,), -1, dtype=torch.long)).to(device),
     )
+
+
+def _move_spatial_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
+    keys = (
+        "l2_point_centers",
+        "l2_brush_bag_ids",
+        "l2_area_positive",
+        "l2_explicit_negative",
+        "l2_implicit_negative",
+    )
+    return {key: batch[key].to(device, non_blocking=device.type == "cuda") for key in keys}
 
 
 def _amp_enabled(device: torch.device, cfg: dict, train: bool) -> bool:
@@ -151,8 +220,8 @@ def _linear_warmup(base_value: float, epoch: int, warmup_epochs: int) -> float:
     return base_value * min(1.0, max(0.0, epoch / warmup_epochs))
 
 
-def _step_ramp(target: float, global_step: int, start_step: int | None, ramp_steps: int) -> float:
-    if start_step is None or global_step < start_step:
+def _step_ramp(target: float, global_step: int, start_step: int, ramp_steps: int) -> float:
+    if global_step < start_step:
         return 0.0
     if ramp_steps <= 0:
         return float(target)
@@ -160,126 +229,174 @@ def _step_ramp(target: float, global_step: int, start_step: int | None, ramp_ste
     return float(target) * max(0.0, min(1.0, progress))
 
 
-def default_schedule_state() -> dict:
+def scheduled_loss_config(
+    cfg: dict,
+    *,
+    epoch: int,
+    global_step: int,
+    l2_supervised_step: int | None = None,
+) -> dict[str, float | dict | bool]:
+    """Resolve the active L1-classification and L2-spatial objective schedule."""
+
+    loss_cfg = cfg["loss"]
+    semantic_temperature = float(loss_cfg.get("semantic_temperature", 1.0))
+    l1_start = int(loss_cfg.get("l1_start_step", 0))
+    spatial_start = int(loss_cfg.get("spatial_start_step", 0))
+    spatial_ramp = int(loss_cfg.get("spatial_ramp_steps", 1000))
+    spatial_backbone_start = int(
+        loss_cfg.get("spatial_backbone_start_step", spatial_start + spatial_ramp)
+    )
+    spatial_schedule_step = (
+        int(global_step)
+        if l2_supervised_step is None
+        else int(l2_supervised_step)
+    )
+    filter_start = int(loss_cfg.get("prototype_filter_start_step", 0))
+    filter_ramp = int(loss_cfg.get("prototype_filter_ramp_steps", 1000))
     return {
-        "teacher_prior_loss_ema": None,
-        "teacher_prior_prev_window_ema": None,
-        "teacher_prior_window_loss_sum": 0.0,
-        "teacher_prior_window_count": 0,
-        "teacher_prior_relative_improvement": None,
-        "teacher_prior_plateau_count": 0,
-        "prototype_start_step": None,
-        "filter_start_step": None,
+        "teacher_weights": loss_cfg.get("teacher_weights"),
+        "relation_weight": float(loss_cfg.get("relation_weight", 0.0)),
+        "semantic_weight": _linear_warmup(
+            float(loss_cfg.get("semantic_weight", 0.0)),
+            epoch,
+            int(loss_cfg.get("semantic_warmup_epochs", 0)),
+        ),
+        "semantic_temperature": semantic_temperature,
+        "primary_temperature": float(
+            loss_cfg.get("primary_temperature", semantic_temperature)
+        ),
+        "pamtd_primary_temperature": float(
+            loss_cfg.get("pamtd_primary_temperature", 0.1)
+        ),
+        "feature_loss_type": str(loss_cfg.get("feature_loss_type", "cosine")),
+        "prototype_filter_weight": _step_ramp(
+            float(loss_cfg.get("prototype_filter_weight", 0.3)),
+            int(global_step),
+            filter_start,
+            filter_ramp,
+        ),
+        "prototype_filter_alpha_min": float(
+            loss_cfg.get("prototype_filter_alpha_min", 0.25)
+        ),
+        "prototype_consensus_weight": float(
+            loss_cfg.get("prototype_consensus_weight", 1.0)
+        ),
+        "prototype_label_weight": float(
+            loss_cfg.get("prototype_label_weight", 1.0)
+        ),
+        "prototype_student_weight": float(
+            loss_cfg.get("prototype_student_weight", 1.0)
+        ),
+        "prototype_momentum": float(
+            loss_cfg.get("prototype_momentum", 0.9)
+        ),
+        "prototype_updates_enabled": (
+            int(loss_cfg.get("prototype_update_until_step", -1)) < 0
+            or int(global_step)
+            < int(loss_cfg.get("prototype_update_until_step", -1))
+        ),
+        "zhcc_response_weight": _step_ramp(
+            float(loss_cfg.get("zhcc_response_weight", 0.1)),
+            int(global_step),
+            int(loss_cfg.get("zhcc_response_start_step", 0)),
+            int(loss_cfg.get("zhcc_response_ramp_steps", 1000)),
+        ),
+        "l2_global_temperature": float(
+            loss_cfg.get("l2_global_temperature", 0.1)
+        ),
+        "l1_weight": _step_ramp(
+            float(loss_cfg.get("l1_weight", 1.0)),
+            int(global_step),
+            l1_start,
+            int(loss_cfg.get("l1_ramp_steps", 0)),
+        ),
+        "spatial_weight": _step_ramp(
+            float(loss_cfg.get("spatial_weight", 0.1)),
+            spatial_schedule_step,
+            spatial_start,
+            spatial_ramp,
+        ),
+        "spatial_point_tolerance_cells": int(
+            loss_cfg.get("spatial_point_tolerance_cells", 1)
+        ),
+        "spatial_abundance_point_weight": float(
+            loss_cfg.get("spatial_abundance_point_weight", 0.5)
+        ),
+        "spatial_brush_weight": float(
+            loss_cfg.get("spatial_brush_weight", 1.0)
+        ),
+        "spatial_brush_top_fraction": float(
+            loss_cfg.get("spatial_brush_top_fraction", 0.25)
+        ),
+        "spatial_explicit_negative_weight": float(
+            loss_cfg.get("spatial_explicit_negative_weight", 1.0)
+        ),
+        "spatial_implicit_negative_weight": float(
+            loss_cfg.get("spatial_implicit_negative_weight", 0.05)
+        ),
+        "spatial_detach_backbone": (
+            spatial_schedule_step < spatial_backbone_start
+        ),
     }
 
 
-def _ensure_schedule_state(schedule_state: dict | None) -> dict:
-    defaults = default_schedule_state()
-    if schedule_state is None:
-        return defaults
-    for key, value in defaults.items():
-        schedule_state.setdefault(key, value)
-    return schedule_state
-
-
-def _set_intervention_steps(cfg: dict, schedule_state: dict, global_step: int) -> None:
-    if schedule_state.get("prototype_start_step") is not None:
-        return
-    delay = int(cfg["loss"].get("proto_to_filter_delay_steps", 1000))
-    schedule_state["prototype_start_step"] = int(global_step)
-    schedule_state["filter_start_step"] = int(global_step) + delay
-
-
-def update_plateau_schedule_state(
+def build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
     cfg: dict,
-    schedule_state: dict,
-    *,
-    global_step: int,
-    teacher_prior_loss: torch.Tensor | float,
-) -> dict:
-    loss_cfg = cfg["loss"]
-    schedule_state = _ensure_schedule_state(schedule_state)
-    if schedule_state.get("prototype_start_step") is not None:
-        return schedule_state
+    steps_per_epoch: int,
+):
+    if str(cfg["train"].get("scheduler", "none")).lower() != "cosine":
+        return None
+    total_steps = max(1, int(cfg["train"]["epochs"]) * max(1, int(steps_per_epoch)))
+    warmup_steps = max(
+        0,
+        int(cfg["train"].get("warmup_epochs", 0)) * max(1, int(steps_per_epoch)),
+    )
+    base_lr = float(cfg["train"]["lr"])
+    min_factor = float(cfg["train"].get("min_lr", 0.0)) / base_lr if base_lr > 0 else 0.0
 
-    max_warmup = int(loss_cfg.get("max_teacher_warmup_steps", 10000))
-    if global_step >= max_warmup:
-        _set_intervention_steps(cfg, schedule_state, global_step)
-        return schedule_state
+    def lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return max(min_factor, float(step + 1) / float(warmup_steps))
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(
+            1.0,
+            max(0.0, float(step - warmup_steps) / float(decay_steps)),
+        )
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_factor + (1.0 - min_factor) * cosine
 
-    current_sum = schedule_state.get("teacher_prior_window_loss_sum")
-    if isinstance(teacher_prior_loss, torch.Tensor):
-        if current_sum is None or isinstance(current_sum, float):
-            current_sum = torch.zeros((), device=teacher_prior_loss.device)
-        elif current_sum.device != teacher_prior_loss.device:
-            current_sum = current_sum.to(teacher_prior_loss.device)
-        schedule_state["teacher_prior_window_loss_sum"] = current_sum + teacher_prior_loss.detach()
-    else:
-        schedule_state["teacher_prior_window_loss_sum"] = float(current_sum or 0.0) + float(teacher_prior_loss)
-
-    schedule_state["teacher_prior_window_count"] = int(schedule_state.get("teacher_prior_window_count") or 0) + 1
-    window_steps = max(1, int(loss_cfg.get("teacher_prior_plateau_window_steps", 1000)))
-    if int(schedule_state["teacher_prior_window_count"]) < window_steps:
-        return schedule_state
-
-    window_sum = schedule_state["teacher_prior_window_loss_sum"]
-    if isinstance(window_sum, torch.Tensor):
-        window_sum_val = float(window_sum.cpu())
-    else:
-        window_sum_val = float(window_sum)
-
-    window_mean = window_sum_val / float(schedule_state["teacher_prior_window_count"])
-    beta = float(loss_cfg.get("teacher_prior_ema_beta", 0.9))
-    current_ema = schedule_state.get("teacher_prior_loss_ema")
-    if current_ema is None:
-        current_ema = window_mean
-    else:
-        current_ema = beta * float(current_ema) + (1.0 - beta) * window_mean
-    prev_ema = schedule_state.get("teacher_prior_prev_window_ema")
-    schedule_state["teacher_prior_loss_ema"] = float(current_ema)
-    
-    if isinstance(teacher_prior_loss, torch.Tensor):
-        schedule_state["teacher_prior_window_loss_sum"] = torch.zeros((), device=teacher_prior_loss.device)
-    else:
-        schedule_state["teacher_prior_window_loss_sum"] = 0.0
-    schedule_state["teacher_prior_window_count"] = 0
-
-    if prev_ema is not None:
-        relative_improvement = (float(prev_ema) - float(current_ema)) / max(float(prev_ema), 1e-8)
-        schedule_state["teacher_prior_relative_improvement"] = float(relative_improvement)
-        min_warmup = int(loss_cfg.get("min_teacher_warmup_steps", 2000))
-        threshold = float(loss_cfg.get("teacher_prior_plateau_threshold", 0.01))
-        if global_step >= min_warmup and relative_improvement < threshold:
-            schedule_state["teacher_prior_plateau_count"] = int(schedule_state.get("teacher_prior_plateau_count") or 0) + 1
-        else:
-            schedule_state["teacher_prior_plateau_count"] = 0
-        patience = int(loss_cfg.get("teacher_prior_plateau_patience", 2))
-        if int(schedule_state["teacher_prior_plateau_count"]) >= patience:
-            _set_intervention_steps(cfg, schedule_state, global_step)
-    schedule_state["teacher_prior_prev_window_ema"] = float(current_ema)
-    return schedule_state
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-def intervention_stage(cfg: dict, global_step: int, schedule_state: dict | None) -> str:
-    state = _ensure_schedule_state(schedule_state)
-    prototype_start = state.get("prototype_start_step")
-    filter_start = state.get("filter_start_step")
-    if prototype_start is None or global_step < int(prototype_start):
-        return "teacher_prior"
-    prototype_ramp_steps = int(cfg["loss"].get("prototype_ramp_steps", 1000))
-    if global_step < int(prototype_start) + max(0, prototype_ramp_steps):
-        return "prototype_ramp"
-    if filter_start is None or global_step < int(filter_start):
-        return "prototype_active"
-    filter_ramp_steps = int(cfg["loss"].get("filter_ramp_steps", 1000))
-    if global_step < int(filter_start) + max(0, filter_ramp_steps):
-        return "filter_ramp"
-    return "pamtd_active"
+def _rng_state() -> dict:
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: dict | None) -> None:
+    if not state:
+        return
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
 
 
 def _log(message: str) -> None:
     try:
         from tqdm.auto import tqdm
+
         tqdm.write(message)
     except ImportError:
         print(message, flush=True)
@@ -297,9 +414,6 @@ def _release_host_memory() -> None:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         return
-
-
-
 
 
 def _build_summary_writer(cfg: dict, output_dir):
@@ -348,8 +462,6 @@ def _write_tensorboard_scalars(writer, row: dict, epoch: int) -> None:
             tag = "train/" + key.removeprefix("train_")
         elif key.startswith("val_"):
             tag = "val/" + key.removeprefix("val_")
-        elif key in {"lr", "global_step"}:
-            tag = "train/" + key
         elif key.startswith("scheduled_"):
             tag = "schedule/" + key.removeprefix("scheduled_")
         else:
@@ -370,172 +482,26 @@ def _write_tensorboard_batch(
     if writer is None:
         return
     writer.add_scalar(f"{phase}_batch/loss", float(loss.detach().cpu()), global_step)
-    for key in ("feature", "relation", "semantic", "zhcc_proto", "zhcc_response", "roi", "roi_consistency"):
+    for key in (
+        "feature",
+        "relation",
+        "semantic",
+        "l1",
+        "l2_spatial",
+        "l2_instance_point",
+        "l2_abundance_point",
+        "l2_brush_bag",
+        "l2_area_positive",
+        "l2_explicit_negative",
+        "l2_implicit_negative",
+    ):
         if key in parts:
-            writer.add_scalar(f"{phase}_batch/{key}", float(parts[key].detach().cpu()), global_step)
+            writer.add_scalar(
+                f"{phase}_batch/{key}",
+                float(parts[key].detach().cpu()),
+                global_step,
+            )
     writer.add_scalar("train/lr_step", float(lr), global_step)
-
-
-def _maybe_refresh_dynamic_prototypes(
-    *,
-    model,
-    cfg: dict,
-    device: torch.device,
-    zhcc_image_bank: PrototypeImageBank | None,
-    prototype_state: dict | None,
-    global_step: int,
-    needed: bool,
-) -> PrototypeRegistry | None:
-    if prototype_state is None:
-        return None
-    current = prototype_state.get("zhcc")
-    if not needed:
-        return current
-    if zhcc_image_bank is None:
-        return current
-    interval = int(cfg["train"].get("dynamic_prototype_refresh_steps", 500))
-    last_step = prototype_state.get("last_refresh_step")
-    should_refresh = current is None or last_step is None or int(global_step) - int(last_step) >= interval
-    if not should_refresh:
-        return current
-    batch_size = int(cfg["train"].get("dynamic_prototype_batch_size", cfg["train"].get("batch_size", 512)))
-    refreshed = build_student_prototype_registry(
-        model=model,
-        image_bank=zhcc_image_bank,
-        cfg=cfg,
-        device=device,
-        batch_size=batch_size,
-    )
-    prototype_state["zhcc"] = refreshed
-    prototype_state["last_refresh_step"] = int(global_step)
-    _log(
-        "dynamic_prototypes_refreshed "
-        f"global_step={global_step} image_count={zhcc_image_bank.count} "
-        f"batch_size={batch_size} prototypes={refreshed.count}"
-    )
-    return refreshed
-
-
-def scheduled_loss_config(
-    cfg: dict,
-    *,
-    epoch: int,
-    global_step: int,
-    schedule_state: dict | None = None,
-) -> dict[str, float | dict | bool | str | None]:
-    loss_cfg = cfg["loss"]
-    semantic_temperature = float(loss_cfg.get("semantic_temperature", 1.0))
-    state = _ensure_schedule_state(schedule_state)
-    prototype_start = state.get("prototype_start_step")
-    filter_start = state.get("filter_start_step")
-    zhcc_proto_weight = _step_ramp(
-        float(loss_cfg.get("zhcc_proto_weight", 0.0)),
-        int(global_step),
-        int(prototype_start) if prototype_start is not None else None,
-        int(loss_cfg.get("prototype_ramp_steps", 1000)),
-    )
-    prototype_filter_weight = _step_ramp(
-        float(loss_cfg.get("prototype_filter_weight", 0.0)),
-        int(global_step),
-        int(filter_start) if filter_start is not None else None,
-        int(loss_cfg.get("filter_ramp_steps", 1000)),
-    )
-    zhcc_response_weight = _step_ramp(
-        float(loss_cfg.get("zhcc_response_weight", 0.0)),
-        int(global_step),
-        int(filter_start) if filter_start is not None else None,
-        int(loss_cfg.get("filter_ramp_steps", 1000)),
-    )
-    roi_start = int(loss_cfg.get("roi_start_step", 0))
-    roi_ramp = int(loss_cfg.get("roi_ramp_steps", 1000))
-    roi_backbone_start = int(loss_cfg.get("roi_backbone_start_step", roi_start + roi_ramp))
-    roi_consistency_start = int(loss_cfg.get("roi_consistency_start_step", roi_backbone_start))
-    return {
-        "teacher_weights": loss_cfg.get("teacher_weights"),
-        "relation_weight": float(loss_cfg["relation_weight"]),
-        "semantic_weight": _linear_warmup(
-            float(loss_cfg.get("semantic_weight", 0.0)),
-            epoch,
-            int(loss_cfg.get("semantic_warmup_epochs", 0)),
-        ),
-        "semantic_temperature": semantic_temperature,
-        "primary_temperature": float(loss_cfg.get("primary_temperature", semantic_temperature)),
-        "attribute_temperature": float(loss_cfg.get("attribute_temperature", 1.0)),
-        "prototype_filter_weight": prototype_filter_weight,
-        "prototype_filter_alpha_min": float(loss_cfg.get("prototype_filter_alpha_min", 0.25)),
-        "feature_loss_type": str(loss_cfg.get("feature_loss_type", "cosine")),
-        "zhcc_proto_weight": zhcc_proto_weight,
-        "zhcc_level2_weight": float(loss_cfg.get("zhcc_level2_weight", 0.5)),
-        "zhcc_primary_temperature": float(loss_cfg.get("zhcc_primary_temperature", 0.1)),
-        "zhcc_attribute_temperature": float(loss_cfg.get("zhcc_attribute_temperature", 0.1)),
-        "consensus_weight": float(loss_cfg.get("consensus_weight", 0.4)),
-        "prototype_label_weight": float(loss_cfg.get("prototype_label_weight", 0.4)),
-        "prototype_l1_agreement_weight": float(loss_cfg.get("prototype_l1_agreement_weight", 0.5)),
-        "prototype_l2_agreement_weight": float(loss_cfg.get("prototype_l2_agreement_weight", 0.5)),
-        "zhcc_response_weight": zhcc_response_weight,
-        "l2_attribute_adjudication": bool(loss_cfg.get("l2_attribute_adjudication", False)),
-        "l2_attribute_uncertainty_eta": float(loss_cfg.get("l2_attribute_uncertainty_eta", 0.5)),
-        "l2_negative_evidence_power": float(loss_cfg.get("l2_negative_evidence_power", 2.0)),
-        "teacher_attribute_prior": loss_cfg.get("teacher_attribute_prior"),
-        "roi_weight": _step_ramp(float(loss_cfg.get("roi_weight", 0.1)), int(global_step), roi_start, roi_ramp),
-        "roi_consistency_weight": _step_ramp(
-            float(loss_cfg.get("roi_consistency_weight", 0.05)),
-            int(global_step),
-            roi_consistency_start,
-            roi_ramp,
-        ),
-        "roi_detach_backbone": int(global_step) < roi_backbone_start,
-        "scale_relation_by_alpha": bool(loss_cfg.get("scale_relation_by_alpha", False)),
-        "prototype_start_step": prototype_start,
-        "filter_start_step": filter_start,
-        "teacher_prior_loss_ema": state.get("teacher_prior_loss_ema"),
-        "teacher_prior_relative_improvement": state.get("teacher_prior_relative_improvement"),
-        "teacher_prior_plateau_count": int(state.get("teacher_prior_plateau_count") or 0),
-        "intervention_stage": intervention_stage(cfg, int(global_step), state),
-    }
-
-
-def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, steps_per_epoch: int):
-    if str(cfg["train"].get("scheduler", "none")).lower() != "cosine":
-        return None
-    total_steps = max(1, int(cfg["train"]["epochs"]) * max(1, int(steps_per_epoch)))
-    warmup_steps = max(0, int(cfg["train"].get("warmup_epochs", 0)) * max(1, int(steps_per_epoch)))
-    base_lr = float(cfg["train"]["lr"])
-    min_factor = float(cfg["train"].get("min_lr", 0.0)) / base_lr if base_lr > 0 else 0.0
-
-    def lr_lambda(step: int) -> float:
-        if warmup_steps > 0 and step < warmup_steps:
-            return max(min_factor, float(step + 1) / float(warmup_steps))
-        decay_steps = max(1, total_steps - warmup_steps)
-        progress = min(1.0, max(0.0, float(step - warmup_steps) / float(decay_steps)))
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_factor + (1.0 - min_factor) * cosine
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-
-def _rng_state() -> dict:
-    state = {
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-        "torch": torch.get_rng_state(),
-    }
-    if torch.cuda.is_available():
-        state["cuda"] = torch.cuda.get_rng_state_all()
-    return state
-
-
-def _restore_rng_state(state: dict | None) -> None:
-    if not state:
-        return
-    if "python" in state:
-        random.setstate(state["python"])
-    if "numpy" in state:
-        np.random.set_state(state["numpy"])
-    if "torch" in state:
-        torch.set_rng_state(state["torch"])
-    if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
 
 
 def run_epoch(
@@ -549,36 +515,43 @@ def run_epoch(
     scaler=None,
     scheduler=None,
     max_batches: int | None = None,
-    zhcc_prototypes=None,
-    zhcc_image_bank: PrototypeImageBank | None = None,
-    zhcc_prototype_state: dict | None = None,
     epoch: int = 1,
     global_step: int = 0,
-    schedule_state: dict | None = None,
+    l2_supervised_step: int = 0,
     summary_writer=None,
     collect_embeddings: bool = False,
     max_eval_batches: int | None = None,
     prefetched_iterator=None,
 ) -> dict[str, float] | tuple[dict[str, float], tuple]:
     model.train(train)
-    schedule_state = _ensure_schedule_state(schedule_state)
-    totals = {
+    totals: dict[str, torch.Tensor | float] = {
         "loss": 0.0,
         "feature": 0.0,
         "relation": 0.0,
         "semantic": 0.0,
-        "reliability": 0.0,
-        "relation_scale": 0.0,
-        "zhcc_proto": 0.0,
-        "zhcc_response": 0.0,
-        "zhcc_l1": 0.0,
-        "zhcc_l2": 0.0,
-        "roi": 0.0,
-        "roi_consistency": 0.0,
+        "pamtd_response": 0.0,
+        "teacher_alpha_mean": 0.0,
+        "l1": 0.0,
+        "l1_accuracy": 0.0,
+        "l1_supervised_tiles": 0.0,
+        "l2_spatial": 0.0,
+        "l2_instance_point": 0.0,
+        "l2_abundance_point": 0.0,
+        "l2_brush_bag": 0.0,
+        "l2_area_positive": 0.0,
+        "l2_explicit_negative": 0.0,
+        "l2_implicit_negative": 0.0,
+        "l2_point_supervised_pairs": 0.0,
+        "l2_point_count": 0.0,
+        "l2_brush_supervised_pairs": 0.0,
+        "l2_brush_bag_count": 0.0,
+        "l2_area_supervised_pairs": 0.0,
+        "l2_explicit_negative_pairs": 0.0,
+        "l2_implicit_negative_pairs": 0.0,
     }
-    gradient_diagnostic_totals: dict[str, float] = {}
-    gradient_diagnostic_count = 0
-    last_gradient_diagnostic_step = global_step - GRADIENT_DIAGNOSTIC_INTERVAL_STEPS
+    gradient_totals: dict[str, float] = {}
+    gradient_count = 0
+    last_gradient_step = global_step - GRADIENT_DIAGNOSTIC_INTERVAL_STEPS
     n_batches = 0
     n_tiles = 0
     start = time.perf_counter()
@@ -586,33 +559,37 @@ def run_epoch(
     interval_tiles = 0
     phase = "train" if train else "val"
     log_interval = int(cfg["train"].get("log_interval", 0) or 0)
-    tensorboard_batch_interval = int(cfg["train"].get("tensorboard_batch_interval", 0) or 0)
+    tensorboard_batch_interval = int(
+        cfg["train"].get("tensorboard_batch_interval", 0) or 0
+    )
     max_grad_norm = float(cfg["train"].get("max_grad_norm", 0.0) or 0.0)
     last_loss_cfg = scheduled_loss_config(
         cfg,
         epoch=epoch,
         global_step=global_step,
-        schedule_state=schedule_state,
+        l2_supervised_step=l2_supervised_step,
     )
-    if zhcc_prototype_state is None:
-        zhcc_prototype_state = {"zhcc": zhcc_prototypes, "last_refresh_step": None}
-    elif "zhcc" not in zhcc_prototype_state:
-        zhcc_prototype_state["zhcc"] = zhcc_prototypes
     embeddings_data = None
     if collect_embeddings:
         embeddings_data = {
             "embeddings": [],
             "prototype_masks": [],
             "prototype_level1": [],
-            "prototype_level2": [],
+            "l1_logits": [],
             "students_by_teacher": {},
             "teachers_by_name": {},
         }
+
     iterator = prefetched_iterator if prefetched_iterator is not None else iter(loader)
     progress_total = len(loader)
     if max_batches is not None:
         progress_total = min(progress_total, int(max_batches))
-    progress_bar = _build_progress_bar(cfg, phase=phase, epoch=epoch, total=progress_total)
+    progress_bar = _build_progress_bar(
+        cfg,
+        phase=phase,
+        epoch=epoch,
+        total=progress_total,
+    )
     try:
         while True:
             if max_batches is not None and n_batches >= int(max_batches):
@@ -626,7 +603,7 @@ def run_epoch(
             will_log = (
                 progress_bar is None
                 and log_interval > 0
-                and (n_batches + 1 == 1 or (n_batches + 1) % log_interval == 0)
+                and (n_batches == 0 or (n_batches + 1) % log_interval == 0)
             )
             batch_start = time.perf_counter()
             image_prepare_start = time.perf_counter()
@@ -637,82 +614,131 @@ def run_epoch(
             n_tiles += int(images.shape[0])
             interval_tiles += int(images.shape[0])
             teachers = _move_teachers(batch, device)
-            prototype_mask, prototype_level1, prototype_level2 = _move_prototype_batch(batch, device)
-            roi_target, roi_valid, roi_consistency = _move_roi_batch(batch, device)
+            l1_mask, l1_target = _move_l1_batch(batch, device)
+            spatial_is_active = bool(batch["l2_spatial_supervised"].any())
+            spatial = (
+                _move_spatial_batch(batch, device)
+                if spatial_is_active
+                else {
+                    key: batch[key]
+                    for key in (
+                        "l2_point_centers",
+                        "l2_brush_bag_ids",
+                        "l2_area_positive",
+                        "l2_explicit_negative",
+                        "l2_implicit_negative",
+                    )
+                }
+            )
+
             with torch.set_grad_enabled(train):
                 loss_cfg = scheduled_loss_config(
                     cfg,
                     epoch=epoch,
                     global_step=global_step,
-                    schedule_state=schedule_state,
+                    l2_supervised_step=l2_supervised_step,
                 )
                 last_loss_cfg = loss_cfg
-                active_zhcc_prototypes = _maybe_refresh_dynamic_prototypes(
-                    model=model,
-                    cfg=cfg,
-                    device=device,
-                    zhcc_image_bank=zhcc_image_bank,
-                    prototype_state=zhcc_prototype_state,
-                    global_step=global_step,
-                    needed=bool(
-                        train
-                        and (
-                            float(loss_cfg["zhcc_proto_weight"]) > 0
-                            or float(loss_cfg["prototype_filter_weight"]) > 0
-                            or float(loss_cfg["zhcc_response_weight"]) > 0
-                            or float(loss_cfg["roi_consistency_weight"]) > 0
-                        )
-                    ),
-                )
-                with torch.autocast(device_type=device.type, enabled=_amp_enabled(device, cfg, train)):
-                    roi_model = getattr(model, "_orig_mod", model)
-                    if int(getattr(roi_model, "roi_l2_num_attributes", 0)) > 0:
-                        outputs = model(images, roi_detach_backbone=bool(loss_cfg["roi_detach_backbone"]))
-                    else:
-                        outputs = model(images)
+                with torch.autocast(
+                    device_type=device.type,
+                    enabled=_amp_enabled(device, cfg, train),
+                ):
+                    outputs = model(
+                        images,
+                        spatial_detach_backbone=bool(
+                            loss_cfg["spatial_detach_backbone"]
+                        ),
+                        return_spatial_features=bool(
+                            train and spatial_is_active
+                        ),
+                        run_spatial=spatial_is_active,
+                    )
+                    raw_model = getattr(model, "_orig_mod", model)
+                    prototype_momentum = float(
+                        loss_cfg["prototype_momentum"]
+                    )
+                    l2_positive = None
+                    l2_known = None
+                    l2_target = None
+                    if spatial_is_active:
+                        l2_positive = (
+                            (spatial["l2_point_centers"] > 0)
+                            | (spatial["l2_brush_bag_ids"] > 0)
+                            | spatial["l2_area_positive"].to(dtype=torch.bool)
+                        ).flatten(2).any(dim=2)
+                        l2_explicit_negative = spatial[
+                            "l2_explicit_negative"
+                        ].to(dtype=torch.bool).flatten(2).any(dim=2)
+                        l2_known = l2_positive | l2_explicit_negative
+                        l2_target = l2_positive.to(dtype=torch.float32)
                     student_by_teacher = outputs["teacher_outputs"]
-                    if collect_embeddings and (max_eval_batches is None or n_batches < max_eval_batches):
-                        embeddings_data["embeddings"].append(outputs["embedding_norm"].detach().cpu())
-                        p_mask = batch.get("prototype_mask", torch.zeros(len(batch["tile_id"]), dtype=torch.bool))
-                        p_lvl1 = batch.get("prototype_level1", torch.full((len(batch["tile_id"]),), -1, dtype=torch.long))
-                        p_lvl2 = batch.get("prototype_level2", torch.zeros((len(batch["tile_id"]), 0), dtype=torch.float32))
-                        embeddings_data["prototype_masks"].append(p_mask.detach().cpu())
-                        embeddings_data["prototype_level1"].append(p_lvl1.detach().cpu())
-                        embeddings_data["prototype_level2"].append(p_lvl2.detach().cpu())
-                        for name, tensor in student_by_teacher.items():
-                            embeddings_data["students_by_teacher"].setdefault(name, []).append(tensor.detach().cpu())
-                        for name, tensor in batch["teacher_features"].items():
-                            feat_tensor = tensor
-                            if isinstance(feat_tensor, np.ndarray):
-                                feat_tensor = torch.from_numpy(feat_tensor)
-                            embeddings_data["teachers_by_name"].setdefault(name, []).append(feat_tensor.detach().cpu())
-                    if float(loss_cfg["prototype_filter_weight"]) > 0:
-                        if prototypes is None:
-                            raise ValueError(
-                                "prototype adjudication requires data.prototype_paths"
-                            )
-                        alpha_by_teacher, alpha_diag = prototype_adjudicated_teacher_weights(
+                    teacher_l2_prototypes = {
+                        name: (
+                            state.prototypes,
+                            state.counts,
+                        )
+                        for name, state in raw_model.teacher_l2_prototypes.items()
+                    }
+                    pamtd_temperature = float(
+                        loss_cfg["pamtd_primary_temperature"]
+                    )
+                    pamtd_student_logits = (
+                        bounded_logits(
+                            outputs["l1_similarity"] / pamtd_temperature
+                        )
+                        if "l1_similarity" in outputs
+                        else None
+                    )
+                    adjudication = (
+                        prototype_adjudicated_teacher_target(
                             teacher_by_name=teachers,
                             prototypes_by_teacher=prototypes,
-                            zhcc_embedding_norm=outputs["embedding_norm"].detach(),
-                            zhcc_prototypes=active_zhcc_prototypes,
-                            prototype_mask=prototype_mask,
-                            prototype_level1=prototype_level1,
-                            prototype_level2=prototype_level2,
-                            alpha_min=float(loss_cfg["prototype_filter_alpha_min"]),
-                            consensus_weight=float(loss_cfg["consensus_weight"]),
-                            prototype_label_weight=float(loss_cfg["prototype_label_weight"]),
-                            l1_agreement_weight=float(loss_cfg["prototype_l1_agreement_weight"]),
-                            l2_agreement_weight=float(loss_cfg["prototype_l2_agreement_weight"]),
-                            zhcc_response_weight=float(loss_cfg["zhcc_response_weight"]),
-                            filter_strength=float(loss_cfg["prototype_filter_weight"]),
-                            primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
-                            attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
+                            student_primary_response=torch.softmax(
+                                pamtd_student_logits,
+                                dim=-1,
+                            ),
+                            class_names=cfg["model"].get(
+                                "l1_class_names",
+                                DEFAULT_L1_CLASSES,
+                            ),
+                            teacher_l2_prototypes=teacher_l2_prototypes,
+                            student_l2_response=raw_model.global_l2_response(
+                                outputs["embedding_norm"],
+                                temperature=float(
+                                    loss_cfg["l2_global_temperature"]
+                                ),
+                            ),
+                            l1_mask=l1_mask,
+                            l1_target=l1_target,
+                            l2_target=l2_target,
+                            l2_known=l2_known,
+                            teacher_weights=loss_cfg.get(
+                                "teacher_weights"
+                            ),
+                            filter_strength=float(
+                                loss_cfg["prototype_filter_weight"]
+                            ),
+                            alpha_min=float(
+                                loss_cfg["prototype_filter_alpha_min"]
+                            ),
+                            consensus_weight=float(
+                                loss_cfg["prototype_consensus_weight"]
+                            ),
+                            prototype_label_weight=float(
+                                loss_cfg["prototype_label_weight"]
+                            ),
+                            student_agreement_weight=float(
+                                loss_cfg["prototype_student_weight"]
+                            ),
+                            primary_temperature=pamtd_temperature,
+                            l2_temperature=float(
+                                loss_cfg["l2_global_temperature"]
+                            ),
                         )
-                    else:
-                        alpha_by_teacher = None
-                        alpha_diag = {}
-                    loss, parts = multi_teacher_distillation_loss(
+                        if prototypes and pamtd_student_logits is not None
+                        else None
+                    )
+                    distillation_loss, distillation_parts = multi_teacher_distillation_loss(
                         student_by_teacher=student_by_teacher,
                         teacher_by_name=teachers,
                         prototypes_by_teacher=prototypes,
@@ -720,157 +746,221 @@ def run_epoch(
                         semantic_weight=float(loss_cfg["semantic_weight"]),
                         semantic_temperature=float(loss_cfg["semantic_temperature"]),
                         teacher_weights=loss_cfg.get("teacher_weights"),
-                        teacher_sample_weights=alpha_by_teacher,
                         feature_loss_type=str(loss_cfg["feature_loss_type"]),
                         primary_temperature=float(loss_cfg["primary_temperature"]),
-                        attribute_temperature=float(loss_cfg["attribute_temperature"]),
-                        scale_relation_by_alpha=bool(loss_cfg["scale_relation_by_alpha"]),
+                        teacher_sample_weights=(
+                            adjudication.teacher_sample_weights
+                            if adjudication is not None
+                            else None
+                        ),
                     )
-                    if active_zhcc_prototypes is not None and float(loss_cfg["zhcc_proto_weight"]) > 0:
-                        if prototypes is None:
-                            raise ValueError("zhcc response distillation requires data.prototype_paths")
-                        target_primary, target_attributes = teacher_semantic_response_target(
-                            teacher_by_name=teachers,
-                            prototypes_by_teacher=prototypes,
-                            target_registry=active_zhcc_prototypes,
-                            teacher_weights=loss_cfg.get("teacher_weights"),
-                            teacher_sample_weights=alpha_by_teacher,
-                            primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
-                            attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
+                    if adjudication is not None:
+                        assert pamtd_student_logits is not None
+                        response_loss = prototype_response_distillation_loss(
+                            pamtd_student_logits,
+                            adjudication.primary_target,
+                            temperature=pamtd_temperature,
+                            sample_weight=(
+                                adjudication.response_sample_weight
+                            ),
                         )
-                        attribute_gate = None
-                        attribute_negative_weight = None
-                        if bool(loss_cfg["l2_attribute_adjudication"]):
-                            adjudicated_l2 = attribute_adjudicated_level2_target(
-                                teacher_by_name=teachers,
-                                prototypes_by_teacher=prototypes,
-                                target_registry=active_zhcc_prototypes,
-                                teacher_weights=loss_cfg.get("teacher_weights"),
-                                teacher_attribute_prior=loss_cfg.get("teacher_attribute_prior"),
-                                prototype_mask=prototype_mask,
-                                prototype_level2=prototype_level2,
-                                consensus_weight=float(loss_cfg["consensus_weight"]),
-                                prototype_label_weight=float(loss_cfg["prototype_label_weight"]),
-                                uncertainty_eta=float(loss_cfg["l2_attribute_uncertainty_eta"]),
-                                negative_evidence_power=float(loss_cfg["l2_negative_evidence_power"]),
-                                primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
-                                attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
-                            )
-                            target_attributes = adjudicated_l2.target
-                            attribute_gate = adjudicated_l2.gate
-                            attribute_negative_weight = adjudicated_l2.negative_weight
-                            alpha_diag.update(adjudicated_l2.diagnostics)
-                        zhcc_loss, zhcc_parts = zhcc_response_distillation_loss(
-                            embedding_norm=outputs["embedding_norm"],
-                            prototypes=active_zhcc_prototypes,
-                            target_primary=target_primary,
-                            target_attributes=target_attributes,
-                            attribute_gate=attribute_gate,
-                            attribute_negative_weight=attribute_negative_weight,
-                            level2_weight=float(loss_cfg["zhcc_level2_weight"]),
-                            primary_temperature=float(loss_cfg["zhcc_primary_temperature"]),
-                            attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
+                        alpha_mean = adjudication.diagnostics[
+                            "teacher_alpha_mean"
+                        ]
+                    else:
+                        response_loss = distillation_loss.new_zeros(())
+                        alpha_mean = distillation_loss.new_ones(())
+                    if "l1_logits" in outputs:
+                        l1_loss, l1_parts = l1_classification_loss(
+                            outputs["l1_logits"],
+                            l1_mask,
+                            l1_target,
                         )
                     else:
-                        zhcc_loss = loss.new_zeros(())
-                        zhcc_parts = {
-                            "zhcc_proto": loss.new_zeros(()),
-                            "zhcc_response": loss.new_zeros(()),
-                            "zhcc_l1": loss.new_zeros(()),
-                            "zhcc_l2": loss.new_zeros(()),
+                        l1_loss = distillation_loss.new_zeros(())
+                        l1_parts = {
+                            "l1": l1_loss.detach(),
+                            "l1_accuracy": l1_loss.detach(),
+                            "l1_supervised_tiles": l1_loss.detach(),
                         }
-                    roi_loss = loss.new_zeros(())
-                    roi_consistency_loss = loss.new_zeros(())
-                    roi_diag = {}
-                    if "roi_patch_logits" in outputs and roi_valid.numel() > 0:
-                        if active_zhcc_prototypes is None:
-                            if float(loss_cfg["roi_consistency_weight"]) > 0:
-                                raise ValueError("ROI local-to-global consistency requires HCC student prototypes")
-                            global_logits = outputs["roi_local_logits"].detach().new_zeros(
-                                outputs["roi_local_logits"].shape
-                            )
-                        else:
-                            global_logits = global_attribute_logits(
-                                outputs["embedding_norm"],
-                                active_zhcc_prototypes,
-                                attribute_temperature=float(loss_cfg["zhcc_attribute_temperature"]),
-                            )
-                        roi_loss, roi_consistency_loss, roi_diag = roi_guided_level2_loss(
-                            patch_logits=outputs["roi_patch_logits"],
-                            local_logits=outputs["roi_local_logits"],
-                            global_logits=global_logits,
-                            roi_target=roi_target,
-                            roi_valid=roi_valid,
-                            roi_consistency=roi_consistency,
+                    if (
+                        "l2_instance_logits" in outputs
+                        and spatial["l2_point_centers"].numel() > 0
+                    ):
+                        spatial_loss, spatial_parts = spatial_morphometry_loss(
+                            instance_logits=outputs["l2_instance_logits"],
+                            abundance_logits=outputs["l2_abundance_logits"],
+                            point_centers=spatial["l2_point_centers"],
+                            brush_bag_ids=spatial["l2_brush_bag_ids"],
+                            area_positive=spatial["l2_area_positive"],
+                            explicit_negative=spatial["l2_explicit_negative"],
+                            implicit_negative=spatial["l2_implicit_negative"],
+                            component_names=cfg["data"].get(
+                                "spatial_component_names"
+                            ),
+                            point_tolerance_cells=int(
+                                loss_cfg["spatial_point_tolerance_cells"]
+                            ),
+                            abundance_point_weight=float(
+                                loss_cfg["spatial_abundance_point_weight"]
+                            ),
+                            brush_weight=float(
+                                loss_cfg["spatial_brush_weight"]
+                            ),
+                            brush_top_fraction=float(
+                                loss_cfg["spatial_brush_top_fraction"]
+                            ),
+                            explicit_negative_weight=float(
+                                loss_cfg["spatial_explicit_negative_weight"]
+                            ),
+                            implicit_negative_weight=float(
+                                loss_cfg["spatial_implicit_negative_weight"]
+                            ),
                         )
-                    global_objective = loss + float(loss_cfg["zhcc_proto_weight"]) * zhcc_loss
-                    roi_objective = (
-                        float(loss_cfg["roi_weight"]) * roi_loss
-                        + float(loss_cfg["roi_consistency_weight"]) * roi_consistency_loss
-                    )
-                    loss = global_objective + roi_objective
-                    should_measure_gradients = (
-                        train
-                        and not bool(loss_cfg["roi_detach_backbone"])
-                        and roi_valid.numel() > 0
-                        and global_step - last_gradient_diagnostic_step >= GRADIENT_DIAGNOSTIC_INTERVAL_STEPS
-                        and bool(roi_valid.any())
-                    )
-                    if should_measure_gradients:
-                        shared_parameters = tuple(roi_model.encoder.backbone.blocks[-1].parameters())
-                        gradient_diagnostics = _objective_gradient_diagnostics(
-                            global_objective,
-                            roi_objective,
-                            shared_parameters,
-                        )
-                        for key, value in gradient_diagnostics.items():
-                            gradient_diagnostic_totals[key] = gradient_diagnostic_totals.get(key, 0.0) + value
-                            if summary_writer is not None:
-                                summary_writer.add_scalar(f"diagnostics/{key}", value, global_step)
-                        gradient_diagnostic_count += 1
-                        last_gradient_diagnostic_step = global_step
-                if train:
-                    optimizer.zero_grad(set_to_none=True)
-                    if scaler is not None and scaler.is_enabled():
-                        scaler.scale(loss).backward()
-                        if max_grad_norm > 0:
-                            scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                        scaler.step(optimizer)
-                        scaler.update()
                     else:
-                        loss.backward()
-                        if max_grad_norm > 0:
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                        optimizer.step()
-                    if scheduler is not None:
-                        scheduler.step()
-                    global_step += 1
-                    teacher_prior_loss = parts["feature"].detach() + float(loss_cfg["relation_weight"]) * parts["relation"].detach()
-                    update_plateau_schedule_state(
-                        cfg,
-                        schedule_state,
-                        global_step=global_step,
-                        teacher_prior_loss=teacher_prior_loss,
+                        spatial_loss = distillation_loss.new_zeros(())
+                        spatial_parts = {
+                            key: spatial_loss.detach()
+                            for key in (
+                                "l2_spatial",
+                                "l2_instance_point",
+                                "l2_abundance_point",
+                                "l2_brush_bag",
+                                "l2_area_positive",
+                                "l2_explicit_negative",
+                                "l2_implicit_negative",
+                                "l2_point_supervised_pairs",
+                                "l2_point_count",
+                                "l2_brush_supervised_pairs",
+                                "l2_brush_bag_count",
+                                "l2_area_supervised_pairs",
+                                "l2_explicit_negative_pairs",
+                                "l2_implicit_negative_pairs",
+                            )
+                        }
+                    global_objective = (
+                        distillation_loss
+                        + float(loss_cfg["l1_weight"]) * l1_loss
+                        + float(loss_cfg["zhcc_response_weight"])
+                        * response_loss
                     )
+                    spatial_objective = (
+                        float(loss_cfg["spatial_weight"]) * spatial_loss
+                    )
+                    loss = global_objective + spatial_objective
+
+                if (
+                    train
+                    and spatial_is_active
+                    and float(loss_cfg["spatial_weight"]) > 0
+                    and not bool(loss_cfg["spatial_detach_backbone"])
+                    and global_step - last_gradient_step
+                    >= GRADIENT_DIAGNOSTIC_INTERVAL_STEPS
+                ):
+                    shared_parameters = tuple(
+                        raw_model.encoder.backbone.blocks[-1].parameters()
+                    )
+                    diagnostics = _objective_gradient_diagnostics(
+                        global_objective,
+                        spatial_objective,
+                        shared_parameters,
+                    )
+                    for key, value in diagnostics.items():
+                        gradient_totals[key] = gradient_totals.get(key, 0.0) + value
+                    gradient_count += 1
+                    last_gradient_step = global_step
+
+                if train:
+                    optimizer_stepped = _optimizer_step(
+                        loss=loss,
+                        model=model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        max_grad_norm=max_grad_norm,
+                    )
+                    if scheduler is not None and optimizer_stepped:
+                        scheduler.step()
+                    if optimizer_stepped:
+                        if bool(loss_cfg["prototype_updates_enabled"]):
+                            raw_model.update_l1_prototypes(
+                                outputs["embedding_norm"],
+                                l1_mask,
+                                l1_target,
+                                momentum=prototype_momentum,
+                            )
+                            if spatial_is_active:
+                                assert l2_positive is not None
+                                raw_model.update_global_l2_prototypes(
+                                    outputs["embedding_norm"],
+                                    teachers,
+                                    l2_positive,
+                                    momentum=prototype_momentum,
+                                )
+                                raw_model.spatial_head.update_prototypes(
+                                    outputs["l2_spatial_features"],
+                                    point_centers=spatial[
+                                        "l2_point_centers"
+                                    ],
+                                    brush_bag_ids=spatial[
+                                        "l2_brush_bag_ids"
+                                    ],
+                                    area_positive=spatial[
+                                        "l2_area_positive"
+                                    ],
+                                    explicit_negative=spatial[
+                                        "l2_explicit_negative"
+                                    ],
+                                    implicit_negative=spatial[
+                                        "l2_implicit_negative"
+                                    ],
+                                    momentum=prototype_momentum,
+                                )
+                        global_step += 1
+                        if spatial_is_active:
+                            l2_supervised_step += 1
+
+            parts = {
+                **distillation_parts,
+                **l1_parts,
+                **spatial_parts,
+                "pamtd_response": response_loss.detach(),
+                "teacher_alpha_mean": alpha_mean.detach(),
+            }
             totals["loss"] = totals["loss"] + loss.detach()
-            for key in ("feature", "relation", "semantic", "reliability", "relation_scale"):
-                totals[key] = totals[key] + parts[key].detach()
-            for key in ("zhcc_proto", "zhcc_response", "zhcc_l1", "zhcc_l2"):
-                totals[key] = totals[key] + zhcc_parts[key].detach()
-            totals["roi"] = totals["roi"] + roi_loss.detach()
-            totals["roi_consistency"] = totals["roi_consistency"] + roi_consistency_loss.detach()
-            for key, value in roi_diag.items():
-                totals.setdefault(key, 0.0)
-                totals[key] = totals[key] + value.detach()
-            for key, value in alpha_diag.items():
-                totals.setdefault(key, 0.0)
-                totals[key] = totals[key] + value.detach()
+            for key in totals:
+                if key == "loss":
+                    continue
+                if key in parts:
+                    totals[key] = totals[key] + parts[key].detach()
+
+            if collect_embeddings and (
+                max_eval_batches is None or n_batches < max_eval_batches
+            ):
+                assert embeddings_data is not None
+                embeddings_data["embeddings"].append(
+                    outputs["embedding_norm"].detach().cpu()
+                )
+                embeddings_data["prototype_masks"].append(l1_mask.detach().cpu())
+                embeddings_data["prototype_level1"].append(l1_target.detach().cpu())
+                if "l1_logits" in outputs:
+                    embeddings_data["l1_logits"].append(
+                        outputs["l1_logits"].detach().cpu()
+                    )
+                for name, tensor in student_by_teacher.items():
+                    embeddings_data["students_by_teacher"].setdefault(name, []).append(
+                        tensor.detach().cpu()
+                    )
+                for name, tensor in batch["teacher_features"].items():
+                    if isinstance(tensor, np.ndarray):
+                        tensor = torch.from_numpy(tensor)
+                    embeddings_data["teachers_by_name"].setdefault(name, []).append(
+                        tensor.detach().cpu()
+                    )
+
             n_batches += 1
             if (
                 summary_writer is not None
                 and tensorboard_batch_interval > 0
-                and train
                 and n_batches % tensorboard_batch_interval == 0
             ):
                 _write_tensorboard_batch(
@@ -878,34 +968,30 @@ def run_epoch(
                     phase=phase,
                     global_step=global_step,
                     loss=loss,
-                    parts={**parts, **zhcc_parts, "roi": roi_loss, "roi_consistency": roi_consistency_loss},
+                    parts=parts,
                     lr=float(optimizer.param_groups[0]["lr"]),
                 )
             if progress_bar is not None:
-                if n_batches % 10 == 0 or n_batches == progress_total:
-                    elapsed = max(time.perf_counter() - start, 1e-9)
-                    progress_bar.set_postfix(
-                        loss=f"{float(loss.detach().cpu()):.4f}",
-                        tiles_s=f"{n_tiles / elapsed:.0f}",
-                        refresh=False,
-                    )
+                elapsed = max(time.perf_counter() - start, 1e-9)
+                progress_bar.set_postfix(
+                    loss=f"{float(loss.detach().cpu()):.4f}",
+                    tiles_s=f"{n_tiles / elapsed:.0f}",
+                    refresh=False,
+                )
                 progress_bar.update(1)
             if will_log:
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 now = time.perf_counter()
                 interval_elapsed = max(now - interval_start, 1e-9)
-                total_elapsed = max(now - start, 1e-9)
                 batch_elapsed = max(now - batch_start, 1e-9)
                 _log(
                     f"{phase}_progress "
                     f"batch={n_batches} tiles={n_tiles} "
                     f"interval_tiles_per_sec={interval_tiles / interval_elapsed:.2f} "
-                    f"total_tiles_per_sec={n_tiles / total_elapsed:.2f} "
                     f"last_data_wait_sec={data_wait:.3f} "
                     f"last_image_prepare_sec={image_prepare:.3f} "
                     f"last_batch_sec={batch_elapsed:.3f} "
-                    f"image_path={'uint8_device_prepare' if batch.get('images_uint8', False) else 'preprocessed_cpu'} "
                     f"loss={float(loss.detach().cpu()):.6f} "
                     f"cuda_mem_mb={_cuda_memory_mb(device):.1f}"
                 )
@@ -917,45 +1003,54 @@ def run_epoch(
             close_iterator()
         if progress_bar is not None:
             progress_bar.close()
+
+    if n_batches == 0:
+        raise ValueError(f"{phase} loader produced no batches")
     elapsed = max(time.perf_counter() - start, 1e-9)
-    result = {}
+    result: dict[str, float] = {}
     for key, value in totals.items():
-        mean_value = value / max(1, n_batches)
-        if isinstance(mean_value, torch.Tensor):
-            result[key] = float(mean_value.detach().cpu())
-        else:
-            result[key] = float(mean_value)
-    for key, value in gradient_diagnostic_totals.items():
-        result[key] = value / max(1, gradient_diagnostic_count)
-    result["gradient_diagnostic_count"] = float(gradient_diagnostic_count)
+        mean_value = value / n_batches
+        result[key] = (
+            float(mean_value.detach().cpu())
+            if isinstance(mean_value, torch.Tensor)
+            else float(mean_value)
+        )
+    for key, value in gradient_totals.items():
+        result[key] = value / max(1, gradient_count)
+    result["gradient_diagnostic_count"] = float(gradient_count)
     result["lr"] = float(optimizer.param_groups[0]["lr"])
     result["tiles_per_sec"] = n_tiles / elapsed
     result["tiles"] = float(n_tiles)
     result["seconds"] = elapsed
     result["global_step_end"] = float(global_step)
-    result["scheduled_zhcc_proto_weight"] = float(last_loss_cfg["zhcc_proto_weight"])
-    result["scheduled_prototype_filter_weight"] = float(last_loss_cfg["prototype_filter_weight"])
-    result["scheduled_zhcc_response_weight"] = float(last_loss_cfg["zhcc_response_weight"])
-    result["scheduled_roi_weight"] = float(last_loss_cfg["roi_weight"])
-    result["scheduled_roi_consistency_weight"] = float(last_loss_cfg["roi_consistency_weight"])
-    result["prototype_start_step"] = float(schedule_state["prototype_start_step"] or -1)
-    result["filter_start_step"] = float(schedule_state["filter_start_step"] or -1)
-    result["teacher_prior_loss_ema"] = float(schedule_state["teacher_prior_loss_ema"] or 0.0)
-    result["teacher_prior_relative_improvement"] = float(schedule_state["teacher_prior_relative_improvement"] or 0.0)
-    result["teacher_prior_plateau_count"] = float(schedule_state["teacher_prior_plateau_count"] or 0)
-    if collect_embeddings:
-        collated_embeddings = (
-            torch.cat(embeddings_data["embeddings"]),
-            {name: torch.cat(values) for name, values in embeddings_data["students_by_teacher"].items()},
-            {name: torch.cat(values) for name, values in embeddings_data["teachers_by_name"].items()},
-            {
-                "prototype_mask": torch.cat(embeddings_data["prototype_masks"]),
-                "prototype_level1": torch.cat(embeddings_data["prototype_level1"]),
-                "prototype_level2": torch.cat(embeddings_data["prototype_level2"]),
-            },
-        )
-        return result, collated_embeddings
-    return result
+    result["l2_supervised_step_end"] = float(l2_supervised_step)
+    result["scheduled_l1_weight"] = float(last_loss_cfg["l1_weight"])
+    result["scheduled_spatial_weight"] = float(last_loss_cfg["spatial_weight"])
+
+    if not collect_embeddings:
+        return result
+    assert embeddings_data is not None
+    collated = (
+        torch.cat(embeddings_data["embeddings"]),
+        {
+            name: torch.cat(values)
+            for name, values in embeddings_data["students_by_teacher"].items()
+        },
+        {
+            name: torch.cat(values)
+            for name, values in embeddings_data["teachers_by_name"].items()
+        },
+        {
+            "prototype_mask": torch.cat(embeddings_data["prototype_masks"]),
+            "prototype_level1": torch.cat(embeddings_data["prototype_level1"]),
+            "l1_logits": (
+                torch.cat(embeddings_data["l1_logits"])
+                if embeddings_data["l1_logits"]
+                else torch.zeros((0, 0))
+            ),
+        },
+    )
+    return result, collated
 
 
 @torch.no_grad()
@@ -965,12 +1060,17 @@ def collect_embeddings(
     device,
     cfg: dict | None = None,
     max_batches: int | None = None,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+) -> tuple[
+    torch.Tensor,
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+]:
     model.eval()
     embeddings = []
-    prototype_masks = []
-    prototype_level1 = []
-    prototype_level2 = []
+    masks = []
+    level1 = []
+    l1_logits = []
     students_by_teacher: dict[str, list[torch.Tensor]] = {}
     teachers_by_name: dict[str, list[torch.Tensor]] = {}
     for batch_idx, batch in enumerate(loader):
@@ -979,30 +1079,50 @@ def collect_embeddings(
         if cfg is not None:
             images = _prepare_images(batch, cfg, device)
         else:
-            images = batch["images"].to(device, non_blocking=device.type == "cuda")
+            images = batch["images"].to(
+                device,
+                non_blocking=device.type == "cuda",
+            )
             if bool(batch.get("images_uint8", False)):
                 if bool(batch.get("images_hwc", False)):
                     images = images.permute(0, 3, 1, 2)
                 images = images.to(torch.float32).div_(255.0)
-        outputs = model(images)
+        outputs = model(images, run_spatial=False)
         embeddings.append(outputs["embedding_norm"].cpu())
-        prototype_masks.append(batch.get("prototype_mask", torch.zeros(len(batch["tile_id"]), dtype=torch.bool)).cpu())
-        prototype_level1.append(batch.get("prototype_level1", torch.full((len(batch["tile_id"]),), -1, dtype=torch.long)).cpu())
-        prototype_level2.append(batch.get("prototype_level2", torch.zeros((len(batch["tile_id"]), 0), dtype=torch.float32)).cpu())
+        mask, target = _move_l1_batch(batch, torch.device("cpu"))
+        masks.append(mask)
+        level1.append(target)
+        if "l1_logits" in outputs:
+            l1_logits.append(outputs["l1_logits"].cpu())
         for name, tensor in outputs["teacher_outputs"].items():
             students_by_teacher.setdefault(name, []).append(tensor.cpu())
         for name, tensor in batch["teacher_features"].items():
             teachers_by_name.setdefault(name, []).append(tensor.cpu())
+    if not embeddings:
+        raise ValueError("loader produced no batches")
     return (
         torch.cat(embeddings),
         {name: torch.cat(values) for name, values in students_by_teacher.items()},
         {name: torch.cat(values) for name, values in teachers_by_name.items()},
         {
-            "prototype_mask": torch.cat(prototype_masks),
-            "prototype_level1": torch.cat(prototype_level1),
-            "prototype_level2": torch.cat(prototype_level2),
+            "prototype_mask": torch.cat(masks),
+            "prototype_level1": torch.cat(level1),
+            "l1_logits": torch.cat(l1_logits) if l1_logits else torch.zeros((0, 0)),
         },
     )
+
+
+def _l1_eval_metrics(supervised: dict[str, torch.Tensor]) -> dict[str, float]:
+    mask = supervised["prototype_mask"].bool()
+    logits = supervised["l1_logits"]
+    if logits.numel() == 0 or not bool(mask.any()):
+        return {"l1_accuracy": 0.0, "l1_evaluated_tiles": 0.0}
+    target = supervised["prototype_level1"][mask]
+    prediction = logits[mask].argmax(dim=1)
+    return {
+        "l1_accuracy": float((prediction == target).float().mean()),
+        "l1_evaluated_tiles": float(mask.sum()),
+    }
 
 
 def fit(
@@ -1015,33 +1135,42 @@ def fit(
     cfg,
     *,
     scheduler=None,
-    zhcc_prototypes=None,
-    zhcc_image_bank: PrototypeImageBank | None = None,
     resume_state: dict | None = None,
 ) -> dict:
     output_dir = ensure_dir(cfg["runtime"]["output_dir"])
     checkpoints = ensure_dir(output_dir / "checkpoints")
     write_json(output_dir / "resolved_config.json", cfg)
     best_loss = float((resume_state or {}).get("best_loss", float("inf")))
-    best_teacher_alignment = float((resume_state or {}).get("best_teacher_alignment", float("-inf")))
-    best_scientific_score = float((resume_state or {}).get("best_scientific_score", float("-inf")))
+    best_teacher_alignment = float(
+        (resume_state or {}).get("best_teacher_alignment", float("-inf"))
+    )
+    best_l1_accuracy = float(
+        (resume_state or {}).get("best_l1_accuracy", float("-inf"))
+    )
     best_metrics = dict((resume_state or {}).get("best_metrics", {}))
+    last_metrics = dict(
+        (resume_state or {}).get(
+            "last_metrics",
+            (resume_state or {}).get("best_metrics", {}),
+        )
+    )
     alignment_history = list((resume_state or {}).get("alignment_history", []))
     start_epoch = int((resume_state or {}).get("epoch", 0)) + 1
     global_step = int((resume_state or {}).get("global_step", 0))
-    schedule_state = _ensure_schedule_state((resume_state or {}).get("schedule_state"))
-    scaler = torch.amp.GradScaler("cuda", enabled=bool(cfg["train"].get("amp", False) and device.type == "cuda"))
+    l2_supervised_step = int(
+        (resume_state or {}).get("l2_supervised_step", 0)
+    )
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=bool(cfg["train"].get("amp", False) and device.type == "cuda"),
+    )
     if resume_state and "scaler" in resume_state:
         scaler.load_state_dict(resume_state["scaler"])
     _restore_rng_state((resume_state or {}).get("rng_state"))
     writer = _build_summary_writer(cfg, output_dir)
-    zhcc_prototype_state = {
-        "zhcc": zhcc_prototypes,
-        "last_refresh_step": (resume_state or {}).get("zhcc_dynamic_prototype_step"),
-    }
-    prefetched_train_iterator = None
     try:
         for epoch in range(start_epoch, int(cfg["train"]["epochs"]) + 1):
+            _set_loader_epoch(train_loader, epoch - 1)
             train_metrics = run_epoch(
                 model,
                 train_loader,
@@ -1053,28 +1182,17 @@ def fit(
                 scaler=scaler,
                 scheduler=scheduler,
                 max_batches=cfg["train"].get("max_train_batches"),
-                zhcc_prototypes=zhcc_prototypes,
-                zhcc_image_bank=zhcc_image_bank,
-                zhcc_prototype_state=zhcc_prototype_state,
                 epoch=epoch,
                 global_step=global_step,
-                schedule_state=schedule_state,
+                l2_supervised_step=l2_supervised_step,
                 summary_writer=writer,
-                prefetched_iterator=prefetched_train_iterator,
             )
-            prefetched_train_iterator = None
             global_step = int(train_metrics["global_step_end"])
+            l2_supervised_step = int(
+                train_metrics["l2_supervised_step_end"]
+            )
             val_iterator = iter(val_loader)
             try:
-                _maybe_refresh_dynamic_prototypes(
-                    model=model,
-                    cfg=cfg,
-                    device=device,
-                    zhcc_image_bank=zhcc_image_bank,
-                    prototype_state=zhcc_prototype_state,
-                    global_step=global_step,
-                    needed=zhcc_image_bank is not None,
-                )
                 val_metrics, val_embeddings = run_epoch(
                     model,
                     val_loader,
@@ -1084,15 +1202,15 @@ def fit(
                     cfg,
                     train=False,
                     max_batches=cfg["train"].get("max_val_batches"),
-                    zhcc_prototypes=zhcc_prototype_state.get("zhcc", zhcc_prototypes),
-                    zhcc_image_bank=zhcc_image_bank,
-                    zhcc_prototype_state=zhcc_prototype_state,
                     epoch=epoch,
                     global_step=global_step,
-                    schedule_state=schedule_state,
+                    l2_supervised_step=l2_supervised_step,
                     summary_writer=writer,
                     collect_embeddings=True,
-                    max_eval_batches=cfg["train"].get("max_eval_batches", cfg["train"].get("max_val_batches")),
+                    max_eval_batches=cfg["train"].get(
+                        "max_eval_batches",
+                        cfg["train"].get("max_val_batches"),
+                    ),
                     prefetched_iterator=val_iterator,
                 )
                 val_iterator = None
@@ -1100,114 +1218,57 @@ def fit(
                 close_val_iterator = getattr(val_iterator, "close", None)
                 if callable(close_val_iterator):
                     close_val_iterator()
-            if epoch < int(cfg["train"]["epochs"]):
-                prefetched_train_iterator = iter(train_loader)
-            current_zhcc_prototypes = zhcc_prototype_state.get("zhcc", zhcc_prototypes)
-            embeddings, student_by_teacher, teacher_by_name, prototype_labels = val_embeddings
-            cpu_prototypes = {name: registry.to("cpu") for name, registry in prototypes.items()} if prototypes else None
-            eval_pairwise_max_samples = int(cfg["train"].get("eval_pairwise_max_samples", 4096))
+            _, student_by_teacher, teacher_by_name, supervised = val_embeddings
+            cpu_prototypes = (
+                {name: registry.to("cpu") for name, registry in prototypes.items()}
+                if prototypes
+                else None
+            )
             embedding_metrics = evaluate_teacher_outputs(
                 student_by_teacher,
                 teacher_by_name,
                 cpu_prototypes,
                 int(cfg["train"]["topk"]),
-                max_pairwise_samples=eval_pairwise_max_samples,
+                max_pairwise_samples=int(
+                    cfg["train"].get("eval_pairwise_max_samples", 4096)
+                ),
             )
-            zhcc_metrics = evaluate_zhcc_prototypes(
-                embeddings,
-                prototype_labels["prototype_mask"],
-                prototype_labels["prototype_level1"],
-                prototype_labels["prototype_level2"],
-                current_zhcc_prototypes.to("cpu") if current_zhcc_prototypes is not None else None,
-                topk=int(cfg["train"]["topk"]),
-                max_pairwise_samples=eval_pairwise_max_samples,
-            )
-            del val_embeddings, embeddings, student_by_teacher, teacher_by_name, prototype_labels
+            l1_metrics = _l1_eval_metrics(supervised)
+            del val_embeddings, student_by_teacher, teacher_by_name, supervised
             _release_host_memory()
-            prototype_bank_metrics = {}
-            if zhcc_image_bank is not None:
-                if current_zhcc_prototypes is not None:
-                    bank_batch_size = int(cfg["train"].get("dynamic_prototype_batch_size", cfg["train"].get("batch_size", 512)))
-                    bank_embeddings = collect_student_prototype_image_embeddings(
-                        model=model,
-                        image_bank=zhcc_image_bank,
-                        cfg=cfg,
-                        device=device,
-                        batch_size=bank_batch_size,
-                    ).cpu()
-                    bank_metrics = evaluate_zhcc_prototypes(
-                        bank_embeddings,
-                        torch.ones(zhcc_image_bank.count, dtype=torch.bool),
-                        zhcc_image_bank.level1,
-                        zhcc_image_bank.level2,
-                        current_zhcc_prototypes.to("cpu"),
-                        topk=int(cfg["train"]["topk"]),
-                        max_pairwise_samples=eval_pairwise_max_samples,
-                    )
-                    prototype_bank_metrics = {f"prototype_bank_{key}": value for key, value in bank_metrics.items()}
-                    del bank_embeddings
-                    _release_host_memory()
-                else:
-                    dummy_metrics = evaluate_zhcc_prototypes(
-                        None,
-                        torch.zeros(0, dtype=torch.bool),
-                        torch.zeros(0, dtype=torch.long),
-                        torch.zeros((0, 0), dtype=torch.float32),
-                        None,
-                    )
-                    prototype_bank_metrics = {f"prototype_bank_{key}": value for key, value in dummy_metrics.items()}
+
             teacher_alignment_values = [
-                float(value) for key, value in embedding_metrics.items() if key.endswith("_feature_cosine")
+                float(value)
+                for key, value in embedding_metrics.items()
+                if key.endswith("_feature_cosine")
             ]
             teacher_alignment = (
                 float(sum(teacher_alignment_values) / len(teacher_alignment_values))
                 if teacher_alignment_values
                 else float("-inf")
             )
-            target_zhcc_proto_weight = float(cfg["loss"].get("zhcc_proto_weight", 0.0))
-            current_zhcc_proto_weight = float(val_metrics.get("scheduled_zhcc_proto_weight", 0.0))
-            zhcc_penalty_scale = min(1.0, current_zhcc_proto_weight / target_zhcc_proto_weight) if target_zhcc_proto_weight > 0 else 0.0
-
-            scientific_score = (
-                (0.0 if not math.isfinite(teacher_alignment) else teacher_alignment)
-                - float(cfg["train"].get("scientific_score_zhcc_response_weight", 0.25))
-                * zhcc_penalty_scale
-                * float(val_metrics["zhcc_proto"])
-            )
             loss_cfg = scheduled_loss_config(
                 cfg,
                 epoch=epoch,
                 global_step=global_step,
-                schedule_state=schedule_state,
+                l2_supervised_step=l2_supervised_step,
             )
             row = {
                 "epoch": epoch,
                 "global_step": global_step,
+                "l2_supervised_step": l2_supervised_step,
                 "feature_loss_type": str(loss_cfg["feature_loss_type"]),
                 "lr": float(optimizer.param_groups[0]["lr"]),
                 "scheduled_semantic_weight": float(loss_cfg["semantic_weight"]),
-                "scheduled_prototype_filter_weight": float(loss_cfg["prototype_filter_weight"]),
-                "scheduled_zhcc_proto_weight": float(loss_cfg["zhcc_proto_weight"]),
-                "scheduled_zhcc_response_weight": float(loss_cfg["zhcc_response_weight"]),
-                "scheduled_roi_weight": float(loss_cfg["roi_weight"]),
-                "scheduled_roi_consistency_weight": float(loss_cfg["roi_consistency_weight"]),
-                "prototype_start_step": -1 if loss_cfg["prototype_start_step"] is None else int(loss_cfg["prototype_start_step"]),
-                "filter_start_step": -1 if loss_cfg["filter_start_step"] is None else int(loss_cfg["filter_start_step"]),
-                "teacher_prior_loss_ema": 0.0
-                if loss_cfg["teacher_prior_loss_ema"] is None
-                else float(loss_cfg["teacher_prior_loss_ema"]),
-                "teacher_prior_relative_improvement": 0.0
-                if loss_cfg["teacher_prior_relative_improvement"] is None
-                else float(loss_cfg["teacher_prior_relative_improvement"]),
-                "teacher_prior_plateau_count": int(loss_cfg["teacher_prior_plateau_count"]),
-                "intervention_stage": str(loss_cfg["intervention_stage"]),
-                **{f"train_{k}": v for k, v in train_metrics.items()},
-                **{f"val_{k}": v for k, v in val_metrics.items()},
-                "teacher_alignment_score": 0.0 if not math.isfinite(teacher_alignment) else teacher_alignment,
-                "scientific_score": scientific_score,
+                "scheduled_l1_weight": float(loss_cfg["l1_weight"]),
+                "scheduled_spatial_weight": float(loss_cfg["spatial_weight"]),
+                **{f"train_{key}": value for key, value in train_metrics.items()},
+                **{f"val_{key}": value for key, value in val_metrics.items()},
+                "teacher_alignment_score": (
+                    0.0 if not math.isfinite(teacher_alignment) else teacher_alignment
+                ),
                 **embedding_metrics,
-                **zhcc_metrics,
-                **prototype_bank_metrics,
+                **l1_metrics,
             }
             alignment_history.append(
                 {
@@ -1222,66 +1283,71 @@ def fit(
             )
             append_csv(output_dir / "metrics.csv", row)
             _write_tensorboard_scalars(writer, row, epoch)
+            last_metrics = row
+            improved_loss = val_metrics["loss"] < best_loss
+            improved_alignment = teacher_alignment > best_teacher_alignment
+            improved_l1 = (
+                l1_metrics["l1_evaluated_tiles"] > 0
+                and l1_metrics["l1_accuracy"] > best_l1_accuracy
+            )
+            if improved_loss:
+                best_loss = val_metrics["loss"]
+                best_metrics = row
+            if improved_alignment:
+                best_teacher_alignment = teacher_alignment
+            if improved_l1:
+                best_l1_accuracy = l1_metrics["l1_accuracy"]
+
+            raw_model = getattr(model, "_orig_mod", model)
             checkpoint = {
-                "model": model.state_dict(),
+                "model": raw_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict() if scheduler is not None else None,
                 "scaler": scaler.state_dict(),
                 "epoch": epoch,
                 "global_step": global_step,
+                "l2_supervised_step": l2_supervised_step,
                 "best_loss": best_loss,
                 "best_teacher_alignment": best_teacher_alignment,
-                "best_scientific_score": best_scientific_score,
+                "best_l1_accuracy": best_l1_accuracy,
                 "best_metrics": best_metrics,
+                "last_metrics": last_metrics,
                 "alignment_history": alignment_history,
                 "rng_state": _rng_state(),
-                "schedule_state": schedule_state,
-                "zhcc_dynamic_prototype_step": zhcc_prototype_state.get("last_refresh_step"),
                 "config": cfg,
+                "training_complete": (
+                    epoch >= int(cfg["train"]["epochs"])
+                ),
+                "expected_epochs": int(cfg["train"]["epochs"]),
             }
-            torch.save(
-                checkpoint,
-                checkpoints / "last.pt",
-            )
-            if val_metrics["loss"] < best_loss:
-                best_loss = val_metrics["loss"]
-                checkpoint["best_loss"] = best_loss
-                torch.save(
-                    checkpoint,
-                    checkpoints / "best.pt",
+            torch.save(checkpoint, checkpoints / "last.pt")
+            if improved_loss:
+                torch.save(checkpoint, checkpoints / "best.pt")
+            if improved_alignment:
+                torch.save(checkpoint, checkpoints / "best_teacher_alignment.pt")
+            if improved_l1:
+                torch.save(checkpoint, checkpoints / "best_l1_accuracy.pt")
+            if bool(
+                cfg["train"].get(
+                    "early_stop_teacher_alignment",
+                    not bool(cfg["data"].get("spatial_manifest_path")),
                 )
-            if teacher_alignment > best_teacher_alignment:
-                best_teacher_alignment = teacher_alignment
-                checkpoint["best_teacher_alignment"] = best_teacher_alignment
-                torch.save(
-                    checkpoint,
-                    checkpoints / "best_teacher_alignment.pt",
-                )
-            if scientific_score > best_scientific_score:
-                best_scientific_score = scientific_score
-                best_metrics = row
-                checkpoint["best_scientific_score"] = best_scientific_score
-                checkpoint["best_metrics"] = best_metrics
-                torch.save(
-                    checkpoint,
-                    checkpoints / "best_scientific_score.pt",
-                )
-            if _should_stop_for_alignment(alignment_history):
+            ) and _should_stop_for_alignment(alignment_history):
                 _log(
                     "early_stop "
                     f"epoch={epoch} window={EARLY_STOP_WINDOW_EPOCHS} "
-                    f"alignment_gain_threshold={EARLY_STOP_ALIGNMENT_GAIN} "
-                    f"per_teacher_gain_threshold={EARLY_STOP_PER_TEACHER_GAIN}"
+                    f"alignment_gain_threshold={EARLY_STOP_ALIGNMENT_GAIN}"
                 )
                 break
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             _release_host_memory()
     finally:
-        close_prefetched_train = getattr(prefetched_train_iterator, "close", None)
-        if callable(close_prefetched_train):
-            close_prefetched_train()
         if writer is not None:
             writer.close()
-    write_json(output_dir / "summary.json", best_metrics)
-    return best_metrics
+    spatial_route = bool(cfg["data"].get("spatial_manifest_path"))
+    summary_metrics = last_metrics if spatial_route else best_metrics
+    if not summary_metrics:
+        raise RuntimeError("training produced no summary metrics")
+    write_json(output_dir / "summary.json", summary_metrics)
+    return summary_metrics

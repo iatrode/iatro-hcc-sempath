@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import importlib.util
 import json
 import math
@@ -21,6 +22,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 if SRC_ROOT.exists() and str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
+
+from hcc_sempath.annotation_information import (  # noqa: E402
+    CurveObservation,
+    aggregate_fixed_probe_curves,
+    fixed_probe_curve,
+    meaningful_reference_checkpoints,
+    prepare_fixed_probe_split,
+    tail_plateau,
+)
 
 
 @dataclass(frozen=True)
@@ -70,6 +80,36 @@ DEFAULT_BROWSER_UMAP_NEIGHBORS = 150
 DEFAULT_BROWSER_UMAP_MIN_DIST = 0.7
 DEFAULT_BROWSER_UMAP_RANDOM_STATE = 0
 DEFAULT_ELBOW_MARGINAL_RATIO = 0.35
+DEFAULT_FIXED_PROBE_RESAMPLES = 16
+DEFAULT_PROBE_SLIDE_FRACTION = 0.20
+DEFAULT_MIN_PROBE_SLIDES = 2
+DEFAULT_FIXED_PROBE_SUPPORT = 0.80
+DEFAULT_CONFIRMATION_INCREMENTS = 2
+DEFAULT_CLASS_REFERENCE_COUNTS = (
+    5,
+    10,
+    15,
+    20,
+    30,
+    40,
+    50,
+    60,
+    70,
+    80,
+    90,
+    100,
+    120,
+    140,
+    160,
+    180,
+    200,
+    250,
+    300,
+    400,
+    500,
+    600,
+    800,
+)
 
 
 def _log(message: str, *, enabled: bool = True) -> None:
@@ -883,6 +923,270 @@ def _recommendation(aggregate_rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _fixed_probe_seed(unit: str, seed: int, resample: int) -> int:
+    digest = hashlib.sha256(unit.encode("utf-8")).digest()
+    return (
+        seed
+        + int.from_bytes(digest[:4], "little")
+        + resample * 100_003
+    )
+
+
+def _reference_checkpoints(
+    capacity: int,
+    requested: list[int],
+) -> list[int]:
+    return meaningful_reference_checkpoints(capacity, requested)
+
+
+def _json_curve_rows(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [
+        {
+            key: _format_float(value)
+            if isinstance(value, float)
+            else value
+            for key, value in row.items()
+        }
+        for row in rows
+    ]
+
+
+def _fixed_probe_unit(
+    *,
+    unit: str,
+    prototype_samples: list[PrototypeSample],
+    features_by_teacher: dict[str, dict[str, np.ndarray]],
+    requested_counts: list[int],
+    seed: int,
+    resamples: int,
+    topk: int,
+    probe_slide_fraction: float,
+    min_probe_slides: int,
+    marginal_ratio_threshold: float,
+    drift_threshold: float,
+    support_threshold: float,
+    confirmation_increments: int,
+    min_slides: int,
+    min_increments: int,
+) -> dict[str, Any]:
+    selected_samples = [
+        sample
+        for sample in prototype_samples
+        if unit == "__all_l1__" or sample.level1_label == unit
+    ]
+    slides = {sample.slide_id for sample in selected_samples}
+    if not selected_samples or len(slides) < min_probe_slides + 2:
+        return {
+            "status": "not_assessable",
+            "enough_now": False,
+            "reason": (
+                "fixed-probe split requires at least "
+                f"{min_probe_slides + 2} slides; observed {len(slides)}"
+            ),
+            "positive_tile_count": len(selected_samples),
+            "positive_slide_count": len(slides),
+            "reference_capacity": 0,
+            "checkpoints": [],
+            "tail_plateau_support": 0.0,
+            "recommended_reference_tile_count": None,
+            "curve": [],
+        }
+    curves: list[list[dict[str, object]]] = []
+    splits_by_teacher: dict[str, list[Any]] = {}
+    for teacher, feature_map in features_by_teacher.items():
+        observations = [
+            CurveObservation(
+                tile_id=sample.tile_id,
+                slide_id=sample.slide_id,
+                stratum=(
+                    sample.level1_label
+                    if unit == "__all_l1__"
+                    else unit
+                ),
+                feature=feature_map[sample.tile_id],
+            )
+            for sample in selected_samples
+        ]
+        splits_by_teacher[teacher] = [
+            prepare_fixed_probe_split(
+                observations,
+                seed=_fixed_probe_seed(unit, seed, resample),
+                probe_slide_fraction=probe_slide_fraction,
+                min_probe_slides=min_probe_slides,
+            )
+            for resample in range(resamples)
+        ]
+
+    all_splits = [
+        split
+        for teacher_splits in splits_by_teacher.values()
+        for split in teacher_splits
+    ]
+    capacity = min(
+        len(split.reference_tile_order) for split in all_splits
+    )
+    checkpoints = _reference_checkpoints(capacity, requested_counts)
+    for teacher_splits in splits_by_teacher.values():
+        curves.extend(
+            [
+                list(
+                    fixed_probe_curve(
+                        split,
+                        checkpoints,
+                        topk=topk,
+                    )
+                )
+                for split in teacher_splits
+            ]
+        )
+    aggregate = list(aggregate_fixed_probe_curves(curves))
+    decisions = [
+        tail_plateau(
+            curve,
+            marginal_ratio_threshold=marginal_ratio_threshold,
+            drift_threshold=drift_threshold,
+            confirmation_increments=confirmation_increments,
+        )
+        for curve in curves
+    ]
+    observed = [
+        onset
+        for stable, onset in decisions
+        if stable and onset is not None
+    ]
+    support = len(observed) / len(curves)
+    enough_curve = len(checkpoints) - 1 >= min_increments
+    enough_slides = len(slides) >= min_slides
+    ready = (
+        enough_curve
+        and enough_slides
+        and support >= support_threshold
+    )
+    if not enough_curve or not enough_slides:
+        reason = (
+            f"requires {min_increments} reference increments and "
+            f"{min_slides} slides; observed {len(checkpoints) - 1} "
+            f"increments and {len(slides)} slides"
+        )
+        status = "not_assessable"
+    elif ready:
+        reason = (
+            "fixed-probe remaining novelty is monotone and its final "
+            "gains and centre drift pass repeated confirmation"
+        )
+        status = "provisionally_stable"
+    else:
+        reason = (
+            "the fixed-probe tail has not passed consecutive "
+            "low-gain confirmation"
+        )
+        status = "still_growing"
+    return {
+        "status": status,
+        "enough_now": ready,
+        "reason": reason,
+        "positive_tile_count": len(selected_samples),
+        "positive_slide_count": len(slides),
+        "reference_capacity": capacity,
+        "checkpoints": checkpoints,
+        "tail_plateau_support": support,
+        "recommended_reference_tile_count": (
+            int(round(float(np.median(observed))))
+            if observed
+            else None
+        ),
+        "curve": _json_curve_rows(aggregate),
+    }
+
+
+def _fixed_probe_l1_information(
+    *,
+    prototype_samples: list[PrototypeSample],
+    features_by_teacher: dict[str, dict[str, np.ndarray]],
+    level1_names: list[str],
+    requested_counts: list[int],
+    seed: int,
+    resamples: int,
+    topk: int,
+    probe_slide_fraction: float,
+    min_probe_slides: int,
+    marginal_ratio_threshold: float,
+    drift_threshold: float,
+    support_threshold: float,
+    confirmation_increments: int,
+    min_slides: int,
+    min_increments: int,
+) -> dict[str, Any]:
+    global_result = _fixed_probe_unit(
+        unit="__all_l1__",
+        prototype_samples=prototype_samples,
+        features_by_teacher=features_by_teacher,
+        requested_counts=requested_counts,
+        seed=seed,
+        resamples=resamples,
+        topk=topk,
+        probe_slide_fraction=probe_slide_fraction,
+        min_probe_slides=min_probe_slides,
+        marginal_ratio_threshold=marginal_ratio_threshold,
+        drift_threshold=drift_threshold,
+        support_threshold=support_threshold,
+        confirmation_increments=confirmation_increments,
+        min_slides=min_slides,
+        min_increments=min_increments,
+    )
+    classes = {
+        name: _fixed_probe_unit(
+            unit=name,
+            prototype_samples=prototype_samples,
+            features_by_teacher=features_by_teacher,
+            requested_counts=list(DEFAULT_CLASS_REFERENCE_COUNTS),
+            seed=seed,
+            resamples=resamples,
+            topk=topk,
+            probe_slide_fraction=probe_slide_fraction,
+            min_probe_slides=min_probe_slides,
+            marginal_ratio_threshold=marginal_ratio_threshold,
+            drift_threshold=drift_threshold,
+            support_threshold=support_threshold,
+            confirmation_increments=confirmation_increments,
+            min_slides=min_slides,
+            min_increments=min_increments,
+        )
+        for name in level1_names
+    }
+    ready = bool(classes) and global_result["enough_now"] and all(
+        result["enough_now"] for result in classes.values()
+    )
+    return {
+        "status": (
+            "provisionally_stable" if ready else "still_growing"
+        ),
+        "enough_now": ready,
+        "global": global_result,
+        "classes": classes,
+        "method": {
+            "primary_curve": (
+                "fixed slide-separated probe remaining novelty under a "
+                "nested reference set; monotone non-increasing by construction"
+            ),
+            "teacher_aggregation": (
+                "equal teacher contribution after per-teacher fixed-probe curves"
+            ),
+            "class_aggregation": (
+                "global L1 probe coverage weights L1 classes equally"
+            ),
+            "resamples": resamples,
+            "probe_slide_fraction": probe_slide_fraction,
+            "minimum_probe_slides": min_probe_slides,
+            "topk": topk,
+            "tail_plateau_support_threshold": support_threshold,
+            "confirmation_increments": confirmation_increments,
+        },
+    }
+
+
 def _pca_2d(matrix: np.ndarray) -> np.ndarray:
     matrix = np.asarray(matrix, dtype=np.float32)
     if matrix.shape[0] == 0:
@@ -1388,6 +1692,7 @@ def _plot_curves(
     output_root: Path,
     teacher_rows: list[dict[str, Any]],
     aggregate_rows: list[dict[str, Any]],
+    fixed_probe_information: dict[str, Any],
     prototype_rows: list[dict[str, Any]],
     max_subset: list[PrototypeSample],
     pca_features_by_teacher: dict[str, dict[str, np.ndarray]],
@@ -1418,7 +1723,53 @@ def _plot_curves(
             fig.savefig(path, dpi=220)
             written.append(str(path))
 
-    _log("plot summary curves", enabled=verbose)
+    _log("plot fixed-probe coverage curves", enabled=verbose)
+    fixed_units = [
+        ("all L1", fixed_probe_information["global"]),
+        *sorted(fixed_probe_information["classes"].items()),
+    ]
+    ncols = 3
+    nrows = int(math.ceil(len(fixed_units) / ncols))
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(5.0 * ncols, 3.8 * nrows),
+        constrained_layout=True,
+    )
+    axes_arr = np.asarray(axes).reshape(-1)
+    for axis, (name, unit) in zip(axes_arr, fixed_units):
+        curve = list(unit.get("curve", []))
+        if curve:
+            x = [int(row["sample_count"]) for row in curve]
+            y = [
+                _as_float(row, "remaining_novelty_mean")
+                for row in curve
+            ]
+            low = [
+                _as_float(row, "remaining_novelty_mean_ci_low")
+                for row in curve
+            ]
+            high = [
+                _as_float(row, "remaining_novelty_mean_ci_high")
+                for row in curve
+            ]
+            axis.plot(x, y, marker="o", linewidth=1.8)
+            axis.fill_between(x, low, high, alpha=0.18, linewidth=0)
+        axis.set_title(
+            f"{name}\n{unit['status']} · N={unit['positive_tile_count']}"
+        )
+        axis.set_xlabel("nested reference tile count")
+        axis.set_ylabel("fixed-probe remaining novelty")
+        axis.grid(True, linewidth=0.5, alpha=0.35)
+    for axis in axes_arr[len(fixed_units) :]:
+        axis.axis("off")
+    fig.suptitle(
+        "L1 annotation coverage: fixed probe under nested reference growth"
+    )
+    save(fig, "infospace_information_summary")
+    plt.close(fig)
+
+    _log("plot secondary discovery diagnostic", enabled=verbose)
     fig, axes = plt.subplots(2, 2, figsize=(11, 7), constrained_layout=True)
     panels = [
         ("infospace_novelty_mean", "New-batch infospace novelty", axes[0, 0]),
@@ -1450,7 +1801,10 @@ def _plot_curves(
         ax.set_title(title)
         ax.set_xlabel("Prototype tile count N")
         ax.grid(True, linewidth=0.5, alpha=0.35)
-    save(fig, "infospace_information_summary")
+    fig.suptitle(
+        "Secondary new-batch discovery diagnostic — not a stopping signal"
+    )
+    save(fig, "infospace_discovery_diagnostic_summary")
     plt.close(fig)
 
     _plot_infospace_distribution(plt=plt, figure_dir=figure_dir, aggregate_rows=aggregate_rows, formats=formats, written=written)
@@ -1481,10 +1835,16 @@ def _plot_curves(
             ax.set_xlabel("Prototype tile count N")
             ax.grid(True, linewidth=0.5, alpha=0.35)
         axes[0, 0].legend(fontsize=8)
-        save(fig, "infospace_information_teacher_audit")
+        fig.suptitle(
+            "Secondary new-batch discovery diagnostic by teacher"
+        )
+        save(fig, "infospace_discovery_diagnostic_teacher_audit")
         plt.close(fig)
 
-    for level in (1, 2):
+    plotted_levels = sorted(
+        {int(row["level"]) for row in prototype_rows}
+    )
+    for level in plotted_levels:
         _log(f"plot L{level} prototype curves/audit", enabled=verbose)
         _plot_prototype_curves(
             plt=plt,
@@ -1589,6 +1949,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     plateau_novelty_threshold = float(getattr(args, "plateau_novelty_threshold", DEFAULT_PLATEAU_NOVELTY_THRESHOLD))
     plateau_drift_threshold = float(getattr(args, "plateau_drift_threshold", DEFAULT_PLATEAU_DRIFT_THRESHOLD))
     plateau_redundancy_threshold = float(getattr(args, "plateau_redundancy_threshold", DEFAULT_PLATEAU_REDUNDANCY_THRESHOLD))
+    fixed_probe_resamples = int(
+        getattr(
+            args,
+            "fixed_probe_resamples",
+            DEFAULT_FIXED_PROBE_RESAMPLES,
+        )
+    )
+    probe_slide_fraction = float(
+        getattr(
+            args,
+            "probe_slide_fraction",
+            DEFAULT_PROBE_SLIDE_FRACTION,
+        )
+    )
+    min_probe_slides = int(
+        getattr(args, "min_probe_slides", DEFAULT_MIN_PROBE_SLIDES)
+    )
+    fixed_probe_support = float(
+        getattr(
+            args,
+            "fixed_probe_support",
+            DEFAULT_FIXED_PROBE_SUPPORT,
+        )
+    )
+    confirmation_increments = int(
+        getattr(
+            args,
+            "confirmation_increments",
+            DEFAULT_CONFIRMATION_INCREMENTS,
+        )
+    )
 
     _log("load prototype_samples", enabled=verbose)
     generated_manifest_info: dict[str, Any] = {}
@@ -1616,6 +2007,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _log(f"available prototype_sample counts: {sorted(subsets)}", enabled=verbose)
 
     level1_names, level2_names = _load_contract(Path(args.prototype_contract) if args.prototype_contract else None, prototype_samples)
+    prototype_levels = {
+        value.lower()
+        for value in _parse_str_list(
+            getattr(args, "prototype_levels", "l1,l2")
+        )
+    }
+    if not prototype_levels or not prototype_levels <= {"l1", "l2"}:
+        raise ValueError(
+            "--prototype-levels must contain l1, l2, or both"
+        )
+    if "l1" not in prototype_levels:
+        level1_names = []
+    if "l2" not in prototype_levels:
+        level2_names = []
     _log(f"prototype labels: L1={len(level1_names)} L2={len(level2_names)}", enabled=verbose)
 
     teacher_paths = _resolve_teacher_paths(args)
@@ -1627,7 +2032,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     report = {
         "sweep_type": "infospace_information_curve",
-        "objective": "estimate decay of newly added tile novelty in teacher-feature infospace before main-model training",
+        "objective": (
+            "estimate annotation coverage from a fixed slide-separated probe "
+            "under nested reference growth before main-model training"
+        ),
         "prototype_sample_manifest": str(prototype_sample_manifest),
         "prototype_contract": str(args.prototype_contract or ""),
         "prototype_sample_counts_requested": prototype_sample_counts,
@@ -1635,7 +2043,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "prototype_sample_counts_skipped": skipped_counts,
         "nested_subsets": True,
         "validation_split_used": False,
-        "coverage_metric_used": False,
+        "coverage_metric_used": True,
         "does_not_train": True,
         "seed": seed,
         "prototype_sample_group_key": prototype_sample_group_key,
@@ -1647,6 +2055,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "teacher_feature_packages": {teacher: [str(path) for path in paths] for teacher, paths in teacher_paths.items()},
         "level1_prototypes": level1_names,
         "level2_prototypes": level2_names,
+        "prototype_levels": sorted(prototype_levels),
         "generated_manifests": generated_manifest_info,
     }
 
@@ -1721,12 +2130,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         plateau_drift_threshold=plateau_drift_threshold,
         plateau_redundancy_threshold=plateau_redundancy_threshold,
     )
-    recommendation = _recommendation(aggregate_rows)
+    discovery_recommendation = _recommendation(aggregate_rows)
+    fixed_probe_information = _fixed_probe_l1_information(
+        prototype_samples=max_subset,
+        features_by_teacher=pca_features_by_teacher,
+        level1_names=level1_names,
+        requested_counts=prototype_sample_counts,
+        seed=seed,
+        resamples=fixed_probe_resamples,
+        topk=infospace_topk,
+        probe_slide_fraction=probe_slide_fraction,
+        min_probe_slides=min_probe_slides,
+        marginal_ratio_threshold=DEFAULT_ELBOW_MARGINAL_RATIO,
+        drift_threshold=plateau_drift_threshold,
+        support_threshold=fixed_probe_support,
+        confirmation_increments=confirmation_increments,
+        min_slides=5,
+        min_increments=3,
+    )
 
     _log("write CSV/JSON outputs", enabled=verbose)
     _write_csv(output_root / "infospace_information_by_teacher.csv", teacher_rows)
     _write_csv(output_root / "infospace_information_by_prototype.csv", prototype_rows)
     _write_csv(output_root / "infospace_information_summary.csv", aggregate_rows)
+    fixed_curve_rows = [
+        {
+            "unit": unit,
+            **row,
+        }
+        for unit, value in [
+            ("__all_l1__", fixed_probe_information["global"]),
+            *sorted(fixed_probe_information["classes"].items()),
+        ]
+        for row in value.get("curve", [])
+    ]
+    _write_csv(
+        output_root / "infospace_fixed_probe_information.csv",
+        fixed_curve_rows,
+    )
 
     figure_paths: list[str] = []
     if not bool(getattr(args, "no_plots", False)):
@@ -1735,6 +2176,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             output_root=output_root,
             teacher_rows=teacher_rows,
             aggregate_rows=aggregate_rows,
+            fixed_probe_information=fixed_probe_information,
             prototype_rows=prototype_rows,
             max_subset=max_subset,
             pca_features_by_teacher=pca_features_by_teacher,
@@ -1745,16 +2187,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             verbose=verbose,
         )
 
-    report.update({"recommendation": recommendation, "figures": figure_paths})
+    report.update(
+        {
+            "fixed_probe_information": fixed_probe_information,
+            "discovery_diagnostic": {
+                "claim_scope": (
+                    "new-batch novelty only; non-monotone and never used "
+                    "to stop annotation"
+                ),
+                "recommendation": discovery_recommendation,
+            },
+            "figures": figure_paths,
+        }
+    )
     _write_json(output_root / "infospace_information_report.json", report)
 
     _log(
         "done "
         f"output_root={output_root} teachers={len(teacher_paths)} counts={len(subsets)} "
-        f"recommended_prototype_sample_count={recommendation['recommended_prototype_sample_count']} figures={len(figure_paths)}",
+        f"fixed_probe_status={fixed_probe_information['status']} "
+        f"figures={len(figure_paths)}",
         enabled=verbose,
     )
-    return {"teacher": teacher_rows, "prototype": prototype_rows, "summary": aggregate_rows, "recommendation": recommendation}
+    return {
+        "teacher": teacher_rows,
+        "prototype": prototype_rows,
+        "summary": aggregate_rows,
+        "fixed_probe_information": fixed_probe_information,
+        "discovery_diagnostic": {
+            "recommendation": discovery_recommendation,
+        },
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1770,6 +2233,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--annotation-json", default="")
     parser.add_argument("--prototype-sample-manifest", default="")
     parser.add_argument("--prototype-contract", default="")
+    parser.add_argument(
+        "--prototype-levels",
+        default="l1,l2",
+        help="Comma-separated prototype levels included in the curve: l1, l2",
+    )
     parser.add_argument("--output-root", default="outputs/infospace_information_curve")
     parser.add_argument("--prototype-sample-counts", default=DEFAULT_PROTOTYPE_SAMPLE_COUNTS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -1779,6 +2247,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plateau-novelty-threshold", type=float, default=DEFAULT_PLATEAU_NOVELTY_THRESHOLD)
     parser.add_argument("--plateau-drift-threshold", type=float, default=DEFAULT_PLATEAU_DRIFT_THRESHOLD)
     parser.add_argument("--plateau-redundancy-threshold", type=float, default=DEFAULT_PLATEAU_REDUNDANCY_THRESHOLD)
+    parser.add_argument(
+        "--fixed-probe-resamples",
+        type=int,
+        default=DEFAULT_FIXED_PROBE_RESAMPLES,
+    )
+    parser.add_argument(
+        "--probe-slide-fraction",
+        type=float,
+        default=DEFAULT_PROBE_SLIDE_FRACTION,
+    )
+    parser.add_argument(
+        "--min-probe-slides",
+        type=int,
+        default=DEFAULT_MIN_PROBE_SLIDES,
+    )
+    parser.add_argument(
+        "--fixed-probe-support",
+        type=float,
+        default=DEFAULT_FIXED_PROBE_SUPPORT,
+    )
+    parser.add_argument(
+        "--confirmation-increments",
+        type=int,
+        default=DEFAULT_CONFIRMATION_INCREMENTS,
+    )
     parser.add_argument("--plot-formats", default=DEFAULT_PLOT_FORMATS)
     parser.add_argument("--pca-label-levels", default=DEFAULT_PCA_LABEL_LEVELS)
     parser.add_argument("--max-pca-categories", type=int, default=DEFAULT_MAX_PCA_CATEGORIES)

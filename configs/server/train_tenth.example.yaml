@@ -7,6 +7,16 @@ data:
   train_tile_fraction: 0.10
   val_tile_fraction: 0.10
 
+# Only the population stream is reduced. The complete fixed L1/L2 expert union
+# is resolved from the full manifest and replayed in every matched condition.
+loss:
+  prototype_filter_start_step: 200
+  prototype_filter_ramp_steps: 100
+  zhcc_response_start_step: 200
+  zhcc_response_ramp_steps: 100
+  spatial_ramp_steps: 100
+  spatial_backbone_start_step: 100
+
 train:
   epochs: 20
   warmup_epochs: 1

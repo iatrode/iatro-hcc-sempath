@@ -110,18 +110,11 @@ def knn_l1(feats: np.ndarray, y: np.ndarray, groups: np.ndarray, masks: dict, k:
 
 
 def neighborhood_purity(feats: np.ndarray, y: np.ndarray, Y: np.ndarray, masks: dict, k: int = KNN_K) -> dict:
-    """Reuse the training-time purity routine for an apples-to-apples intrinsic metric."""
-    import torch
-    from hcc_sempath.training.zhcc_metrics import _neighborhood_purity
-
-    # purity is computed over the full set's neighbor graph; report global value
-    l1p, l2p = _neighborhood_purity(
-        torch.from_numpy(_l2norm(feats).astype("float32")),
-        torch.from_numpy(y.astype("int64")),
-        torch.from_numpy(Y.astype("int64")),
-        k,
+    del feats, y, Y, masks, k
+    raise RuntimeError(
+        "V1 historical metric only: global-L2 neighborhood purity was "
+        "removed from the active HCC-SemPath V2 route."
     )
-    return {"All": {"l1_purity": round(float(l1p), 4), "l2_purity": round(float(l2p), 4)}}
 
 
 def main() -> None:

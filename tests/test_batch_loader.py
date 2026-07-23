@@ -7,7 +7,10 @@ import numpy as np
 import pytest
 import torch
 
-from hcc_sempath.training.train import _PackageShuffleBatchLoader
+from hcc_sempath.training.train import (
+    _InterleavedBatchLoader,
+    _PackageShuffleBatchLoader,
+)
 
 
 class _FakeDataset:
@@ -21,8 +24,6 @@ class _FakeDataset:
 
     H = W = 4
     TEACHER_DIMS = {"t0": 3, "t1": 5}
-    L2 = 2
-
     def __init__(self, package_sizes, jitter=True):
         self.package_sizes = list(package_sizes)
         self.total = sum(self.package_sizes)
@@ -52,7 +53,11 @@ class _FakeDataset:
         return plan
 
     def batch_buffer_spec(self):
-        return {"image_hw": (self.H, self.W), "teacher_dims": dict(self.TEACHER_DIMS), "level2_dim": self.L2}
+        return {
+            "image_hw": (self.H, self.W),
+            "teacher_dims": dict(self.TEACHER_DIMS),
+            "spatial_shape": (0, 0, 0),
+        }
 
     def scatter_package_rows(self, package_idx, rows, positions, buffers):
         if self.jitter:
@@ -67,8 +72,6 @@ class _FakeDataset:
                 buf.teacher_features[name][slot.pos].fill_(float(gid))
             buf.prototype_mask[slot.pos] = bool(gid % 2)
             buf.prototype_level1[slot.pos] = gid
-            if buf.prototype_level2.shape[1] > 0:
-                buf.prototype_level2[slot.pos].fill_(float(gid))
             buf.tile_id[slot.pos] = str(gid)
 
 
@@ -94,6 +97,28 @@ def _expected(dataset, chunk_size, seed, batch_size, reshuffle_epoch=0):
             placed[int(perm[within])] = gid
         shuffled.append(placed)
     return shuffled
+
+
+def test_expert_batches_are_interleaved_at_a_fixed_population_interval():
+    population = [["p0"], ["p1"], ["p2"], ["p3"], ["p4"]]
+    expert = [["e0"], ["e1"]]
+    loader = _InterleavedBatchLoader(
+        population,
+        expert,
+        interval=2,
+    )
+
+    assert list(loader) == [
+        ["e0"],
+        ["p0"],
+        ["p1"],
+        ["e1"],
+        ["p2"],
+        ["p3"],
+        ["e0"],
+        ["p4"],
+    ]
+    assert len(loader) == 8
 
 
 @pytest.mark.parametrize("num_workers", [1, 4, 8])
@@ -163,6 +188,26 @@ def test_reshuffle_changes_order_across_epochs():
     epoch2 = _drain_gids(loader)
     assert epoch1 != epoch2
     assert sorted(g for b in epoch1 for g in b) == sorted(g for b in epoch2 for g in b)
+
+
+def test_set_epoch_restores_package_shuffle_order() -> None:
+    ds = _FakeDataset([23, 17, 31, 5], jitter=False)
+    loader = _PackageShuffleBatchLoader(
+        ds,
+        batch_size=8,
+        num_workers=1,
+        prefetch_batches=1,
+        collate_fn=None,
+        seed=11,
+        chunk_size=4,
+        buffer_batches=2,
+        reshuffle_each_epoch=True,
+    )
+    first = _drain_gids(loader)
+    _drain_gids(loader)
+    loader.set_epoch(0)
+
+    assert _drain_gids(loader) == first
 
 
 def test_early_exit_does_not_hang_or_leak_threads():

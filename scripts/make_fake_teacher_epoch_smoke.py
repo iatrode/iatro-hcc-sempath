@@ -93,10 +93,8 @@ def main() -> None:
             "num_workers": 0,
         },
         "model": {
-            "backbone_name": "vit_tiny_patch16_224",
             "embedding_dim": 384,
             "teacher_dims": DEFAULT_TEACHER_DIMS,
-            "pretrained": False,
         },
         "loss": {
             "teacher_weights": {teacher: 1.0 for teacher in DEFAULT_TEACHER_DIMS},
@@ -104,9 +102,8 @@ def main() -> None:
             "semantic_weight": 0.0,
             "semantic_warmup_epochs": 0,
             "semantic_temperature": 1.0,
-            "prototype_filter_weight": 0.0,
-            "prototype_filter_warmup_epochs": 0,
-            "prototype_filter_alpha_min": 0.25,
+            "l1_weight": 1.0,
+            "spatial_weight": 0.1,
         },
         "train": {
             "batch_size": args.batch_size,

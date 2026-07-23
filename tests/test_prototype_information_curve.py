@@ -114,7 +114,8 @@ def test_prototype_information_curve_outputs_nested_feature_metrics(tmp_path: Pa
     assert report["does_not_train"] is True
     assert report["nested_subsets"] is True
     assert report["seed"] == 13
-    assert "recommendation" in report
+    assert "fixed_probe_information" in report
+    assert "discovery_diagnostic" in report
 
     subsets = _rows(output_root / "nested_subsets.csv")
     assert [row["prototype_sample_count"] for row in subsets] == ["2", "4", "6"]
@@ -137,7 +138,10 @@ def test_prototype_information_curve_outputs_nested_feature_metrics(tmp_path: Pa
         prototype_rows[0]
     )
     assert summary_rows[-1]["plateau_consensus"] in {"true", "false"}
-    assert result["recommendation"]["recommended_prototype_sample_count"] in {2, 4, 6}
+    assert result["fixed_probe_information"]["enough_now"] is False
+    assert result["fixed_probe_information"]["global"][
+        "status"
+    ] == "not_assessable"
 
 
 def test_missing_centers_are_reported_without_global_mean_fill(tmp_path: Path) -> None:
@@ -197,6 +201,7 @@ def test_default_prototype_sample_counts_stop_at_three_thousand() -> None:
     parser = module.build_parser()
     args = parser.parse_args([])
     assert args.seed == 13
+    assert args.prototype_levels == "l1,l2"
 
 
 def test_teacher_aliases_resolve_local_feature_directories(tmp_path: Path) -> None:

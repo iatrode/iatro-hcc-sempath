@@ -1,12 +1,10 @@
-inherits: ../../../configs/local/server/train_tenth.yaml
+inherits: tenth_duration_full_population.yaml
 
-# A5: A0 with static student prototypes.
-# The initial student prototype registry is built at the normal intervention
-# point. This interval exceeds the complete run length, so it is not refreshed.
+# A5: A0 with prototypes frozen after the 200-step bootstrap interval.
 # All other settings, including prototype_filter_weight=0.5, inherit from A0.
 
 runtime:
-  output_dir: runtime/ablation/a5_static_prototypes
+  output_dir: outputs/experiments/ablation/a5_static_prototypes
 
-train:
-  dynamic_prototype_refresh_steps: 1000000000
+loss:
+  prototype_update_until_step: 200

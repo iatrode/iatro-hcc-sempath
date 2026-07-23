@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import weakref
 from dataclasses import dataclass, field
+from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Thread
 import torch
@@ -11,6 +14,7 @@ import numpy as np
 
 from . import _pipeline_probe as _probe
 
+from iatro.iac import read_tables
 from iatro.iac.adapters.tiles import read_package_metadata
 from ..modeling.prototypes import PrototypeRegistry, load_prototype_registry
 from ..modeling.models import (
@@ -18,8 +22,11 @@ from ..modeling.models import (
     STUDENT_BACKBONE_NAME,
     STUDENT_IMAGE_SIZE,
     STUDENT_PATCH_SIZE,
+    SPATIAL_OUTPUT_STRIDE,
+    SPATIAL_PATCH_PADDING,
     STUDENT_PRETRAINED_PATH,
     STUDENT_PRETRAINED_SHA256,
+    canonical_payload_sha256,
 )
 from .config import (
     embedding_dim,
@@ -41,9 +48,13 @@ from .datasets import (
 )
 from .engine import build_lr_scheduler, fit
 from .manifest import load_training_manifest
-from .prototype_images import PrototypeImageBank, load_prototype_image_bank
-from .prototype_labels import load_prototype_labels
-from .roi import build_roi_targets
+from .prototype_labels import DEFAULT_L1_CLASSES, load_prototype_labels
+from .roi import (
+    SpatialRoiTarget,
+    build_spatial_roi_targets,
+    empty_spatial_roi_target,
+    spatial_component_names,
+)
 from .utils import seed_everything
 
 
@@ -64,14 +75,64 @@ class BatchBuffer:
     teacher_features: dict                       # name -> (B, dim) float32, pinned
     prototype_mask: torch.Tensor                 # (B,) bool
     prototype_level1: torch.Tensor               # (B,) long
-    prototype_level2: torch.Tensor               # (B, L2) float32 (L2 may be 0)
-    roi_target: torch.Tensor                      # (B, K, Gh, Gw) float32
-    roi_valid: torch.Tensor                       # (B, K, Gh, Gw) bool
-    roi_consistency: torch.Tensor                 # (B, K) bool
+    spatial_targets: list[SpatialRoiTarget | None]
+    spatial_shape: tuple[int, int, int]
     tile_id: list = field(default_factory=list)  # (B,) str
 
     def view(self, count: int) -> dict:
         """Expose the filled prefix as the dict the engine expects."""
+        selected = self.spatial_targets[:count]
+        component_count, grid_h, grid_w = self.spatial_shape
+        if any(item is not None for item in selected):
+            empty = empty_spatial_roi_target(
+                component_count,
+                (grid_h, grid_w),
+            )
+            spatial = [item if item is not None else empty for item in selected]
+            spatial_payload = {
+                "l2_point_centers": torch.stack(
+                    [item.point_centers for item in spatial]
+                ),
+                "l2_brush_bag_ids": torch.stack(
+                    [item.brush_bag_ids for item in spatial]
+                ),
+                "l2_area_positive": torch.stack(
+                    [item.area_positive for item in spatial]
+                ),
+                "l2_explicit_negative": torch.stack(
+                    [item.explicit_negative for item in spatial]
+                ),
+                "l2_implicit_negative": torch.stack(
+                    [item.implicit_negative for item in spatial]
+                ),
+                "l2_spatial_supervised": torch.stack(
+                    [item.supervised for item in spatial]
+                ),
+            }
+        else:
+            spatial_payload = {
+                "l2_point_centers": torch.zeros((count, 0, 0, 0)),
+                "l2_brush_bag_ids": torch.zeros(
+                    (count, 0, 0, 0),
+                    dtype=torch.long,
+                ),
+                "l2_area_positive": torch.zeros(
+                    (count, 0, 0, 0),
+                    dtype=torch.bool,
+                ),
+                "l2_explicit_negative": torch.zeros(
+                    (count, 0, 0, 0),
+                    dtype=torch.bool,
+                ),
+                "l2_implicit_negative": torch.zeros(
+                    (count, 0, 0, 0),
+                    dtype=torch.bool,
+                ),
+                "l2_spatial_supervised": torch.zeros(
+                    (count, 0),
+                    dtype=torch.bool,
+                ),
+            }
         return {
             "tile_id": list(self.tile_id[:count]),
             "images": self.images[:count],
@@ -80,17 +141,14 @@ class BatchBuffer:
             "teacher_features": {name: feat[:count] for name, feat in self.teacher_features.items()},
             "prototype_mask": self.prototype_mask[:count],
             "prototype_level1": self.prototype_level1[:count],
-            "prototype_level2": self.prototype_level2[:count],
-            "roi_target": self.roi_target[:count],
-            "roi_valid": self.roi_valid[:count],
-            "roi_consistency": self.roi_consistency[:count],
+            **spatial_payload,
         }
 
 
 def _alloc_batch_buffer(batch_size: int, spec: dict, pin: bool) -> BatchBuffer:
     h, w = spec["image_hw"]
     kw = {"pin_memory": True} if pin else {}
-    roi_k, roi_h, roi_w = spec.get("roi_shape", (0, 0, 0))
+    spatial_k, spatial_h, spatial_w = spec.get("spatial_shape", (0, 0, 0))
     return BatchBuffer(
         images=torch.empty((batch_size, h, w, 3), dtype=torch.uint8, **kw),
         teacher_features={
@@ -99,10 +157,8 @@ def _alloc_batch_buffer(batch_size: int, spec: dict, pin: bool) -> BatchBuffer:
         },
         prototype_mask=torch.zeros((batch_size,), dtype=torch.bool),
         prototype_level1=torch.full((batch_size,), -1, dtype=torch.long),
-        prototype_level2=torch.zeros((batch_size, int(spec["level2_dim"])), dtype=torch.float32, **kw),
-        roi_target=torch.zeros((batch_size, roi_k, roi_h, roi_w), dtype=torch.float32, **kw),
-        roi_valid=torch.zeros((batch_size, roi_k, roi_h, roi_w), dtype=torch.bool),
-        roi_consistency=torch.zeros((batch_size, roi_k), dtype=torch.bool),
+        spatial_targets=[None] * batch_size,
+        spatial_shape=(spatial_k, spatial_h, spatial_w),
         tile_id=[""] * batch_size,
     )
 
@@ -148,6 +204,9 @@ class _ChunkPlanBatchSampler:
         if self.drop_last:
             return n // self.batch_size
         return (n + self.batch_size - 1) // self.batch_size
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
 
 
 class _PackageShuffleBatchLoader:
@@ -217,6 +276,10 @@ class _PackageShuffleBatchLoader:
                 for name, feat in batch["teacher_features"].items()
             }
         return batch
+
+    def set_epoch(self, epoch: int) -> None:
+        self._stop_active()
+        self._epoch = int(epoch)
 
     def _draw_batch(self, buffer: list[dict], rng: np.random.Generator) -> list[dict]:
         take = min(self.batch_size, len(buffer))
@@ -510,6 +573,224 @@ class _PackageShuffleBatchLoader:
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
 
+class _TargetedPackageBatchLoader:
+    """Decode only the fixed expert tiles, preserving package-row alignment."""
+
+    def __init__(
+        self,
+        dataset: PackageSampledDistillationDataset,
+        rows_by_package: dict[int, np.ndarray],
+        *,
+        batch_size: int,
+        seed: int,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = max(1, int(batch_size))
+        self.seed = int(seed)
+        self._epoch = 0
+        self._cycle = 0
+        self._pairs = [
+            (int(package_idx), int(row))
+            for package_idx, rows in sorted(rows_by_package.items())
+            for row in rows
+        ]
+        if not self._pairs:
+            raise ValueError("expert replay requires at least one package row")
+
+    def __len__(self) -> int:
+        return (len(self._pairs) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        rng = np.random.default_rng(
+            self.seed + self._epoch * 1_000_003 + self._cycle
+        )
+        self._cycle += 1
+        order = rng.permutation(len(self._pairs))
+        for start in range(0, len(order), self.batch_size):
+            selected = [self._pairs[int(index)] for index in order[start : start + self.batch_size]]
+            by_package: dict[int, list[int]] = {}
+            for package_idx, row in selected:
+                by_package.setdefault(package_idx, []).append(row)
+            samples: list[dict] = []
+            for package_idx, rows in by_package.items():
+                samples.extend(
+                    self.dataset.read_package_rows(
+                        package_idx,
+                        np.asarray(rows, dtype=np.int64),
+                    )
+                )
+            yield self.dataset.collate(samples)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+        self._cycle = 0
+
+
+class _InterleavedBatchLoader:
+    """Insert expert replay before each fixed population-batch interval."""
+
+    def __init__(self, population_loader, expert_loader, *, interval: int) -> None:
+        self.population_loader = population_loader
+        self.expert_loader = expert_loader
+        self.interval = int(interval)
+        if self.interval <= 0:
+            raise ValueError(
+                f"expert replay interval must be positive, got {interval}"
+            )
+
+    def __len__(self) -> int:
+        population_batches = len(self.population_loader)
+        expert_batches = (
+            population_batches + self.interval - 1
+        ) // self.interval
+        return population_batches + expert_batches
+
+    def __iter__(self):
+        population_iterator = iter(self.population_loader)
+        expert_iterator = iter(self.expert_loader)
+        try:
+            for batch_index, batch in enumerate(population_iterator, start=1):
+                if (batch_index - 1) % self.interval == 0:
+                    try:
+                        expert_batch = next(expert_iterator)
+                    except StopIteration:
+                        expert_iterator = iter(self.expert_loader)
+                        expert_batch = next(expert_iterator)
+                    yield expert_batch
+                yield batch
+        finally:
+            for iterator in (population_iterator, expert_iterator):
+                close = getattr(iterator, "close", None)
+                if callable(close):
+                    close()
+
+    def set_epoch(self, epoch: int) -> None:
+        for loader in (self.population_loader, self.expert_loader):
+            setter = getattr(loader, "set_epoch", None)
+            if callable(setter):
+                setter(int(epoch))
+                continue
+            for name in ("batch_sampler", "sampler"):
+                candidate = getattr(loader, name, None)
+                setter = getattr(candidate, "set_epoch", None)
+                if callable(setter):
+                    setter(int(epoch))
+                    break
+
+
+def _target_rows_by_package(
+    package_paths: list[str],
+    target_tile_ids: set[str],
+    *,
+    require_all: bool = True,
+) -> dict[int, np.ndarray]:
+    """Resolve a small fixed expert set without materializing all tile records."""
+
+    if not target_tile_ids:
+        return {}
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    rows_by_package: dict[int, np.ndarray] = {}
+    found: set[str] = set()
+    duplicates: set[str] = set()
+    value_set = None
+    for package_idx, package_path in enumerate(package_paths):
+        _, _, record_table = read_tables(package_path)
+        tile_ids = record_table.column("tile_id")
+        if value_set is None or value_set.type != tile_ids.type:
+            value_set = pa.array(sorted(target_tile_ids), type=tile_ids.type)
+        matched = pc.indices_nonzero(
+            pc.is_in(tile_ids, value_set=value_set)
+        ).to_numpy(zero_copy_only=False)
+        if matched.size == 0:
+            continue
+        resolved_rows: list[int] = []
+        for row in matched.tolist():
+            tile_id = str(tile_ids[int(row)].as_py())
+            if tile_id in found:
+                duplicates.add(tile_id)
+            found.add(tile_id)
+            resolved_rows.append(int(row))
+        rows_by_package[package_idx] = np.asarray(
+            resolved_rows,
+            dtype=np.int64,
+        )
+    if duplicates:
+        sample = ", ".join(sorted(duplicates)[:3])
+        raise ValueError(
+            "expert tile_id appears in multiple training packages: "
+            f"count={len(duplicates)} sample={sample}"
+        )
+    missing = sorted(target_tile_ids.difference(found))
+    if missing and require_all:
+        raise ValueError(
+            "expert supervision references tiles outside the training split: "
+            f"count={len(missing)} sample={', '.join(missing[:3])}"
+        )
+    return rows_by_package
+
+
+def _package_cohort_ids(
+    package_paths: list[str],
+) -> tuple[set[str], set[str]]:
+    """Read aggregate patient/slide identities without materializing tiles."""
+
+    patient_ids: set[str] = set()
+    slide_ids: set[str] = set()
+    for package_path in package_paths:
+        _, slide_table, _ = read_tables(package_path)
+        if "patient_id" in slide_table.column_names:
+            patient_ids.update(
+                str(value)
+                for value in slide_table.column("patient_id").to_pylist()
+                if value not in (None, "")
+            )
+        if "slide_id" in slide_table.column_names:
+            slide_ids.update(
+                str(value)
+                for value in slide_table.column("slide_id").to_pylist()
+                if value not in (None, "")
+            )
+    return patient_ids, slide_ids
+
+
+def _validation_package_keep_indices(
+    validation_packages: list[str],
+    expert_packages: list[str],
+) -> list[int]:
+    """Exclude every validation package sharing an expert patient or slide."""
+
+    expert_paths = set(expert_packages)
+    expert_patients, expert_slides = _package_cohort_ids(expert_packages)
+    keep: list[int] = []
+    for index, package_path in enumerate(validation_packages):
+        if package_path in expert_paths:
+            continue
+        patients, slides = _package_cohort_ids([package_path])
+        if patients & expert_patients or slides & expert_slides:
+            continue
+        keep.append(index)
+    return keep
+
+
+def _assert_disjoint_package_cohorts(
+    train_packages: list[str],
+    validation_packages: list[str],
+) -> None:
+    """Fail before training if package splits share a patient or slide."""
+
+    train_patients, train_slides = _package_cohort_ids(train_packages)
+    val_patients, val_slides = _package_cohort_ids(validation_packages)
+    patient_overlap = train_patients & val_patients
+    slide_overlap = train_slides & val_slides
+    if patient_overlap or slide_overlap:
+        raise ValueError(
+            "train/validation cohort leakage: "
+            f"patients={len(patient_overlap)} slides={len(slide_overlap)}"
+        )
+
+
 def _paths_from_data(cfg: dict, key: str) -> list[str]:
     value = cfg["data"].get(key)
     if value is None:
@@ -530,6 +811,144 @@ def _teacher_paths_from_data(cfg: dict, key: str) -> dict[str, list[str]]:
         else:
             result[str(name)] = [str(paths)]
     return result
+
+
+def _resume_contract(cfg: dict) -> dict:
+    """Freeze every numerical/data semantic while allowing host-only changes."""
+
+    contract = copy.deepcopy(cfg)
+    for key in ("device", "output_dir"):
+        contract.get("runtime", {}).pop(key, None)
+    for key in (
+        "num_workers",
+        "prefetch_factor",
+        "persistent_workers",
+        "package_pin_memory",
+    ):
+        contract.get("data", {}).pop(key, None)
+    for key in (
+        "log_interval",
+        "progress",
+        "progress_interval_sec",
+        "tensorboard",
+        "tensorboard_batch_interval",
+        "tensorboard_log_dir",
+    ):
+        contract.get("train", {}).pop(key, None)
+    return contract
+
+
+def _file_sha256(path: str | Path) -> str:
+    with Path(path).open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _optimizer_visible_contract_sha256(
+    package_paths: list[str],
+) -> str:
+    """Digest package identity/cohort metadata without persisting identifiers."""
+
+    packages = []
+    for package_path in sorted(
+        set(str(Path(path).resolve()) for path in package_paths)
+    ):
+        _, slide_table, record_table = read_tables(package_path)
+        packages.append(
+            {
+                "path": package_path,
+                "record_count": int(record_table.num_rows),
+                "patient_ids": sorted(
+                    str(value)
+                    for value in (
+                        slide_table.column("patient_id").to_pylist()
+                        if "patient_id" in slide_table.column_names
+                        else []
+                    )
+                    if value not in (None, "")
+                ),
+                "slide_ids": sorted(
+                    str(value)
+                    for value in (
+                        slide_table.column("slide_id").to_pylist()
+                        if "slide_id" in slide_table.column_names
+                        else []
+                    )
+                    if value not in (None, "")
+                ),
+            }
+        )
+    return canonical_payload_sha256(
+        {"version": 1, "packages": packages}
+    )
+
+
+def _supervision_asset_sha256(cfg: dict) -> dict[str, str]:
+    assets: dict[str, str] = {}
+    for key in (
+        "prototype_supervision_manifest_path",
+        "expert_replay_prototype_manifest_path",
+        "spatial_manifest_path",
+        "prototype_path",
+    ):
+        path = cfg["data"].get(key)
+        if path:
+            assets[f"data.{key}"] = _file_sha256(path)
+    prototype_paths = cfg["data"].get("prototype_paths")
+    if isinstance(prototype_paths, dict):
+        for teacher, path in sorted(prototype_paths.items()):
+            if path:
+                assets[
+                    f"data.prototype_paths.{teacher}"
+                ] = _file_sha256(path)
+    return assets
+
+
+def _verify_frozen_supervision_assets(cfg: dict) -> None:
+    expected = cfg["data"].get("supervision_asset_sha256")
+    if not isinstance(expected, dict) or not expected:
+        raise ValueError(
+            "checkpoint has no frozen supervision-asset digests"
+        )
+    if _supervision_asset_sha256(cfg) != expected:
+        raise ValueError(
+            "supervision assets changed after checkpoint creation"
+        )
+
+
+def _freeze_optimizer_visible_contract(
+    cfg: dict,
+    *,
+    population_packages: list[str],
+    expert_packages: list[str],
+    expert_replay_enabled: bool,
+) -> None:
+    """Freeze exact optimizer inputs and mutable supervision asset contents."""
+
+    visible = list(population_packages)
+    if expert_replay_enabled:
+        visible.extend(expert_packages)
+    frozen_packages = sorted(
+        set(str(Path(path).resolve()) for path in visible)
+    )
+    cfg["data"]["optimizer_visible_tile_packages"] = frozen_packages
+    cfg["data"]["optimizer_visible_contract_sha256"] = (
+        _optimizer_visible_contract_sha256(frozen_packages)
+    )
+
+    cfg["data"]["supervision_asset_sha256"] = (
+        _supervision_asset_sha256(cfg)
+    )
+
+
+def _validate_resume_contract(cfg: dict, resume_state: dict) -> None:
+    saved_cfg = resume_state.get("config")
+    if not isinstance(saved_cfg, dict):
+        raise ValueError("resume checkpoint has no resolved training config")
+    if _resume_contract(saved_cfg) != _resume_contract(cfg):
+        raise ValueError(
+            "resume config changes the model, loss, data, or optimization "
+            "contract; start a separate run instead"
+        )
 
 
 def _limit_records(records: list, limit: int, seed: int) -> list:
@@ -584,10 +1003,13 @@ def _limit_records(records: list, limit: int, seed: int) -> list:
 
 
 def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -> dict[str, PrototypeRegistry] | None:
-    semantic_weight = float(cfg["loss"].get("semantic_weight", 0.0))
-    prototype_filter_weight = float(cfg["loss"].get("prototype_filter_weight", 0.0))
-    zhcc_proto_weight = float(cfg["loss"].get("zhcc_proto_weight", 0.0))
-    if semantic_weight == 0 and prototype_filter_weight == 0 and zhcc_proto_weight == 0:
+    loss_cfg = cfg["loss"]
+    prototype_responses_enabled = (
+        float(loss_cfg.get("semantic_weight", 0.0)) > 0
+        or float(loss_cfg.get("prototype_filter_weight", 0.0)) > 0
+        or float(loss_cfg.get("zhcc_response_weight", 0.0)) > 0
+    )
+    if not prototype_responses_enabled:
         return None
     prototype_paths = cfg["data"].get("prototype_paths")
     if isinstance(prototype_paths, dict):
@@ -595,55 +1017,9 @@ def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -
     prototype_path = cfg["data"].get("prototype_path")
     if prototype_path is None:
         raise ValueError(
-            "data.prototype_path or data.prototype_paths is required when semantic_weight, "
-            "prototype_filter_weight, or zhcc_proto_weight > 0"
+            "data.prototype_path or data.prototype_paths is required when semantic_weight > 0"
         )
     return {name: load_prototype_registry(prototype_path, expected_dim=dim).to(device) for name, dim in dims.items()}
-
-
-def _load_zhcc_prototypes(cfg: dict, device: torch.device) -> PrototypeRegistry | None:
-    prototype_path = cfg["data"].get("zhcc_prototype_path")
-    if prototype_path is None:
-        needs_global_l2 = (
-            float(cfg["loss"].get("zhcc_response_weight", 0.0)) > 0
-            or (
-                cfg["data"].get("roi_manifest_path")
-                and float(cfg["loss"].get("roi_consistency_weight", 0.05)) > 0
-            )
-        )
-        if needs_global_l2 and not cfg["data"].get("zhcc_prototype_image_path"):
-            raise ValueError(
-                "data.zhcc_prototype_path or data.zhcc_prototype_image_path is required for global L2 supervision"
-            )
-        return None
-    return load_prototype_registry(prototype_path, expected_dim=embedding_dim(cfg)).to(device)
-
-
-def _load_zhcc_image_bank(cfg: dict) -> PrototypeImageBank | None:
-    image_path = cfg["data"].get("zhcc_prototype_image_path")
-    if image_path is None:
-        if float(cfg["loss"].get("zhcc_proto_weight", 0.0)) > 0:
-            raise ValueError(
-                "data.zhcc_prototype_image_path is required when loss.zhcc_proto_weight > 0"
-            )
-        return None
-    return load_prototype_image_bank(image_path)
-
-
-def _label_contract_registry(
-    *,
-    cfg: dict,
-    prototypes: dict[str, PrototypeRegistry] | None,
-    zhcc_prototypes: PrototypeRegistry | None,
-    zhcc_image_bank: PrototypeImageBank | None,
-) -> PrototypeRegistry | None:
-    if zhcc_prototypes is not None:
-        return zhcc_prototypes.to("cpu")
-    if zhcc_image_bank is not None:
-        return zhcc_image_bank.label_contract(embedding_dim(cfg))
-    if prototypes:
-        return next(iter(prototypes.values())).to("cpu")
-    return None
 
 
 def _prototype_source_splits(cfg: dict, key: str, default: list[str]) -> set[str] | None:
@@ -724,11 +1100,34 @@ def main() -> None:
         train_teacher_packages = _teacher_paths_from_data(cfg, "train_teacher_feature_package_paths")
         val_teacher_packages = _teacher_paths_from_data(cfg, "val_teacher_feature_package_paths")
         names = list(train_teacher_packages)
+        expert_tile_packages = train_tile_packages + val_tile_packages
+        expert_teacher_packages = {
+            name: train_teacher_packages[name] + val_teacher_packages[name]
+            for name in names
+        }
     elif manifest_path:
         manifest = load_training_manifest(manifest_path)
         train_tile_packages, train_teacher_packages = manifest_data_paths(cfg, manifest, "train")
         val_tile_packages, val_teacher_packages = manifest_data_paths(cfg, manifest, "val")
         names = teacher_names(cfg)
+        full_cfg = copy.deepcopy(cfg)
+        full_cfg["data"]["train_tile_fraction"] = 1.0
+        full_cfg["data"]["val_tile_fraction"] = 1.0
+        expert_train_tiles, expert_train_teachers = manifest_data_paths(
+            full_cfg,
+            manifest,
+            "train",
+        )
+        expert_val_tiles, expert_val_teachers = manifest_data_paths(
+            full_cfg,
+            manifest,
+            "val",
+        )
+        expert_tile_packages = expert_train_tiles + expert_val_tiles
+        expert_teacher_packages = {
+            name: expert_train_teachers[name] + expert_val_teachers[name]
+            for name in names
+        }
     else:
         tile_packages = image_tile_package_paths(cfg)
         teacher_packages = teacher_feature_package_paths(cfg)
@@ -737,37 +1136,54 @@ def main() -> None:
         train_teacher_packages = teacher_packages
         val_teacher_packages = teacher_packages
         names = list(teacher_packages)
+        expert_tile_packages = list(train_tile_packages)
+        expert_teacher_packages = {
+            name: list(paths)
+            for name, paths in train_teacher_packages.items()
+        }
+    if manifest_path or explicit_split_packages:
+        _assert_disjoint_package_cohorts(
+            train_tile_packages,
+            val_tile_packages,
+        )
     validate_training_config(cfg, names)
     dims = teacher_dims(cfg, names)
     prototypes = _load_prototype_map(cfg, dims, device)
-    zhcc_prototypes = _load_zhcc_prototypes(cfg, device)
-    zhcc_image_bank = _load_zhcc_image_bank(cfg)
-    label_contract = _label_contract_registry(
-        cfg=cfg,
-        prototypes=prototypes,
-        zhcc_prototypes=zhcc_prototypes,
-        zhcc_image_bank=zhcc_image_bank,
-    )
-    if cfg["data"].get("roi_manifest_path") and label_contract is None:
-        raise ValueError("ROI supervision requires an L2 prototype label contract")
-    prototype_manifest_path = cfg["data"].get("prototype_supervision_manifest_path")
-    prototype_label_required = (
-        float(cfg["loss"].get("prototype_filter_weight", 0.0)) > 0
-        and float(cfg["loss"].get("prototype_label_weight", 0.4)) > 0
-    )
-    if prototype_label_required and prototype_manifest_path is None:
+    l1_class_names = [
+        str(name)
+        for name in cfg["model"].get("l1_class_names", DEFAULT_L1_CLASSES)
+    ]
+    if tuple(l1_class_names) != DEFAULT_L1_CLASSES:
         raise ValueError(
-            "data.prototype_supervision_manifest_path is required when prototype-label adjudication is enabled"
+            f"fixed L1 class contract must be {list(DEFAULT_L1_CLASSES)}, got {l1_class_names}"
         )
+    prototype_manifest_path = cfg["data"].get("prototype_supervision_manifest_path")
     train_prototype_labels = load_prototype_labels(
         prototype_manifest_path,
-        label_contract,
+        l1_class_names,
         allowed_source_splits=_prototype_source_splits(cfg, "prototype_supervision_train_splits", ["train"]),
     )
     val_prototype_labels = load_prototype_labels(
         prototype_manifest_path,
-        label_contract,
+        l1_class_names,
         allowed_source_splits=_prototype_source_splits(cfg, "prototype_supervision_val_splits", ["val"]),
+    )
+    replay_prototype_manifest_path = cfg["data"].get(
+        "expert_replay_prototype_manifest_path",
+        prototype_manifest_path,
+    )
+    replay_prototype_labels = (
+        train_prototype_labels
+        if replay_prototype_manifest_path == prototype_manifest_path
+        else load_prototype_labels(
+            replay_prototype_manifest_path,
+            l1_class_names,
+            allowed_source_splits=_prototype_source_splits(
+                cfg,
+                "prototype_supervision_train_splits",
+                ["train"],
+            ),
+        )
     )
     all_tile_packages = sorted(set(train_tile_packages + val_tile_packages))
     tile_metadata = read_package_metadata(all_tile_packages[0])
@@ -780,30 +1196,88 @@ def main() -> None:
         candidate_size = (int(metadata["tile_height"]), int(metadata["tile_width"]))
         if candidate_size != image_size:
             raise ValueError(f"tile package size mismatch: {package_path} has {candidate_size}, expected {image_size}")
-    roi_manifest_path = cfg["data"].get("roi_manifest_path")
-    roi_attribute_names = (
-        [label_contract.names[idx] for idx in label_contract.attribute_indices]
-        if label_contract is not None
-        else []
+    spatial_manifest_path = cfg["data"].get("spatial_manifest_path")
+    component_names = spatial_component_names(spatial_manifest_path) if spatial_manifest_path else []
+    cfg["data"]["spatial_component_names"] = list(component_names)
+    spatial_stride = int(cfg["model"].get("spatial_output_stride", SPATIAL_OUTPUT_STRIDE))
+    spatial_grid_size = (
+        (
+            (image_size[0] + 2 * SPATIAL_PATCH_PADDING - STUDENT_PATCH_SIZE) // spatial_stride + 1,
+            (image_size[1] + 2 * SPATIAL_PATCH_PADDING - STUDENT_PATCH_SIZE) // spatial_stride + 1,
+        )
+        if spatial_manifest_path
+        else (0, 0)
     )
-    patch_size = STUDENT_PATCH_SIZE
-    roi_grid_size = (image_size[0] // patch_size, image_size[1] // patch_size) if roi_manifest_path else (0, 0)
-    if roi_manifest_path and (image_size[0] % patch_size or image_size[1] % patch_size):
-        raise ValueError(f"ROI patch size {patch_size} does not divide image size {image_size}")
-    train_roi_targets = build_roi_targets(
-        roi_manifest_path,
-        attribute_names=roi_attribute_names,
+    train_spatial_targets = build_spatial_roi_targets(
+        spatial_manifest_path,
+        component_names=component_names,
         image_size=image_size,
-        grid_size=roi_grid_size,
-        allowed_splits=set(cfg["data"].get("roi_train_splits", ["train"])),
+        grid_size=spatial_grid_size,
+        allowed_splits=set(
+            cfg["data"].get("spatial_train_splits", ["train"])
+        ),
+        point_tolerance_cells=int(
+            cfg["loss"].get("spatial_point_tolerance_cells", 1)
+        ),
     )
-    # ROI supervision is a training-side prototype asset. Validation batches
-    # intentionally carry no ROI targets; localization is evaluated externally
+    # Spatial supervision is a training-side expert asset. Validation batches
+    # intentionally carry no spatial targets; localization is evaluated externally
     # only after the training run is frozen.
-    val_roi_targets = {}
-    roi_dataset_kwargs = {
-        "roi_attribute_count": len(roi_attribute_names) if roi_manifest_path else 0,
-        "roi_grid_size": roi_grid_size,
+    val_spatial_targets = {}
+    expert_tile_ids = set(replay_prototype_labels).union(
+        train_spatial_targets
+    )
+    expert_rows_by_package: dict[int, np.ndarray] = {}
+    if expert_tile_ids:
+        resolved_rows = _target_rows_by_package(
+            expert_tile_packages,
+            expert_tile_ids,
+        )
+        selected_indices = sorted(resolved_rows)
+        selected_paths = {
+            expert_tile_packages[index]
+            for index in selected_indices
+        }
+        expert_tile_packages = [
+            expert_tile_packages[index]
+            for index in selected_indices
+        ]
+        expert_teacher_packages = {
+            name: [
+                paths[index]
+                for index in selected_indices
+            ]
+            for name, paths in expert_teacher_packages.items()
+        }
+        expert_rows_by_package = {
+            new_index: resolved_rows[old_index]
+            for new_index, old_index in enumerate(selected_indices)
+        }
+
+        # Expert-supervised packages are never part of the internal
+        # teacher-alignment validation stream. This keeps the package-level
+        # split disjoint even when an older manifest auto-split ignored the
+        # annotation asset's explicit train designation.
+        val_keep = _validation_package_keep_indices(
+            val_tile_packages,
+            list(selected_paths),
+        )
+        val_tile_packages = [
+            val_tile_packages[index]
+            for index in val_keep
+        ]
+        val_teacher_packages = {
+            name: [paths[index] for index in val_keep]
+            for name, paths in val_teacher_packages.items()
+        }
+        if not val_tile_packages:
+            raise ValueError(
+                "expert-supervised package exclusion left an empty "
+                "validation split"
+            )
+    spatial_dataset_kwargs = {
+        "spatial_component_count": len(component_names) if spatial_manifest_path else 0,
+        "spatial_grid_size": spatial_grid_size,
     }
     dynamic_package_sampling = bool(cfg["data"].get("dynamic_package_sampling", False))
     if dynamic_package_sampling:
@@ -822,8 +1296,8 @@ def main() -> None:
             seed=int(cfg["runtime"]["seed"]),
             expected_dims=dims,
             prototype_labels=train_prototype_labels,
-            roi_targets=train_roi_targets,
-            **roi_dataset_kwargs,
+            spatial_targets=train_spatial_targets,
+            **spatial_dataset_kwargs,
         )
         val_ds = PackageSampledDistillationDataset(
             val_tile_packages,
@@ -833,8 +1307,8 @@ def main() -> None:
             seed=int(cfg["runtime"]["seed"]) + 1,
             expected_dims=dims,
             prototype_labels=val_prototype_labels,
-            roi_targets=val_roi_targets,
-            **roi_dataset_kwargs,
+            spatial_targets=val_spatial_targets,
+            **spatial_dataset_kwargs,
         )
     elif manifest_path or explicit_split_packages:
         train_records = read_packaged_tile_records(train_tile_packages)
@@ -866,16 +1340,16 @@ def main() -> None:
             **common_dataset_kwargs,
             teacher_cache_package_paths=train_teacher_packages,
             prototype_labels=train_prototype_labels,
-            roi_targets=train_roi_targets,
-            **roi_dataset_kwargs,
+            spatial_targets=train_spatial_targets,
+            **spatial_dataset_kwargs,
         )
         val_ds = DistillationTileDataset(
             val_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=val_teacher_packages,
             prototype_labels=val_prototype_labels,
-            roi_targets=val_roi_targets,
-            **roi_dataset_kwargs,
+            spatial_targets=val_spatial_targets,
+            **spatial_dataset_kwargs,
         )
     else:
         records = read_packaged_tile_records(train_tile_packages)
@@ -913,16 +1387,16 @@ def main() -> None:
             **common_dataset_kwargs,
             teacher_cache_package_paths=train_teacher_packages,
             prototype_labels=train_prototype_labels,
-            roi_targets=train_roi_targets,
-            **roi_dataset_kwargs,
+            spatial_targets=train_spatial_targets,
+            **spatial_dataset_kwargs,
         )
         val_ds = DistillationTileDataset(
             val_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=val_teacher_packages,
             prototype_labels=val_prototype_labels,
-            roi_targets=val_roi_targets,
-            **roi_dataset_kwargs,
+            spatial_targets=val_spatial_targets,
+            **spatial_dataset_kwargs,
         )
     num_workers = int(cfg["data"]["num_workers"])
     loader_kwargs = {
@@ -1003,6 +1477,57 @@ def main() -> None:
             collate_fn=collate_distillation,
             **loader_kwargs,
         )
+    replay_interval = int(
+        cfg["data"].get("expert_replay_interval_batches", 16)
+    )
+    if expert_tile_ids and replay_interval > 0:
+        expert_ds = PackageSampledDistillationDataset(
+            expert_tile_packages,
+            expert_teacher_packages,
+            image_size=image_size,
+            max_records=0,
+            seed=int(cfg["runtime"]["seed"]),
+            mean=cfg["data"].get("mean"),
+            std=cfg["data"].get("std"),
+            expected_dims=dims,
+            prototype_labels=train_prototype_labels,
+            tensor_collate=bool(
+                cfg["data"].get(
+                    "tensor_collate",
+                    device.type == "cuda",
+                )
+            ),
+            spatial_targets=train_spatial_targets,
+            **spatial_dataset_kwargs,
+        )
+        expert_batch_size = int(
+            cfg["data"].get(
+                "expert_batch_size",
+                min(64, int(cfg["train"]["batch_size"])),
+            )
+        )
+        expert_loader = _TargetedPackageBatchLoader(
+            expert_ds,
+            expert_rows_by_package,
+            batch_size=expert_batch_size,
+            seed=int(cfg["runtime"]["seed"]) + 100_003,
+        )
+        train_loader = _InterleavedBatchLoader(
+            train_loader,
+            expert_loader,
+            interval=replay_interval,
+        )
+        cfg["data"]["expert_replay_interval_batches"] = replay_interval
+        cfg["data"]["expert_batch_size"] = expert_batch_size
+        cfg["data"]["expert_replay_tiles"] = len(expert_tile_ids)
+    _freeze_optimizer_visible_contract(
+        cfg,
+        population_packages=train_tile_packages,
+        expert_packages=expert_tile_packages,
+        expert_replay_enabled=bool(
+            expert_tile_ids and replay_interval > 0
+        ),
+    )
     model = HCCSemPathModel(
         backbone_name=STUDENT_BACKBONE_NAME,
         embedding_dim=embedding_dim(cfg),
@@ -1012,22 +1537,25 @@ def main() -> None:
         projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
         teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),
         grad_checkpointing=bool(cfg["model"].get("grad_checkpointing", False)),
-        roi_l2_num_attributes=len(roi_attribute_names) if roi_manifest_path else 0,
-        roi_patch_dim=int(cfg["model"].get("roi_patch_dim", embedding_dim(cfg))),
-        roi_top_q=float(cfg["model"].get("roi_top_q", 0.1)),
-        roi_patch_temperature=float(cfg["model"].get("roi_patch_temperature", 0.1)),
+        l1_num_classes=len(l1_class_names),
+        spatial_num_components=len(component_names) if spatial_manifest_path else 0,
+        spatial_dim=int(cfg["model"].get("spatial_dim", 256)),
+        spatial_output_stride=spatial_stride,
     ).to(device)
-    if roi_manifest_path:
-        actual_grid = tuple(int(value) for value in model.encoder.backbone.patch_embed.grid_size)
-        if actual_grid != roi_grid_size:
+    if spatial_manifest_path and model.spatial_head is not None:
+        if spatial_grid_size != (32, 32):
             raise ValueError(
-                f"ROI grid mismatch: configured patch size yields {roi_grid_size}, "
-                f"but backbone exposes {actual_grid}"
+                f"fixed 224px/14px-window spatial contract expects a 32x32 grid, got {spatial_grid_size}"
             )
     resume_state = None
     if args.resume:
         resume_state = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(resume_state["model"])
+        _validate_resume_contract(cfg, resume_state)
+        state = {
+            key.removeprefix("_orig_mod."): value
+            for key, value in resume_state["model"].items()
+        }
+        model.load_state_dict(state)
     if bool(cfg["train"].get("compile", False)):
         model = torch.compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
@@ -1045,8 +1573,6 @@ def main() -> None:
         device,
         cfg,
         scheduler=scheduler,
-        zhcc_prototypes=zhcc_prototypes,
-        zhcc_image_bank=zhcc_image_bank,
         resume_state=resume_state,
     )
     print("train_ok " + " ".join(f"{k}={v}" for k, v in metrics.items()))

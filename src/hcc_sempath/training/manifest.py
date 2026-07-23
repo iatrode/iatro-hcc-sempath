@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from iatro.iac.adapters.tiles import read_package_manifest
+from iatro.iac import read_header, read_tables
 
 
 TILE_SUFFIX = ".tiles.iac"
@@ -67,7 +67,7 @@ def _discover_tile_packages(root: str | Path, tile_suffix: str = TILE_SUFFIX) ->
 
 
 def _package_tile_count(path: Path) -> int:
-    return len(read_package_manifest(path))
+    return int(read_header(path)["num_records"])
 
 
 def _count_split_tiles(tile_root: str | Path, stems: list[str], tile_suffix: str) -> int:
@@ -79,10 +79,16 @@ def _split_key_for_package(path: Path, split_key: str) -> str:
         return package_stem(path)
     if split_key not in {"patient_id", "slide_id"}:
         raise ValueError(f"unsupported split_key: {split_key}")
-    records = read_package_manifest(path)
-    if not records:
-        raise ValueError(f"empty tile package: {path}")
-    values = {getattr(record, split_key) for record in records}
+    _, slide_table, _ = read_tables(path)
+    if split_key not in slide_table.column_names:
+        raise ValueError(f"package slide table has no {split_key}: {path}")
+    values = {
+        str(value)
+        for value in slide_table.column(split_key).to_pylist()
+        if value not in (None, "")
+    }
+    if not values:
+        raise ValueError(f"empty {split_key} in package slide table: {path}")
     if len(values) != 1:
         sample = ", ".join(sorted(values)[:3])
         raise ValueError(f"package has multiple {split_key} values: {path} sample={sample}")
@@ -113,17 +119,52 @@ def _split_development_packages(
     return [package_stem(path) for path in sorted(train_paths)], [package_stem(path) for path in sorted(val_paths)]
 
 
-def _split_public_packages(packages: list[Path], public_exval_n: int, seed: int) -> tuple[list[str], list[str]]:
-    stems = [package_stem(path) for path in packages]
+def _split_public_packages(
+    packages: list[Path],
+    public_exval_n: int,
+    seed: int,
+    split_key: str,
+) -> tuple[list[str], list[str]]:
+    """Hold out whole split-key groups until the package target is reached.
+
+    ``public_exval_n`` remains a package-count target. Patient/slide groups are
+    never split, so the actual held-out package count may exceed the requested
+    target when the final selected group contains multiple packages. With
+    ``split_key="stem"`` every group has one package and the count is exact.
+    """
+
     rng = random.Random(seed)
-    shuffled = sorted(stems)
-    rng.shuffle(shuffled)
     if public_exval_n < 0:
         raise ValueError("public_exval_n must be non-negative")
-    if public_exval_n > len(shuffled):
-        raise ValueError(f"public_exval_n={public_exval_n} exceeds public package count={len(shuffled)}")
-    exval = sorted(shuffled[:public_exval_n])
-    train = sorted(shuffled[public_exval_n:])
+    if public_exval_n > len(packages):
+        raise ValueError(
+            f"public_exval_n={public_exval_n} exceeds public "
+            f"package count={len(packages)}"
+        )
+    groups: dict[str, list[Path]] = defaultdict(list)
+    for path in packages:
+        groups[_split_key_for_package(path, split_key)].append(path)
+    group_keys = sorted(groups)
+    rng.shuffle(group_keys)
+    exval_keys: set[str] = set()
+    exval_count = 0
+    for key in group_keys:
+        if exval_count >= public_exval_n:
+            break
+        exval_keys.add(key)
+        exval_count += len(groups[key])
+    train = sorted(
+        package_stem(path)
+        for key, paths in groups.items()
+        if key not in exval_keys
+        for path in paths
+    )
+    exval = sorted(
+        package_stem(path)
+        for key, paths in groups.items()
+        if key in exval_keys
+        for path in paths
+    )
     return train, exval
 
 
@@ -167,7 +208,12 @@ def build_training_manifest(
         packages = _discover_tile_packages(public_root, tile_suffix=tile_suffix)
         if not packages:
             raise ValueError(f"no tile packages found for public source {public_name}: {public_root}")
-        train_stems, exval_stems = _split_public_packages(packages, public_exval_n, seed)
+        train_stems, exval_stems = _split_public_packages(
+            packages,
+            public_exval_n,
+            seed,
+            split_key,
+        )
         datasets[public_name] = {"role": "public", "tile_root": str(public_root)}
         splits["train"][public_name] = train_stems
         splits["exval"][f"{public_name}_heldout"] = {"source": public_name, "stems": exval_stems}
@@ -208,6 +254,9 @@ def _auto_split_payload(manifest: dict, split: str) -> dict:
     auto_split = manifest.get("auto_split")
     if not isinstance(auto_split, dict) or not bool(auto_split.get("enabled", False)):
         return {}
+    cached = manifest.get("_resolved_auto_splits")
+    if isinstance(cached, dict):
+        return cached.get(split, {})
     tile_suffix = str(manifest.get("tile_suffix", TILE_SUFFIX))
     split_key = str(auto_split.get("split_key", manifest.get("split_key", "stem")))
     development_val_frac = float(auto_split.get("development_val_fraction", auto_split.get("val_fraction", 0.15)))
@@ -228,6 +277,7 @@ def _auto_split_payload(manifest: dict, split: str) -> dict:
             payload["exval"][f"{name}_heldout"] = {"source": name, "stems": exval_stems}
         elif role == "external":
             payload["exval"][f"{name}_heldout"] = {"source": name, "stems": [package_stem(path, tile_suffix) for path in packages]}
+    manifest["_resolved_auto_splits"] = payload
     return payload.get(split, {})
 
 
@@ -340,7 +390,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build a training manifest from per-WSI tile IAC packages.")
     parser.add_argument("--dev-source", action="append", default=[], help="Development source as name=tile_root.")
     parser.add_argument("--public-source", default="", help="Public source as name=tile_root.")
-    parser.add_argument("--public-exval-n", type=int, default=0)
+    parser.add_argument(
+        "--public-exval-n",
+        type=int,
+        default=0,
+        help=(
+            "Target number of public packages held out for exval. Whole "
+            "--split-key groups are retained, so patient/slide grouping may "
+            "produce more packages than requested."
+        ),
+    )
     parser.add_argument("--val-frac", type=float, default=0.15)
     parser.add_argument("--split-key", default="patient_id", choices=["patient_id", "slide_id", "stem"])
     parser.add_argument("--seed", type=int, default=13)

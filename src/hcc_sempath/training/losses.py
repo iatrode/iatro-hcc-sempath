@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -21,7 +23,7 @@ def feature_distillation_loss_per_sample(
     loss_type: str = "cosine",
 ) -> torch.Tensor:
     student = student.float()
-    teacher = teacher.float()
+    teacher = teacher.detach().float()
     cosine = 1.0 - F.cosine_similarity(student, teacher, dim=-1)
     if loss_type == "cosine":
         return cosine
@@ -36,34 +38,35 @@ def feature_distillation_loss_per_sample(
     raise ValueError(f"unsupported feature_loss_type: {loss_type}")
 
 
-def _weighted_mean(loss_per_sample: torch.Tensor, weight: torch.Tensor | None) -> torch.Tensor:
-    if weight is None:
-        return loss_per_sample.mean()
-    weight = weight.to(device=loss_per_sample.device, dtype=loss_per_sample.dtype)
-    if weight.shape != loss_per_sample.shape:
-        raise ValueError(f"weight shape mismatch: weight={tuple(weight.shape)} loss={tuple(loss_per_sample.shape)}")
-    return (weight * loss_per_sample).sum() / weight.sum().clamp_min(1e-6)
-
-
 def relation_distillation_loss(
     student: torch.Tensor,
     teacher: torch.Tensor,
     sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    difference = relation_distillation_loss_matrix(student, teacher)
+    if sample_weight is None:
+        return difference.mean()
+    weight = _validated_sample_weight(
+        sample_weight,
+        difference.shape[0],
+        difference,
+        label="relation",
+    )
+    pair_weight = weight[:, None] * weight[None, :]
+    return (difference * pair_weight).sum() / pair_weight.sum().clamp_min(1e-6)
+
+
+def relation_distillation_loss_matrix(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+) -> torch.Tensor:
     student = student.float()
-    teacher = teacher.float()
+    teacher = teacher.detach().float()
     student_norm = F.normalize(student, dim=-1)
     teacher_norm = F.normalize(teacher, dim=-1)
     student_rel = student_norm @ student_norm.transpose(0, 1)
     teacher_rel = teacher_norm @ teacher_norm.transpose(0, 1)
-    relation_error = (student_rel - teacher_rel).square()
-    if sample_weight is None:
-        return relation_error.mean()
-    weight = sample_weight.to(device=student.device, dtype=student.dtype)
-    if weight.shape != (student.shape[0],):
-        raise ValueError(f"sample_weight must have shape=({student.shape[0]},), got {tuple(weight.shape)}")
-    pair_weight = weight[:, None] * weight[None, :]
-    return (relation_error * pair_weight).sum() / pair_weight.sum().clamp_min(1e-6)
+    return (student_rel - teacher_rel).square()
 
 
 def semantic_distillation_loss(
@@ -71,11 +74,26 @@ def semantic_distillation_loss(
     teacher: torch.Tensor,
     prototypes: PrototypeRegistry,
     primary_temperature: float = 1.0,
-    attribute_temperature: float = 1.0,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    primary = primary_prototype_kl_loss(student, teacher, prototypes, temperature=primary_temperature)
-    attributes = attribute_prototype_bce_loss(student, teacher, prototypes, temperature=attribute_temperature)
-    return primary + attributes
+    """Preserve the four-class L1 semantic axis only.
+
+    Legacy tile-level L2 attributes are deliberately excluded. The nine spatial
+    components receive supervision only from expert point/circle/brush
+    geometry under the fixed component measurement schema.
+    """
+
+    per_sample = primary_prototype_kl_loss_per_sample(
+        student,
+        teacher,
+        prototypes,
+        temperature=primary_temperature,
+    )
+    return _weighted_sample_mean(
+        per_sample,
+        sample_weight,
+        label="semantic",
+    )
 
 
 def primary_prototype_kl_loss(
@@ -83,36 +101,87 @@ def primary_prototype_kl_loss(
     teacher: torch.Tensor,
     prototypes: PrototypeRegistry,
     temperature: float = 1.0,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    primary = prototypes.primary_prototypes
-    student_logits = bounded_logits(normalized_prototype_logits(student, primary) / temperature)
-    teacher_logits = bounded_logits(normalized_prototype_logits(teacher, primary) / temperature)
-    teacher_target = clamp_probability(F.softmax(teacher_logits, dim=-1), normalize=True)
-    return (
-        F.kl_div(
-            F.log_softmax(student_logits, dim=-1),
-            teacher_target,
-            reduction="batchmean",
-        )
-        * (temperature**2)
+    per_sample = primary_prototype_kl_loss_per_sample(
+        student,
+        teacher,
+        prototypes,
+        temperature=temperature,
+    )
+    return _weighted_sample_mean(
+        per_sample,
+        sample_weight,
+        label="semantic",
     )
 
 
-def attribute_prototype_bce_loss(
+def primary_prototype_kl_loss_per_sample(
     student: torch.Tensor,
     teacher: torch.Tensor,
     prototypes: PrototypeRegistry,
     temperature: float = 1.0,
 ) -> torch.Tensor:
-    if not prototypes.attribute_indices:
-        return student.new_zeros(())
-    attributes = prototypes.attribute_prototypes
-    student_logits = bounded_logits(normalized_prototype_logits(student, attributes) / temperature)
-    with torch.no_grad():
-        teacher_targets = clamp_probability(
-            torch.sigmoid(bounded_logits(normalized_prototype_logits(teacher, attributes) / temperature))
+    if not math.isfinite(float(temperature)) or temperature <= 0:
+        raise ValueError(
+            f"semantic temperature must be positive, got {temperature}"
         )
-    return F.binary_cross_entropy_with_logits(student_logits, teacher_targets) * (temperature**2)
+    primary = prototypes.primary_prototypes
+    student_logits = bounded_logits(normalized_prototype_logits(student, primary) / temperature)
+    teacher_logits = bounded_logits(normalized_prototype_logits(teacher, primary) / temperature)
+    teacher_target = clamp_probability(
+        F.softmax(teacher_logits, dim=-1),
+        normalize=True,
+    ).detach()
+    return F.kl_div(
+        F.log_softmax(student_logits, dim=-1),
+        teacher_target,
+        reduction="none",
+    ).sum(dim=-1) * (temperature**2)
+
+
+def _validated_sample_weight(
+    sample_weight: torch.Tensor,
+    expected_size: int,
+    reference: torch.Tensor,
+    *,
+    label: str,
+) -> torch.Tensor:
+    weight = sample_weight.detach().to(
+        device=reference.device,
+        dtype=reference.dtype,
+    ).view(-1)
+    if weight.shape != (expected_size,):
+        raise ValueError(
+            f"{label} sample weight shape mismatch: "
+            f"weight={tuple(weight.shape)} "
+            f"expected={(expected_size,)}"
+        )
+    if not bool(torch.isfinite(weight).all()) or bool((weight < 0).any()):
+        raise ValueError(
+            f"{label} sample weights must be finite and non-negative"
+        )
+    return weight
+
+
+def _weighted_sample_mean(
+    values: torch.Tensor,
+    sample_weight: torch.Tensor | None,
+    *,
+    label: str,
+) -> torch.Tensor:
+    if sample_weight is None:
+        return values.mean()
+    weight = _validated_sample_weight(
+        sample_weight,
+        values.shape[0],
+        values,
+        label=label,
+    )
+    denominator = weight.sum()
+    if float(denominator.detach()) <= 0:
+        raise ValueError(f"{label} sample weights have zero total mass")
+    return (values * weight).sum() / denominator
 
 
 def total_distillation_loss(
@@ -124,20 +193,23 @@ def total_distillation_loss(
     semantic_temperature: float,
     feature_loss_type: str = "cosine",
     primary_temperature: float | None = None,
-    attribute_temperature: float | None = None,
-    teacher_sample_weight: torch.Tensor | None = None,
-    scale_relation_by_alpha: bool = False,
+    sample_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    reliability = None
-    if teacher_sample_weight is not None:
-        reliability = teacher_sample_weight.to(device=student.device, dtype=student.dtype)
-        if reliability.shape != (student.shape[0],):
-            raise ValueError(
-                f"teacher_sample_weight must have shape=({student.shape[0]},), got {tuple(reliability.shape)}"
-        )
-    feature_per_sample = feature_distillation_loss_per_sample(student, teacher, loss_type=feature_loss_type)
-    feature = _weighted_mean(feature_per_sample, reliability)
-    relation = relation_distillation_loss(student, teacher, reliability if scale_relation_by_alpha else None)
+    feature_per_sample = feature_distillation_loss_per_sample(
+        student,
+        teacher,
+        loss_type=feature_loss_type,
+    )
+    feature = _weighted_sample_mean(
+        feature_per_sample,
+        sample_weight,
+        label="feature",
+    )
+    relation = relation_distillation_loss(
+        student,
+        teacher,
+        sample_weight=sample_weight,
+    )
     if prototypes is None or semantic_weight == 0:
         semantic = feature.new_zeros(())
     else:
@@ -146,17 +218,13 @@ def total_distillation_loss(
             teacher=teacher,
             prototypes=prototypes,
             primary_temperature=semantic_temperature if primary_temperature is None else primary_temperature,
-            attribute_temperature=semantic_temperature if attribute_temperature is None else attribute_temperature,
+            sample_weight=sample_weight,
         )
-    reliability_mean = reliability.mean() if reliability is not None else relation.new_ones(())
-    relation_scale = relation.new_ones(())
     total = feature + relation_weight * relation + semantic_weight * semantic
     return total, {
         "feature": feature.detach(),
         "relation": relation.detach(),
         "semantic": semantic.detach(),
-        "reliability": reliability_mean.detach(),
-        "relation_scale": relation_scale.detach(),
     }
 
 
@@ -168,53 +236,151 @@ def multi_teacher_distillation_loss(
     semantic_weight: float,
     semantic_temperature: float,
     teacher_weights: dict[str, float] | None = None,
-    teacher_sample_weights: dict[str, torch.Tensor] | None = None,
     feature_loss_type: str = "cosine",
     primary_temperature: float | None = None,
-    attribute_temperature: float | None = None,
-    scale_relation_by_alpha: bool = False,
+    teacher_sample_weights: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if not student_by_teacher:
+        raise ValueError("multi-teacher distillation requires at least one teacher")
     if set(student_by_teacher) != set(teacher_by_name):
         raise ValueError(
             f"student/teacher names differ: student={sorted(student_by_teacher)} teacher={sorted(teacher_by_name)}"
         )
-    if teacher_sample_weights is not None and set(teacher_sample_weights) != set(student_by_teacher):
+    if (
+        teacher_sample_weights is not None
+        and set(teacher_sample_weights) != set(student_by_teacher)
+    ):
         raise ValueError(
-            f"teacher_sample_weights must match student teachers: "
-            f"weights={sorted(teacher_sample_weights)} student={sorted(student_by_teacher)}"
+            "teacher sample weights must match student heads: "
+            f"weights={sorted(teacher_sample_weights)} "
+            f"student={sorted(student_by_teacher)}"
         )
-    total = None
-    totals = {
-        "feature": next(iter(student_by_teacher.values())).new_zeros(()),
-        "relation": next(iter(student_by_teacher.values())).new_zeros(()),
-        "semantic": next(iter(student_by_teacher.values())).new_zeros(()),
-        "reliability": next(iter(student_by_teacher.values())).new_zeros(()),
-        "relation_scale": next(iter(student_by_teacher.values())).new_zeros(()),
-    }
-    weight_sum = 0.0
+    unknown_teacher_weights = set(teacher_weights or {}).difference(
+        student_by_teacher
+    )
+    if unknown_teacher_weights:
+        raise ValueError(
+            "teacher weights contain unknown teachers: "
+            f"{sorted(unknown_teacher_weights)}"
+        )
+    if semantic_weight != 0 and (
+        prototypes_by_teacher is None
+        or set(prototypes_by_teacher) != set(student_by_teacher)
+    ):
+        raise ValueError(
+            "semantic distillation requires one prototype registry per "
+            f"teacher: prototypes={sorted(prototypes_by_teacher or {})} "
+            f"student={sorted(student_by_teacher)}"
+        )
+    zero = next(iter(student_by_teacher.values())).new_zeros(
+        (),
+        dtype=torch.float32,
+    )
+    feature_numerator = zero
+    feature_denominator = zero
+    relation_numerator = zero
+    relation_denominator = zero
+    semantic_numerator = zero
+    semantic_denominator = zero
+    positive_teacher_count = 0
     for name in sorted(student_by_teacher):
-        weight = float((teacher_weights or {}).get(name, 1.0))
-        if weight <= 0:
+        teacher_weight = float((teacher_weights or {}).get(name, 1.0))
+        if not math.isfinite(teacher_weight) or teacher_weight < 0:
+            raise ValueError(
+                f"teacher weight must be finite and non-negative: "
+                f"teacher={name} weight={teacher_weight}"
+            )
+        if teacher_weight == 0:
             continue
-        prototypes = prototypes_by_teacher.get(name) if prototypes_by_teacher else None
-        loss, parts = total_distillation_loss(
-            student=student_by_teacher[name],
-            teacher=teacher_by_name[name],
-            prototypes=prototypes,
-            relation_weight=relation_weight,
-            semantic_weight=semantic_weight,
-            semantic_temperature=semantic_temperature,
-            feature_loss_type=feature_loss_type,
-            primary_temperature=primary_temperature,
-            attribute_temperature=attribute_temperature,
-            teacher_sample_weight=teacher_sample_weights.get(name) if teacher_sample_weights is not None else None,
-            scale_relation_by_alpha=scale_relation_by_alpha,
+        positive_teacher_count += 1
+        student = student_by_teacher[name]
+        teacher = teacher_by_name[name].detach()
+        sample_weight = (
+            teacher_sample_weights.get(name)
+            if teacher_sample_weights is not None
+            else torch.ones(
+                student.shape[0],
+                device=student.device,
+                dtype=torch.float32,
+            )
         )
-        total = weight * loss if total is None else total + weight * loss
-        for key in totals:
-            totals[key] = totals[key] + weight * parts[key]
-        weight_sum += weight
-    if total is None or weight_sum == 0:
+        feature_values = feature_distillation_loss_per_sample(
+            student,
+            teacher,
+            loss_type=feature_loss_type,
+        )
+        alpha = _validated_sample_weight(
+            sample_weight,
+            student.shape[0],
+            feature_values,
+            label=f"teacher={name}",
+        )
+        weighted_alpha = alpha * teacher_weight
+
+        feature_numerator = feature_numerator + (
+            feature_values * weighted_alpha
+        ).sum()
+        feature_denominator = (
+            feature_denominator + weighted_alpha.sum()
+        )
+
+        relation_values = relation_distillation_loss_matrix(
+            student,
+            teacher,
+        )
+        pair_weight = (
+            alpha[:, None] * alpha[None, :] * teacher_weight
+        )
+        relation_numerator = relation_numerator + (
+            relation_values * pair_weight
+        ).sum()
+        relation_denominator = (
+            relation_denominator + pair_weight.sum()
+        )
+
+        prototypes = prototypes_by_teacher.get(name) if prototypes_by_teacher else None
+        if prototypes is not None and semantic_weight != 0:
+            semantic_values = primary_prototype_kl_loss_per_sample(
+                student,
+                teacher,
+                prototypes,
+                temperature=(
+                    semantic_temperature
+                    if primary_temperature is None
+                    else primary_temperature
+                ),
+            )
+            semantic_numerator = semantic_numerator + (
+                semantic_values * weighted_alpha
+            ).sum()
+            semantic_denominator = (
+                semantic_denominator + weighted_alpha.sum()
+            )
+
+    if positive_teacher_count == 0:
         raise ValueError("at least one teacher must have a positive loss weight")
-    total = total / weight_sum
-    return total, {key: value / weight_sum for key, value in totals.items()}
+    if float(feature_denominator.detach()) <= 0:
+        raise ValueError(
+            "teacher sample weights have zero total mass across the batch"
+        )
+    if float(relation_denominator.detach()) <= 0:
+        raise ValueError(
+            "teacher pair weights have zero total mass across the batch"
+        )
+    feature = feature_numerator / feature_denominator
+    relation = relation_numerator / relation_denominator
+    semantic = (
+        semantic_numerator / semantic_denominator
+        if semantic_weight != 0
+        else zero
+    )
+    total = (
+        feature
+        + float(relation_weight) * relation
+        + float(semantic_weight) * semantic
+    )
+    return total, {
+        "feature": feature.detach(),
+        "relation": relation.detach(),
+        "semantic": semantic.detach(),
+    }

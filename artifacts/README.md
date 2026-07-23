@@ -10,7 +10,7 @@ artifacts/
     teachers/           frozen external teacher weights
   prototypes/           teacher and z_hcc prototype assets
   experiments/
-    ablation/           A0-A4 raw runs and checkpoints
+    ablation/           A0-A6 raw runs and checkpoints
     search/             hyperparameter-search runs
     manuscript/         generated outputs from tracked experiments/
   caches/

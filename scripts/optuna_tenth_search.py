@@ -8,7 +8,6 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
 from typing import Any
@@ -59,7 +58,7 @@ def require_prototype_inputs(cfg: dict[str, Any]) -> None:
         missing.append("data.prototype_paths")
     else:
         missing.extend(f"data.prototype_paths.{teacher}" for teacher in TEACHERS if teacher not in prototype_paths)
-    for key in ("zhcc_prototype_image_path", "prototype_supervision_manifest_path"):
+    for key in ("prototype_supervision_manifest_path", "spatial_manifest_path"):
         if not data.get(key):
             missing.append(f"data.{key}")
     if missing:
@@ -85,7 +84,6 @@ def inject_prototype_assets(cfg: dict[str, Any], asset_dir: Path) -> dict[str, A
         "uni2_h": str(asset_dir / "uni2_h_hcc_semantic_prototypes.pt"),
         "virchow2": str(asset_dir / "virchow2_hcc_semantic_prototypes.pt"),
     }
-    cfg["data"]["zhcc_prototype_image_path"] = str(asset_dir / "zhcc_hcc_prototype_images.pt")
     cfg["data"]["prototype_supervision_manifest_path"] = str(asset_dir / "hcc_prototype_supervision_manifest.csv")
     cfg["data"]["prototype_supervision_train_splits"] = ["train"]
     cfg["data"]["prototype_supervision_val_splits"] = ["val"]
@@ -110,7 +108,6 @@ def maybe_build_prototype_assets(
         asset_dir / "h_optimus_1_hcc_semantic_prototypes.pt",
         asset_dir / "uni2_h_hcc_semantic_prototypes.pt",
         asset_dir / "virchow2_hcc_semantic_prototypes.pt",
-        asset_dir / "zhcc_hcc_prototype_images.pt",
         asset_dir / "hcc_prototype_supervision_manifest.csv",
     ]
     if any(not path.exists() for path in required_assets):
@@ -156,25 +153,18 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     cfg["data"]["tensor_collate"] = bool(cfg["data"].get("tensor_collate", True))
     cfg["data"]["package_chunk_size"] = int(cfg["data"].get("package_chunk_size", 64))
     cfg["loss"]["relation_weight"] = 0.05
-    cfg["loss"]["scale_relation_by_alpha"] = True
     cfg["loss"]["semantic_weight"] = trial.suggest_categorical("semantic_weight", [0.02, 0.05])
-    cfg["loss"]["zhcc_proto_weight"] = trial.suggest_categorical("zhcc_proto_weight", [0.10, 0.20, 0.30])
-    cfg["loss"]["zhcc_level2_weight"] = 0.50
-    cfg["loss"]["prototype_filter_weight"] = trial.suggest_categorical("prototype_filter_weight", [0.30, 0.50])
-    cfg["loss"]["prototype_filter_alpha_min"] = 0.25
-    cfg["loss"]["consensus_weight"] = 0.5
-    cfg["loss"]["prototype_label_weight"] = 0.5
-    cfg["loss"]["prototype_l1_agreement_weight"] = 0.5
-    cfg["loss"]["prototype_l2_agreement_weight"] = 0.5
-    cfg["loss"]["zhcc_response_weight"] = trial.suggest_categorical("zhcc_response_weight", [0.15, 0.30])
-    cfg["loss"]["zhcc_primary_temperature"] = 0.10
-    cfg["loss"]["zhcc_attribute_temperature"] = 0.10
-    cfg["loss"]["min_teacher_warmup_steps"] = 1000
-    cfg["loss"]["max_teacher_warmup_steps"] = 4000
-    cfg["loss"]["teacher_prior_plateau_window_steps"] = 500
-    cfg["loss"]["prototype_ramp_steps"] = 500
-    cfg["loss"]["filter_ramp_steps"] = 500
-    cfg["loss"]["proto_to_filter_delay_steps"] = 500
+    cfg["loss"]["l1_weight"] = trial.suggest_categorical("l1_weight", [0.5, 1.0])
+    cfg["loss"]["spatial_weight"] = trial.suggest_categorical("spatial_weight", [0.05, 0.10, 0.20])
+    cfg["loss"]["spatial_point_tolerance_cells"] = 1
+    cfg["loss"]["spatial_abundance_point_weight"] = 0.5
+    cfg["loss"]["spatial_brush_weight"] = 1.0
+    cfg["loss"]["spatial_brush_top_fraction"] = 0.25
+    cfg["loss"]["spatial_explicit_negative_weight"] = 1.0
+    cfg["loss"]["spatial_implicit_negative_weight"] = 0.05
+    cfg["loss"]["spatial_start_step"] = 0
+    cfg["loss"]["spatial_ramp_steps"] = 500
+    cfg["loss"]["spatial_backbone_start_step"] = 500
 
     cfg["train"]["batch_size"] = int(cfg["train"].get("batch_size", 512))
     cfg["train"]["epochs"] = int(epochs)
@@ -185,21 +175,14 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     cfg["train"]["max_val_batches"] = 256
     cfg["train"]["max_eval_batches"] = 64
     cfg["train"]["eval_pairwise_max_samples"] = 2048
-    cfg["train"]["dynamic_prototype_batch_size"] = 512
     cfg["train"]["log_interval"] = 0
     cfg["train"]["progress"] = "tqdm"
     cfg["train"]["tensorboard"] = False
     cfg["train"]["tensorboard_batch_interval"] = 0
-    cfg["train"]["pipeline_profile_interval"] = int(cfg["train"].get("pipeline_profile_interval", 25))
-    cfg["train"]["batch_timing_interval"] = int(cfg["train"].get("batch_timing_interval", 0))
-    cfg["train"]["system_profile_interval"] = int(cfg["train"].get("system_profile_interval", 1))
-    cfg["train"]["batch_profile_csv"] = bool(cfg["train"].get("batch_profile_csv", True))
-    cfg["train"]["batch_profile_csv_interval"] = int(cfg["train"].get("batch_profile_csv_interval", 1))
-    cfg["train"]["system_profile_paths"] = cfg["train"].get("system_profile_paths", ["runtime"])
     return cfg
 
 
-def score_row(row: dict[str, str], objective: str, target_zhcc_proto_weight: float = 0.20) -> float:
+def score_row(row: dict[str, str], objective: str) -> float:
     def value(key: str) -> float:
         try:
             return float(row.get(key, 0.0) or 0.0)
@@ -207,21 +190,15 @@ def score_row(row: dict[str, str], objective: str, target_zhcc_proto_weight: flo
             return 0.0
 
     teacher_alignment = value("teacher_alignment_score")
-    response_loss = value("val_zhcc_proto")
-    prototype_topk = value("zhcc_prototype_topk_precision")
-    l1_acc = value("zhcc_level1_accuracy")
-    l2_auc = value("zhcc_level2_macro_auc")
+    l1_acc = value("l1_accuracy")
     train_tiles_per_sec = value("train_tiles_per_sec")
     if objective == "teacher_alignment":
         return teacher_alignment
     if objective == "speed":
         return train_tiles_per_sec
-    if objective in {"prototype_qc", "response_alignment"}:
-        return -response_loss
-
-    current_weight = value("scheduled_zhcc_proto_weight")
-    scale = min(1.0, current_weight / target_zhcc_proto_weight) if target_zhcc_proto_weight > 0 else 0.0
-    return teacher_alignment - 0.25 * response_loss * scale
+    if objective == "l1_accuracy":
+        return l1_acc
+    return teacher_alignment + 0.25 * l1_acc
 
 
 def read_metric_rows(metrics_path: Path) -> list[dict[str, str]]:
@@ -286,9 +263,6 @@ def train_with_pruning(
     thread.start()
     metrics_path = output_dir / "metrics.csv"
     
-    # Extract target zhcc_proto_weight
-    target_zhcc_proto_weight = float(trial.params.get("zhcc_proto_weight", 0.20))
-    
     reported_epochs: set[int] = set()
     best_score = float("-inf")
     while process.poll() is None:
@@ -296,7 +270,7 @@ def train_with_pruning(
             epoch = int(float(row.get("epoch", "0") or 0))
             if epoch <= 0 or epoch in reported_epochs:
                 continue
-            score = score_row(row, objective, target_zhcc_proto_weight=target_zhcc_proto_weight)
+            score = score_row(row, objective)
             reported_epochs.add(epoch)
             best_score = max(best_score, score)
             trial.report(score, step=epoch)
@@ -313,7 +287,7 @@ def train_with_pruning(
     rows = read_metric_rows(metrics_path)
     if not rows:
         raise RuntimeError(f"training produced no metrics: {metrics_path}")
-    final_score = score_row(rows[-1], objective, target_zhcc_proto_weight=target_zhcc_proto_weight)
+    final_score = score_row(rows[-1], objective)
     best_score = max(best_score, final_score)
     trial.set_user_attr("output_dir", str(output_dir))
     trial.set_user_attr("final_epoch", rows[-1].get("epoch"))
@@ -327,8 +301,8 @@ def train_with_pruning(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Optuna 1/10 HCC-SemPath hyperparameter search.")
     parser.add_argument("--base-config", default="configs/local/server/train_tenth.yaml")
-    parser.add_argument("--study-name", default="hcc_sempath_tenth_pamtd")
-    parser.add_argument("--storage", default="sqlite:///runtime/optuna/hcc_sempath_tenth_pamtd_response.db")
+    parser.add_argument("--study-name", default="hcc_sempath_tenth_spatial")
+    parser.add_argument("--storage", default="sqlite:///runtime/optuna/hcc_sempath_tenth_spatial.db")
     parser.add_argument("--output-root", default="runtime/optuna_runs")
     parser.add_argument("--annotation-json", default="")
     parser.add_argument("--prototype-asset-dir", default="artifacts/prototypes/hcc_annotation_final_3000")
@@ -338,7 +312,7 @@ def main() -> None:
     parser.add_argument("--poll-sec", type=float, default=20.0)
     parser.add_argument(
         "--objective",
-        choices=["combined", "teacher_alignment", "response_alignment", "prototype_qc", "speed"],
+        choices=["combined", "teacher_alignment", "l1_accuracy", "speed"],
         default="combined",
     )
     parser.add_argument("--sampler-seed", type=int, default=13)

@@ -5,7 +5,13 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from hcc_sempath.cli.annotate_prototypes import ROI_L2_PROTOTYPES, ROI_TARGET_PER_ATTRIBUTE
+from hcc_sempath.cli.annotate_prototypes import ROI_L2_PROTOTYPES
+
+
+# This only bounds the size of the historical-label navigation pool. It is not
+# an annotation target or a stopping rule; per-component information curves
+# decide whether additional expert annotation is needed.
+DEFAULT_PLANNING_COVERAGE = 100
 
 
 def _records(path: str | Path) -> list[dict]:
@@ -24,8 +30,10 @@ def _records(path: str | Path) -> list[dict]:
 def build_roi_candidate_queue(
     annotation_paths: list[str | Path],
     *,
-    target: int = ROI_TARGET_PER_ATTRIBUTE,
+    planning_coverage: int = DEFAULT_PLANNING_COVERAGE,
 ) -> dict:
+    if planning_coverage <= 0:
+        raise ValueError("planning_coverage must be positive")
     attributes = list(ROI_L2_PROTOTYPES)
     by_tile: dict[str, dict] = {}
     for path in annotation_paths:
@@ -49,7 +57,10 @@ def build_roi_candidate_queue(
     available = Counter()
     for item in by_tile.values():
         available.update(item["source_l2"])
-    goals = {name: min(target, available[name]) for name in attributes}
+    goals = {
+        name: min(planning_coverage, available[name])
+        for name in attributes
+    }
     selected: list[dict] = []
     counts = Counter()
     remaining = dict(by_tile)
@@ -74,35 +85,63 @@ def build_roi_candidate_queue(
         priority = [name for name in best["source_l2"] if useful[name]]
         selected.append({**best, "priority_attributes": priority, "rank": len(selected)})
         counts.update(best["source_l2"])
-    targets = {name: target for name in attributes}
-    unfilled = {name: max(0, target - available[name]) for name in attributes}
+    unfilled = {
+        name: max(0, planning_coverage - available[name])
+        for name in attributes
+    }
     return {
-        "version": 1,
-        "complete": not any(unfilled.values()),
+        "version": 2,
         "l2_prototypes": attributes,
-        "target_per_attribute": targets,
+        "planning_coverage_per_attribute": {
+            name: planning_coverage for name in attributes
+        },
         "source_positive_inventory": {name: available[name] for name in attributes},
         "selected_source_coverage": {name: counts[name] for name in attributes},
-        "unfilled_targets": unfilled,
+        "unfilled_planning_coverage": unfilled,
         "candidate_count": len(selected),
         "candidates": selected,
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a quota-aware V2 ROI candidate pool.")
+    parser = argparse.ArgumentParser(
+        description="Build an old-L2 navigation-hint pool for V2 ROI annotation."
+    )
     parser.add_argument("--annotations", action="append", required=True, help="Tile-level annotation JSON or supplemental candidate JSON; repeatable. Existing L2 labels are optional and only affect priority.")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--target", type=int, default=ROI_TARGET_PER_ATTRIBUTE)
+    parser.add_argument(
+        "--planning-coverage",
+        type=int,
+        default=DEFAULT_PLANNING_COVERAGE,
+        help=(
+            "Maximum historical positive-tile coverage retained per component "
+            "for navigation planning; this is not an annotation target."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     output = Path(args.output)
     if output.exists() and not args.overwrite:
         raise FileExistsError(f"refusing to replace ROI candidate pool without --overwrite: {output}")
-    payload = build_roi_candidate_queue(args.annotations, target=args.target)
+    payload = build_roi_candidate_queue(
+        args.annotations,
+        planning_coverage=args.planning_coverage,
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({key: payload[key] for key in ("candidate_count", "source_positive_inventory", "unfilled_targets")}, indent=2))
+    print(
+        json.dumps(
+            {
+                key: payload[key]
+                for key in (
+                    "candidate_count",
+                    "source_positive_inventory",
+                    "unfilled_planning_coverage",
+                )
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

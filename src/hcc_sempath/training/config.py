@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 import random
 
 import yaml
@@ -269,38 +270,238 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
         )
     _unexpected_keys(cfg.get("model", {}).get("teacher_dims"), expected, "model.teacher_dims")
     _unexpected_keys(cfg.get("loss", {}).get("teacher_weights"), expected, "loss.teacher_weights")
+    teacher_weights = cfg.get("loss", {}).get("teacher_weights")
+    if isinstance(teacher_weights, dict):
+        invalid = {
+            str(name): value
+            for name, value in teacher_weights.items()
+            if not math.isfinite(float(value)) or float(value) < 0
+        }
+        if invalid:
+            raise ValueError(
+                "loss.teacher_weights must be finite and non-negative: "
+                f"{invalid}"
+            )
+        if not any(float(value) > 0 for value in teacher_weights.values()):
+            raise ValueError(
+                "loss.teacher_weights requires at least one positive teacher"
+            )
+
+    obsolete_train_keys = sorted(
+        key
+        for key in (
+            "pipeline_profile_interval",
+            "batch_timing_interval",
+            "system_profile_interval",
+            "batch_profile_csv",
+            "batch_profile_csv_interval",
+            "batch_profile_fields",
+            "system_profile_paths",
+            "detailed_timing",
+            "detailed_timing_sync",
+            "torch_profile_batches",
+            "torch_profile_row_limit",
+            "torch_profile_record_shapes",
+            "torch_profile_memory",
+            "torch_profile_stack",
+        )
+        if key in cfg.get("train", {})
+    )
+    if obsolete_train_keys:
+        raise ValueError(
+            "obsolete profiling keys are no longer implemented; use tqdm and "
+            f"TensorBoard metrics instead: {obsolete_train_keys}"
+        )
 
     semantic_weight = float(cfg.get("loss", {}).get("semantic_weight", 0.0))
-    prototype_filter_weight = float(cfg.get("loss", {}).get("prototype_filter_weight", 0.0))
-    zhcc_proto_weight = float(cfg.get("loss", {}).get("zhcc_proto_weight", 0.0))
     loss_cfg = cfg.get("loss", {})
-    for key in ("roi_weight", "roi_consistency_weight"):
-        if key in loss_cfg and float(loss_cfg[key]) < 0:
-            raise ValueError(f"loss.{key} must be non-negative")
-    for key in ("roi_top_q", "roi_patch_temperature"):
-        if key in cfg.get("model", {}) and float(cfg["model"][key]) <= 0:
-            raise ValueError(f"model.{key} must be positive")
-    if float(cfg.get("model", {}).get("roi_top_q", 0.1)) > 1:
-        raise ValueError("model.roi_top_q must be <= 1")
-    for key in ("zhcc_primary_temperature", "zhcc_attribute_temperature", "primary_temperature", "attribute_temperature"):
-        if key in loss_cfg and float(loss_cfg[key]) <= 0:
-            raise ValueError(f"loss.{key} must be positive")
-    l1_weight = float(loss_cfg.get("prototype_l1_agreement_weight", 0.5))
-    l2_weight = float(loss_cfg.get("prototype_l2_agreement_weight", 0.5))
-    if l1_weight < 0 or l2_weight < 0 or (l1_weight + l2_weight) <= 0:
-        raise ValueError("prototype L1/L2 agreement weights must be non-negative and not both zero")
+    prototype_responses_enabled = (
+        semantic_weight > 0
+        or float(loss_cfg.get("prototype_filter_weight", 0.0)) > 0
+        or float(loss_cfg.get("zhcc_response_weight", 0.0)) > 0
+    )
+    obsolete_loss_keys = sorted(
+        key
+        for key in (
+            "scale_relation_by_alpha",
+            "consensus_weight",
+            "prototype_l1_agreement_weight",
+            "prototype_l2_agreement_weight",
+            "zhcc_proto_weight",
+            "zhcc_level2_weight",
+            "zhcc_primary_temperature",
+            "zhcc_attribute_temperature",
+            "attribute_temperature",
+            "l2_attribute_adjudication",
+            "roi_weight",
+            "roi_consistency_weight",
+            "roi_start_step",
+            "roi_ramp_steps",
+            "roi_backbone_start_step",
+            "roi_consistency_start_step",
+            "spatial_offset_weight",
+            "spatial_region_dice_weight",
+            "min_teacher_warmup_steps",
+            "max_teacher_warmup_steps",
+            "teacher_prior_plateau_window_steps",
+            "prototype_ramp_steps",
+            "filter_ramp_steps",
+            "proto_to_filter_delay_steps",
+        )
+        if key in loss_cfg
+    )
+    if obsolete_loss_keys:
+        raise ValueError(
+            "legacy tile-level L2/ROI loss route was removed; replace these keys "
+            f"with spatial_* objectives: {obsolete_loss_keys}"
+        )
+    obsolete_data_keys = sorted(
+        key
+        for key in (
+            "zhcc_prototype_path",
+            "zhcc_prototype_image_path",
+            "roi_manifest_path",
+            "roi_train_splits",
+        )
+        if key in cfg.get("data", {})
+    )
+    if obsolete_data_keys:
+        raise ValueError(
+            "legacy tile-level L2/ROI data route was removed; use "
+            f"data.spatial_manifest_path/spatial_train_splits: {obsolete_data_keys}"
+        )
+    obsolete_spatial_model_keys = sorted(
+        key
+        for key in (
+            "roi_patch_dim",
+            "roi_top_q",
+            "roi_patch_temperature",
+            "spatial_point_sigma",
+        )
+        if key in cfg.get("model", {})
+    )
+    if obsolete_spatial_model_keys:
+        raise ValueError(
+            "legacy Top-Q ROI head was removed; use model.spatial_* keys: "
+            f"{obsolete_spatial_model_keys}"
+        )
+    for key in (
+        "relation_weight",
+        "semantic_weight",
+        "l1_weight",
+        "spatial_weight",
+        "spatial_abundance_point_weight",
+        "spatial_brush_weight",
+        "spatial_explicit_negative_weight",
+        "spatial_implicit_negative_weight",
+        "prototype_consensus_weight",
+        "prototype_label_weight",
+        "prototype_student_weight",
+        "zhcc_response_weight",
+    ):
+        if key in loss_cfg and (
+            not math.isfinite(float(loss_cfg[key]))
+            or float(loss_cfg[key]) < 0
+        ):
+            raise ValueError(f"loss.{key} must be finite and non-negative")
+    for key in (
+        "semantic_temperature",
+        "primary_temperature",
+        "pamtd_primary_temperature",
+        "l2_global_temperature",
+    ):
+        if key in loss_cfg and (
+            not math.isfinite(float(loss_cfg[key]))
+            or float(loss_cfg[key]) <= 0
+        ):
+            raise ValueError(f"loss.{key} must be finite and positive")
+    if str(loss_cfg.get("feature_loss_type", "cosine")) not in {
+        "cosine",
+        "cosine_plus_norm_mse",
+        "cosine_plus_raw_mse",
+    }:
+        raise ValueError("loss.feature_loss_type is unsupported")
+    for key in ("prototype_filter_weight", "prototype_filter_alpha_min"):
+        value = float(loss_cfg.get(key, 0.0))
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"loss.{key} must be in [0, 1]")
+    reliability_mass = sum(
+        float(loss_cfg.get(key, 1.0))
+        for key in (
+            "prototype_consensus_weight",
+            "prototype_label_weight",
+            "prototype_student_weight",
+        )
+    )
+    adjudication_enabled = (
+        float(loss_cfg.get("prototype_filter_weight", 0.0)) > 0
+        or float(loss_cfg.get("zhcc_response_weight", 0.0)) > 0
+    )
+    if adjudication_enabled and reliability_mass <= 0:
+        raise ValueError(
+            "PAMT-D reliability requires at least one positive consensus, "
+            "expert-label, or student-agreement coefficient"
+        )
+    if (
+        adjudication_enabled
+        and float(loss_cfg.get("prototype_filter_alpha_min", 0.25)) == 0
+        and float(loss_cfg.get("prototype_consensus_weight", 1.0)) == 0
+        and float(loss_cfg.get("prototype_student_weight", 1.0)) == 0
+    ):
+        raise ValueError(
+            "PAMT-D population tiles can have zero reliability mass when "
+            "alpha_min, consensus, and student-agreement coefficients are all zero"
+        )
+    prototype_momentum = float(loss_cfg.get("prototype_momentum", 0.9))
+    if not math.isfinite(prototype_momentum) or not (
+        0.0 <= prototype_momentum < 1.0
+    ):
+        raise ValueError("loss.prototype_momentum must be in [0, 1)")
+    if int(loss_cfg.get("prototype_update_until_step", -1)) < -1:
+        raise ValueError(
+            "loss.prototype_update_until_step must be -1 (dynamic) or "
+            "a non-negative optimizer step"
+        )
+    point_tolerance = int(loss_cfg.get("spatial_point_tolerance_cells", 1))
+    if point_tolerance < 0:
+        raise ValueError("loss.spatial_point_tolerance_cells must be non-negative")
+    brush_fraction = float(loss_cfg.get("spatial_brush_top_fraction", 0.25))
+    if not math.isfinite(brush_fraction) or not (
+        0.0 < brush_fraction <= 1.0
+    ):
+        raise ValueError("loss.spatial_brush_top_fraction must be in (0, 1]")
+    if (
+        "expert_replay_interval_batches" in cfg.get("data", {})
+        and int(cfg["data"]["expert_replay_interval_batches"]) < 0
+    ):
+        raise ValueError(
+            "data.expert_replay_interval_batches must be non-negative"
+        )
+    if (
+        "expert_batch_size" in cfg.get("data", {})
+        and int(cfg["data"]["expert_batch_size"]) <= 0
+    ):
+        raise ValueError("data.expert_batch_size must be positive")
+    if (
+        cfg.get("data", {}).get("spatial_manifest_path")
+        and bool(cfg.get("train", {}).get("early_stop_teacher_alignment", False))
+    ):
+        raise ValueError(
+            "spatial training requires the prescribed terminal epoch; "
+            "train.early_stop_teacher_alignment must be false"
+        )
     prototype_paths = cfg.get("data", {}).get("prototype_paths")
     if isinstance(prototype_paths, dict):
         _unexpected_keys(prototype_paths, expected, "data.prototype_paths")
-        if semantic_weight > 0 or prototype_filter_weight > 0 or zhcc_proto_weight > 0:
+        if prototype_responses_enabled:
             missing = sorted(name for name in names if name not in prototype_paths)
             if missing:
                 raise ValueError(f"data.prototype_paths missing teacher entries: {missing}")
-    elif semantic_weight > 0 or prototype_filter_weight > 0 or zhcc_proto_weight > 0:
+    elif prototype_responses_enabled:
         if cfg.get("data", {}).get("prototype_path") is None:
             raise ValueError(
-                "data.prototype_path or data.prototype_paths is required when semantic_weight, "
-                "prototype_filter_weight, or zhcc_proto_weight > 0"
+                "data.prototype_path or data.prototype_paths is required when "
+                "semantic or PAMT-D prototype-response losses are enabled"
             )
 
 

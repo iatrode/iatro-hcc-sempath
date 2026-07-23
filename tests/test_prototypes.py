@@ -246,7 +246,7 @@ def test_hcc_taxonomy_package_loads_with_expected_levels(tmp_path: Path) -> None
     assert registry.names[-1] == "ductular-portal-present"
 
 
-def test_prototype_supervision_manifest_is_resolved_by_registry_names(tmp_path: Path) -> None:
+def test_l1_supervision_manifest_is_resolved_by_registry_names(tmp_path: Path) -> None:
     manifest_path = tmp_path / "prototype_supervision.csv"
     manifest_path.write_text(
         "tile_id,level1_label,level2_labels,source_split,expert_a,expert_b,adjudicated\n"
@@ -266,4 +266,3 @@ def test_prototype_supervision_manifest_is_resolved_by_registry_names(tmp_path: 
 
     assert set(labels) == {"tile_1"}
     assert labels["tile_1"].level1 == 0
-    assert labels["tile_1"].level2.tolist() == [1.0, 1.0]

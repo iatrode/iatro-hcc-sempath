@@ -1,50 +1,42 @@
-# Experiments
+# Experiments and Evidence Status
 
-This directory contains post-training workflows and manuscript evidence for the
-fixed HCC-SemPath model. Not every subdirectory is a manuscript experiment:
-some are historical scaffolds or local engineering checks retained for
-provenance.
+HCC-SemPath V2 is the active route: four-teacher PAMT-D shapes shared
+`z_hcc`; L1 is four-class classification; L2 is nine-component spatial
+morphometry. The implementation contract is complete, but annotation is not
+frozen and no V2 training checkpoint, calibrated decoder, external result, or
+ablation result exists yet.
 
-## Current Manuscript Evidence
+## Active sequence
 
-The current scientific evidence path is:
+| Claim unit | Required experiment | Status |
+| --- | --- | --- |
+| Four teachers shape reusable HCC representation | full-training retention, prototype alignment, and gradient diagnostics | pending V2 training |
+| Small expert supervision guides population learning | full V2 training with complete fixed L1/L2 replay | pending |
+| L1 supports four tissue states | patient/slide-separated external L1 evaluation | pending |
+| Countable L2 components localize instances | complete point/circle localization and count validation | pending |
+| Dense-cell brushes support abundance | complete region-level density calibration | pending |
+| Continuous/structural/pigment components support spatial composition | complete area/burden calibration | pending |
+| Bile pigment supports focus density | frozen threshold/connectivity/minimum-size validation | pending |
+| PAMT-D, multiple teachers, and dynamic prototypes contribute | matched A0-A6 full-population, one-tenth-duration study | pending |
+| Release reproduces the trained model | checkpoint, preprocessing, cohort, supervision, and decoder provenance audit | implemented; empirical asset pending |
 
-1. `10_teacher_disagreement_review`: completed expert-reviewed
-   teacher-disagreement asset and main random500/top500 analysis.
-2. `ablation`: completed matched 10%-scale A0-A4 mechanism study.
-3. `09_representation_audit`: non-copy / teacher-retention support.
-4. `07_full_exval_cache`: external representation-cache QC.
-5. `01_checkpoint_comparison`: checkpoint provenance.
-6. `06_attention_qc`: optional qualitative support.
+V2 becomes paper-evaluable only after:
 
-## Current Expert Asset
+1. L2 annotation reaches confirmed component-wise information plateaus;
+2. full V2 training finishes;
+3. an independent slide-separated asset freezes the component decoders;
+4. external evaluation and the matched mechanism study complete.
 
-```text
-annotations/reviews/teacher_disagreement/exval_1000/review.csv
-```
+## Historical V1 boundary
 
-It contains 1,000 external-validation tiles with cross-blinded expert
-adjudication:
+The existing numerical outputs under experiment/result directories were
+produced by the superseded V1 route, including its tile-level L2 attribute
+readout. They remain local or recoverable from Git history for provenance and
+hypothesis formation, but are not V2 localization, count, density, burden, or
+area evidence.
 
-- `random500`: 500 fully random external-validation tiles.
-- `top500`: 500 non-degenerate external-validation tiles prioritized by
-  teacher-only disagreement score.
+Two maintained local protocols remain:
 
-The high-conflict queue is a teacher-defined stress set. Expert labels and
-HCC-SemPath predictions are not used to construct it.
-
-## Historical / Engineering Workflows
-
-The following folders are retained for provenance or local workflow history, but
-are not the current manuscript experiments:
-
-- `00_local_eval`
-- `02_embedding_export`
-- `03_retrieval_benchmark`
-- `04_blinded_review_package`
-- `05_review_analysis`
-- `08_pre_review_gate`
-- `shared`
-
-Use `experiments/reports/current_experiment_status.md` for the current status
-of completed evidence and remaining gaps.
+- [`ablation/README.md`](ablation/README.md): planned V2 A0-A6 mechanism study.
+- [`10_teacher_disagreement_review/README.md`](10_teacher_disagreement_review/README.md):
+  historical 1,000-tile human-review asset construction and leakage boundary.

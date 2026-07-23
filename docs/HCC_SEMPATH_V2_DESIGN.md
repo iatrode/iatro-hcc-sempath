@@ -1,413 +1,426 @@
-# HCC-SemPath V2 Scientific and Implementation Design
+# HCC-SemPath V2: L1 Classification and L2 Spatial Morphometry
 
-Status: active design of record for the `develop` branch.
+Status: active design of record. This is the single binding scientific,
+supervision, implementation, validation, and release contract for V2.
 
-This document defines the complete V2 research design. `update.md` is the implementation
-ledger, not a substitute for this design. The former V1 foundation is retained only as
-`HCC_SEMPATH_DESIGN_V1_DEPRECATED.md` for historical traceability.
+## 1. Research problem
 
-## 1. Research Objective
+HCC-SemPath V2 learns two different pathology objects from one fixed
+DINOv2-S/14 tile encoder:
 
-V1 organizes each pathology tile through one global HCC embedding, one mutually exclusive
-Level-1 tissue-state axis, and non-exclusive tile-level Level-2 morphology attributes. Its
-Level-2 supervision indicates that a morphology is present somewhere in the tile but does not
-identify where it appears.
+1. a four-class, mutually exclusive Level-1 tissue-state classification;
+2. weakly supervised spatial Level-2 morphometry for nine HCC components,
+   supporting component location, instance count, local abundance, and
+   calibrated area where the supervision permits it.
 
-V2 asks:
+Level 2 is not a tile-classification task. The former deployable global L2
+scores, attribute-classification loss, Top-Q pooling, and local/global score
+consistency are outside the V2 path. Global component centroids exist only as
+a no-gradient PAMT-D reliability coordinate during training; they are neither
+an L2 output nor a spatial pseudo-label.
 
-> Can expert ROI annotations explicitly direct the student toward the local tissue regions that
-> instantiate each Level-2 morphology attribute, and can that independently anchored local
-> evidence improve the deployable global HCC representation without degrading Level-1 structure,
-> morphology retrieval, or retained teacher knowledge?
+## 2. Core hypothesis
 
-The primary intervention is ROI-guided local morphology learning. Attribute-wise teacher
-adjudication is an optional secondary ablation and is not a prerequisite for V2.
+A 224-pixel tile contains both cell-scale objects and structures that span
+several attention cells. A useful spatial head therefore needs:
 
-## 2. Core Hypothesis
+- a 14-by-14-pixel local observation window for nuclei and other small objects;
+- denser coordinate sampling than the native 16-by-16 DINO token grid;
+- semantic context from the final Transformer tokens;
+- explicit multi-cell aggregation for fat vacuoles, ducts, vessels, and other
+  extended structures;
+- component-aware interpretation of point, circle, and brush marks.
 
-Level-2 attributes such as necrosis, bile pigment, inflammatory cells, fibrous stroma, or
-vascular structures are spatially sparse and may coexist within one tile. Global pooling can
-learn contextual shortcuts because the correct tile-level label does not identify the causal
-region.
+The hypothesis is that fusing these signals can preserve the pretrained
+teacher representation while sparse expert L1/L2 constraints reshape the
+shared `z_hcc` toward scientifically interpretable global and local outputs.
 
-The V2 hypothesis is:
+## 3. Fixed semantic contract
 
-1. expert ROI annotations provide an independent spatial anchor for each Level-2 attribute;
-2. patch-level attribute supervision forces local features to respond at the annotated
-   morphology rather than at correlated global context;
-3. a one-way, stop-gradient local-to-global constraint transfers validated local evidence into
-   the reusable global embedding;
-4. staged optimization and a bounded loss budget prevent sparse ROI supervision from dominating
-   Level-1 organization and multi-teacher distillation.
+### Level 1
 
-## 3. Scientific Object and Claims
+The global L1 classes, in fixed order, are:
 
-The released scientific object remains the global normalized embedding `z_hcc`. The ROI branch
-is a training-time spatial supervision path and an optional interpretation output. V2 does not
-turn HCC-SemPath into a diagnostic detector or a segmentation model.
+1. `HCC-tumor`
+2. `Background-liver`
+3. `Inflammatory-stromal`
+4. `Degenerative-material`
 
-The spatial map is an attribute-specific patch evidence map. It may be described as
-ROI-guided local attention only when `attention` is explicitly defined as this supervised
-attribute evidence. V2 does not claim direct supervision of every native Transformer
-self-attention matrix.
+The output is one four-way softmax.
 
-Primary claim:
+### Level 2
 
-> ROI-anchored local morphology evidence reshapes the global HCC representation and improves
-> Level-2 morphology organization while preserving global Level-1 and retrieval performance.
+The spatial components, in fixed order, are:
 
-Secondary claim:
+1. `hepatocellular-parenchyma-present`
+2. `necrosis-present`
+3. `hemorrhage-present`
+4. `bile-pigment-present`
+5. `inflammatory-cell-present`
+6. `fibrous-stroma-present`
+7. `steatosis-vacuolation-present`
+8. `vascular-structure-present`
+9. `ductular-portal-present`
 
-> The local branch produces spatial evidence aligned with held-out expert ROIs and avoids
-> all-zero, all-one, and full-tile broadcast shortcuts.
+Hyaline change belongs only to the deprecated tile-level V1 asset.
 
-## 4. Semantic Axes
+## 4. Component-and-geometry annotation contract
 
-### 4.1 Level 1
+Tool meaning is resolved jointly with component biology:
 
-Level 1 remains a mutually exclusive global tissue-state axis. V2 does not introduce local L1
-supervision and does not change its taxonomy or loss.
+| Components | Point | Circle | Brush | Identifiable measurements |
+| --- | --- | --- | --- | --- |
+| Hepatocellular parenchyma, hemorrhage, inflammatory cells | One instance | One larger instance | Dense-cell bag with unknown exact count | Instance count plus local density |
+| Steatosis/vacuolation, vascular structure, ductular/portal structure | One instance with unresolved extent | One large instance with approximate extent | One connected marked structure with approximate extent; overlapping strokes merge | Structure count plus area |
+| Necrosis, fibrous stroma | Invalid for positive annotation | Positive extent | Positive extent | Area/coverage only |
+| Bile pigment | Small positive pigment seed, not an instance | Larger positive focus with approximate extent | Irregular/fused positive pigment extent | Pigment burden/area; derived focus density only |
 
-### 4.2 Level 2
+A circle is never treated as a generic brush bag. It is a large point for
+countable components and supplies one countable centre; for bile pigment it
+supplies focus extent without claiming a biological instance. A brush is
+class-routed: dense-cell bag, connected large discrete structure, or
+continuous positive area. Brush input events are annotation mechanics:
+overlapping strokes on the same discrete structure form one instance.
 
-Level 2 remains non-exclusive and multi-label. A tile may contain multiple attributes, and each
-attribute may occupy only a small subset of patch tokens. Tile-level L2 presence and spatial L2
-validity are distinct:
+Explicit negatives are strong negative evidence. Ordinary unmarked space is
+usually background but can contain deliberately unresolved mixtures, so it
+must not receive the same confidence as an explicit negative.
 
-- tile-level expert or teacher evidence can supervise global presence;
-- only ROI annotations can supervise spatial location;
-- global confidence, teacher consensus, or unlocalized tile labels never become patch targets.
+`roi_reviewed` records that a tile was visited and saved; it is not promoted to
+a complete nine-component review. A geometry-free `state=negative,
+review_complete=true` record supplies a strong tile-wide negative. Unmentioned
+components remain ignored unless an explicit completeness field says
+otherwise.
 
-## 5. ROI Annotation Contract
+## 5. Model
 
-### 5.1 Supported geometry
+### Shared encoder and teachers
 
-The annotation contract supports:
+The student architecture and initialization remain fixed to pretrained
+DINOv2-S/14 at native 224-pixel input.
+All existing teacher feature caches remain usable. The four teachers shape the
+shared representation through feature and relation distillation. The stable
+L1 annotations define teacher-specific four-class prototypes and online
+student-space class centroids. Their responses provide both HCC semantic
+supervision and per-tile PAMT-D teacher reliability, while direct L1
+cross-entropy anchors the human boundary.
 
-- point annotations;
-- free brush/polyline annotations;
-- circles;
-- polygons/freehand closed regions;
-- explicit negative geometry where required;
-- attribute-wise complete review with no positive region.
+L2 follows the same small-to-large premise: sparse expert spatial constraints
+update local positive/negative component centroids and reshape the local
+features and shared encoder while four-teacher distillation anchors `z_hcc`.
+Teacher-space component centroids participate only in per-tile reliability
+adjudication. Teacher features never generate L2 centres, brush masks, or
+spatial pseudo-labels.
 
-Coordinates may be recorded in pixels or normalized tile coordinates. Every record includes at
-least tile ID, split, L2 attribute, state, geometry or complete-review status, and annotation
-version/identity in the production manifest.
+### L1 head
 
-### 5.2 Tri-state token target
-
-For tile `x`, patch token `j`, and attribute `k`:
-
-```text
-y_roi[x,j,k] in {0,1}
-v_roi[x,j,k] in {0,1}
-```
-
-- positive ROI geometry: `y_roi=1`, `v_roi=1`;
-- attribute explicitly toggled negative for the tile: the whole tile becomes `y_roi=0`,
-  `v_roi=1` for that attribute (a tile-wide reviewed negative);
-- explicit reviewed negative geometry: `y_roi=0`, `v_roi=1` on the marked region;
-- every attribute not marked positive and not explicitly toggled negative: `v_roi=0`,
-  contributing no loss, because mixed or unclear tissue cannot be reliably declared negative;
-- unreviewed, ambiguous, out-of-tissue, or unmarked regions around partial point/brush
-  annotations: `v_roi=0` and contribute no loss.
-
-Negative supervision is opt-in per attribute, not a side effect of reviewing a tile. An attribute
-becomes a tile-wide negative only when the annotator explicitly toggles that ROI class to negative,
-which is the only way an unmarked attribute leaves the ignore state. Hyaline
-change is removed from the V2 ROI taxonomy because its 35 tile-level positives do not justify a
-separate spatial objective. If a tile is
-saved as an incomplete draft, point or partial brush annotations never convert unmarked patches
-into negatives and that draft is excluded from training.
-
-### 5.3 Coordinate-to-token conversion
-
-Geometry is rasterized at patch centers on the actual backbone grid. The fixed student is
-pretrained DINOv2-S/14 at the native `224 x 224` tile size, producing a `16 x 16` patch grid.
-The patch size is an implementation invariant rather than a configuration option. Training aborts
-if the ROI grid differs from the backbone grid. Rendering overlays and token conversion are audited
-before ROI annotations are used for training.
-
-The global path uses DINOv2's native CLS-token pooling. The official pretrained checkpoint is a
-local fixed asset with a pinned SHA-256 checksum; training performs no network download.
-
-### 5.4 Training asset and annotation volume
-
-ROI annotation follows the existing Level-1 prototype workflow: one training-side prototype
-asset is annotated completely. There is no separately annotated validation or test subset during
-training. Model selection does not consume an ROI validation score. After training is frozen,
-localization and representation quality are evaluated by independent external sampling.
-
-Every selected tile is reviewed once for the ROI Level-2 attributes that are confidently
-classifiable. All visible positive foci for the selected attribute are marked. Unmarked attributes
-remain unknown/ignored by default, because mixed or unclear tissue can be impossible to separate
-reliably. An attribute becomes a negative training signal only when the annotator explicitly
-toggles that ROI class to negative for the tile. Separate negative queues are neither needed nor
-permitted.
-
-Selection is quota-driven by confirmed ROI-positive attribute counts, not by nine independent
-passes over every tile and not by a fixed total tile count. The production target is 100
-ROI-positive tiles per retained attribute. A deterministic multi-label cover of the existing
-3,000 tile-level annotations yields a 402-tile priority pool: it covers at least 100
-source-positive tiles for seven attributes, all 98 ductular/portal source-positive tiles, and all
-55 vascular source-positive tiles. This old-L2-positive pool is a scheduling accelerator, not a
-hard boundary. The annotator serves priority-pool tiles first while their source labels match
-remaining ROI deficits, then falls back to unreviewed tiles from the full IAC input until the ROI
-positive counts reach the target.
-
-Selection prioritizes independent slides and caps repeated tiles from one slide for the same
-attribute. Per-attribute feasibility is reported by independent positive slide count. Attributes
-without adequate slide diversity remain exploratory even if their tile quota is exhausted.
-
-## 6. Model Architecture
-
-### 6.1 Global path
-
-The existing encoder produces the reusable embedding:
+The normalized global embedding is read against four no-gradient,
+expert-updated student-space centroids:
 
 ```text
-z_hcc = normalize(project(global_pool(ViT(x))))
+z = normalize(project(CLS))
+l1_logits[k] = cosine(z, centroid_l1[k]) / temperature
 ```
 
-The public `encode()` contract is unchanged. Existing release checkpoints remain loadable because
-the ROI branch is instantiated only when an ROI manifest is configured.
+Human L1 labels update the centroids and use cross entropy on the resulting
+response. Semantic distillation and PAMT-D use only the four primary teacher
+prototypes; legacy L2 attributes in old prototype packages are ignored.
 
-### 6.2 Local patch path
+### Dense local branch
 
-The encoder exposes the ViT patch tokens before global pooling:
+The pretrained 14-by-14 DINO patch projection is reused with stride 7 and
+padding 4:
 
 ```text
-h_patch[j] = ViT_patch_token_j(x)
-u[j]       = normalize(P_patch(h_patch[j]))
+local = conv2d(image, pretrained_patch_projection, kernel=14, stride=7, padding=4)
 ```
 
-`P_patch` is separate from the global projector. Each L2 attribute has a normalized query
-`q_patch[k]`:
+For a 224-pixel input this produces a 32-by-32 local grid without replacing or
+invalidating the teacher caches.
+
+Final 16-by-16 Transformer patch tokens are bilinearly projected onto the
+32-by-32 grid and fused with the local features. Residual context blocks with
+dilations 1, 2, and 4 aggregate evidence across multiple grid cells. This is
+the route used for structures whose identity is not visible in one local
+window.
+
+### Spatial outputs
+
+For each of nine components the head emits:
+
+- `l2_instance_logits [B, 9, 32, 32]`;
+- `l2_abundance_logits [B, 9, 32, 32]`.
+
+These maps are positive-versus-negative local prototype responses over the
+fused spatial features. One supervised tile/component contributes one centroid
+observation, so a large brush cannot dominate merely by covering more grid
+cells. Point/circle centres update instance prototypes. Cell points and dense
+cell brushes update density prototypes; circle/brush extent updates discrete
+structure area prototypes; continuous and pigment extent updates burden/area
+prototypes. A structure point never supplies an inferred extent.
+
+A single prototype is a semantic readout coordinate after the trainable local,
+semantic, fusion, and nonlinear context transformations. It is not a claim
+that one component has a single raw-image morphology. Distinct appearances,
+including heterogeneous hepatocellular nuclei, receive independent spatial
+loss at their annotated locations and may map to the same component direction.
+The L2 annotation gate likewise measures fixed-probe coverage rather than
+distance to one global centre. A multi-prototype morphology bank is not part of
+the primary model because it would partition the small expert asset into
+unidentified latent subtypes without changing the required component output.
+
+The instance tensor retains fixed nine-class topology, but non-countable
+channels are deterministically suppressed and marked invalid in both model
+output and decoder metadata; they are not trained as latent pseudo-counts.
+
+Decoded outputs are capability-masked:
+
+- NMS coordinates and counts only for cell-instance and discrete-structure
+  components;
+- density mass/mean only for the three cell/density components;
+- area fraction/pixels only for continuous, pigment, and discrete-structure
+  components;
+- thresholded bile-pigment focus density as a secondary morphology descriptor,
+  not an instance count or direct loss target.
+
+Count and density/area remain separate measurements. They are not summed into a
+fabricated global L2 confidence score, and unsupported measurements are emitted
+as invalid rather than zero.
+
+## 6. Targets and losses
+
+Countable instance centres use a tolerant one-to-one peak objective: adjacent
+clicks cannot be satisfied by the same response cell. Matching maximizes
+cardinality before response score, and non-matched cells within the union of
+click-tolerance regions are negative for the instance objective, so one click
+cannot train two decoded peaks. Dense-cell brushes use an aggregate
+positive-bag objective. Area-capable components use positive occupied-area
+support. Explicit negatives and ordinary unmarked background remain distinct
+confidence sources in both the direct loss and the local prototype readout.
+
+The point tolerance represents click/grid uncertainty, not nucleus diameter.
+A point never supplies an inferred object area or an exact sub-grid centre.
+Positive support is removed from implicit-negative masks in every geometry
+route. Mixed point/brush cell annotations supervise resolved instances and
+unresolved abundance separately; they are not converted into contradictory
+dense instance truth.
+
+PAMT-D combines teacher base weights and per-tile reliability as
+`w_m * alpha_mi`. Feature and L1-semantic losses are normalized jointly over
+teacher-by-tile mass; relation loss uses `w_m * alpha_mi * alpha_mj` over
+teacher-by-pair mass. The student and teachers enter adjudication through the
+same fixed-temperature cosine coordinate, with the temperature applied once.
+The shared response KL is further weighted by each tile's normalized teacher
+reliability mass. Teacher features, response targets, and reliability weights
+are gradient stops.
+
+The total objective is:
 
 ```text
-a[j,k] = bounded_cosine(u[j], q_patch[k]) / tau_patch
+L = L_four_teacher(alpha_PAMTD)
+  + lambda_response * L_student_prototype_response
+  + lambda_l1 * CE(L1)
+  + lambda_spatial * (
+        L_instance_point_peak
+      + lambda_abundance_point * L_abundance_point_peak
+      + L_brush_density_bag
+      + L_positive_area
+      + L_explicit_negative
+      + L_implicit_background
+    )
 ```
 
-The queries are learnable but are explicitly anchored by valid ROI-token loss. They receive no
-global pseudo-spatial target. This is the primary V2 implementation. Positive-token EMA
-prototypes from the earlier upgrade plan remain a possible ablation, not part of the primary
-method, because adding both mechanisms would make the main claim unnecessarily complex.
+Each term is normalized per supervised tile/component pair before pairs are
+averaged. Cell brushes remain density bags; structure and continuous-component
+extent marks supervise the area head. Negative loss reaches the instance head
+only for countable components. Ordinary unmarked background cannot dominate
+sparse positive or explicit-negative supervision mechanically.
 
-### 6.3 Local aggregation
+The explicit-negative and implicit-background mechanisms have intentionally
+different roles. Explicit negatives receive unit direct-loss weight and define
+the prototype boundary whenever available. Unmarked background receives a
+0.05 direct-loss weight; its pair-averaged EMA centroid is only the fallback
+contrastive coordinate when no explicit-negative centroid exists. The
+coefficient of a contrastive coordinate is not a label-confidence weight, so
+the 0.05 direct-loss weight must not be reapplied to centroid subtraction and
+the fallback centroid must not be removed on the premise that it is strong
+per-cell supervision.
 
-Patch logits are aggregated with Top-Q pooling:
+## 7. Optimization
+
+The spatial head starts with detached backbone signals, then the spatial
+weight ramps and the backbone is released. These counters advance only on
+L2-supervised updates:
 
 ```text
-ell_local[k] = mean(top_q_j(a[j,k]))
+spatial_start_step           0
+spatial_ramp_steps           1000
+spatial_backbone_start_step  1000
 ```
 
-Top-Q allows sparse morphology to influence tile-level local evidence without the instability of
-hard max or the dilution of global average pooling. `q`, temperature, activation area, and
-degenerate-map rate are frozen before confirmatory evaluation.
+After release, the global and spatial gradient norms, spatial gradient share,
+and gradient cosine are measured on the final shared Transformer block. These
+are diagnostics, not dynamic loss weights.
 
-### 6.4 Directional local-to-global transfer
+The fixed L1/L2 expert-tile union is replayed at a configured interval among
+population batches. This keeps both dynamic prototype systems and direct
+human supervision active throughout training without changing the full-corpus
+four-teacher objective.
 
-For an ROI-supervised tile/attribute pair:
+Online student prototypes are updated only after the corresponding optimizer
+step. Thus a batch cannot first enter a centroid and then use that same
+centroid to supervise itself. Explicit-negative centroids define the local
+decision boundary when available; weak implicit-background centroids are used
+only as a fallback.
 
-```text
-ell_global[k] = bounded_cosine(z_hcc, p_global[k]) / tau_global
-L_local_global = BCEWithLogits(
-    ell_global[k],
-    stopgrad(sigmoid(ell_local[k]))
-)
-```
+## 8. Data organization
 
-The direction is local to global only. Gradients from this consistency term update the global
-embedding path but do not turn global predictions into patch supervision. A pair participates
-only if it has at least one valid ROI token or a complete spatial review.
+- L1 uses the stable 3,000-tile expert classification asset.
+- L2 uses the current nine-class spatial annotation manifest.
+- Both assets are intentionally small expert interventions on the
+  population-scale four-teacher representation; neither is expected to label
+  the full corpus.
+- The union of their training tiles is replayed throughout population
+  distillation; newly annotated tiles enter the same union automatically.
+- Reduced-scale ablations subsample only the population stream. They retain the
+  complete fixed L1/L2 expert union so supervision coverage is identical across
+  matched conditions.
+- The shared priority list serves the stable 3,000 tiles first and expands
+  outside that boundary only when still-growing component curves require more
+  examples.
+- L2 has no preset class quota or total tile count. Per-component sufficiency is
+  measured separately in each of the four frozen teacher feature spaces on one
+  fixed, slide-separated probe while a nested reference set grows. Remaining
+  task-space novelty is therefore monotone non-increasing. Annotation stops
+  only after every teacher has consecutive low-information-gain tail
+  increments and slide/geometry QC passes; a teacher average cannot hide an
+  under-covered teacher.
+- The L2 curve x-axis is unique component-positive tiles rather than clicks or
+  strokes. Point/circle/brush counts, component-specific measurement
+  capabilities, slide balance, rasterization failures, and annotation
+  conflicts are independent QC. Raw RGB or an untrained DINO representation is
+  never used as a substitute for the four-teacher distillation task space.
+- The fixed-probe plateau must repeat across slide-aware resamples and
+  consecutive tail increments. New-batch discovery novelty may rebound and is
+  reported only as a secondary diagnostic, never as a stopping signal.
+- The final L2 tile count is the union required for all nine component curves
+  to pass. Early-saturating components stop consuming annotation effort;
+  still-growing components drive subsequent tile selection.
+- Old L2 tile labels may prioritize which image is shown next; they never enter
+  the target tensor.
+- Training consumes all configured image IAC packages and the four existing
+  teacher-feature IAC streams.
+- Patient/slide separation remains the split unit.
 
-## 7. Loss Design and Gradient Budget
+## 9. Validation
 
-### 7.1 ROI token loss
+Training records validation loss, L1 accuracy when validation labels exist,
+and retained teacher alignment. None of these substitutes for spatial
+validation. Consequently, teacher-alignment plateau stopping is disabled for
+the spatial route, and the terminal checkpoint after the prescribed schedule
+is the pre-validation spatial candidate. The training-side L2 annotation asset
+is not reused as a spatial validation set.
 
-```text
-L_roi = sum(v_roi * BCEWithLogits(a, y_roi)) / max(sum(v_roi), 1)
-```
+After checkpoint freezing, spatial validation is performed on an independent,
+slide-separated expert sample:
 
-Tiles without valid ROI tokens produce exactly zero ROI loss. Normalization is by valid tokens,
-not by batch size times all attributes.
+- instance localization and count metrics only for count-capable components;
+- density calibration for hepatocellular, hemorrhagic, and inflammatory-cell
+  components;
+- area metrics for necrosis, fibrous stroma, bile pigment, vacuolation,
+  vascular structures, and ductular/portal structures;
+- bile-pigment focus-density repeatability only under a frozen threshold,
+  connectivity, minimum-area, and spatial-scale definition;
+- results stratified by component mode and annotation geometry;
+- per-component and macro results with independent-slide counts.
 
-### 7.2 Total objective
+`scripts/calibrate_spatial_decoder.py` implements this gate. Exact point/count
+pairs require explicit per-component `roi_count_complete`; measurement pairs
+likewise require `roi_measurement_complete`. These flags are validation-only
+claims and are never inferred from ordinary weak training marks. Dense-cell
+brushes are evaluated as top-fraction MIL bags, not exact positive pixels.
+Threshold scoring excludes incomplete tile/component pairs, retains explicit
+and weak implicit negatives only inside complete pairs, and includes
+complete-negative tiles when selecting bile minimum-focus size.
 
-```text
-L_total = L_teacher
-        + lambda_relation * L_relation
-        + lambda_semantic * L_semantic
-        + lambda_global_l2 * L_global_l2
-        + lambda_roi * L_roi
-        + lambda_lg * L_local_global
-```
+Validation tile IDs must resolve inside the requested manifest `val`/`exval`
+partition, which must be patient/slide-disjoint from the entire
+optimizer-visible population plus L1/L2 expert replay cohort. The terminal
+checkpoint freezes the exact optimizer-visible package list, an aggregate
+package/cohort digest, and SHA-256 digests of mutable L1/L2/prototype
+supervision assets. Resume, independent evaluation, and calibration never
+reconstruct that contract from a later directory scan. The aggregate
+report contains component/mode, point/circle/brush/mixed strata, slide-macro
+metrics, and independent-slide counts. The versioned decoder asset binds the
+ordered thresholds, NMS kernels, bile minimum-focus size, and output stride to
+the exact terminal model-state digest, research contract, annotation,
+protocol, and validation cohort. The release exporter rejects a calibration
+from any other checkpoint.
 
-Initial ROI values are deliberately small:
+The comparison is against the deprecated global-L2 baseline only as a
+historical control. The confirmatory claim concerns spatial measurement, not
+tile-level attribute classification.
 
-```text
-lambda_roi = 0.10
-lambda_lg  = 0.05
-```
+## 10. Release and downstream boundary
 
-They are ramps, not immediate constants. Runs log global and ROI objective gradient norms and their
-cosine on the final shared Transformer block. These diagnostics certify mechanism activity but do
-not dynamically reweight objectives or stop training when an objective naturally saturates. A run
-is invalid only when the ROI path is disconnected or non-finite, persistently dominates the
-combined teacher/global objective, or materially degrades L1/retrieval.
+The released pathology tower owns the frozen encoder, normalized `z_hcc`, L1
+readout, spatial instance/measurement maps, capability masks, calibrated
+measurements, preprocessing metadata, and provenance. Downstream systems may
+consume these outputs through a one-way, versioned interface. Their token,
+language, routing, or task losses cannot modify the released V2 checkpoint or
+be required to reproduce it.
 
-### 7.3 Attribute-wise teacher adjudication
+Continuous-token adapters, language alignment, whole-slide aggregation,
+patient-level diagnosis, staging, prognosis, and treatment recommendation are
+separate research objects. They do not change V2 training or its confirmatory
+evidence boundary.
 
-The implemented `r[m,k]`, soft target `q[k]`, uncertainty gate, negative mask, and asymmetric L2
-loss are retained behind `loss.l2_attribute_adjudication: false` by default. They address global
-teacher disagreement, not ROI localization.
+## 11. Expected contribution
 
-They are excluded from the primary ROI experiment unless all of the following pass:
+V2 contributes one HCC-specific representation with:
 
-- slide-cross-fitted teacher-attribute reliability is available;
-- effective global L2 gradient scale is matched to the symmetric baseline;
-- the mechanism improves external L2 evidence beyond ROI-V2 alone;
-- it does not expand the central paper claim beyond what the data can support.
+- retained multi-teacher foundation features;
+- stable four-class global tissue state;
+- nine-component, geometry-aware spatial output;
+- native support for class-routed point/circle/brush annotations;
+- cell-scale localization plus multi-grid structural context;
+- count, density, and validated area measurements for downstream spatial
+  analysis.
 
-## 8. Optimization Schedule
+## 12. Implementation and acceptance map
 
-### Stage A — existing global representation
+- `modeling/models.py`: dynamic L1/local L2 prototype readouts, dense fused
+  spatial features, and decoder.
+- `spatial_schema.py`: fixed nine-class measurement capabilities.
+- `training/roi.py`: instance centres, density bags, positive area, explicit
+  negatives, and weak implicit-background targets.
+- `training/spatial_losses.py`: tolerant instance peaks, abundance point peaks,
+  dense-cell brush bags, positive-area loss, and capability-routed negatives.
+- `training/pamtd.py`: per-tile four-teacher adjudication and shared semantic
+  response target.
+- `training/engine.py`: active objective and L2-supervised-step warm-up.
+- `training/train.py`: L1/L2 ingestion, fixed expert-tile replay, and frozen
+  optimizer/supervision contracts.
+- `training/spatial_validation.py`: independent completeness-aware calibration
+  and aggregate spatial validation.
+- `training/evaluate.py`: frozen-contract verification and evaluation-cohort
+  exclusion.
+- `scripts/roi_information_curve.py`: executable four-teacher,
+  component-wise annotation sufficiency/QC curve.
+- `scripts/calibrate_spatial_decoder.py`: terminal-checkpoint decoder freeze.
+- `scripts/export_release_sempath.py`: provenance-bound V2 release without
+  teacher heads.
 
-Train the teacher-prior/global path under the existing schedule. ROI code may be present but its
-weight is zero before `roi_start_step`.
+The implementation is acceptable only while:
 
-### Stage B0 — ROI head warm-up
-
-- detach ViT patch tokens before the ROI projector;
-- train only the patch projector and attribute queries from valid ROI tokens;
-- keep local-to-global consistency at zero;
-- verify finite loss, non-degenerate activation area, and attribute-specific response variance.
-
-### Stage B1 — joint ROI shaping
-
-- enable ROI gradients into the backbone at `roi_backbone_start_step`;
-- ramp `lambda_roi` rather than switching it abruptly;
-- start and ramp local-to-global consistency separately;
-- retain gradient clipping and monitor objective-specific gradient ratios.
-
-Default implementation schedule:
-
-```text
-roi_start_step               0
-roi_ramp_steps               1000
-roi_backbone_start_step      1000
-roi_consistency_start_step   1000
-```
-
-Production values may shift relative to the teacher-prior plateau, but the B0-before-B1 ordering
-is fixed.
-
-## 9. Validation Design
-
-### 9.1 Controlled models
-
-Use the same training tiles, optimizer budget, seeds, external query/gallery, and fixed training
-schedule:
-
-1. V1 global model;
-2. V2 ROI local head with detached backbone;
-3. V2 ROI joint backbone, without local-to-global consistency;
-4. full V2 ROI joint backbone plus local-to-global consistency;
-5. optional full V2 plus attribute-wise teacher adjudication.
-
-The primary comparison is 1 versus 4. Model 5 is auxiliary and cannot replace that comparison.
-
-### 9.2 Spatial evidence
-
-- pointing accuracy on an independently sampled external annotation set after training;
-- token F1 and soft IoU on externally sampled, completely reviewed regions;
-- per-attribute activation-area distribution;
-- all-zero, all-one, and full-map broadcast rates;
-- external slide-clustered confidence intervals;
-- qualitative overlays selected without using model identity or test performance.
-
-### 9.3 Global Level-2 evidence
-
-- external macro and per-attribute average precision;
-- macro AUC;
-- calibration and coverage;
-- performance stratified by ROI size and attribute prevalence.
-
-### 9.4 Primary representation evidence
-
-- blinded morphology retrieval using the existing frozen query/gallery protocol;
-- precision@k, mean relevance@k, NDCG@k, and paired model win rate;
-- comparison with V1 and all frozen teachers;
-- slide-clustered bootstrap confidence intervals.
-
-### 9.5 Non-degradation requirements
-
-- Level-1 accuracy and balanced accuracy;
-- teacher-prior retention;
-- global embedding stability;
-- retrieval performance;
-- throughput, memory, and release-interface compatibility;
-- per-objective gradient norms and total ROI gradient share.
-
-## 10. Decision Gates
-
-### Gate R0 — training annotation contract
-
-- geometry rendering matches source coordinates;
-- tri-state masks preserve ignore regions;
-- all selected tiles carry complete nine-attribute review state;
-- positive quotas and independent-slide coverage are documented.
-
-### Gate R1 — optimization validity
-
-- B0 is numerically stable;
-- training diagnostics remain finite and maps are non-degenerate;
-- no ROI validation metric is used for model selection.
-- training runs for at most 100 epochs and is stopped only after epoch 60 when fixed validation
-  teacher alignment improves by less than 0.002 over 20 epochs and no individual teacher cosine
-  improves by at least 0.003; training loss and dynamic-prototype loss never trigger stopping.
-
-### Gate R2 — frozen external evaluation
-
-- after training is frozen, full V2 improves external L2/localization evidence over V1 and
-  local-head-only controls;
-- L1 and blinded retrieval show no material degradation;
-- ROI gradients remain within the frozen budget.
-
-### Gate R3 — manuscript inclusion
-
-- multiple seeds and paired slide-clustered intervals are complete;
-- localization and representation claims agree;
-- only mechanisms that pass independent ablation enter the manuscript method.
-
-## 11. Expected Contribution
-
-V2 contributes an ROI-guided extension of HCC-SemPath in which independently annotated local
-morphology evidence shapes a compact global HCC embedding. The contribution is not merely a heat
-map: the scientific test is whether validated local evidence improves the reusable representation
-while preserving its global tissue organization and retrieval value.
-
-## 12. Implementation Map and Current Status
-
-Implemented:
-
-- ROI point/brush/circle UI and polygon-capable backend;
-- JSON/JSONL/UI-state manifest loading;
-- tri-state geometry-to-token conversion;
-- patch-token exposure with unchanged `encode()`;
-- patch projector, attribute queries, Top-Q local pooling;
-- masked ROI loss and directional local-to-global loss;
-- B0/B1 detach and ramp schedule;
-- ROI diagnostics and configuration validation;
-- unit/integration tests for geometry, masks, gradients, scheduling, dataset collation, and scatter.
-
-Pending real-data evidence:
-
-- complete nine-class ROI annotation asset reaching 100 positive tiles per retained attribute;
-- annotation rendering audit and per-attribute independent-slide feasibility report;
-- gradient-norm instrumentation and budget audit;
-- multi-seed V1/V2 ablations;
-- post-training external localization and L2 evaluation;
-- retrieval/L1 non-degradation analysis;
-- manuscript integration after Gate R3.
+1. point, circle, and brush follow the component table above;
+2. area-only and pigment components never export biological instance counts;
+3. unresolved mixtures are not promoted to strong negative truth;
+4. L2 reaches the shared encoder after supervised-step warm-up while
+   four-teacher distillation remains active;
+5. unsupported measurements remain invalid;
+6. annotation sufficiency is determined by component-wise information
+   plateaus, not a preset tile quota;
+7. reduced-duration ablations retain the full population and complete expert
+   union;
+8. only an independently calibrated terminal checkpoint can become a release.

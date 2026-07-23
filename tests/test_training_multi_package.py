@@ -31,12 +31,27 @@ from hcc_sempath.training.feature_pack_shuffle import maybe_prepare_shuffled_iac
 from hcc_sempath.training.manifest import build_training_manifest
 from hcc_sempath.training.manifest import validate_manifest_artifacts
 from hcc_sempath.training.engine import _prepare_images
-from hcc_sempath.training.train import BatchSlot, _PackageShuffleBatchLoader, _alloc_batch_buffer
+from hcc_sempath.training.train import (
+    BatchSlot,
+    _PackageShuffleBatchLoader,
+    _assert_disjoint_package_cohorts,
+    _freeze_optimizer_visible_contract,
+    _verify_frozen_supervision_assets,
+    _alloc_batch_buffer,
+    _target_rows_by_package,
+    _validation_package_keep_indices,
+)
 from hcc_sempath.training.prototype_labels import PrototypeLabel
-from hcc_sempath.training.roi import RoiTileTarget
+from hcc_sempath.training.roi import SpatialRoiTarget
 
 
-def _write_package(root: Path, slide_id: str, value: int, count: int = 1) -> tuple[Path, Path]:
+def _write_package(
+    root: Path,
+    slide_id: str,
+    value: int,
+    count: int = 1,
+    patient_id: str | None = None,
+) -> tuple[Path, Path]:
     tile_dir = root / f"{slide_id}_tiles"
     tile_dir.mkdir()
     rows = []
@@ -48,7 +63,7 @@ def _write_package(root: Path, slide_id: str, value: int, count: int = 1) -> tup
         rows.append(
             {
                 "tile_id": tile_id,
-                "patient_id": f"p_{slide_id}",
+                "patient_id": patient_id or f"p_{slide_id}",
                 "slide_id": slide_id,
                 "tile_path": str(tile_path),
                 "x": idx * 32,
@@ -131,6 +146,85 @@ def test_multi_package_dataset_uses_external_slide_split(tmp_path: Path) -> None
     np.testing.assert_allclose(batch["teacher_features"]["toy"][1].numpy(), np.full((4,), 20, dtype=np.float32))
 
 
+def test_package_splits_reject_same_patient_across_slides(
+    tmp_path: Path,
+) -> None:
+    train_tile, _ = _write_package(
+        tmp_path,
+        "slide_train",
+        10,
+        patient_id="shared-patient",
+    )
+    val_tile, _ = _write_package(
+        tmp_path,
+        "slide_val",
+        20,
+        patient_id="shared-patient",
+    )
+
+    with pytest.raises(ValueError, match="cohort leakage"):
+        _assert_disjoint_package_cohorts(
+            [str(train_tile)],
+            [str(val_tile)],
+        )
+
+
+def test_optimizer_visible_contract_freezes_packages_and_assets(
+    tmp_path: Path,
+) -> None:
+    population, _ = _write_package(
+        tmp_path,
+        "population",
+        10,
+    )
+    replay, _ = _write_package(
+        tmp_path,
+        "replay",
+        20,
+    )
+    spatial = tmp_path / "spatial.json"
+    spatial.write_text('{"version": 1}', encoding="utf-8")
+    cfg = {
+        "data": {
+            "spatial_manifest_path": str(spatial),
+        }
+    }
+
+    _freeze_optimizer_visible_contract(
+        cfg,
+        population_packages=[str(population)],
+        expert_packages=[str(replay)],
+        expert_replay_enabled=True,
+    )
+
+    assert cfg["data"]["optimizer_visible_tile_packages"] == sorted(
+        [str(population.resolve()), str(replay.resolve())]
+    )
+    assert (
+        len(cfg["data"]["optimizer_visible_contract_sha256"])
+        == 64
+    )
+    first_asset_digest = cfg["data"]["supervision_asset_sha256"][
+        "data.spatial_manifest_path"
+    ]
+    _verify_frozen_supervision_assets(cfg)
+    spatial.write_text('{"version": 2}', encoding="utf-8")
+    with pytest.raises(ValueError, match="changed"):
+        _verify_frozen_supervision_assets(cfg)
+    _freeze_optimizer_visible_contract(
+        cfg,
+        population_packages=[str(population)],
+        expert_packages=[str(replay)],
+        expert_replay_enabled=True,
+    )
+    assert (
+        cfg["data"]["supervision_asset_sha256"][
+            "data.spatial_manifest_path"
+        ]
+        != first_asset_digest
+    )
+
+
 def test_dataset_adds_dynamic_prototype_supervision_fields(tmp_path: Path) -> None:
     tile_a, feature_a = _write_package(tmp_path, "slide_a", 10, count=2)
     records = read_packaged_tile_records([tile_a])
@@ -138,7 +232,6 @@ def test_dataset_adds_dynamic_prototype_supervision_fields(tmp_path: Path) -> No
         "slide_a_0000000": PrototypeLabel(
             tile_id="slide_a_0000000",
             level1=1,
-            level2=torch.tensor([1.0, 0.0]),
             source_split="train",
         )
     }
@@ -154,54 +247,132 @@ def test_dataset_adds_dynamic_prototype_supervision_fields(tmp_path: Path) -> No
 
     assert batch["prototype_mask"].tolist() == [True, False]
     assert batch["prototype_level1"].tolist() == [1, -1]
-    assert batch["prototype_level2"].shape == (2, 2)
 
 
-def test_dataset_collates_roi_targets_and_preserves_ignore_mask(tmp_path: Path) -> None:
+def test_expert_row_resolution_reads_only_requested_tile_ids(
+    tmp_path: Path,
+) -> None:
+    tile_a, _ = _write_package(tmp_path, "slide_a", 10, count=3)
+    tile_b, _ = _write_package(tmp_path, "slide_b", 20, count=2)
+
+    rows = _target_rows_by_package(
+        [str(tile_a), str(tile_b)],
+        {"slide_a_0000001", "slide_b_0000000"},
+    )
+
+    assert rows[0].tolist() == [1]
+    assert rows[1].tolist() == [0]
+
+
+def test_expert_row_resolution_rejects_tile_outside_train_packages(
+    tmp_path: Path,
+) -> None:
+    tile_a, _ = _write_package(tmp_path, "slide_a", 10, count=2)
+
+    with pytest.raises(ValueError, match="outside the training split"):
+        _target_rows_by_package(
+            [str(tile_a)],
+            {"slide_a_0000000", "missing_tile"},
+        )
+
+
+def test_expert_row_resolution_can_find_subset_without_missing_error(
+    tmp_path: Path,
+) -> None:
+    tile_a, _ = _write_package(tmp_path, "slide_a", 10, count=2)
+
+    rows = _target_rows_by_package(
+        [str(tile_a)],
+        {"slide_a_0000000", "outside"},
+        require_all=False,
+    )
+
+    assert rows[0].tolist() == [0]
+
+
+def test_validation_exclusion_covers_same_patient_across_packages(
+    tmp_path: Path,
+) -> None:
+    expert, _ = _write_package(
+        tmp_path,
+        "slide_expert",
+        10,
+        patient_id="shared",
+    )
+    related, _ = _write_package(
+        tmp_path,
+        "slide_related",
+        20,
+        patient_id="shared",
+    )
+    independent, _ = _write_package(
+        tmp_path,
+        "slide_independent",
+        30,
+        patient_id="other",
+    )
+
+    keep = _validation_package_keep_indices(
+        [str(related), str(independent)],
+        [str(expert)],
+    )
+
+    assert keep == [1]
+
+
+def test_dataset_collates_spatial_targets_and_preserves_ignore_mask(tmp_path: Path) -> None:
     tile_a, feature_a = _write_package(tmp_path, "slide_a", 10, count=2)
     records = read_packaged_tile_records([tile_a])
     target = torch.zeros((2, 2, 2), dtype=torch.float32)
     valid = torch.zeros((2, 2, 2), dtype=torch.bool)
     target[0, 0, 0] = 1
-    valid[0, 0, 0] = True
+    valid[0, 1, 1] = True
     dataset = DistillationTileDataset(
         records,
         teacher_cache_dir=None,
         image_size=(32, 32),
         teacher_cache_package_paths={"toy": [feature_a]},
-        roi_targets={
-            "slide_a_0000000": RoiTileTarget(
-                target=target,
-                valid=valid,
-                consistency=torch.tensor([True, False]),
+        spatial_targets={
+            "slide_a_0000000": SpatialRoiTarget(
+                point_centers=target,
+                brush_bag_ids=torch.zeros_like(target, dtype=torch.long),
+                area_positive=torch.zeros_like(valid),
+                explicit_negative=torch.zeros_like(valid),
+                implicit_negative=valid,
             )
         },
-        roi_attribute_count=2,
-        roi_grid_size=(2, 2),
+        spatial_component_count=2,
+        spatial_grid_size=(2, 2),
     )
     batch = collate_distillation([dataset[0], dataset[1]])
 
-    assert batch["roi_target"].shape == (2, 2, 2, 2)
-    assert batch["roi_valid"][0].sum().item() == 1
-    assert batch["roi_valid"][1].sum().item() == 0
+    assert batch["l2_point_centers"].shape == (2, 2, 2, 2)
+    assert batch["l2_implicit_negative"][0].sum().item() == 1
+    assert batch["l2_implicit_negative"][1].sum().item() == 0
 
 
-def test_package_scatter_loader_copies_roi_tensors(tmp_path: Path) -> None:
+def test_package_scatter_loader_copies_spatial_tensors(tmp_path: Path) -> None:
     tile_path, feature_path = _write_package(tmp_path, "slide_a", 10, count=2)
     target = torch.zeros((1, 2, 2), dtype=torch.float32)
     valid = torch.zeros((1, 2, 2), dtype=torch.bool)
     target[0, 1, 1] = 1
-    valid[0, 1, 1] = True
+    valid[0, 0, 0] = True
     dataset = PackageSampledDistillationDataset(
         [tile_path],
         {"toy": [feature_path]},
         image_size=(32, 32),
         expected_dims={"toy": 4},
-        roi_targets={
-            "slide_a_0000000": RoiTileTarget(target, valid, torch.tensor([True]))
+        spatial_targets={
+            "slide_a_0000000": SpatialRoiTarget(
+                point_centers=target,
+                brush_bag_ids=torch.zeros_like(target, dtype=torch.long),
+                area_positive=torch.zeros_like(valid),
+                explicit_negative=torch.zeros_like(valid),
+                implicit_negative=valid,
+            )
         },
-        roi_attribute_count=1,
-        roi_grid_size=(2, 2),
+        spatial_component_count=1,
+        spatial_grid_size=(2, 2),
     )
     buffer = _alloc_batch_buffer(2, dataset.batch_buffer_spec(), pin=False)
     dataset.scatter_package_rows(
@@ -211,9 +382,10 @@ def test_package_scatter_loader_copies_roi_tensors(tmp_path: Path) -> None:
         [buffer],
     )
 
-    assert buffer.roi_target[0, 0, 1, 1].item() == 1
-    assert buffer.roi_valid[0].sum().item() == 1
-    assert buffer.roi_valid[1].sum().item() == 0
+    batch = buffer.view(2)
+    assert batch["l2_point_centers"][0, 0, 1, 1].item() == 1
+    assert batch["l2_implicit_negative"][0].sum().item() == 1
+    assert batch["l2_implicit_negative"][1].sum().item() == 0
 
 
 def test_build_training_manifest_splits_public_heldout_by_count(tmp_path: Path) -> None:
@@ -244,6 +416,59 @@ def test_build_training_manifest_splits_public_heldout_by_count(tmp_path: Path) 
     assert manifest["summary"]["datasets"]["internal"]["package_count"] == 4
     assert manifest["summary"]["datasets"]["tcga"]["package_count"] == 5
     assert manifest["summary"]["splits"]["exval"]["tcga_heldout"]["package_count"] == 2
+
+
+def test_build_training_manifest_keeps_public_patient_group_intact(
+    tmp_path: Path,
+) -> None:
+    dev_root = tmp_path / "dev"
+    public_root = tmp_path / "public"
+    dev_root.mkdir()
+    public_root.mkdir()
+    for idx in range(2):
+        _write_package(dev_root, f"dev_{idx}", idx)
+    _write_package(
+        public_root,
+        "shared_slide_a",
+        10,
+        patient_id="shared-patient",
+    )
+    _write_package(
+        public_root,
+        "shared_slide_b",
+        20,
+        patient_id="shared-patient",
+    )
+    _write_package(
+        public_root,
+        "independent_slide",
+        30,
+        patient_id="independent-patient",
+    )
+
+    manifest = build_training_manifest(
+        dev_sources={"internal": dev_root},
+        public_source=("tcga", public_root),
+        public_exval_n=1,
+        val_frac=0.5,
+        split_key="patient_id",
+        seed=1,
+    )
+
+    public_train = set(manifest["splits"]["train"]["tcga"])
+    public_exval = set(
+        manifest["splits"]["exval"]["tcga_heldout"]["stems"]
+    )
+    shared_stems = {"shared_slide_a", "shared_slide_b"}
+    assert shared_stems <= public_exval
+    assert public_train.isdisjoint(public_exval)
+    assert len(public_exval) == 2
+    assert (
+        manifest["summary"]["splits"]["exval"]["tcga_heldout"][
+            "package_count"
+        ]
+        == len(public_exval)
+    )
 
 
 def test_manifest_data_paths_resolve_teacher_features_by_convention(tmp_path: Path) -> None:

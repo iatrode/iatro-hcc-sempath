@@ -25,7 +25,7 @@ from .feature_pack_merge import (
     MergedTeacherFeatureCacheReader,
 )
 from .prototype_labels import PrototypeLabel
-from .roi import RoiTileTarget, roi_payload
+from .roi import SpatialRoiTarget, spatial_roi_payload
 
 
 @dataclass(frozen=True)
@@ -51,36 +51,21 @@ def _build_image_transform(
     return transforms.Compose(transform_steps)
 
 
-_EMPTY_PROTOTYPE_LEVEL2 = torch.zeros(0, dtype=torch.float32)
-_cached_zeros: dict[tuple[int, ...], torch.Tensor] = {}
-
-
-def _get_zero_tensor(like_tensor: torch.Tensor) -> torch.Tensor:
-    shape = tuple(like_tensor.shape)
-    if shape not in _cached_zeros:
-        _cached_zeros[shape] = torch.zeros(shape, dtype=like_tensor.dtype, device=like_tensor.device)
-    return _cached_zeros[shape]
-
-
 def _prototype_payload(tile_id: str, prototype_labels: dict[str, PrototypeLabel] | None) -> dict:
     if not prototype_labels:
         return {
             "prototype_mask": False,
             "prototype_level1": -1,
-            "prototype_level2": _EMPTY_PROTOTYPE_LEVEL2,
         }
     label = prototype_labels.get(tile_id)
     if label is None:
-        first = next(iter(prototype_labels.values()))
         return {
             "prototype_mask": False,
             "prototype_level1": -1,
-            "prototype_level2": _get_zero_tensor(first.level2),
         }
     return {
         "prototype_mask": True,
         "prototype_level1": label.level1,
-        "prototype_level2": label.level2,
     }
 
 
@@ -338,6 +323,8 @@ def validate_teacher_feature_package_pairs(
         if count <= 0:
             raise ValueError(f"empty tile package: {tile_path}")
         counts.append(count)
+        tile_record_ids: list[str] | None = None
+        feature_ids_by_path: dict[Path, list[str]] = {}
         for teacher_name, feature_paths in teacher_paths_by_name.items():
             feature_path = feature_paths[package_idx]
             feature_header = read_header(feature_path)
@@ -359,12 +346,25 @@ def validate_teacher_feature_package_pairs(
                 teachers = {str(name) for name in feature_header.get("teachers", [])}
                 if teacher_name not in teachers:
                     raise ValueError(f"merged feature package missing teacher={teacher_name}: path={feature_path}")
+            if tile_record_ids is None:
                 _, _, tile_records = read_tables(tile_path)
+                tile_record_ids = [
+                    str(value)
+                    for value in tile_records.column("tile_id").to_pylist()
+                ]
+            feature_ids = feature_ids_by_path.get(feature_path)
+            if feature_ids is None:
                 _, _, feature_records = read_tables(feature_path)
-                tile_ids = [str(value) for value in tile_records.column("tile_id").to_pylist()]
-                feature_ids = [str(value) for value in feature_records.column("tile_id").to_pylist()]
-                if feature_ids != tile_ids:
-                    raise ValueError(f"merged feature/tile tile_id order mismatch: teacher={teacher_name} path={feature_path}")
+                feature_ids = [
+                    str(value)
+                    for value in feature_records.column("tile_id").to_pylist()
+                ]
+                feature_ids_by_path[feature_path] = feature_ids
+            if feature_ids != tile_record_ids:
+                raise ValueError(
+                    "feature/tile tile_id order mismatch: "
+                    f"teacher={teacher_name} path={feature_path}"
+                )
             for key in ("tile_width", "tile_height", "stride_x", "stride_y"):
                 if int(feature_header[key]) != int(tile_header[key]):
                     raise ValueError(
@@ -404,9 +404,9 @@ class DistillationTileDataset(Dataset):
             | None
         ) = None,
         prototype_labels: dict[str, PrototypeLabel] | None = None,
-        roi_targets: dict[str, RoiTileTarget] | None = None,
-        roi_attribute_count: int = 0,
-        roi_grid_size: tuple[int, int] = (0, 0),
+        spatial_targets: dict[str, SpatialRoiTarget] | None = None,
+        spatial_component_count: int = 0,
+        spatial_grid_size: tuple[int, int] = (0, 0),
     ) -> None:
         self.records = records
         if teacher_cache_dir is not None:
@@ -426,9 +426,9 @@ class DistillationTileDataset(Dataset):
             resize=True,
         )
         self.prototype_labels = prototype_labels or {}
-        self.roi_targets = roi_targets or {}
-        self.roi_attribute_count = int(roi_attribute_count)
-        self.roi_grid_size = tuple(int(value) for value in roi_grid_size)
+        self.spatial_targets = spatial_targets or {}
+        self.spatial_component_count = int(spatial_component_count)
+        self.spatial_grid_size = tuple(int(value) for value in spatial_grid_size)
         self._thread_local = threading.local()
 
     def _packaged_reader(self, package_path: Path) -> TilePackageReader:
@@ -467,11 +467,11 @@ class DistillationTileDataset(Dataset):
             "image": image_tensor,
             "teacher_features": teacher_features,
             **_prototype_payload(record.tile_id, self.prototype_labels),
-            **roi_payload(
+            **spatial_roi_payload(
                 record.tile_id,
-                self.roi_targets,
-                attribute_count=self.roi_attribute_count,
-                grid_size=self.roi_grid_size,
+                self.spatial_targets,
+                component_count=self.spatial_component_count,
+                grid_size=self.spatial_grid_size,
             ),
         }
 
@@ -518,9 +518,9 @@ class PackageSampledDistillationDataset(Dataset):
         expected_dims: dict[str, int] | None = None,
         prototype_labels: dict[str, PrototypeLabel] | None = None,
         tensor_collate: bool = False,
-        roi_targets: dict[str, RoiTileTarget] | None = None,
-        roi_attribute_count: int = 0,
-        roi_grid_size: tuple[int, int] = (0, 0),
+        spatial_targets: dict[str, SpatialRoiTarget] | None = None,
+        spatial_component_count: int = 0,
+        spatial_grid_size: tuple[int, int] = (0, 0),
     ) -> None:
         self.tile_paths = [Path(path) for path in image_tile_package_paths]
         self.teacher_package_paths = {
@@ -561,15 +561,14 @@ class PackageSampledDistillationDataset(Dataset):
             resize=False,
         )
         self.prototype_labels = prototype_labels or {}
-        self.roi_targets = roi_targets or {}
-        self.roi_attribute_count = int(roi_attribute_count)
-        self.roi_grid_size = tuple(int(value) for value in roi_grid_size)
+        self.spatial_targets = spatial_targets or {}
+        self.spatial_component_count = int(spatial_component_count)
+        self.spatial_grid_size = tuple(int(value) for value in spatial_grid_size)
         self.tensor_collate = bool(tensor_collate)
         self.mean_tensor = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1) if mean is not None else None
         self.std_tensor = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1) if std is not None else None
         self._image_hw = (int(image_size), int(image_size)) if isinstance(image_size, int) else (int(image_size[0]), int(image_size[1]))
         self._teacher_dims: dict[str, int] = dict(expected_dims) if expected_dims else {}
-        self._level2_dim = int(next(iter(self.prototype_labels.values())).level2.numel()) if self.prototype_labels else 0
         # Per-thread reader LRU cap (entries = tile/feature readers). Keeps total
         # open file handles bounded across many worker threads. Each cached entry
         # is one open package file; with ~1.8k packages an unbounded cache would
@@ -783,6 +782,12 @@ class PackageSampledDistillationDataset(Dataset):
                     "image": images[index],
                     "teacher_features": {name: values[index] for name, values in feature_batches.items()},
                     **_prototype_payload(tile_id, self.prototype_labels),
+                    **spatial_roi_payload(
+                        tile_id,
+                        self.spatial_targets,
+                        component_count=self.spatial_component_count,
+                        grid_size=self.spatial_grid_size,
+                    ),
                 }
             )
         return samples
@@ -807,16 +812,15 @@ class PackageSampledDistillationDataset(Dataset):
         return {
             "image_hw": self._image_hw,
             "teacher_dims": teacher_dims,
-            "level2_dim": self._level2_dim,
-            "roi_shape": (self.roi_attribute_count, *self.roi_grid_size),
+            "spatial_shape": (self.spatial_component_count, *self.spatial_grid_size),
         }
 
     def scatter_package_rows(
         self,
         package_idx: int,
         rows: np.ndarray,
-        positions: "list[BatchSlot]",
-        buffers: "list[BatchBuffer]",
+        positions: list,
+        buffers: list,
     ) -> None:
         """Decode rows and write them into pre-allocated pinned batch tensors at
         their final positions. ``positions[k]`` is the (buffer, slot) for
@@ -844,7 +848,6 @@ class PackageSampledDistillationDataset(Dataset):
         order = sorted(range(n), key=lambda k: int(rows[k]))
         buf = buffers[positions[0].buffer_idx]
         h, w = int(buf.images.shape[1]), int(buf.images.shape[2])
-        l2_dim = int(buf.prototype_level2.shape[1])
         teacher_names = list(buf.teacher_features.keys())
 
         sorted_rows = [int(rows[k]) for k in order]
@@ -860,7 +863,6 @@ class PackageSampledDistillationDataset(Dataset):
         pos_stage = np.empty(n, dtype=np.int64)
         mask_stage = np.zeros(n, dtype=bool)
         l1_stage = np.full(n, -1, dtype=np.int64)
-        l2_stage = np.zeros((n, l2_dim), dtype=np.float32) if l2_dim > 0 else None
         tid_stage: list = [None] * n
 
         for i, k in enumerate(order):
@@ -871,23 +873,12 @@ class PackageSampledDistillationDataset(Dataset):
                 feat_stage[name][i] = features[i]
             with _probe.section("proto"):
                 proto = _prototype_payload(tile_id, self.prototype_labels)
-                roi = roi_payload(
-                    tile_id,
-                    self.roi_targets,
-                    attribute_count=self.roi_attribute_count,
-                    grid_size=self.roi_grid_size,
-                )
                 tid_stage[i] = tile_id
                 mask_stage[i] = bool(proto["prototype_mask"])
                 l1_stage[i] = int(proto["prototype_level1"])
-                if l2_stage is not None:
-                    level2 = proto["prototype_level2"]
-                    if level2.numel() == l2_dim:
-                        l2_stage[i] = level2.numpy()
-                if buf.roi_target.numel() > 0:
-                    buf.roi_target[int(pos_stage[i])].copy_(roi["roi_target"])
-                    buf.roi_valid[int(pos_stage[i])].copy_(roi["roi_valid"])
-                    buf.roi_consistency[int(pos_stage[i])].copy_(roi["roi_consistency"])
+                buf.spatial_targets[int(pos_stage[i])] = self.spatial_targets.get(
+                    tile_id
+                )
 
         # Single batched, GIL-held flush per tensor (was 8*n per-tile ops).
         with _probe.section("copy_flush"):
@@ -897,8 +888,6 @@ class PackageSampledDistillationDataset(Dataset):
                 buf.teacher_features[name].index_copy_(0, pos_t, torch.from_numpy(feat_stage[name]))
             buf.prototype_mask.index_copy_(0, pos_t, torch.from_numpy(mask_stage))
             buf.prototype_level1.index_copy_(0, pos_t, torch.from_numpy(l1_stage))
-            if l2_stage is not None:
-                buf.prototype_level2.index_copy_(0, pos_t, torch.from_numpy(l2_stage))
             for i in range(n):
                 buf.tile_id[int(pos_stage[i])] = tid_stage[i]
         _probe.flush_thread()
@@ -956,11 +945,11 @@ class PackageSampledDistillationDataset(Dataset):
             "image": image,
             "teacher_features": teacher_features,
             **_prototype_payload(tile_id, self.prototype_labels),
-            **roi_payload(
+            **spatial_roi_payload(
                 tile_id,
-                self.roi_targets,
-                attribute_count=self.roi_attribute_count,
-                grid_size=self.roi_grid_size,
+                self.spatial_targets,
+                component_count=self.spatial_component_count,
+                grid_size=self.spatial_grid_size,
             ),
         }
 
@@ -988,11 +977,11 @@ class PackageSampledDistillationDataset(Dataset):
                     "image": images[index],
                     "teacher_features": {name: values[index] for name, values in feature_batches.items()},
                     **_prototype_payload(tile_id, self.prototype_labels),
-                    **roi_payload(
+                    **spatial_roi_payload(
                         tile_id,
-                        self.roi_targets,
-                        attribute_count=self.roi_attribute_count,
-                        grid_size=self.roi_grid_size,
+                        self.spatial_targets,
+                        component_count=self.spatial_component_count,
+                        grid_size=self.spatial_grid_size,
                     ),
                 }
         return [item for item in results if item is not None]
@@ -1015,10 +1004,12 @@ class PackageSampledDistillationDataset(Dataset):
             },
             "prototype_mask": torch.tensor([bool(item["prototype_mask"]) for item in batch], dtype=torch.bool),
             "prototype_level1": torch.tensor([int(item["prototype_level1"]) for item in batch], dtype=torch.long),
-            "prototype_level2": torch.stack([item["prototype_level2"] for item in batch]),
-            "roi_target": torch.stack([item["roi_target"] for item in batch]),
-            "roi_valid": torch.stack([item["roi_valid"] for item in batch]),
-            "roi_consistency": torch.stack([item["roi_consistency"] for item in batch]),
+            "l2_point_centers": torch.stack([item["l2_point_centers"] for item in batch]),
+            "l2_brush_bag_ids": torch.stack([item["l2_brush_bag_ids"] for item in batch]),
+            "l2_area_positive": torch.stack([item["l2_area_positive"] for item in batch]),
+            "l2_explicit_negative": torch.stack([item["l2_explicit_negative"] for item in batch]),
+            "l2_implicit_negative": torch.stack([item["l2_implicit_negative"] for item in batch]),
+            "l2_spatial_supervised": torch.stack([item["l2_spatial_supervised"] for item in batch]),
         }
 
     def close(self) -> None:
@@ -1105,8 +1096,10 @@ def collate_distillation(batch: list[dict]) -> dict:
         },
         "prototype_mask": torch.tensor([bool(item.get("prototype_mask", False)) for item in batch], dtype=torch.bool),
         "prototype_level1": torch.tensor([int(item.get("prototype_level1", -1)) for item in batch], dtype=torch.long),
-        "prototype_level2": torch.stack([item.get("prototype_level2", torch.zeros(0, dtype=torch.float32)) for item in batch]),
-        "roi_target": torch.stack([item.get("roi_target", torch.zeros((0, 0, 0))) for item in batch]),
-        "roi_valid": torch.stack([item.get("roi_valid", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),
-        "roi_consistency": torch.stack([item.get("roi_consistency", torch.zeros(0, dtype=torch.bool)) for item in batch]),
+        "l2_point_centers": torch.stack([item.get("l2_point_centers", torch.zeros((0, 0, 0))) for item in batch]),
+        "l2_brush_bag_ids": torch.stack([item.get("l2_brush_bag_ids", torch.zeros((0, 0, 0), dtype=torch.long)) for item in batch]),
+        "l2_area_positive": torch.stack([item.get("l2_area_positive", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),
+        "l2_explicit_negative": torch.stack([item.get("l2_explicit_negative", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),
+        "l2_implicit_negative": torch.stack([item.get("l2_implicit_negative", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),
+        "l2_spatial_supervised": torch.stack([item.get("l2_spatial_supervised", torch.zeros(0, dtype=torch.bool)) for item in batch]),
     }

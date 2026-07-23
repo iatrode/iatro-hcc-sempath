@@ -1,6 +1,7 @@
-inherits: ../../../configs/server/train_tenth.example.yaml
+inherits: tenth_duration_full_population.yaml
 
-# Ablation A0 — dynamic prototypes with half-strength filtering at 1/10 scale.
+# Ablation A0 — dynamic prototypes with half-strength filtering at
+# one-tenth-duration, full-population scale.
 #
 # This historical reference condition is retained specifically for the A0-A5
 # dynamic-versus-static prototype contrast. It is not the universal reference

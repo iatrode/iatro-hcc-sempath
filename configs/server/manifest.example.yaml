@@ -1,6 +1,6 @@
 version: 1
 tile_suffix: .tiles.iac
-split_key: stem
+split_key: patient_id
 seed: 13
 
 datasets:
@@ -27,7 +27,7 @@ auto_split:
   enabled: true
   development_val_fraction: 0.15
   external_val_fraction: 0.50
-  split_key: stem
+  split_key: patient_id
   seed: 13
 
 splits:

@@ -27,6 +27,7 @@ from hcc_sempath.cli.annotate_prototypes import (
     _auth_ok,
     _annotation_key,
     _load_or_create_auth_token,
+    _validate_brush_geometry,
     discover_iac_packages,
     make_handler,
 )
@@ -151,12 +152,15 @@ def test_annotation_cli_always_requires_l1_and_l2_roi_workspaces() -> None:
         "--l1-state", "l1.json",
         "--l2-state", "l2.json",
         "--priority-manifest", "priority.json",
+        "--roi-candidate-manifest", "roi-candidates.json",
+        "--roi-priority-attributes", "vascular-structure-present,ductular-portal-present",
     ])
     assert (args.l1_state, args.l2_state, args.priority_manifest) == (
         "l1.json", "l2.json", "priority.json",
     )
     assert not any("--state" in action.option_strings for action in parser._actions)
-    assert not any("--roi-candidate-manifest" in action.option_strings for action in parser._actions)
+    assert args.roi_candidate_manifest == "roi-candidates.json"
+    assert args.roi_priority_attributes == "vascular-structure-present,ductular-portal-present"
     assert not any("--roi-plan-config" in action.option_strings for action in parser._actions)
     assert not any("--roi-plan-checkpoint" in action.option_strings for action in parser._actions)
     assert not any("--roi-plan-device" in action.option_strings for action in parser._actions)
@@ -218,13 +222,20 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert 'data-roi-tool="eraser">Eraser' in HTML
     assert "['point','brush','eraser','circle']" in HTML
     assert "roiToolByClass[roiAttribute]=roiTool" in HTML
-    assert "selectRoiTool(roiToolByClass[name]||'point',false)" in HTML
+    assert "const AREA_ONLY_CLASSES=new Set(['necrosis-present','fibrous-stroma-present'])" in HTML
+    assert "function roiToolAllowed(tool,attribute=roiAttribute)" in HTML
+    assert "AREA_ONLY_CLASSES.has(name)?'brush':'point'" in HTML
+    assert 'id="roiNavigationNotice"' in HTML
+    assert "old-L2 candidates reviewed, but the information curve is not ready" in HTML
     assert "Brush / eraser width" in HTML
     assert "function densifyPath(points,maxStep)" in HTML
     assert "function eraseBrushGeometry(item,center,eraserRadius)" in HTML
     assert "function eraseCurrentClassAt(center,eraserRadius)" in HTML
     assert "function eraseCurrentClassAlong(start,end,eraserRadius)" in HTML
     assert "function setupEraser()" in HTML
+    assert "const finalPoint=[p.x,p.y],lastPoint=roiDrawing.points" in HTML
+    assert "pointDistanceSq(lastPoint,finalPoint)>1e-12" in HTML
+    assert "addEventListener('pointercancel'" in HTML
     assert "function setupTileUndo()" in HTML
     assert "getElementById('tileStage').addEventListener('contextmenu'" in HTML
     assert "ev.preventDefault();ev.stopPropagation();undoRoi()" in HTML
@@ -286,10 +297,8 @@ def _write_roi_queue(path: Path, tile_ids: list[str]) -> None:
     path.write_text(
         json.dumps(
             {
-                "version": 1,
-                "complete": False,
+                "version": 2,
                 "l2_prototypes": ROI_L2_PROTOTYPES,
-                "target_per_attribute": {name: 100 for name in ROI_L2_PROTOTYPES},
                 "candidates": [
                     {
                         "tile_id": tile_id,
@@ -353,7 +362,437 @@ def test_shared_priority_list_drives_roi_then_expands_to_fallback_tile(tmp_path:
         data.close()
 
 
-def test_build_roi_queue_excludes_hyaline_and_reports_true_deficits(tmp_path: Path) -> None:
+def test_brush_validation_keeps_edge_overlap_and_rejects_invalid_geometry() -> None:
+    _validate_brush_geometry(
+        {
+            "type": "brush",
+            "coordinate_space": "normalized",
+            "points": [[-0.04, 0.4], [-0.02, 0.6]],
+            "width": 0.10,
+        }
+    )
+
+    with pytest.raises(ValueError, match="does not intersect"):
+        _validate_brush_geometry(
+            {
+                "type": "brush",
+                "coordinate_space": "normalized",
+                "points": [[-0.20, 0.4], [-0.15, 0.6]],
+                "width": 0.05,
+            }
+        )
+    with pytest.raises(ValueError, match="finite positive width"):
+        _validate_brush_geometry(
+            {
+                "type": "brush",
+                "coordinate_space": "normalized",
+                "points": [[0.2, 0.4]],
+                "width": float("nan"),
+            }
+        )
+    with pytest.raises(ValueError, match="finite x/y"):
+        _validate_brush_geometry(
+            {
+                "type": "brush",
+                "coordinate_space": "normalized",
+                "points": [[float("inf"), 0.4]],
+                "width": 0.05,
+            }
+        )
+
+
+def test_old_l2_candidates_bias_random_navigation_without_prefilling_labels(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    state_path = tmp_path / "roi.json"
+    queue_path = tmp_path / "roi_candidates.json"
+    _write_iac(iac_path)
+    queue_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "candidates": [
+                    {
+                        "tile_id": "s1_0000000",
+                        "source_l2": ["fibrous-stroma-present"],
+                    },
+                    {
+                        "tile_id": "s1_0000001",
+                        "source_l2": ["vascular-structure-present"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    data = AnnotationData(
+        iac_path,
+        state_path,
+        roi_candidate_manifest=queue_path,
+        roi_priority_attributes=["vascular-structure-present"],
+        min_tissue_fraction=0,
+    )
+    try:
+        result = data.random_record(0)
+        assert result["record"]["tile_id"] == "s1_0000001"
+        assert result["selection"] == "legacy_l2_navigation_hint"
+        assert "source_l2" not in result
+        assert data.state.annotations == {}
+    finally:
+        data.close()
+
+
+def test_roi_navigation_priority_attribute_order_changes_sampling_weight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_path = tmp_path / "roi_candidates.json"
+    queue_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "candidates": [
+                    {"tile_id": "vascular", "source_l2": ["vascular-structure-present"]},
+                    {"tile_id": "bile", "source_l2": ["bile-pigment-present"]},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    queue = RoiCandidateQueue(queue_path)
+    monkeypatch.setattr(random, "random", lambda: 0.5)
+    counts = {name: 0 for name in ROI_L2_PROTOTYPES}
+
+    vascular_first = queue.weighted_remaining(
+        processed_tile_ids=set(),
+        roi_positive_counts=counts,
+        priority_attributes=["vascular-structure-present", "bile-pigment-present"],
+    )
+    bile_first = queue.weighted_remaining(
+        processed_tile_ids=set(),
+        roi_positive_counts=counts,
+        priority_attributes=["bile-pigment-present", "vascular-structure-present"],
+    )
+
+    assert vascular_first[0]["tile_id"] == "vascular"
+    assert bile_first[0]["tile_id"] == "bile"
+
+
+def test_roi_navigation_has_no_fixed_positive_tile_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_path = tmp_path / "roi_candidates.json"
+    attribute = "vascular-structure-present"
+    queue_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "candidates": [
+                    {"tile_id": "vascular", "source_l2": [attribute]},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    queue = RoiCandidateQueue(queue_path)
+    monkeypatch.setattr(random, "random", lambda: 0.5)
+
+    remaining = queue.weighted_remaining(
+        processed_tile_ids=set(),
+        roi_positive_counts={attribute: 10_000},
+        priority_attributes=[attribute],
+    )
+
+    assert [item["tile_id"] for item in remaining] == ["vascular"]
+
+
+def _write_roi_information_report(
+    path: Path,
+    *,
+    deficient: dict[str, str],
+) -> None:
+    attributes = {}
+    for name in ROI_L2_PROTOTYPES:
+        status = deficient.get(name, "provisionally_stable")
+        support = 0.0 if status == "not_assessable" else 0.5
+        attributes[name] = {
+            "status": status,
+            "teacher_low_gain_support_by_teacher_ratio": {
+                "0.35": {
+                    teacher: support
+                    for teacher in (
+                        "gigapath",
+                        "h_optimus_1",
+                        "uni2_h",
+                        "virchow2",
+                    )
+                }
+            },
+        }
+    path.write_text(json.dumps({"attributes": attributes}), encoding="utf-8")
+
+
+def test_roi_navigation_uses_information_deficit_inside_old_l2_pool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_path = tmp_path / "roi_candidates.json"
+    report_path = tmp_path / "roi_information_report.json"
+    queue_path.write_text(
+        json.dumps(
+            {
+                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "candidates": [
+                    {
+                        "tile_id": "necrosis",
+                        "source_l2": ["necrosis-present"],
+                    },
+                    {
+                        "tile_id": "fibrous",
+                        "source_l2": ["fibrous-stroma-present"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_roi_information_report(
+        report_path,
+        deficient={"necrosis-present": "still_growing"},
+    )
+    queue = RoiCandidateQueue(
+        queue_path,
+        information_report_path=report_path,
+    )
+    monkeypatch.setattr(random, "random", lambda: 0.5)
+
+    remaining = queue.weighted_remaining(
+        processed_tile_ids=set(),
+        roi_positive_counts={name: 0 for name in ROI_L2_PROTOTYPES},
+    )
+
+    assert [item["tile_id"] for item in remaining] == [
+        "necrosis",
+        "fibrous",
+    ]
+    assert remaining[0]["dynamic_priority_attributes"][0] == (
+        "necrosis-present"
+    )
+
+
+def test_roi_navigation_learns_cross_label_yield_when_direct_hints_are_used(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_path = tmp_path / "roi_candidates.json"
+    report_path = tmp_path / "roi_information_report.json"
+    candidates = [
+        {
+            "tile_id": f"reviewed-fibrous-{index}",
+            "source_l2": ["fibrous-stroma-present"],
+        }
+        for index in range(4)
+    ]
+    candidates.extend(
+        {
+            "tile_id": f"reviewed-ductular-{index}",
+            "source_l2": ["ductular-portal-present"],
+        }
+        for index in range(4)
+    )
+    candidates.extend(
+        [
+            {
+                "tile_id": "remaining-fibrous",
+                "source_l2": ["fibrous-stroma-present"],
+            },
+            {
+                "tile_id": "remaining-ductular",
+                "source_l2": ["ductular-portal-present"],
+            },
+        ]
+    )
+    queue_path.write_text(
+        json.dumps(
+            {
+                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "candidates": candidates,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_roi_information_report(
+        report_path,
+        deficient={"vascular-structure-present": "not_assessable"},
+    )
+    queue = RoiCandidateQueue(
+        queue_path,
+        information_report_path=report_path,
+    )
+    monkeypatch.setattr(random, "random", lambda: 0.5)
+    processed = {
+        item["tile_id"]
+        for item in candidates
+        if item["tile_id"].startswith("reviewed-")
+    }
+    positive_by_tile = {
+        tile_id: (
+            {"vascular-structure-present"}
+            if tile_id.startswith("reviewed-fibrous-")
+            else set()
+        )
+        for tile_id in processed
+    }
+
+    remaining = queue.weighted_remaining(
+        processed_tile_ids=processed,
+        roi_positive_counts={name: 0 for name in ROI_L2_PROTOTYPES},
+        roi_positive_by_tile=positive_by_tile,
+    )
+
+    assert [item["tile_id"] for item in remaining] == [
+        "remaining-fibrous",
+        "remaining-ductular",
+    ]
+    policy = queue.sampling_policy()["vascular-structure-present"]
+    assert policy["remaining_direct_hint_count"] == 0
+    assert policy["predicted_remaining_yield"] > 0
+
+
+def test_roi_navigation_lists_direct_deficient_hints_before_inferred_hints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_path = tmp_path / "roi_candidates.json"
+    report_path = tmp_path / "roi_information_report.json"
+    queue_path.write_text(
+        json.dumps(
+            {
+                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "candidates": [
+                    {
+                        "tile_id": "direct",
+                        "source_l2": ["vascular-structure-present"],
+                    },
+                    {
+                        "tile_id": "inferred",
+                        "source_l2": ["fibrous-stroma-present"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_roi_information_report(
+        report_path,
+        deficient={"vascular-structure-present": "not_assessable"},
+    )
+    queue = RoiCandidateQueue(
+        queue_path,
+        information_report_path=report_path,
+    )
+    random_values = iter([0.01, 0.99])
+    monkeypatch.setattr(random, "random", lambda: next(random_values))
+
+    remaining = queue.weighted_remaining(
+        processed_tile_ids=set(),
+        roi_positive_counts={name: 0 for name in ROI_L2_PROTOTYPES},
+    )
+
+    assert [item["tile_id"] for item in remaining] == [
+        "direct",
+        "inferred",
+    ]
+    assert remaining[0]["direct_priority_attributes"] == [
+        "vascular-structure-present"
+    ]
+
+
+def test_roi_navigation_reports_exhausted_old_l2_class(
+    tmp_path: Path,
+) -> None:
+    queue_path = tmp_path / "roi_candidates.json"
+    queue_path.write_text(
+        json.dumps(
+            {
+                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "candidates": [
+                    {
+                        "tile_id": "vascular",
+                        "source_l2": ["vascular-structure-present"],
+                    },
+                    {
+                        "tile_id": "necrosis",
+                        "source_l2": ["necrosis-present"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    queue = RoiCandidateQueue(queue_path)
+
+    status = queue.direct_hint_status({"vascular"})
+
+    assert status["vascular-structure-present"] == {
+        "total": 1,
+        "reviewed": 1,
+        "remaining": 0,
+        "exhausted": True,
+    }
+    assert status["necrosis-present"]["exhausted"] is False
+    assert status["necrosis-present"]["remaining"] == 1
+
+
+def test_roi_navigation_hints_stay_inside_shared_priority_boundary(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    queue_path = tmp_path / "roi_candidates.json"
+    priority_path = tmp_path / "priority.json"
+    _write_iac(iac_path)
+    queue_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "candidates": [
+                    {"tile_id": "s1_0000001", "source_l2": ["vascular-structure-present"]},
+                    {"tile_id": "s1_0000002", "source_l2": ["vascular-structure-present"]},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    priority_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "candidates": [
+                    {"tile_id": "s1_0000002", "iac": "tiles.iac", "row": 2, "slide": "s1"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    data = AnnotationData(
+        iac_path,
+        tmp_path / "roi.json",
+        roi_candidate_manifest=queue_path,
+        roi_priority_attributes=["vascular-structure-present"],
+        priority_queue=SharedPriorityQueue(priority_path),
+        min_tissue_fraction=0,
+    )
+    try:
+        result = data.random_record("all")
+        assert result["record"]["tile_id"] == "s1_0000002"
+        assert result["selection"] == "legacy_l2_navigation_hint"
+    finally:
+        data.close()
+
+
+def test_build_roi_queue_excludes_hyaline_and_reports_planning_coverage(tmp_path: Path) -> None:
     source = tmp_path / "annotations.json"
     source.write_text(
         json.dumps(
@@ -366,12 +805,13 @@ def test_build_roi_queue_excludes_hyaline_and_reports_true_deficits(tmp_path: Pa
         ),
         encoding="utf-8",
     )
-    payload = build_roi_candidate_queue([source], target=2)
+    payload = build_roi_candidate_queue([source], planning_coverage=2)
     assert "hyaline-change-present" not in payload["l2_prototypes"]
     assert payload["candidate_count"] == 2
-    assert payload["complete"] is False
+    assert payload["version"] == 2
+    assert payload["planning_coverage_per_attribute"][ROI_L2_PROTOTYPES[0]] == 2
     assert payload["source_positive_inventory"][ROI_L2_PROTOTYPES[0]] == 1
-    assert payload["unfilled_targets"][ROI_L2_PROTOTYPES[0]] == 1
+    assert payload["unfilled_planning_coverage"][ROI_L2_PROTOTYPES[0]] == 1
     assert payload["selected_source_coverage"][ROI_L2_PROTOTYPES[1]] == 2
     queue_path = tmp_path / "queue.json"
     queue_path.write_text(json.dumps(payload), encoding="utf-8")
