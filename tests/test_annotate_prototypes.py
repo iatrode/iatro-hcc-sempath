@@ -204,6 +204,8 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert 'class="imageControlRow overviewControlRow"' in HTML
     assert '<h3>Location overview</h3><label class="rangeControl">Zoom' in HTML
     assert 'id="overviewZoom"' in HTML
+    assert ".thumbWrap{position:relative;min-height:220px" in HTML
+    assert "overflow:hidden;overscroll-behavior:contain" in HTML
     assert 'id="tileZoomIn"' not in HTML
     assert 'id="roiRedo"' in HTML
     assert "undoRoi()" in HTML
@@ -247,6 +249,25 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "syncPositiveLabels();renderRoi()" in HTML
     assert "wheelZoom:false,doubleClickReset:false,onScale:syncOverviewZoom" in HTML
     assert "overviewZoom.addEventListener('input'" in HTML
+    assert 'id="contextViewport"' in HTML
+    assert "const CONTEXT_RADIUS=5,CONTEXT_RECENTER_DELTA=2" in HTML
+    assert "requestAnimationFrame(paintContextPan)" in HTML
+    assert "translate3d(${contextTx}px,${contextTy}px,0)" in HTML
+    assert "Math.min(availableW/(visible*contextData.cell_width),availableH/(visible*contextData.cell_height))" in HTML
+    assert ".contextLoading{position:absolute" in HTML
+    assert "pointer-events:none" in HTML
+    assert "repeating-linear-gradient(135deg" in HTML
+    assert "--context-grid-x" in HTML
+    assert "if(contextDrag){" in HTML
+    assert "contextPendingWindow={data,image,centerRow,anchor}" in HTML
+    assert "/api/context-center?" in HTML
+    assert "contextTx=contextDrag.startTx+dx;contextTy=contextDrag.startTy+dy;\n        scheduleContextPan()" in HTML
+    assert "viewport.clientWidth-baseW*scale" in HTML
+    assert "translate3d(${tx}px,${ty}px,0) scale(${scale})" in HTML
+    assert "/api/context-window?" in HTML
+    assert "async function openContextTile(record)" in HTML
+    assert "await showRecord(record)" in HTML
+    assert "replenishContextBuffer()" in HTML
     assert "roiCursor" in HTML
     assert "updateRoiCursor" in HTML
     assert "exclude_row" in HTML
@@ -651,6 +672,7 @@ def test_roi_navigation_learns_cross_label_yield_when_direct_hints_are_used(
         processed_tile_ids=processed,
         roi_positive_counts={name: 0 for name in ROI_L2_PROTOTYPES},
         roi_positive_by_tile=positive_by_tile,
+        priority_attributes=["vascular-structure-present"],
     )
 
     assert [item["tile_id"] for item in remaining] == [
@@ -660,6 +682,49 @@ def test_roi_navigation_learns_cross_label_yield_when_direct_hints_are_used(
     policy = queue.sampling_policy()["vascular-structure-present"]
     assert policy["remaining_direct_hint_count"] == 0
     assert policy["predicted_remaining_yield"] > 0
+
+
+def test_roi_progress_exposes_explicit_navigation_target(tmp_path: Path) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    queue_path = tmp_path / "roi_candidates.json"
+    report_path = tmp_path / "roi_information_report.json"
+    _write_iac(iac_path)
+    queue_path.write_text(
+        json.dumps(
+            {
+                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "candidates": [
+                    {
+                        "tile_id": "s1_0000000",
+                        "source_l2": ["steatosis-vacuolation-present"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_roi_information_report(
+        report_path,
+        deficient={
+            "steatosis-vacuolation-present": "still_growing",
+            "vascular-structure-present": "not_assessable",
+        },
+    )
+    data = AnnotationData(
+        iac_path,
+        tmp_path / "roi.json",
+        roi_candidate_manifest=queue_path,
+        roi_information_report=report_path,
+        roi_priority_attributes=["steatosis-vacuolation-present"],
+        roi_mode=True,
+        min_tissue_fraction=0,
+    )
+    try:
+        assert data.progress(0)["roi_priority_attributes"] == [
+            "steatosis-vacuolation-present"
+        ]
+    finally:
+        data.close()
 
 
 def test_roi_navigation_lists_direct_deficient_hints_before_inferred_hints(
@@ -1310,6 +1375,39 @@ def test_context_jpg_renders_half_resolution_5x5_grid(tmp_path: Path) -> None:
         image = Image.open(io.BytesIO(data.context_jpg(0, 0))).convert("RGB")
         assert image.size == (40, 40)
         assert image.getpixel((20, 20)) != (245, 247, 249)
+        window = data.context_window(0, 0, radius=5)
+        assert window["grid_size"] == 11
+        assert window["visible_grid_size"] == 5
+        assert len(window["cells"]) == 121
+        center = next(
+            item
+            for item in window["cells"]
+            if item["dx"] == 0 and item["dy"] == 0
+        )
+        right = next(
+            item
+            for item in window["cells"]
+            if item["dx"] == 1 and item["dy"] == 0
+        )
+        assert center["record"]["row"] == 0
+        assert right["record"]["row"] == 1
+        assert data.context_center(
+            0,
+            0,
+            grid_x=1,
+            grid_y=0,
+        )["record"]["row"] == 1
+        prefetched = Image.open(
+            io.BytesIO(
+                data.context_jpg(
+                    0,
+                    0,
+                    radius=5,
+                    selected_row=0,
+                )
+            )
+        ).convert("RGB")
+        assert prefetched.size == (88, 88)
         thumb = Image.open(io.BytesIO(data.thumbnail_jpg(0, selected_row=0))).convert("RGB")
         assert thumb.size == (8, 8)
     finally:
@@ -1419,6 +1517,18 @@ def test_endpoints_via_http_get(tmp_path: Path) -> None:
             assert "candidate" in json.loads(response.read().decode("utf-8"))
         with urlopen(f"{root_url}api/reviewed-list?token=secret&package=all", timeout=5) as response:
             assert json.loads(response.read().decode("utf-8")) == {"items": [], "total": 0}
+        with urlopen(
+            f"{root_url}api/context-window?token=secret&package=0&row=0&radius=5",
+            timeout=5,
+        ) as response:
+            context = json.loads(response.read().decode("utf-8"))
+            assert context["grid_size"] == 11
+            assert context["visible_grid_size"] == 5
+        with urlopen(
+            f"{root_url}api/context-center?token=secret&package=0&row=0&grid_x=1&grid_y=0",
+            timeout=5,
+        ) as response:
+            assert json.loads(response.read().decode("utf-8"))["record"]["row"] == 1
         with urlopen(f"{root_url}api/tile?token=secret&package=0&row=0", timeout=5) as response:
             assert len(response.read()) > 0
     finally:

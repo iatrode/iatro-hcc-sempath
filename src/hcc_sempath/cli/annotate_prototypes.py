@@ -35,6 +35,10 @@ from iatro.iac.adapters.tiles import decode_jxl
 LOG = logging.getLogger("hcc_sempath.annotate_prototypes")
 OVERVIEW_CELL_PX = 4
 OVERVIEW_WORKERS = 8
+CONTEXT_VISIBLE_RADIUS = 2
+CONTEXT_PREFETCH_RADIUS = 5
+CONTEXT_MAX_RADIUS = 8
+CONTEXT_WORKERS = 8
 MAX_OPEN_IAC_VIEWERS = 8
 
 L1_PROTOTYPES = [
@@ -362,7 +366,7 @@ class RoiCandidateQueue:
             if item["tile_id"] not in processed_tile_ids
             and item["tile_id"] != exclude_tile_id
             and (allowed_tile_ids is None or item["tile_id"] in allowed_tile_ids)
-            and any(name in active_set for name in item["source_l2"])
+            and item["source_l2"]
         ]
         probabilities = self._source_target_probabilities(
             roi_positive_by_tile or {},
@@ -1391,15 +1395,16 @@ class AnnotationData:
             if self.roi_mode and self.roi_queue is not None
             else {}
         )
-        roi_priority_attributes = (
-            [
+        if self.roi_priority_attributes:
+            roi_priority_attributes = list(self.roi_priority_attributes)
+        elif roi_information_policy:
+            roi_priority_attributes = [
                 name
                 for name, value in roi_information_policy.items()
                 if float(value.get("urgency", 0.0)) > 0.0
             ]
-            if roi_information_policy
-            else list(self.roi_priority_attributes)
-        )
+        else:
+            roi_priority_attributes = []
         processed_tile_ids = {
             str(item["tile_id"])
             for item in self.state.annotations.values()
@@ -1872,38 +1877,233 @@ class AnnotationData:
         LOG.info("overview_return iac=%s path=%s annotated=%d bytes=%d", package.rel_path, cache_path, len(annotated), buffer.tell())
         return buffer.getvalue()
 
-    def context_jpg(self, index: int, row: int) -> bytes:
+    def context_window(
+        self,
+        index: int,
+        row: int,
+        *,
+        radius: int = CONTEXT_PREFETCH_RADIUS,
+    ) -> dict:
         viewer = self.viewer(index)
         center = viewer._by_row[row]
+        radius = max(
+            CONTEXT_VISIBLE_RADIUS,
+            min(CONTEXT_MAX_RADIUS, int(radius)),
+        )
         tile_w = max(1, int(viewer.header.get("tile_width", viewer.stride_x))) // 2
         tile_h = max(1, int(viewer.header.get("tile_height", viewer.stride_y))) // 2
         tile_w = max(1, tile_w)
         tile_h = max(1, tile_h)
-        canvas = Image.new("RGB", (tile_w * 5, tile_h * 5), (245, 247, 249))
+        cells = []
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                record = viewer._image_lookup.get(
+                    (
+                        center.slide_key,
+                        center.grid_x + dx,
+                        center.grid_y + dy,
+                    )
+                )
+                cells.append(
+                    {
+                        "dx": dx,
+                        "dy": dy,
+                        "record": (
+                            None
+                            if record is None
+                            else viewer._record_json(record)
+                        ),
+                    }
+                )
+        return {
+            "center": viewer._record_json(center),
+            "radius": radius,
+            "visible_radius": CONTEXT_VISIBLE_RADIUS,
+            "grid_size": radius * 2 + 1,
+            "visible_grid_size": CONTEXT_VISIBLE_RADIUS * 2 + 1,
+            "cell_width": tile_w,
+            "cell_height": tile_h,
+            "cells": cells,
+        }
+
+    def context_center(
+        self,
+        index: int,
+        row: int,
+        *,
+        grid_x: float,
+        grid_y: float,
+    ) -> dict:
+        viewer = self.viewer(index)
+        source = viewer._by_row[row]
+        exact = viewer._image_lookup.get(
+            (
+                source.slide_key,
+                int(round(grid_x)),
+                int(round(grid_y)),
+            )
+        )
+        if exact is not None:
+            return {"record": viewer._record_json(exact)}
+        records = viewer._by_slide.get(source.slide_key, [])
+        if not records:
+            raise FileNotFoundError(
+                f"slide has no context records: {source.slide_key}"
+            )
+        nearest = min(
+            records,
+            key=lambda record: (
+                (record.grid_x - grid_x) ** 2
+                + (record.grid_y - grid_y) ** 2
+            ),
+        )
+        return {"record": viewer._record_json(nearest)}
+
+    def context_jpg(
+        self,
+        index: int,
+        row: int,
+        *,
+        radius: int = CONTEXT_VISIBLE_RADIUS,
+        selected_row: int | None = None,
+    ) -> bytes:
+        start = perf_counter()
+        viewer = self.viewer(index)
+        window = self.context_window(index, row, radius=radius)
+        center = viewer._by_row[row]
+        radius = int(window["radius"])
+        side = int(window["grid_size"])
+        tile_w = int(window["cell_width"])
+        tile_h = int(window["cell_height"])
+        canvas = Image.new(
+            "RGB",
+            (tile_w * side, tile_h * side),
+            (245, 247, 249),
+        )
         draw = ImageDraw.Draw(canvas)
-        for dy in range(-2, 3):
-            for dx in range(-2, 3):
-                record = viewer._image_lookup.get((center.slide_key, center.grid_x + dx, center.grid_y + dy))
-                x = (dx + 2) * tile_w
-                y = (dy + 2) * tile_h
-                if record is None:
-                    draw.rectangle([x, y, x + tile_w - 1, y + tile_h - 1], outline=(210, 215, 220))
-                    continue
-                try:
-                    image = Image.open(io.BytesIO(viewer.read_tile_png(record.row))).convert("RGB")
-                    image = image.resize((tile_w, tile_h), Image.Resampling.BILINEAR)
+        placements = []
+        for cell in window["cells"]:
+            x = (int(cell["dx"]) + radius) * tile_w
+            y = (int(cell["dy"]) + radius) * tile_h
+            record_json = cell["record"]
+            if record_json is None:
+                draw.rectangle(
+                    [x, y, x + tile_w - 1, y + tile_h - 1],
+                    outline=(210, 215, 220),
+                )
+                continue
+            placements.append(
+                (
+                    x,
+                    y,
+                    viewer._by_row[int(record_json["row"])],
+                )
+            )
+
+        payloads = viewer.reader.read_payloads(
+            record.row for _x, _y, record in placements
+        )
+
+        def decode_context_tile(
+            item: tuple[
+                tuple[int, int, IacRecord],
+                bytes,
+            ],
+        ) -> tuple[int, int, IacRecord, Image.Image | None]:
+            (x, y, record), payload = item
+            try:
+                image = decode_jxl(payload).convert("RGB")
+                image = image.resize(
+                    (tile_w, tile_h),
+                    Image.Resampling.BILINEAR,
+                )
+                return x, y, record, image
+            except Exception:
+                LOG.exception("context_tile_decode_failed row=%d", record.row)
+                return x, y, record, None
+
+        workers = min(CONTEXT_WORKERS, max(1, len(placements)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            decoded = executor.map(
+                decode_context_tile,
+                zip(placements, payloads),
+            )
+            for x, y, _record, image in decoded:
+                if image is None:
+                    draw.rectangle(
+                        [x, y, x + tile_w - 1, y + tile_h - 1],
+                        outline=(210, 80, 80),
+                    )
+                else:
                     canvas.paste(image, (x, y))
-                except Exception:
-                    LOG.exception("context_tile_decode_failed row=%d", record.row)
-                    draw.rectangle([x, y, x + tile_w - 1, y + tile_h - 1], outline=(210, 80, 80))
-        center_x = 2 * tile_w
-        center_y = 2 * tile_h
-        draw.rectangle([center_x, center_y, center_x + tile_w - 1, center_y + tile_h - 1], outline=(220, 20, 20), width=4)
-        draw.line([center_x, center_y + tile_h // 2, center_x + tile_w, center_y + tile_h // 2], fill=(220, 20, 20), width=2)
-        draw.line([center_x + tile_w // 2, center_y, center_x + tile_w // 2, center_y + tile_h], fill=(220, 20, 20), width=2)
+
+        draw = ImageDraw.Draw(canvas)
+        for offset in range(side + 1):
+            x = min(canvas.width - 1, offset * tile_w)
+            y = min(canvas.height - 1, offset * tile_h)
+            draw.line(
+                [x, 0, x, canvas.height - 1],
+                fill=(205, 210, 216),
+                width=1,
+            )
+            draw.line(
+                [0, y, canvas.width - 1, y],
+                fill=(205, 210, 216),
+                width=1,
+            )
+
+        selected = viewer._by_row.get(
+            row if selected_row is None else int(selected_row)
+        )
+        if selected is not None and selected.slide_key == center.slide_key:
+            dx = selected.grid_x - center.grid_x
+            dy = selected.grid_y - center.grid_y
+            if -radius <= dx <= radius and -radius <= dy <= radius:
+                selected_x = (dx + radius) * tile_w
+                selected_y = (dy + radius) * tile_h
+                draw.rectangle(
+                    [
+                        selected_x,
+                        selected_y,
+                        selected_x + tile_w - 1,
+                        selected_y + tile_h - 1,
+                    ],
+                    outline=(220, 20, 20),
+                    width=4,
+                )
+                draw.line(
+                    [
+                        selected_x,
+                        selected_y + tile_h // 2,
+                        selected_x + tile_w,
+                        selected_y + tile_h // 2,
+                    ],
+                    fill=(220, 20, 20),
+                    width=2,
+                )
+                draw.line(
+                    [
+                        selected_x + tile_w // 2,
+                        selected_y,
+                        selected_x + tile_w // 2,
+                        selected_y + tile_h,
+                    ],
+                    fill=(220, 20, 20),
+                    width=2,
+                )
         buffer = io.BytesIO()
         canvas.save(buffer, format="JPEG", quality=90)
-        LOG.info("context_render index=%d row=%d bytes=%d", index, row, buffer.tell())
+        LOG.info(
+            "context_render index=%d row=%d selected_row=%s radius=%d "
+            "records=%d bytes=%d elapsed=%.3fs",
+            index,
+            row,
+            selected_row,
+            radius,
+            len(placements),
+            buffer.tell(),
+            perf_counter() - start,
+        )
         return buffer.getvalue()
 
 
@@ -2081,7 +2281,7 @@ aside{overflow:hidden;background:var(--panel);border-right:1px solid var(--line)
 main{min-width:0;display:grid;grid-template-rows:auto auto minmax(0,1fr);height:100svh}.topbar{display:grid;grid-template-columns:auto auto minmax(160px,1fr) auto;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel)}.topbarTitle{min-width:0;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.topTools{display:flex;align-items:center;gap:6px}.topTools button{min-height:32px;padding:4px 10px}.subbar{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:42px;padding:5px 12px;border-bottom:1px solid var(--line);background:#fafbfc}.versionGroup{display:flex;align-items:center;gap:6px;min-width:0}.versionLabel{color:var(--muted);font-size:12px}.topProgress{min-width:300px;text-align:right;font-size:12px;color:var(--muted)}.topProgress b{color:var(--text)}
 .workspace{min-height:0;overflow:auto;padding:12px}.primaryWorkspace{display:grid;grid-template-columns:minmax(420px,680px) minmax(300px,1fr);grid-template-rows:auto auto;column-gap:20px;align-items:start}.pkg{position:relative;padding:8px;border:1px solid var(--line);margin-bottom:6px;cursor:pointer;background:#fff;overflow:hidden}.pkg.active{border-color:var(--blue);background:var(--blue-soft)}
 .pkg>*{position:relative;z-index:1}.pkg::before{content:"";position:absolute;inset:0 auto 0 0;width:var(--pct,0%);background:#dff3eb;z-index:0}
-.muted{color:var(--muted);font-size:12px}.thumbWrap{min-height:220px;border:1px solid #c7cbd1;background:white;overflow:auto}.imageControlRow{display:flex;align-items:center;gap:8px;margin:0 0 6px}.tileControlRow{grid-column:1;grid-row:1;width:100%;justify-content:space-between}.overviewControlRow{margin-top:14px}.overviewControlRow h3{margin:0}
+.muted{color:var(--muted);font-size:12px}.thumbWrap{position:relative;min-height:220px;border:1px solid #c7cbd1;background:white;overflow:hidden;overscroll-behavior:contain}.imageControlRow{display:flex;align-items:center;gap:8px;margin:0 0 6px}.tileControlRow{grid-column:1;grid-row:1;width:100%;justify-content:space-between}.overviewControlRow{margin-top:14px}.overviewControlRow h3{margin:0}
 .thumb{display:block;width:auto;height:auto;max-width:none;background:white;cursor:crosshair}.loading{padding:18px;color:#6b7280;font-size:12px}
 .tileViewport{grid-column:1;grid-row:2;width:100%;height:520px;overflow:auto;border:1px solid #c7cbd1;background:#f8fafc}.tileViewport,.tileStage,.tile,.roiCanvas{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}.tileStage{position:relative;width:224px;height:224px;background:#fff;transform-origin:0 0}.tile{position:absolute;inset:0;width:224px;height:224px;object-fit:contain;background:#fff;-webkit-user-drag:none}.roiCanvas{position:absolute;inset:0;width:224px;height:224px;touch-action:none;cursor:crosshair}.roiClassBar{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;max-width:none;overflow:visible;padding-bottom:0}.roiClassButton{min-height:32px;padding:4px 8px;border-left-width:8px;white-space:nowrap;flex:0 0 auto}.roiClassButton.selected{background:#111827;color:#fff}.roiTools{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin:8px 0}.roiTools button{min-height:32px;padding:4px 8px}.roiTools button.selected{background:var(--blue);color:#fff}.roiPlan{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:8px 0;padding:8px;border:1px solid var(--line);background:#f8fafc}.roiPlanStatus{flex:1 1 260px}.roiPlanDecision{display:flex;flex-wrap:wrap;gap:6px}.roiPlanDecision button{min-height:32px;padding:4px 9px}.rangeControl{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:#fff;padding:4px 8px;min-height:32px}.rangeControl input{width:130px}.rangeValue{min-width:38px;text-align:right;font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px}.chips{display:grid;grid-template-columns:1fr;gap:6px;margin:8px 0 16px}
 .panzoom{touch-action:none;transform-origin:0 0;will-change:transform;cursor:grab}.panzoom.dragging{cursor:grabbing}
@@ -2089,7 +2289,7 @@ button.chip{position:relative;text-align:left;border:1px solid #c7cbd1;backgroun
 .annotationControls{grid-column:2;grid-row:1/span 2;min-width:0;width:100%;border-left:1px solid var(--line);padding-left:16px}.annotationControls .chips{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.actions button{padding:8px 12px}.bar{height:6px;background:#e5e7eb;margin:4px 0}.bar>div{height:6px;background:#18865b}.statusLine{min-height:20px;margin-top:6px;color:var(--muted);font-size:12px;white-space:pre-wrap}.roiNavigationNotice{margin:7px 0;padding:7px 9px;border:1px solid #f59e0b;background:#fffbeb;color:#92400e;font-size:12px;white-space:pre-wrap}
 pre{white-space:pre-wrap;font-size:12px;background:#f1f3f4;padding:8px}
 .authGate{position:fixed;inset:0;background:rgba(244,246,248,.96);z-index:10;display:none;align-items:center;justify-content:center;padding:18px}.authBox{width:min(420px,100%);background:#fff;border:1px solid var(--line);padding:16px;box-shadow:0 14px 40px rgba(15,23,42,.18)}.authBox h3{margin:0 0 10px}.authBox input{width:100%;min-height:42px;border:1px solid var(--line);padding:0 10px;margin-bottom:10px}.authBox .status{min-height:18px;color:var(--danger);font-size:12px}
-.contextOverlay{position:fixed;inset:0;background:rgba(15,23,42,.86);z-index:9;display:flex;flex-direction:column}.contextBar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;background:#fff}.contextStage{min-height:0;flex:1;overflow:hidden;display:flex;align-items:center;justify-content:center}.contextStage img{max-width:none;max-height:none;background:#fff;border:1px solid rgba(255,255,255,.5)}
+.contextOverlay{position:fixed;inset:0;background:rgba(15,23,42,.86);z-index:9;display:flex;flex-direction:column}.contextBar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;background:#fff}.contextHint{margin-top:2px;color:var(--muted);font-size:12px}.contextStage{min-height:0;flex:1;overflow:hidden;display:flex;align-items:center;justify-content:center;padding:12px}.contextViewport{--context-cell-w:112px;--context-cell-h:112px;--context-grid-x:0px;--context-grid-y:0px;position:relative;overflow:hidden;background-color:#eef1f4;background-image:linear-gradient(to right,#cfd5dc 1px,transparent 1px),linear-gradient(to bottom,#cfd5dc 1px,transparent 1px),repeating-linear-gradient(135deg,#f2f4f6 0 9px,#e8ecf0 9px 18px);background-size:var(--context-cell-w) var(--context-cell-h),var(--context-cell-w) var(--context-cell-h),auto;background-position:var(--context-grid-x) var(--context-grid-y),var(--context-grid-x) var(--context-grid-y),0 0;border:1px solid rgba(255,255,255,.65);box-shadow:0 12px 38px rgba(0,0,0,.34);touch-action:none;cursor:grab;-webkit-user-select:none;user-select:none}.contextViewport.dragging{cursor:grabbing}.contextImg{position:absolute;left:0;top:0;max-width:none;max-height:none;background:#fff;pointer-events:none;-webkit-user-drag:none;will-change:transform;transform:translate3d(0,0,0)}.contextLoading{position:absolute;right:8px;bottom:8px;padding:5px 8px;background:rgba(15,23,42,.78);color:#fff;font-size:12px;pointer-events:none}.contextLoading.hidden{display:none}
 .labelDialog{width:min(700px,calc(100% - 24px));max-height:80svh;border:1px solid var(--line);padding:0}.dialogHead{display:flex;align-items:center;justify-content:space-between;padding:12px;border-bottom:1px solid var(--line)}.dialogBody{padding:12px;overflow:auto;max-height:60svh}.labelEditorRow{display:grid;grid-template-columns:70px minmax(0,1fr) auto auto auto;gap:6px;align-items:center;margin-bottom:6px}.labelEditorRow input{min-height:36px;border:1px solid var(--line);padding:0 8px}.labelEditorRow button{min-height:36px;padding:4px 8px}.addLabelRow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;margin-top:12px}.addLabelRow input{min-height:38px;border:1px solid var(--line);padding:0 8px}
 .hidden{display:none!important}
 @media(max-width:1200px){
@@ -2108,7 +2308,7 @@ pre{white-space:pre-wrap;font-size:12px;background:#f1f3f4;padding:8px}
 <main><div class="topbar"><button id="toggleQueue" type="button">Tiles</button><div id="modeNav" class="modeNav"></div><div id="title" class="topbarTitle">Prototype annotation</div><div class="topTools"><button id="contextBtn" type="button">Context</button><button id="manageLabels" class="labelManage" type="button">Labels</button></div></div><div class="subbar"><div class="versionGroup"><span class="versionLabel">Version</span><select id="versionSelect" class="versionSelect" title="Annotation version"></select><button id="newVersion" class="compactButton" type="button">New</button></div><div id="progress" class="topProgress"></div></div><section class="workspace"><div class="primaryWorkspace"><div class="imageControlRow tileControlRow"><div class="muted" id="recordMeta"></div><label class="rangeControl">Tile zoom <input id="tileZoom" type="range" min="1" max="6" step="0.1" value="2"><span id="tileZoomValue" class="rangeValue">2.0×</span></label></div>
 <div id="tileViewport" class="tileViewport"><div id="tileStage" class="tileStage"><img id="tile" class="tile" draggable="false"><canvas id="roiCanvas" class="roiCanvas" width="224" height="224"></canvas></div></div><div class="annotationControls"><div id="prototypeLabels"><div id="l1Section"><div id="l1" class="chips"></div></div><div id="l2Section"><div id="l2" class="chips"></div></div></div><div id="roiClassBar" class="roiClassBar"></div><div id="roiStatus" class="muted">Select an ROI class, then draw on the tile.</div><div id="roiPlan" class="roiPlan"><button type="button" id="roiPlanGenerate">Find similar marks</button><label id="roiSimilarityControl" class="rangeControl hidden">Similarity <input id="roiSimilarity" type="range" min="0.20" max="0.99" step="0.01" value="0.70"><span id="roiSimilarityValue" class="rangeValue">70%</span></label><label id="roiExclusionControl" class="rangeControl hidden">Exclusion <input id="roiExclusion" type="range" min="3" max="40" step="1" value="7"><span id="roiExclusionValue" class="rangeValue">7 px</span></label><div id="roiPlanStatus" class="roiPlanStatus muted">Select one class and add 1–3 reliable point or circle seeds.</div><div id="roiPlanDecision" class="roiPlanDecision hidden"><button type="button" id="roiPlanAccept" class="primary">Accept visible matches</button><button type="button" id="roiPlanRestart">Start from scratch</button></div></div><div id="roiNavigationNotice" class="roiNavigationNotice hidden"></div><details id="roiCountDetails" class="muted"><summary>ROI positive tile counts</summary><div id="roiCountProgress"></div></details><div id="roiTools" class="roiTools"><button type="button" data-roi-tool="point">Point</button><button type="button" data-roi-tool="brush">Brush</button><button type="button" data-roi-tool="eraser">Eraser</button><button type="button" data-roi-tool="circle">Circle</button><label class="rangeControl">Brush / eraser width <input id="brushWidth" type="range" min="0.012" max="0.500" step="0.002" value="0.035"><span id="brushWidthValue" class="rangeValue">3.5%</span></label><button type="button" id="roiUndo">Undo</button><button type="button" id="roiRedo">Redo</button><button type="button" id="roiClear">Clear selected class</button><button type="button" id="tileGridToggle">Grid</button></div><div class="actions"><button onclick="save()" class="primary">Save + next</button><button onclick="nextRandom(true)">Skip + next</button><button onclick="reviewed()">Browse saved tiles</button></div><div id="status" class="statusLine"></div></div></div><div class="imageControlRow overviewControlRow"><h3>Location overview</h3><label class="rangeControl">Zoom <input id="overviewZoom" type="range" min="0.25" max="12" step="0.25" value="1"><span id="overviewZoomValue" class="rangeValue">1.0×</span></label></div><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom"></div></section></main>
 </div>
-<div id="contextOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>5x5 context</b><div id="contextMeta" class="muted"></div></div><button id="contextClose" type="button">Close</button></div><div class="contextStage"><img id="contextImg" class="panzoom"></div></div>
+<div id="contextOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>5×5 context</b><div id="contextMeta" class="muted"></div><div class="contextHint">Drag freely to explore · click a tile to annotate it</div></div><button id="contextClose" type="button">Close</button></div><div id="contextStage" class="contextStage"><div id="contextViewport" class="contextViewport"><img id="contextImg" class="contextImg" draggable="false"><div id="contextLoading" class="contextLoading hidden">Loading nearby tiles…</div></div></div></div>
 <dialog id="labelDialog" class="labelDialog"><div class="dialogHead"><b id="labelDialogTitle">Label management</b><button id="closeLabels" type="button">Close</button></div><div class="dialogBody"><div id="labelEditor"></div><div class="addLabelRow"><input id="newLabelName" placeholder="New label name"><button id="addLabel" class="primary" type="button">Add</button><button id="saveLabels" type="button">Save label configuration</button></div><div id="labelStatus" class="muted"></div></div></dialog>
 <dialog id="versionDialog" class="labelDialog"><div class="dialogHead"><b>Create annotation version</b><button id="closeVersion" type="button">Close</button></div><div class="dialogBody"><div class="addLabelRow"><input id="newVersionName" placeholder="Version name"><button id="createVersion" class="primary" type="button">Create</button></div><div id="versionStatus" class="muted">The new version starts with no annotations and keeps the current label configuration.</div></div></dialog>
 <script>
@@ -2117,6 +2317,11 @@ let roi=[],roiTool='point',roiToolByClass={},roiAttribute='__all__',roiDrawing=n
 let roiClassState={},roiExclusionOverrides={};
 let reviewedReturn=null;
 let pendingLabelAdds=[];
+const CONTEXT_RADIUS=5,CONTEXT_RECENTER_DELTA=2;
+let contextData=null,contextCellMap=new Map(),contextSelected=null,contextCenterRow=null;
+let contextTx=0,contextTy=0,contextCellW=1,contextCellH=1,contextImageW=1,contextImageH=1;
+let contextViewportW=1,contextViewportH=1;
+let contextDrag=null,contextFrame=0,contextRequest=0,contextPendingWindow=null;
 let undoStack=[],redoStack=[];
 let tileScale=2;
 const ROI_ALL='__all__';
@@ -2135,7 +2340,24 @@ function isMobile(){return window.matchMedia('(max-width:760px)').matches;}
 function applyModeLayout(){const l1Mode=MODE==='l1';document.getElementById('roiClassBar').style.display=l1Mode?'none':'flex';document.getElementById('roiStatus').style.display=l1Mode?'none':'block';document.getElementById('roiPlan').style.display=l1Mode?'none':'flex';document.getElementById('roiCountDetails').style.display=l1Mode?'none':'block';document.getElementById('roiTools').style.display=l1Mode?'none':'flex';document.getElementById('roiCanvas').style.display=l1Mode?'none':'block';document.getElementById('prototypeLabels').style.display=l1Mode?'block':'none';document.getElementById('l1Section').style.display=l1Mode?'block':'none';document.getElementById('l2Section').style.display='none';document.getElementById('tileViewport').style.cursor=l1Mode?'default':'crosshair';}
 async function ensureAuth(){setAuthToken(tokenFromUrl()||localStorage.getItem('hcc_sempath_annotation_token')||''); if(!AUTH_TOKEN){document.getElementById('authGate').style.display='flex'; throw new Error('');}}
 async function submitAuth(){setAuthToken(document.getElementById('authInput').value.trim()); try{await api('/api/scan-status'); document.getElementById('authGate').style.display='none'; refreshPackage().catch(e=>document.getElementById('status').textContent=e.message||String(e));}catch(e){document.getElementById('authStatus').textContent='Invalid token.';}}
-function setupPanZoom(el,onClick,options={}){let scale=1,tx=0,ty=0,drag=false,sx=0,sy=0,stx=0,sty=0,moved=0;const wheelZoom=options.wheelZoom!==false,doubleClickReset=options.doubleClickReset!==false,onScale=options.onScale||null;const apply=()=>{el.style.transform=`translate(${tx}px,${ty}px) scale(${scale})`;if(onScale)onScale(scale)};const setScale=next=>{scale=Math.min(12,Math.max(.25,next));apply()};el.addEventListener('wheel',ev=>{ev.preventDefault();if(wheelZoom)setScale(scale*(ev.deltaY<0?1.15:.87))},{passive:false});el.addEventListener('pointerdown',ev=>{drag=true;moved=0;sx=ev.clientX;sy=ev.clientY;stx=tx;sty=ty;el.classList.add('dragging');el.setPointerCapture(ev.pointerId);});el.addEventListener('pointermove',ev=>{if(!drag)return;const dx=ev.clientX-sx,dy=ev.clientY-sy;moved=Math.max(moved,Math.abs(dx)+Math.abs(dy));tx=stx+dx;ty=sty+dy;apply()});el.addEventListener('pointerup',ev=>{if(!drag)return;drag=false;el.classList.remove('dragging');if(moved<6&&onClick)onClick(ev)});if(doubleClickReset)el.addEventListener('dblclick',ev=>{ev.preventDefault();tx=0;ty=0;setScale(1)});el.setPanZoomScale=setScale;el.resetPanZoom=()=>{tx=0;ty=0;setScale(1)}}
+function setupPanZoom(el,onClick,options={}){
+    let scale=1,tx=0,ty=0,drag=false,sx=0,sy=0,stx=0,sty=0,moved=0,minTx=0,minTy=0,frame=0;
+    const wheelZoom=options.wheelZoom!==false,doubleClickReset=options.doubleClickReset!==false,onScale=options.onScale||null;
+    const clamp=()=>{tx=Math.min(0,Math.max(minTx,tx));ty=Math.min(0,Math.max(minTy,ty))};
+    const measure=()=>{const viewport=el.parentElement,baseW=el.naturalWidth||el.offsetWidth||0,baseH=el.naturalHeight||el.offsetHeight||0;minTx=Math.min(0,viewport.clientWidth-baseW*scale);minTy=Math.min(0,viewport.clientHeight-baseH*scale);clamp()};
+    const paint=()=>{frame=0;el.style.transform=`translate3d(${tx}px,${ty}px,0) scale(${scale})`;if(onScale)onScale(scale)};
+    const apply=()=>{clamp();if(!frame)frame=requestAnimationFrame(paint)};
+    const setScale=next=>{scale=Math.min(12,Math.max(.25,next));measure();apply()};
+    el.addEventListener('load',()=>{measure();apply()});
+    el.addEventListener('wheel',ev=>{ev.preventDefault();if(wheelZoom)setScale(scale*(ev.deltaY<0?1.15:.87))},{passive:false});
+    el.addEventListener('pointerdown',ev=>{measure();drag=true;moved=0;sx=ev.clientX;sy=ev.clientY;stx=tx;sty=ty;el.classList.add('dragging');el.setPointerCapture(ev.pointerId)});
+    el.addEventListener('pointermove',ev=>{if(!drag)return;const dx=ev.clientX-sx,dy=ev.clientY-sy;moved=Math.max(moved,Math.abs(dx)+Math.abs(dy));tx=stx+dx;ty=sty+dy;apply()});
+    el.addEventListener('pointerup',ev=>{if(!drag)return;drag=false;el.classList.remove('dragging');if(moved<6&&onClick)onClick(ev)});
+    el.addEventListener('pointercancel',()=>{drag=false;el.classList.remove('dragging')});
+    if(doubleClickReset)el.addEventListener('dblclick',ev=>{ev.preventDefault();tx=0;ty=0;setScale(1)});
+    el.setPanZoomScale=setScale;el.resetPanZoom=()=>{tx=0;ty=0;setScale(1)};
+    window.addEventListener('resize',()=>{measure();apply()});
+}
 function labelName(level,id){const item=(LABELS.levels[level]||[]).find(x=>x.id===id);return item?item.name:id}
 function prototypeButton(level,id, selected, count, maxCount, onClick){const b=document.createElement('button'); const pct=maxCount?Math.round(count/maxCount*100):0; b.className='chip'+(selected?' selected':''); b.style.setProperty('--pct',pct+'%'); b.innerHTML=`<span class=chipRow><span>${labelName(level,id)}</span><span class=chipCount>${count}</span></span>`; b.onclick=onClick; return b;}
 function roiColor(attribute){const i=L2.indexOf(attribute);return ROI_COLORS[(i<0?0:i)%ROI_COLORS.length]}
@@ -2320,7 +2542,150 @@ async function save(){
         console.error(e);
     }
 }
-async function openContext(){if(!current){document.getElementById('status').textContent='No tile selected.'; return;} const overlay=document.getElementById('contextOverlay'); const img=document.getElementById('contextImg'); document.getElementById('contextMeta').textContent=`Package ${pkg+1} · tile ${current.row+1}`; overlay.classList.remove('hidden'); img.onload=()=>{if(img.resetPanZoom)img.resetPanZoom();}; img.src=authed(scoped(`/api/context?package=${pkg}&row=${current.row}&t=${Date.now()}`));}
+function clampContextPan(){
+    contextTx=Math.min(0,Math.max(contextViewportW-contextImageW,contextTx));
+    contextTy=Math.min(0,Math.max(contextViewportH-contextImageH,contextTy));
+}
+function paintContextPan(){
+    contextFrame=0;
+    const viewport=document.getElementById('contextViewport');
+    document.getElementById('contextImg').style.transform=`translate3d(${contextTx}px,${contextTy}px,0)`;
+    const gridX=((contextTx%contextCellW)+contextCellW)%contextCellW,gridY=((contextTy%contextCellH)+contextCellH)%contextCellH;
+    viewport.style.setProperty('--context-grid-x',`${gridX}px`);
+    viewport.style.setProperty('--context-grid-y',`${gridY}px`);
+}
+function scheduleContextPan(){
+    if(!contextFrame)contextFrame=requestAnimationFrame(paintContextPan);
+}
+function layoutContext(anchor={fx:.5,fy:.5}){
+    if(!contextData)return;
+    const stage=document.getElementById('contextStage'),viewport=document.getElementById('contextViewport'),img=document.getElementById('contextImg');
+    const visible=contextData.visible_grid_size,availableW=Math.max(80,stage.clientWidth-24),availableH=Math.max(80,stage.clientHeight-24);
+    const scale=Math.max(.1,Math.min(availableW/(visible*contextData.cell_width),availableH/(visible*contextData.cell_height)));
+    contextCellW=contextData.cell_width*scale;contextCellH=contextData.cell_height*scale;
+    const viewportW=visible*contextCellW,viewportH=visible*contextCellH;
+    contextViewportW=viewportW;contextViewportH=viewportH;
+    contextImageW=contextData.grid_size*contextCellW;contextImageH=contextData.grid_size*contextCellH;
+    viewport.style.width=`${viewportW}px`;viewport.style.height=`${viewportH}px`;
+    viewport.style.setProperty('--context-cell-w',`${contextCellW}px`);
+    viewport.style.setProperty('--context-cell-h',`${contextCellH}px`);
+    img.style.width=`${contextImageW}px`;img.style.height=`${contextImageH}px`;
+    contextTx=viewportW/2-(contextData.radius+anchor.fx)*contextCellW;
+    contextTy=viewportH/2-(contextData.radius+anchor.fy)*contextCellH;
+    clampContextPan();scheduleContextPan();
+}
+function contextCellAtLocal(x,y){
+    if(!contextData)return null;
+    const column=Math.floor((x-contextTx)/contextCellW),row=Math.floor((y-contextTy)/contextCellH);
+    return contextCellMap.get(`${column-contextData.radius}:${row-contextData.radius}`)||null;
+}
+function contextCenterPosition(){
+    const imageX=(contextViewportW/2-contextTx)/contextCellW,imageY=(contextViewportH/2-contextTy)/contextCellH;
+    return{imageX,imageY,column:Math.floor(imageX),row:Math.floor(imageY),fx:imageX-Math.floor(imageX),fy:imageY-Math.floor(imageY)};
+}
+function installContextWindow(data,image,centerRow,anchor){
+    contextData=data;contextCenterRow=centerRow;
+    contextCellMap=new Map(data.cells.map(cell=>[`${cell.dx}:${cell.dy}`,cell]));
+    document.getElementById('contextImg').src=image.src;
+    layoutContext(anchor);
+    document.getElementById('contextMeta').textContent=`Package ${contextSelected.package+1} · selected tile ${contextSelected.row+1} · view center ${data.center.row+1}`;
+}
+async function loadContextWindow(centerRow,anchor={fx:.5,fy:.5}){
+    if(!contextSelected)return;
+    const request=++contextRequest,loading=document.getElementById('contextLoading');
+    contextPendingWindow=null;
+    loading.classList.remove('hidden');
+    const query=`package=${contextSelected.package}&row=${centerRow}&radius=${CONTEXT_RADIUS}`;
+    const metadataPromise=api(`/api/context-window?${query}`);
+    const preload=new Image();
+    const imagePromise=new Promise((resolve,reject)=>{preload.onload=()=>resolve(preload);preload.onerror=()=>reject(new Error('Context image failed to load.'));});
+    preload.src=authed(scoped(`/api/context?${query}&selected_row=${contextSelected.row}`));
+    try{
+        const [data,image]=await Promise.all([metadataPromise,imagePromise]);
+        if(request!==contextRequest)return;
+        if(contextDrag){
+            contextPendingWindow={data,image,centerRow,anchor};
+        }else{
+            installContextWindow(data,image,centerRow,anchor);
+        }
+    }finally{
+        if(request===contextRequest)loading.classList.add('hidden');
+    }
+}
+async function replenishContextBuffer(){
+    if(!contextData||!contextSelected)return;
+    const data=contextData,center=contextCenterPosition();
+    const absoluteGridX=data.center.grid_x+center.imageX-data.radius-.5;
+    const absoluteGridY=data.center.grid_y+center.imageY-data.radius-.5;
+    if(Math.max(Math.abs(absoluteGridX-data.center.grid_x),Math.abs(absoluteGridY-data.center.grid_y))<CONTEXT_RECENTER_DELTA)return;
+    const request=contextRequest,loading=document.getElementById('contextLoading');
+    loading.textContent='Loading nearby tiles…';loading.classList.remove('hidden');
+    try{
+        const target=await api(`/api/context-center?package=${contextSelected.package}&row=${data.center.row}&grid_x=${absoluteGridX}&grid_y=${absoluteGridY}`);
+        if(contextDrag||contextData!==data||request!==contextRequest)return;
+        await loadContextWindow(
+            target.record.row,
+            {
+                fx:.5+absoluteGridX-target.record.grid_x,
+                fy:.5+absoluteGridY-target.record.grid_y,
+            },
+        );
+    }finally{
+        if(request===contextRequest)loading.classList.add('hidden');
+    }
+}
+async function openContextTile(record){
+    if(!record)return;
+    if(current)tileHistory.push({package:pkg,record:current});
+    tileForward=[];
+    closeContext();
+    await showRecord(record);
+    document.getElementById('status').textContent='Opened tile from context view.';
+}
+function closeContext(){
+    contextRequest++;
+    contextDrag=null;contextPendingWindow=null;
+    document.getElementById('contextViewport').classList.remove('dragging');
+    document.getElementById('contextLoading').classList.add('hidden');
+    document.getElementById('contextOverlay').classList.add('hidden');
+}
+async function openContext(){
+    if(!current){document.getElementById('status').textContent='No tile selected.';return}
+    contextSelected={package:pkg,row:current.row};
+    contextData=null;contextCellMap=new Map();contextCenterRow=current.row;
+    document.getElementById('contextMeta').textContent=`Package ${pkg+1} · selected tile ${current.row+1}`;
+    document.getElementById('contextOverlay').classList.remove('hidden');
+    try{await loadContextWindow(current.row)}catch(e){document.getElementById('contextMeta').textContent=e.message||String(e)}
+}
+function setupContextNavigator(){
+    const viewport=document.getElementById('contextViewport');
+    viewport.addEventListener('pointerdown',ev=>{
+        if(ev.button!==0||!contextData)return;
+        ev.preventDefault();
+        contextDrag={pointerId:ev.pointerId,startX:ev.clientX,startY:ev.clientY,startTx:contextTx,startTy:contextTy,moved:0};
+        viewport.classList.add('dragging');viewport.setPointerCapture(ev.pointerId);
+    });
+    viewport.addEventListener('pointermove',ev=>{
+        if(!contextDrag||contextDrag.pointerId!==ev.pointerId)return;
+        const dx=ev.clientX-contextDrag.startX,dy=ev.clientY-contextDrag.startY;
+        contextDrag.moved=Math.max(contextDrag.moved,Math.abs(dx)+Math.abs(dy));
+        contextTx=contextDrag.startTx+dx;contextTy=contextDrag.startTy+dy;
+        scheduleContextPan();
+    });
+    viewport.addEventListener('pointerup',ev=>{
+        if(!contextDrag||contextDrag.pointerId!==ev.pointerId)return;
+        const moved=contextDrag.moved;contextDrag=null;viewport.classList.remove('dragging');
+        if(moved<6){
+            contextPendingWindow=null;
+            const rect=viewport.getBoundingClientRect(),cell=contextCellAtLocal(ev.clientX-rect.left,ev.clientY-rect.top);
+            if(cell?.record)openContextTile(cell.record);
+        }else{
+            contextRequest++;contextPendingWindow=null;
+            replenishContextBuffer().catch(error=>{document.getElementById('contextMeta').textContent=error.message||String(error)});
+        }
+    });
+    viewport.addEventListener('pointercancel',()=>{contextDrag=null;contextRequest++;contextPendingWindow=null;viewport.classList.remove('dragging')});
+}
 function renderModeNav(){const nav=document.getElementById('modeNav');nav.innerHTML='';MODES.forEach(mode=>{const b=document.createElement('button');b.type='button';b.textContent=mode.toUpperCase();b.classList.toggle('active',mode===MODE);b.disabled=mode===MODE;b.onclick=()=>{const url=new URL(location.href);url.searchParams.set('mode',mode);url.searchParams.delete('version');if(AUTH_TOKEN)url.searchParams.set('token',AUTH_TOKEN);location.href=url.toString()};nav.appendChild(b)});document.getElementById('title').textContent=MODE==='l1'?'L1 classification':'L2 ROI annotation';}
 function versionStorageKey(){return `hcc_sempath_annotation_version:${MODE}`}
 function renderVersions(){const select=document.getElementById('versionSelect');select.innerHTML='';VERSIONS.forEach(item=>{const option=document.createElement('option');option.value=item.id;option.textContent=`${item.name} (${item.annotations})`;option.selected=item.id===VERSION;select.appendChild(option)});}
@@ -2335,13 +2700,14 @@ document.getElementById('roiSimilarity').addEventListener('input',renderRoi);
 document.getElementById('roiExclusion').addEventListener('input',()=>{if(roiAttribute!==ROI_ALL)roiExclusionOverrides[roiAttribute]=roiExclusionDistance();renderRoi()});
 document.getElementById('brushWidth').addEventListener('input',updateBrushWidth);updateBrushWidth();
 document.getElementById('tileZoom').addEventListener('input',ev=>setTileZoom(parseFloat(ev.target.value)));setTileZoom(tileScale);document.getElementById('tileGridToggle').onclick=()=>{showGrid=!showGrid;document.getElementById('tileGridToggle').classList.toggle('selected',showGrid);renderRoi();};document.getElementById('tileViewport').addEventListener('wheel',ev=>{ev.preventDefault();if(ROI_MODE)setBrushWidth(brushWidth()*(ev.deltaY<0?1.12:1/1.12))},{passive:false});
-setupPanZoom(document.getElementById('contextImg'));
+setupContextNavigator();
 const overviewZoom=document.getElementById('overviewZoom'),overviewZoomValue=document.getElementById('overviewZoomValue'),thumb=document.getElementById('thumb');function syncOverviewZoom(scale){overviewZoom.value=scale;overviewZoomValue.textContent=`${scale.toFixed(2).replace(/0$/,'')}×`}setupPanZoom(thumb,async ev=>{const img=ev.target, r=img.getBoundingClientRect(); const x=(ev.clientX-r.left)/r.width, y=(ev.clientY-r.top)/r.height; const rec=await api(`/api/nearest?package=${pkg}&rx=${x}&ry=${y}`); await showRecord(rec.record);},{wheelZoom:false,doubleClickReset:false,onScale:syncOverviewZoom});overviewZoom.addEventListener('input',ev=>thumb.setPanZoomScale(parseFloat(ev.target.value)));
 document.getElementById('toggleQueue').addEventListener('click',()=>setQueueOpen(document.getElementById('layout').classList.contains('queue-collapsed')));
 document.getElementById('hideQueue').addEventListener('click',()=>setQueueOpen(false));
 document.getElementById('reviewedDetails').addEventListener('toggle',ev=>{if(ev.target.open)loadReviewedList();else returnFromReviewed()});
 document.getElementById('contextBtn').addEventListener('click',openContext);
-document.getElementById('contextClose').addEventListener('click',()=>document.getElementById('contextOverlay').classList.add('hidden'));
+document.getElementById('contextClose').addEventListener('click',closeContext);
+window.addEventListener('resize',()=>{if(contextData&&!document.getElementById('contextOverlay').classList.contains('hidden'))layoutContext()});
 document.getElementById('versionSelect').addEventListener('change',ev=>{const url=new URL(location.href);url.searchParams.set('version',ev.target.value);localStorage.setItem(versionStorageKey(),ev.target.value);if(AUTH_TOKEN)url.searchParams.set('token',AUTH_TOKEN);location.href=url.toString()});
 document.getElementById('newVersion').addEventListener('click',()=>document.getElementById('versionDialog').showModal());
 document.getElementById('closeVersion').addEventListener('click',()=>document.getElementById('versionDialog').close());
@@ -2484,9 +2850,54 @@ def make_handler(
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                if parsed.path == "/api/context-center":
+                    row = int(qs["row"][0])
+                    grid_x = float(qs["grid_x"][0])
+                    grid_y = float(qs["grid_y"][0])
+                    _json_response(
+                        self,
+                        selected_data.context_center(
+                            index,
+                            row,
+                            grid_x=grid_x,
+                            grid_y=grid_y,
+                        ),
+                    )
+                    return
+                if parsed.path == "/api/context-window":
+                    row = int(qs["row"][0])
+                    radius = int(
+                        qs.get(
+                            "radius",
+                            [str(CONTEXT_PREFETCH_RADIUS)],
+                        )[0]
+                    )
+                    _json_response(
+                        self,
+                        selected_data.context_window(
+                            index,
+                            row,
+                            radius=radius,
+                        ),
+                    )
+                    return
                 if parsed.path == "/api/context":
                     row = int(qs["row"][0])
-                    body = selected_data.context_jpg(index, row)
+                    radius = int(
+                        qs.get(
+                            "radius",
+                            [str(CONTEXT_VISIBLE_RADIUS)],
+                        )[0]
+                    )
+                    selected_row = int(
+                        qs.get("selected_row", [str(row)])[0]
+                    )
+                    body = selected_data.context_jpg(
+                        index,
+                        row,
+                        radius=radius,
+                        selected_row=selected_row,
+                    )
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "image/jpeg")
                     self.send_header("Content-Length", str(len(body)))
@@ -2679,7 +3090,9 @@ def _annotation_parser() -> argparse.ArgumentParser:
         "--roi-priority-attributes",
         default="",
         help=(
-            "Optional comma-separated restriction for old-L2 navigation. "
+            "Optional comma-separated target restriction for old-L2 navigation. "
+            "Related historical labels may still be used as retrieval hints for "
+            "the selected targets. "
             "Normal annotation should leave this empty so the current "
             "information report selects deficient ROI attributes dynamically."
         ),
