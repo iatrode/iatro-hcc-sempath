@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from dataclasses import dataclass
 import gc
 import math
 from numbers import Number
@@ -9,6 +10,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from ..modeling.models import bounded_logits
 from .losses import multi_teacher_distillation_loss
@@ -28,6 +30,16 @@ EARLY_STOP_CHECK_INTERVAL_EPOCHS = 10
 EARLY_STOP_WINDOW_EPOCHS = 20
 EARLY_STOP_ALIGNMENT_GAIN = 0.002
 EARLY_STOP_PER_TEACHER_GAIN = 0.003
+
+
+@dataclass
+class PrototypeAnchorRefreshState:
+    """Fixed expert banks and their last exact student-space refresh."""
+
+    global_loader: object | None
+    spatial_loader: object | None
+    last_global_step: int | None = None
+    last_spatial_step: int | None = None
 
 
 def _objective_gradient_diagnostics(
@@ -203,25 +215,317 @@ def _image_normalization(
     return mean, std
 
 
+def _normalize_uint8_images_fp16(
+    images: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse uint8 normalization and the AMP input cast into one CUDA kernel."""
+
+    return ((images.to(torch.float32) / 255.0 - mean) / std).to(torch.float16)
+
+
+_compiled_normalize_uint8_images_fp16 = torch.compile(
+    _normalize_uint8_images_fp16,
+    fullgraph=True,
+    dynamic=True,
+)
+
+
 def _prepare_images(
     batch: dict,
     cfg: dict,
     device: torch.device,
     *,
     normalization: tuple[torch.Tensor, torch.Tensor] | None = None,
+    amp_input: bool = False,
 ) -> torch.Tensor:
     images = batch["images"].to(device, non_blocking=device.type == "cuda")
     if not bool(batch.get("images_uint8", False)):
         return images
     if bool(batch.get("images_hwc", False)):
         images = images.permute(0, 3, 1, 2)
-    images = images.to(torch.float32).div_(255.0)
     mean, std = (
         _image_normalization(cfg, device)
         if normalization is None
         else normalization
     )
+    if bool(
+        cfg.get("train", {}).get("fused_image_prepare", False)
+        and device.type == "cuda"
+        and amp_input
+    ):
+        return _compiled_normalize_uint8_images_fp16(images, mean, std)
+    images = images.to(torch.float32).div_(255.0)
     return images.sub_(mean).div_(std)
+
+
+def _l2_positive_from_batch(batch: dict) -> torch.Tensor:
+    return (
+        (batch["l2_point_centers"] > 0)
+        | (batch["l2_brush_bag_ids"] > 0)
+        | batch["l2_area_positive"].to(dtype=torch.bool)
+    ).flatten(2).any(dim=2)
+
+
+@torch.inference_mode()
+def _refresh_global_prototype_anchors(
+    model,
+    loader,
+    cfg: dict,
+    device: torch.device,
+) -> dict[str, int | float]:
+    """Recompute exact L1 and global L2 anchors from the complete bank."""
+
+    raw_model = getattr(model, "_orig_mod", model)
+    if raw_model.l1_prototypes is None:
+        raise RuntimeError("dynamic anchor refresh requires an L1 readout")
+    embedding_dim = int(raw_model.l1_prototypes.shape[1])
+    l1_sums = torch.zeros(
+        raw_model.l1_num_classes,
+        embedding_dim,
+        device=device,
+        dtype=torch.float32,
+    )
+    l1_counts = torch.zeros(
+        raw_model.l1_num_classes,
+        device=device,
+        dtype=torch.float32,
+    )
+    component_count = int(raw_model.spatial_num_components)
+    l2_sums = torch.zeros(
+        component_count,
+        embedding_dim,
+        device=device,
+        dtype=torch.float32,
+    )
+    l2_counts = torch.zeros(
+        component_count,
+        device=device,
+        dtype=torch.float32,
+    )
+    teacher_sums = {
+        name: torch.zeros_like(state.prototypes, dtype=torch.float32)
+        for name, state in raw_model.teacher_l2_prototypes.items()
+    }
+    normalization = _image_normalization(cfg, device)
+    was_training = bool(raw_model.training)
+    raw_model.eval()
+    tile_count = 0
+    started = time.perf_counter()
+    try:
+        for batch in loader:
+            images = _prepare_images(
+                batch,
+                cfg,
+                device,
+                normalization=normalization,
+            )
+            embedding_norm = F.normalize(
+                raw_model.encode(images),
+                dim=-1,
+            ).float()
+            mask, targets, _ = _move_l1_batch(batch, device)
+            selected = F.one_hot(
+                targets.clamp(0, raw_model.l1_num_classes - 1),
+                num_classes=raw_model.l1_num_classes,
+            ).to(dtype=embedding_norm.dtype)
+            selected = selected * mask.to(
+                dtype=embedding_norm.dtype
+            ).unsqueeze(1)
+            l1_sums.add_(selected.transpose(0, 1) @ embedding_norm)
+            l1_counts.add_(selected.sum(dim=0))
+
+            if component_count > 0:
+                positive = _l2_positive_from_batch(batch).to(
+                    device=device,
+                    dtype=embedding_norm.dtype,
+                    non_blocking=device.type == "cuda",
+                )
+                l2_sums.add_(positive.transpose(0, 1) @ embedding_norm)
+                l2_counts.add_(positive.sum(dim=0))
+                teachers = _move_teachers(batch, device)
+                for name, features in teachers.items():
+                    normalized = F.normalize(
+                        features.detach().float(),
+                        dim=-1,
+                    )
+                    teacher_sums[name].add_(
+                        positive.transpose(0, 1) @ normalized
+                    )
+            tile_count += len(batch["tile_id"])
+    finally:
+        raw_model.train(was_training)
+    raw_model.replace_l1_prototypes(l1_sums, l1_counts)
+    if component_count > 0:
+        raw_model.replace_global_l2_prototypes(
+            l2_sums,
+            l2_counts,
+            teacher_sums,
+        )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return {
+        "tiles": tile_count,
+        "l1_observations": int(l1_counts.sum().item()),
+        "l2_positive_observations": int(l2_counts.sum().item()),
+        "seconds": time.perf_counter() - started,
+    }
+
+
+@torch.inference_mode()
+def _refresh_spatial_prototype_anchors(
+    model,
+    loader,
+    cfg: dict,
+    device: torch.device,
+) -> dict[str, int | float]:
+    """Recompute exact local anchors from all spatially annotated tiles."""
+
+    raw_model = getattr(model, "_orig_mod", model)
+    head = raw_model.spatial_head
+    if head is None:
+        raise RuntimeError("spatial anchor refresh requires the spatial head")
+    accumulated = {
+        name: (
+            torch.zeros_like(getattr(head, f"{name}_prototypes")),
+            torch.zeros_like(getattr(head, f"{name}_prototype_counts")),
+        )
+        for name in (
+            "instance",
+            "measurement",
+            "instance_negative",
+            "measurement_negative",
+            "instance_implicit_negative",
+            "measurement_implicit_negative",
+        )
+    }
+    normalization = _image_normalization(cfg, device)
+    was_training = bool(raw_model.training)
+    raw_model.eval()
+    tile_count = 0
+    started = time.perf_counter()
+    try:
+        for batch in loader:
+            spatial_sample_mask = batch[
+                "l2_spatial_supervised"
+            ].any(dim=1)
+            if not bool(spatial_sample_mask.any()):
+                continue
+            images = _prepare_images(
+                batch,
+                cfg,
+                device,
+                normalization=normalization,
+            )
+            outputs = raw_model(
+                images,
+                spatial_detach_backbone=True,
+                return_spatial_features=True,
+                run_spatial=True,
+                spatial_sample_mask=spatial_sample_mask,
+            )
+            spatial = _move_spatial_batch(batch, device)
+            active = {
+                key: value[
+                    spatial_sample_mask.to(value.device)
+                ]
+                for key, value in spatial.items()
+            }
+            observations = head.prototype_observation_sums(
+                outputs["l2_spatial_features"],
+                point_centers=active["l2_point_centers"],
+                brush_bag_ids=active["l2_brush_bag_ids"],
+                area_positive=active["l2_area_positive"],
+                explicit_negative=active["l2_explicit_negative"],
+                implicit_negative=active["l2_implicit_negative"],
+            )
+            for name, (sums, counts) in observations.items():
+                accumulated[name][0].add_(sums)
+                accumulated[name][1].add_(counts)
+            tile_count += int(spatial_sample_mask.sum())
+    finally:
+        raw_model.train(was_training)
+    head.replace_prototypes(accumulated)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return {
+        "tiles": tile_count,
+        "positive_observations": int(
+            accumulated["measurement"][1].sum().item()
+        ),
+        "seconds": time.perf_counter() - started,
+    }
+
+
+def _maybe_refresh_prototype_anchors(
+    *,
+    model,
+    cfg: dict,
+    device: torch.device,
+    state: PrototypeAnchorRefreshState | None,
+    global_step: int,
+    l2_supervised_step: int,
+) -> None:
+    if state is None:
+        return
+    global_interval = int(
+        cfg["train"].get("dynamic_prototype_refresh_steps", 500)
+    )
+    refresh_global = state.global_loader is not None and (
+        state.last_global_step is None
+        or (
+            global_interval > 0
+            and global_step - state.last_global_step >= global_interval
+        )
+    )
+    if refresh_global:
+        metrics = _refresh_global_prototype_anchors(
+            model,
+            state.global_loader,
+            cfg,
+            device,
+        )
+        state.last_global_step = int(global_step)
+        _log(
+            "dynamic_global_prototypes_refreshed "
+            f"global_step={global_step} tiles={metrics['tiles']} "
+            f"l1_observations={metrics['l1_observations']} "
+            f"l2_positive_observations={metrics['l2_positive_observations']} "
+            f"seconds={metrics['seconds']:.2f}"
+        )
+
+    if state.spatial_loader is None:
+        return
+    spatial_interval = int(
+        cfg["train"].get(
+            "dynamic_spatial_prototype_refresh_steps",
+            500,
+        )
+    )
+    refresh_spatial = (
+        state.last_spatial_step is None
+        or (
+            spatial_interval > 0
+            and l2_supervised_step - state.last_spatial_step
+            >= spatial_interval
+        )
+    )
+    if refresh_spatial:
+        metrics = _refresh_spatial_prototype_anchors(
+            model,
+            state.spatial_loader,
+            cfg,
+            device,
+        )
+        state.last_spatial_step = int(l2_supervised_step)
+        _log(
+            "dynamic_spatial_prototypes_refreshed "
+            f"l2_supervised_step={l2_supervised_step} "
+            f"tiles={metrics['tiles']} "
+            f"positive_observations={metrics['positive_observations']} "
+            f"seconds={metrics['seconds']:.2f}"
+        )
 
 
 def _move_l1_batch(
@@ -337,14 +641,6 @@ def scheduled_loss_config(
         ),
         "prototype_student_weight": float(
             loss_cfg.get("prototype_student_weight", 1.0)
-        ),
-        "prototype_momentum": float(
-            loss_cfg.get("prototype_momentum", 0.9)
-        ),
-        "prototype_updates_enabled": (
-            int(loss_cfg.get("prototype_update_until_step", -1)) < 0
-            or int(global_step)
-            < int(loss_cfg.get("prototype_update_until_step", -1))
         ),
         "zhcc_response_weight": _step_ramp(
             float(loss_cfg.get("zhcc_response_weight", 0.1)),
@@ -573,6 +869,7 @@ def run_epoch(
     collect_embeddings: bool = False,
     max_eval_batches: int | None = None,
     prefetched_iterator=None,
+    prototype_anchor_state: PrototypeAnchorRefreshState | None = None,
 ) -> dict[str, float] | tuple[dict[str, float], tuple]:
     model.train(train)
     totals: dict[str, torch.Tensor | float] = {
@@ -668,6 +965,11 @@ def run_epoch(
                 cfg,
                 device,
                 normalization=image_normalization,
+                amp_input=bool(
+                    train
+                    and cfg["train"].get("amp", False)
+                    and device.type == "cuda"
+                ),
             )
             if will_log and device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -679,7 +981,8 @@ def run_epoch(
                 batch,
                 device,
             )
-            spatial_is_active = bool(batch["l2_spatial_supervised"].any())
+            spatial_sample_mask = batch["l2_spatial_supervised"].any(dim=1)
+            spatial_is_active = bool(spatial_sample_mask.any())
             spatial = (
                 _move_spatial_batch(batch, device)
                 if spatial_is_active
@@ -703,6 +1006,15 @@ def run_epoch(
                     l2_supervised_step=l2_supervised_step,
                 )
                 last_loss_cfg = loss_cfg
+                if train:
+                    _maybe_refresh_prototype_anchors(
+                        model=model,
+                        cfg=cfg,
+                        device=device,
+                        state=prototype_anchor_state,
+                        global_step=global_step,
+                        l2_supervised_step=l2_supervised_step,
+                    )
                 with torch.autocast(
                     device_type=device.type,
                     enabled=_amp_enabled(device, cfg, train),
@@ -716,11 +1028,13 @@ def run_epoch(
                             train and spatial_is_active
                         ),
                         run_spatial=spatial_is_active,
+                        spatial_sample_mask=(
+                            spatial_sample_mask
+                            if spatial_is_active
+                            else None
+                        ),
                     )
                     raw_model = getattr(model, "_orig_mod", model)
-                    prototype_momentum = float(
-                        loss_cfg["prototype_momentum"]
-                    )
                     l2_positive = None
                     l2_known = None
                     l2_target = None
@@ -851,14 +1165,20 @@ def run_epoch(
                         "l2_instance_logits" in outputs
                         and spatial["l2_point_centers"].numel() > 0
                     ):
+                        active_spatial = {
+                            key: value[
+                                spatial_sample_mask.to(value.device)
+                            ]
+                            for key, value in spatial.items()
+                        }
                         spatial_loss, spatial_parts = spatial_morphometry_loss(
                             instance_logits=outputs["l2_instance_logits"],
                             abundance_logits=outputs["l2_abundance_logits"],
-                            point_centers=spatial["l2_point_centers"],
-                            brush_bag_ids=spatial["l2_brush_bag_ids"],
-                            area_positive=spatial["l2_area_positive"],
-                            explicit_negative=spatial["l2_explicit_negative"],
-                            implicit_negative=spatial["l2_implicit_negative"],
+                            point_centers=active_spatial["l2_point_centers"],
+                            brush_bag_ids=active_spatial["l2_brush_bag_ids"],
+                            area_positive=active_spatial["l2_area_positive"],
+                            explicit_negative=active_spatial["l2_explicit_negative"],
+                            implicit_negative=active_spatial["l2_implicit_negative"],
                             component_names=cfg["data"].get(
                                 "spatial_component_names"
                             ),
@@ -945,40 +1265,6 @@ def run_epoch(
                     if scheduler is not None and optimizer_stepped:
                         scheduler.step()
                     if optimizer_stepped:
-                        if bool(loss_cfg["prototype_updates_enabled"]):
-                            raw_model.update_l1_prototypes(
-                                outputs["embedding_norm"],
-                                l1_mask,
-                                l1_target,
-                                momentum=prototype_momentum,
-                            )
-                            if spatial_is_active:
-                                assert l2_positive is not None
-                                raw_model.update_global_l2_prototypes(
-                                    outputs["embedding_norm"],
-                                    teachers,
-                                    l2_positive,
-                                    momentum=prototype_momentum,
-                                )
-                                raw_model.spatial_head.update_prototypes(
-                                    outputs["l2_spatial_features"],
-                                    point_centers=spatial[
-                                        "l2_point_centers"
-                                    ],
-                                    brush_bag_ids=spatial[
-                                        "l2_brush_bag_ids"
-                                    ],
-                                    area_positive=spatial[
-                                        "l2_area_positive"
-                                    ],
-                                    explicit_negative=spatial[
-                                        "l2_explicit_negative"
-                                    ],
-                                    implicit_negative=spatial[
-                                        "l2_implicit_negative"
-                                    ],
-                                    momentum=prototype_momentum,
-                                )
                         global_step += 1
                         if spatial_is_active:
                             l2_supervised_step += 1
@@ -1216,6 +1502,8 @@ def fit(
     *,
     scheduler=None,
     resume_state: dict | None = None,
+    prototype_anchor_loader=None,
+    spatial_prototype_anchor_loader=None,
 ) -> dict:
     output_dir = ensure_dir(cfg["runtime"]["output_dir"])
     checkpoints = ensure_dir(output_dir / "checkpoints")
@@ -1247,6 +1535,23 @@ def fit(
     if resume_state and "scaler" in resume_state:
         scaler.load_state_dict(resume_state["scaler"])
     _restore_rng_state((resume_state or {}).get("rng_state"))
+    prototype_anchor_state = (
+        PrototypeAnchorRefreshState(
+            global_loader=prototype_anchor_loader,
+            spatial_loader=spatial_prototype_anchor_loader,
+            last_global_step=(resume_state or {}).get(
+                "dynamic_prototype_step"
+            ),
+            last_spatial_step=(resume_state or {}).get(
+                "dynamic_spatial_prototype_step"
+            ),
+        )
+        if (
+            prototype_anchor_loader is not None
+            or spatial_prototype_anchor_loader is not None
+        )
+        else None
+    )
     writer = _build_summary_writer(cfg, output_dir)
     try:
         for epoch in range(start_epoch, int(cfg["train"]["epochs"]) + 1):
@@ -1266,6 +1571,7 @@ def fit(
                 global_step=global_step,
                 l2_supervised_step=l2_supervised_step,
                 summary_writer=writer,
+                prototype_anchor_state=prototype_anchor_state,
             )
             global_step = int(train_metrics["global_step_end"])
             l2_supervised_step = int(
@@ -1337,6 +1643,16 @@ def fit(
                 "epoch": epoch,
                 "global_step": global_step,
                 "l2_supervised_step": l2_supervised_step,
+                "dynamic_prototype_step": (
+                    prototype_anchor_state.last_global_step
+                    if prototype_anchor_state is not None
+                    else None
+                ),
+                "dynamic_spatial_prototype_step": (
+                    prototype_anchor_state.last_spatial_step
+                    if prototype_anchor_state is not None
+                    else None
+                ),
                 "feature_loss_type": str(loss_cfg["feature_loss_type"]),
                 "lr": float(optimizer.param_groups[0]["lr"]),
                 "scheduled_semantic_weight": float(loss_cfg["semantic_weight"]),

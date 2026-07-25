@@ -199,7 +199,6 @@ def _point_peak_loss(
         )
     point_count = centers.flatten(2).sum(dim=2)
     supervised = point_count > 0
-    pair_loss = logits.new_zeros(point_count.shape)
     height, width = logits.shape[-2:]
     centers_cpu = centers.detach().to(device="cpu")
     supervised_cpu = (
@@ -207,7 +206,7 @@ def _point_peak_loss(
     )
     if not bool(supervised_cpu.any()):
         return (
-            _mean_supervised_pair(pair_loss, supervised, logits),
+            logits.sum() * 0.0,
             supervised,
             point_count,
         )
@@ -224,6 +223,12 @@ def _point_peak_loss(
             pair_batch,
             pair_component,
         ].to(device="cpu")
+    selected_flat_indices: list[int] = []
+    selected_pair_indices: list[int] = []
+    extra_flat_indices: list[int] = []
+    extra_pair_indices: list[int] = []
+    component_count = logits.shape[1]
+    plane_size = height * width
     for pair_idx, (batch_idx, component_idx) in enumerate(
         supervised_pairs.tolist()
     ):
@@ -276,7 +281,7 @@ def _point_peak_loss(
             width=width,
         )
 
-        selected_logits: list[torch.Tensor] = []
+        selected_cells_ordered: list[int] = []
         selected_cells: set[int] = set()
         for click_idx in range(len(click_cells)):
             # More clicks than resolvable grid cells can occur after coordinate
@@ -284,17 +289,16 @@ def _point_peak_loss(
             # the count target rather than silently discarding the click.
             cell = matched_cell.get(click_idx, candidates[click_idx][0])
             selected_cells.add(cell)
-            selected_logits.append(
-                logits[
-                    batch_idx,
-                    component_idx,
-                    cell // width,
-                    cell % width,
-                ]
-            )
-        positive_loss = torch.stack(
-            [F.softplus(-value) for value in selected_logits]
-        ).mean()
+            selected_cells_ordered.append(cell)
+        plane_offset = (
+            int(batch_idx) * component_count + int(component_idx)
+        ) * plane_size
+        selected_flat_indices.extend(
+            plane_offset + cell for cell in selected_cells_ordered
+        )
+        selected_pair_indices.extend(
+            [pair_idx] * len(selected_cells_ordered)
+        )
         if exclusive:
             exclusive_cells = {
                 cell for choices in candidates for cell in choices
@@ -305,24 +309,58 @@ def _point_peak_loss(
                     for row, col in exclusion_cpu[pair_idx].nonzero().tolist()
                 )
             extra_cells = sorted(exclusive_cells - selected_cells)
-            if extra_cells:
-                extra_logits = torch.stack(
-                    [
-                        logits[
-                            batch_idx,
-                            component_idx,
-                            cell // width,
-                            cell % width,
-                        ]
-                        for cell in extra_cells
-                    ]
-                )
-                positive_loss = positive_loss + F.softplus(
-                    extra_logits
-                ).mean()
-        pair_loss[batch_idx, component_idx] = positive_loss
+            extra_flat_indices.extend(
+                plane_offset + cell for cell in extra_cells
+            )
+            extra_pair_indices.extend([pair_idx] * len(extra_cells))
+
+    pair_count = int(supervised_pairs.shape[0])
+    flat_logits = logits.flatten()
+
+    def _grouped_mean(
+        flat_indices: list[int],
+        group_indices: list[int],
+        *,
+        positive: bool,
+    ) -> torch.Tensor:
+        if not flat_indices:
+            return logits.new_zeros((pair_count,))
+        index = torch.tensor(
+            flat_indices,
+            device=logits.device,
+            dtype=torch.long,
+        )
+        group = torch.tensor(
+            group_indices,
+            device=logits.device,
+            dtype=torch.long,
+        )
+        values = flat_logits.index_select(0, index)
+        losses = F.softplus(-values if positive else values)
+        sums = logits.new_zeros((pair_count,)).scatter_add(
+            0,
+            group,
+            losses,
+        )
+        counts = torch.bincount(
+            group,
+            minlength=pair_count,
+        ).to(dtype=logits.dtype)
+        return sums / counts.clamp_min(1)
+
+    pair_loss = _grouped_mean(
+        selected_flat_indices,
+        selected_pair_indices,
+        positive=True,
+    )
+    if exclusive:
+        pair_loss = pair_loss + _grouped_mean(
+            extra_flat_indices,
+            extra_pair_indices,
+            positive=False,
+        )
     return (
-        _mean_supervised_pair(pair_loss, supervised, logits),
+        pair_loss.mean(),
         supervised,
         point_count,
     )

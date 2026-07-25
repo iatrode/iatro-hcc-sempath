@@ -9,7 +9,7 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Thread
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import numpy as np
 
 from . import _pipeline_probe as _probe
@@ -573,57 +573,183 @@ class _PackageShuffleBatchLoader:
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
 
-class _TargetedPackageBatchLoader:
-    """Decode only the fixed expert tiles, preserving package-row alignment."""
+class _MaterializedExpertBank:
+    """One in-memory copy of the small fixed L1/L2 expert union."""
+
+    def __init__(self, batches: list[dict]) -> None:
+        if not batches:
+            raise ValueError("expert bank materialization produced no batches")
+        self.tile_id = [
+            tile_id
+            for batch in batches
+            for tile_id in batch["tile_id"]
+        ]
+        self.images = torch.cat(
+            [batch["images"] for batch in batches],
+            dim=0,
+        )
+        self.images_uint8 = bool(batches[0].get("images_uint8", False))
+        self.images_hwc = bool(batches[0].get("images_hwc", False))
+        tensor_keys = (
+            "prototype_mask",
+            "prototype_level1",
+            "l2_point_centers",
+            "l2_brush_bag_ids",
+            "l2_area_positive",
+            "l2_explicit_negative",
+            "l2_implicit_negative",
+            "l2_spatial_supervised",
+        )
+        self.tensors = {
+            key: torch.cat([batch[key] for batch in batches], dim=0)
+            for key in tensor_keys
+        }
+        teacher_names = list(batches[0]["teacher_features"])
+        self.teacher_features = {
+            name: torch.cat(
+                [
+                    batch["teacher_features"][name]
+                    for batch in batches
+                ],
+                dim=0,
+            )
+            for name in teacher_names
+        }
+        if len(set(self.tile_id)) != len(self.tile_id):
+            raise ValueError("materialized expert bank contains duplicate tiles")
+        self.index_by_tile_id = {
+            tile_id: index
+            for index, tile_id in enumerate(self.tile_id)
+        }
+
+    def __len__(self) -> int:
+        return len(self.tile_id)
+
+    @property
+    def memory_bytes(self) -> int:
+        tensors = [
+            self.images,
+            *self.tensors.values(),
+            *self.teacher_features.values(),
+        ]
+        return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+    def batch(self, indices: torch.Tensor) -> dict:
+        rows = [int(index) for index in indices.tolist()]
+        payload = {
+            "tile_id": [self.tile_id[index] for index in rows],
+            "images": self.images.index_select(0, indices),
+            "images_uint8": self.images_uint8,
+            "teacher_features": {
+                name: values.index_select(0, indices)
+                for name, values in self.teacher_features.items()
+            },
+            **{
+                key: values.index_select(0, indices)
+                for key, values in self.tensors.items()
+            },
+        }
+        if self.images_hwc:
+            payload["images_hwc"] = True
+        return payload
+
+
+class _InMemoryExpertBatchLoader:
+    """Deterministic shuffled views over one materialized expert bank."""
 
     def __init__(
         self,
-        dataset: PackageSampledDistillationDataset,
-        rows_by_package: dict[int, np.ndarray],
+        bank: _MaterializedExpertBank,
         *,
+        indices: list[int] | None,
         batch_size: int,
         seed: int,
     ) -> None:
-        self.dataset = dataset
+        self.bank = bank
+        self.indices = np.asarray(
+            list(range(len(bank))) if indices is None else indices,
+            dtype=np.int64,
+        )
+        if self.indices.size == 0:
+            raise ValueError("expert loader requires at least one bank row")
         self.batch_size = max(1, int(batch_size))
         self.seed = int(seed)
         self._epoch = 0
         self._cycle = 0
-        self._pairs = [
-            (int(package_idx), int(row))
-            for package_idx, rows in sorted(rows_by_package.items())
-            for row in rows
-        ]
-        if not self._pairs:
-            raise ValueError("expert replay requires at least one package row")
 
     def __len__(self) -> int:
-        return (len(self._pairs) + self.batch_size - 1) // self.batch_size
+        return (
+            len(self.indices) + self.batch_size - 1
+        ) // self.batch_size
 
     def __iter__(self):
         rng = np.random.default_rng(
             self.seed + self._epoch * 1_000_003 + self._cycle
         )
         self._cycle += 1
-        order = rng.permutation(len(self._pairs))
+        order = rng.permutation(self.indices)
         for start in range(0, len(order), self.batch_size):
-            selected = [self._pairs[int(index)] for index in order[start : start + self.batch_size]]
-            by_package: dict[int, list[int]] = {}
-            for package_idx, row in selected:
-                by_package.setdefault(package_idx, []).append(row)
-            samples: list[dict] = []
-            for package_idx, rows in by_package.items():
-                samples.extend(
-                    self.dataset.read_package_rows(
-                        package_idx,
-                        np.asarray(rows, dtype=np.int64),
-                    )
-                )
-            yield self.dataset.collate(samples)
+            selected = torch.from_numpy(
+                order[start : start + self.batch_size].copy()
+            ).long()
+            yield self.bank.batch(selected)
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
         self._cycle = 0
+
+
+def _global_indices_for_package_rows(
+    dataset: PackageSampledDistillationDataset,
+    rows_by_package: dict[int, np.ndarray],
+) -> list[int]:
+    offsets = {
+        package_idx: int(dataset.block_offsets[position])
+        for position, package_idx in enumerate(dataset.package_order)
+    }
+    indices: list[int] = []
+    for package_idx, rows in sorted(rows_by_package.items()):
+        sampled_rows = dataset.package_sample_rows[package_idx]
+        if sampled_rows is not None:
+            raise ValueError(
+                "expert bank requires the complete package row space"
+            )
+        base = offsets[package_idx]
+        indices.extend(base + int(row) for row in rows)
+    return indices
+
+
+def _materialize_expert_bank(
+    dataset: PackageSampledDistillationDataset,
+    rows_by_package: dict[int, np.ndarray],
+    *,
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+) -> _MaterializedExpertBank:
+    indices = _global_indices_for_package_rows(
+        dataset,
+        rows_by_package,
+    )
+    loader_kwargs = {
+        "batch_size": max(1, int(batch_size)),
+        "num_workers": max(0, int(num_workers)),
+        "shuffle": False,
+        "collate_fn": dataset.collate,
+        "pin_memory": False,
+    }
+    if int(num_workers) > 0:
+        loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+        loader_kwargs["persistent_workers"] = False
+    bank = _MaterializedExpertBank(
+        list(DataLoader(Subset(dataset, indices), **loader_kwargs))
+    )
+    print(
+        "expert_bank_materialized "
+        f"tiles={len(bank)} memory_mib={bank.memory_bytes / (1024**2):.1f}",
+        flush=True,
+    )
+    return bank
 
 
 class _InterleavedBatchLoader:
@@ -649,7 +775,12 @@ class _InterleavedBatchLoader:
         population_iterator = iter(self.population_loader)
         expert_iterator = iter(self.expert_loader)
         try:
-            for batch_index, batch in enumerate(population_iterator, start=1):
+            # Creating a multiprocessing DataLoader iterator starts its decode
+            # workers. Yield the already materialized expert batch before
+            # blocking on the first population result, so those workers can
+            # fill the prefetch queue while the GPU processes expert
+            # supervision.
+            for batch_index in range(1, len(self.population_loader) + 1):
                 if (batch_index - 1) % self.interval == 0:
                     try:
                         expert_batch = next(expert_iterator)
@@ -657,6 +788,10 @@ class _InterleavedBatchLoader:
                         expert_iterator = iter(self.expert_loader)
                         expert_batch = next(expert_iterator)
                     yield expert_batch
+                try:
+                    batch = next(population_iterator)
+                except StopIteration:
+                    break
                 yield batch
         finally:
             for iterator in (population_iterator, expert_iterator):
@@ -1071,6 +1206,25 @@ def _cap_compute_threads(num_workers: int) -> None:
         pass
 
 
+def _build_optimizer(
+    model,
+    cfg: dict,
+    device: torch.device,
+) -> torch.optim.AdamW:
+    """Build the numerically equivalent low-traffic CUDA optimizer when enabled."""
+
+    kwargs = {
+        "lr": cfg["train"]["lr"],
+        "weight_decay": cfg["train"]["weight_decay"],
+    }
+    if bool(
+        cfg["train"].get("fused_optimizer", False)
+        and device.type == "cuda"
+    ):
+        kwargs["fused"] = True
+    return torch.optim.AdamW(model.parameters(), **kwargs)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train HCC-SemPath distillation model.")
     parser.add_argument("--config", required=True)
@@ -1480,7 +1634,9 @@ def main() -> None:
     replay_interval = int(
         cfg["data"].get("expert_replay_interval_batches", 16)
     )
-    if expert_tile_ids and replay_interval > 0:
+    prototype_anchor_loader = None
+    spatial_prototype_anchor_loader = None
+    if expert_tile_ids:
         expert_ds = PackageSampledDistillationDataset(
             expert_tile_packages,
             expert_teacher_packages,
@@ -1506,26 +1662,69 @@ def main() -> None:
                 min(64, int(cfg["train"]["batch_size"])),
             )
         )
-        expert_loader = _TargetedPackageBatchLoader(
+        cfg["data"]["expert_batch_size"] = expert_batch_size
+        prototype_batch_size = int(
+            cfg["train"].get(
+                "dynamic_prototype_batch_size",
+                cfg["train"]["batch_size"],
+            )
+        )
+        expert_bank = _materialize_expert_bank(
             expert_ds,
             expert_rows_by_package,
-            batch_size=expert_batch_size,
-            seed=int(cfg["runtime"]["seed"]) + 100_003,
+            batch_size=prototype_batch_size,
+            num_workers=num_workers,
+            prefetch_factor=int(
+                cfg["data"].get("prefetch_factor", 2)
+            ),
         )
-        train_loader = _InterleavedBatchLoader(
-            train_loader,
-            expert_loader,
-            interval=replay_interval,
-        )
-        cfg["data"]["expert_replay_interval_batches"] = replay_interval
-        cfg["data"]["expert_batch_size"] = expert_batch_size
-        cfg["data"]["expert_replay_tiles"] = len(expert_tile_ids)
+        if train_prototype_labels:
+            prototype_anchor_loader = _InMemoryExpertBatchLoader(
+                expert_bank,
+                indices=None,
+                batch_size=prototype_batch_size,
+                seed=int(cfg["runtime"]["seed"]) + 200_003,
+            )
+        if train_spatial_targets:
+            spatial_indices = [
+                expert_bank.index_by_tile_id[tile_id]
+                for tile_id in sorted(train_spatial_targets)
+            ]
+            spatial_prototype_anchor_loader = (
+                _InMemoryExpertBatchLoader(
+                    expert_bank,
+                    indices=spatial_indices,
+                    batch_size=expert_batch_size,
+                    seed=int(cfg["runtime"]["seed"]) + 300_007,
+                )
+            )
+        if replay_interval > 0:
+            expert_loader = _InMemoryExpertBatchLoader(
+                expert_bank,
+                indices=None,
+                batch_size=expert_batch_size,
+                seed=int(cfg["runtime"]["seed"]) + 100_003,
+            )
+            train_loader = _InterleavedBatchLoader(
+                train_loader,
+                expert_loader,
+                interval=replay_interval,
+            )
+            cfg["data"]["expert_replay_interval_batches"] = (
+                replay_interval
+            )
+            cfg["data"]["expert_replay_tiles"] = len(expert_tile_ids)
     _freeze_optimizer_visible_contract(
         cfg,
         population_packages=train_tile_packages,
         expert_packages=expert_tile_packages,
         expert_replay_enabled=bool(
-            expert_tile_ids and replay_interval > 0
+            expert_tile_ids
+            and (
+                replay_interval > 0
+                or prototype_anchor_loader is not None
+                or spatial_prototype_anchor_loader is not None
+            )
         ),
     )
     model = HCCSemPathModel(
@@ -1558,7 +1757,7 @@ def main() -> None:
         model.load_state_dict(state)
     if bool(cfg["train"].get("compile", False)):
         model = torch.compile(model)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
+    optimizer = _build_optimizer(model, cfg, device)
     if resume_state and "optimizer" in resume_state:
         optimizer.load_state_dict(resume_state["optimizer"])
     scheduler = build_lr_scheduler(optimizer, cfg, len(train_loader))
@@ -1574,6 +1773,10 @@ def main() -> None:
         cfg,
         scheduler=scheduler,
         resume_state=resume_state,
+        prototype_anchor_loader=prototype_anchor_loader,
+        spatial_prototype_anchor_loader=(
+            spatial_prototype_anchor_loader
+        ),
     )
     print("train_ok " + " ".join(f"{k}={v}" for k, v in metrics.items()))
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import math
 import os
 from pathlib import Path
 import shutil
@@ -21,6 +23,31 @@ except ImportError as exc:  # pragma: no cover
 
 
 TEACHERS = ("gigapath", "h_optimus_1", "uni2_h", "virchow2")
+BASELINE_PARAMS = {"lr": 1e-4, "weight_decay": 1e-2}
+SEARCH_SPACE = {
+    "lr": {"low": 3e-5, "high": 2e-4, "log": True},
+    "weight_decay": {"low": 1e-3, "high": 3e-2, "log": True},
+}
+RESULT_METRICS = (
+    "train_loss",
+    "train_feature",
+    "train_relation",
+    "train_semantic",
+    "train_pamtd_response",
+    "train_l1",
+    "train_l1_accuracy",
+    "train_l2_spatial",
+    "train_l2_instance_point",
+    "train_l2_abundance_point",
+    "train_l2_brush_bag",
+    "train_l2_area_positive",
+    "train_l2_explicit_negative",
+    "train_l2_implicit_negative",
+    "teacher_alignment_score",
+    "train_tiles_per_sec",
+    "global_step",
+    "l2_supervised_step",
+)
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -48,6 +75,31 @@ def load_yaml(path: Path) -> dict[str, Any]:
 def write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+
+def config_digest(cfg: dict[str, Any]) -> str:
+    payload = yaml.safe_dump(cfg, sort_keys=True, allow_unicode=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def source_commit(repo: Path) -> str:
+    explicit = os.environ.get("HCC_SEMPATH_SOURCE_COMMIT", "").strip()
+    if explicit:
+        return explicit
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    commit = result.stdout.strip()
+    if result.returncode != 0 or not commit:
+        raise RuntimeError(
+            "source commit is unavailable; export HCC_SEMPATH_SOURCE_COMMIT "
+            "when running from a source archive"
+        )
+    return commit
 
 
 def require_prototype_inputs(cfg: dict[str, Any]) -> None:
@@ -144,6 +196,8 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     cfg.setdefault("train", {})
     cfg["runtime"]["output_dir"] = str(output_dir)
 
+    # Optuna uses a deterministic one-tenth population view. The fixed L1/L2
+    # expert banks remain complete and identical across trials.
     cfg["data"]["train_tile_fraction"] = 0.10
     cfg["data"]["val_tile_fraction"] = 0.10
     cfg["data"]["num_workers"] = int(cfg["data"].get("num_workers", 16))
@@ -152,30 +206,23 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     cfg["data"]["dynamic_package_sampling"] = bool(cfg["data"].get("dynamic_package_sampling", True))
     cfg["data"]["tensor_collate"] = bool(cfg["data"].get("tensor_collate", True))
     cfg["data"]["package_chunk_size"] = int(cfg["data"].get("package_chunk_size", 64))
-    cfg["loss"]["relation_weight"] = 0.05
-    cfg["loss"]["semantic_weight"] = trial.suggest_categorical("semantic_weight", [0.02, 0.05])
-    cfg["loss"]["l1_weight"] = trial.suggest_categorical("l1_weight", [0.5, 1.0])
-    cfg["loss"]["spatial_weight"] = trial.suggest_categorical("spatial_weight", [0.05, 0.10, 0.20])
-    cfg["loss"]["spatial_point_tolerance_cells"] = 1
-    cfg["loss"]["spatial_abundance_point_weight"] = 0.5
-    cfg["loss"]["spatial_brush_weight"] = 1.0
-    cfg["loss"]["spatial_brush_top_fraction"] = 0.25
-    cfg["loss"]["spatial_explicit_negative_weight"] = 1.0
-    cfg["loss"]["spatial_implicit_negative_weight"] = 0.05
-    cfg["loss"]["spatial_start_step"] = 0
-    cfg["loss"]["spatial_ramp_steps"] = 500
-    cfg["loss"]["spatial_backbone_start_step"] = 500
 
     cfg["train"]["batch_size"] = int(cfg["train"].get("batch_size", 512))
     cfg["train"]["epochs"] = int(epochs)
-    cfg["train"]["warmup_epochs"] = 1
-    cfg["train"]["lr"] = 1e-4
-    cfg["train"]["weight_decay"] = 0.01
+    cfg["train"]["lr"] = trial.suggest_float("lr", **SEARCH_SPACE["lr"])
+    cfg["train"]["weight_decay"] = trial.suggest_float(
+        "weight_decay",
+        **SEARCH_SPACE["weight_decay"],
+    )
     cfg["train"]["max_grad_norm"] = 1.0
-    cfg["train"]["max_val_batches"] = 256
-    cfg["train"]["max_eval_batches"] = 64
-    cfg["train"]["eval_pairwise_max_samples"] = 2048
-    cfg["train"]["log_interval"] = 0
+    # Hyperparameter selection is based on the population training objective.
+    # Keep one diagnostic batch only because the generic trainer currently
+    # finalizes its epoch row after that pass; it is not an Optuna validation
+    # signal.
+    cfg["train"]["max_val_batches"] = 1
+    cfg["train"]["max_eval_batches"] = 1
+    cfg["train"]["eval_pairwise_max_samples"] = 512
+    cfg["train"]["log_interval"] = 200
     cfg["train"]["progress"] = "tqdm"
     cfg["train"]["tensorboard"] = False
     cfg["train"]["tensorboard_batch_interval"] = 0
@@ -183,15 +230,25 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
 
 
 def score_row(row: dict[str, str], objective: str) -> float:
-    def value(key: str) -> float:
+    def value(key: str, *, required: bool = False) -> float:
         try:
-            return float(row.get(key, 0.0) or 0.0)
-        except ValueError:
+            result = float(row.get(key, "") or "nan")
+        except ValueError as exc:
+            if required:
+                raise ValueError(f"non-numeric objective metric {key}={row.get(key)!r}") from exc
             return 0.0
+        if not math.isfinite(result):
+            if required:
+                raise ValueError(f"non-finite objective metric {key}={result}")
+            return 0.0
+        return result
 
     teacher_alignment = value("teacher_alignment_score")
     l1_acc = value("l1_accuracy")
     train_tiles_per_sec = value("train_tiles_per_sec")
+    train_loss = value("train_loss", required=objective == "train_loss")
+    if objective == "train_loss":
+        return -train_loss
     if objective == "teacher_alignment":
         return teacher_alignment
     if objective == "speed":
@@ -199,6 +256,55 @@ def score_row(row: dict[str, str], objective: str) -> float:
     if objective == "l1_accuracy":
         return l1_acc
     return teacher_alignment + 0.25 * l1_acc
+
+
+def export_study_artifacts(
+    study: optuna.Study,
+    *,
+    output_root: Path,
+    manifest: dict[str, Any],
+) -> None:
+    rows: list[dict[str, Any]] = []
+    for trial in study.get_trials(deepcopy=False):
+        row = {
+            "number": trial.number,
+            "state": trial.state.name,
+            "objective_score": trial.value,
+            "lr": trial.params.get("lr"),
+            "weight_decay": trial.params.get("weight_decay"),
+        }
+        row.update(
+            {
+                metric: trial.user_attrs.get(f"final_{metric}")
+                for metric in RESULT_METRICS
+            }
+        )
+        row["output_dir"] = trial.user_attrs.get("output_dir")
+        row["failure_reason"] = trial.user_attrs.get("failure_reason")
+        rows.append(row)
+
+    summary_path = output_root / "study_summary.csv"
+    temporary_summary = summary_path.with_suffix(".csv.tmp")
+    fieldnames = list(rows[0]) if rows else [
+        "number",
+        "state",
+        "objective_score",
+        "lr",
+        "weight_decay",
+    ]
+    with temporary_summary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary_summary.replace(summary_path)
+
+    manifest_path = output_root / "study_manifest.yaml"
+    write_yaml(manifest_path, manifest)
+    if study.best_trials:
+        best = study.best_trial
+        best_config = Path(str(best.user_attrs.get("output_dir", ""))) / "config.yaml"
+        if best_config.is_file():
+            shutil.copy2(best_config, output_root / "best_config.yaml")
 
 
 def read_metric_rows(metrics_path: Path) -> list[dict[str, str]]:
@@ -211,10 +317,16 @@ def read_metric_rows(metrics_path: Path) -> list[dict[str, str]]:
 def stream_process(process: subprocess.Popen[str], log_path: Path) -> None:
     with log_path.open("a", encoding="utf-8") as log:
         assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="")
-            log.write(line)
-            log.flush()
+        while True:
+            character = process.stdout.read(1)
+            if not character:
+                break
+            flush = character in {"\r", "\n"}
+            print(character, end="", flush=flush)
+            log.write(character)
+            if flush:
+                log.flush()
+        log.flush()
 
 
 def terminate_process(process: subprocess.Popen[str]) -> None:
@@ -292,7 +404,8 @@ def train_with_pruning(
     trial.set_user_attr("output_dir", str(output_dir))
     trial.set_user_attr("final_epoch", rows[-1].get("epoch"))
     trial.set_user_attr("final_score", final_score)
-    trial.set_user_attr("final_train_tiles_per_sec", rows[-1].get("train_tiles_per_sec"))
+    for metric in RESULT_METRICS:
+        trial.set_user_attr(f"final_{metric}", rows[-1].get(metric))
     trial.set_user_attr("final_val_tiles_per_sec", rows[-1].get("val_tiles_per_sec"))
     trial.set_user_attr("best_observed_score", best_score)
     return best_score
@@ -308,12 +421,13 @@ def main() -> None:
     parser.add_argument("--prototype-asset-dir", default="artifacts/prototypes/hcc_annotation_final_3000")
     parser.add_argument("--python", default="python")
     parser.add_argument("--n-trials", type=int, default=24)
-    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--timeout-hours", type=float, default=0.0)
     parser.add_argument("--poll-sec", type=float, default=20.0)
     parser.add_argument(
         "--objective",
-        choices=["combined", "teacher_alignment", "l1_accuracy", "speed"],
-        default="combined",
+        choices=["train_loss", "combined", "teacher_alignment", "l1_accuracy", "speed"],
+        default="train_loss",
     )
     parser.add_argument("--sampler-seed", type=int, default=13)
     args = parser.parse_args()
@@ -340,8 +454,21 @@ def main() -> None:
     output_root = Path(args.output_root) / args.study_name
     output_root.mkdir(parents=True, exist_ok=True)
 
-    sampler = optuna.samplers.TPESampler(seed=int(args.sampler_seed), multivariate=True, group=True)
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=4, n_warmup_steps=4, interval_steps=1)
+    sampler = optuna.samplers.TPESampler(
+        seed=int(args.sampler_seed),
+        n_startup_trials=4,
+        multivariate=True,
+        group=True,
+    )
+    pruner = (
+        optuna.pruners.NopPruner()
+        if int(args.epochs) <= 1
+        else optuna.pruners.MedianPruner(
+            n_startup_trials=2,
+            n_warmup_steps=1,
+            interval_steps=1,
+        )
+    )
     study = optuna.create_study(
         study_name=args.study_name,
         direction="maximize",
@@ -350,6 +477,43 @@ def main() -> None:
         sampler=sampler,
         pruner=pruner,
     )
+    study.enqueue_trial(BASELINE_PARAMS, skip_if_exists=True)
+    commit = source_commit(repo)
+    manifest = {
+        "study_name": args.study_name,
+        "purpose": "new-manuscript one-tenth-population hyperparameter search",
+        "source_commit": commit,
+        "base_config": str(base_config_path),
+        "base_config_sha256": config_digest(base_cfg),
+        "objective": args.objective,
+        "direction": "maximize",
+        "objective_interpretation": (
+            "negative train_loss; all task-loss definitions and weights are fixed across trials"
+            if args.objective == "train_loss"
+            else args.objective
+        ),
+        "epochs_per_trial": int(args.epochs),
+        "population_fraction": 0.10,
+        "complete_l1_l2_expert_banks": True,
+        "n_trials_requested": int(args.n_trials),
+        "timeout_hours": float(args.timeout_hours),
+        "runtime_seed": int(base_cfg["runtime"]["seed"]),
+        "sampler": "TPESampler",
+        "sampler_seed": int(args.sampler_seed),
+        "n_startup_trials": 4,
+        "pruner": (
+            "NopPruner"
+            if int(args.epochs) <= 1
+            else "MedianPruner(n_startup_trials=2,n_warmup_steps=1,interval_steps=1)"
+        ),
+        "baseline_params": BASELINE_PARAMS,
+        "search_space": SEARCH_SPACE,
+        "fixed_loss_config": base_cfg.get("loss", {}),
+    }
+    for key, value in manifest.items():
+        if isinstance(value, (str, int, float, bool)):
+            study.set_user_attr(key, value)
+    export_study_artifacts(study, output_root=output_root, manifest=manifest)
 
     def objective(trial: optuna.Trial) -> float:
         trial_dir = output_root / f"trial_{trial.number:04d}"
@@ -359,17 +523,47 @@ def main() -> None:
         cfg = trial_config(base_cfg, trial, trial_dir, epochs=int(args.epochs))
         cfg_path = trial_dir / "config.yaml"
         write_yaml(cfg_path, cfg)
-        return train_with_pruning(
-            trial=trial,
-            cfg_path=cfg_path,
-            output_dir=trial_dir,
-            python_bin=str(args.python),
-            repo=repo,
-            poll_sec=float(args.poll_sec),
-            objective=str(args.objective),
+        print(
+            f"trial_start number={trial.number} "
+            f"source_commit={commit} "
+            f"lr={trial.params['lr']:.8g} "
+            f"weight_decay={trial.params['weight_decay']:.8g}",
+            flush=True,
         )
+        trial.set_user_attr("source_commit", commit)
+        trial.set_user_attr("config_sha256", config_digest(cfg))
+        try:
+            return train_with_pruning(
+                trial=trial,
+                cfg_path=cfg_path,
+                output_dir=trial_dir,
+                python_bin=str(args.python),
+                repo=repo,
+                poll_sec=float(args.poll_sec),
+                objective=str(args.objective),
+            )
+        except Exception as exc:
+            trial.set_user_attr("failure_reason", f"{type(exc).__name__}: {exc}")
+            raise
 
-    study.optimize(objective, n_trials=int(args.n_trials), gc_after_trial=True)
+    def export_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        del trial
+        export_study_artifacts(study, output_root=output_root, manifest=manifest)
+
+    timeout = (
+        None
+        if float(args.timeout_hours) <= 0
+        else float(args.timeout_hours) * 3600.0
+    )
+    study.optimize(
+        objective,
+        n_trials=int(args.n_trials),
+        timeout=timeout,
+        gc_after_trial=True,
+        callbacks=[export_callback],
+        catch=(RuntimeError, ValueError),
+    )
+    export_study_artifacts(study, output_root=output_root, manifest=manifest)
     best = study.best_trial
     print(f"best_trial={best.number} value={best.value:.6f}")
     print(f"best_params={best.params}")

@@ -8,7 +8,9 @@ import pytest
 import torch
 
 from hcc_sempath.training.train import (
+    _InMemoryExpertBatchLoader,
     _InterleavedBatchLoader,
+    _MaterializedExpertBank,
     _PackageShuffleBatchLoader,
 )
 
@@ -119,6 +121,90 @@ def test_expert_batches_are_interleaved_at_a_fixed_population_interval():
         ["p4"],
     ]
     assert len(loader) == 8
+
+
+def test_first_expert_batch_does_not_wait_for_population_decode():
+    class _SlowPopulationIterator:
+        def __init__(self) -> None:
+            self._done = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._done:
+                raise StopIteration
+            self._done = True
+            time.sleep(0.1)
+            return ["p0"]
+
+    class _SlowPopulation:
+        def __len__(self):
+            return 1
+
+        def __iter__(self):
+            return _SlowPopulationIterator()
+
+    iterator = iter(
+        _InterleavedBatchLoader(
+            _SlowPopulation(),
+            [["e0"]],
+            interval=1,
+        )
+    )
+    start = time.perf_counter()
+
+    assert next(iterator) == ["e0"]
+    assert time.perf_counter() - start < 0.05
+    assert next(iterator) == ["p0"]
+
+
+def test_materialized_expert_loader_reuses_complete_bank() -> None:
+    size = 4
+    zeros = torch.zeros((size, 2, 1, 1), dtype=torch.bool)
+    bank = _MaterializedExpertBank(
+        [
+            {
+                "tile_id": [f"tile-{index}" for index in range(size)],
+                "images": torch.arange(size).view(size, 1, 1, 1),
+                "images_uint8": False,
+                "teacher_features": {
+                    "teacher": torch.arange(size).view(size, 1).float()
+                },
+                "prototype_mask": torch.ones(size, dtype=torch.bool),
+                "prototype_level1": torch.arange(size),
+                "l2_point_centers": zeros.float(),
+                "l2_brush_bag_ids": zeros.long(),
+                "l2_area_positive": zeros,
+                "l2_explicit_negative": zeros,
+                "l2_implicit_negative": zeros,
+                "l2_spatial_supervised": torch.zeros(
+                    (size, 2),
+                    dtype=torch.bool,
+                ),
+            }
+        ]
+    )
+    loader = _InMemoryExpertBatchLoader(
+        bank,
+        indices=None,
+        batch_size=2,
+        seed=3,
+    )
+    first_cycle = [
+        tile_id
+        for batch in loader
+        for tile_id in batch["tile_id"]
+    ]
+    second_cycle = [
+        tile_id
+        for batch in loader
+        for tile_id in batch["tile_id"]
+    ]
+
+    assert sorted(first_cycle) == [f"tile-{index}" for index in range(size)]
+    assert sorted(second_cycle) == sorted(first_cycle)
+    assert first_cycle != second_cycle
 
 
 @pytest.mark.parametrize("num_workers", [1, 4, 8])

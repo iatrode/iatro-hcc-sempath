@@ -100,13 +100,15 @@ The student architecture and initialization remain fixed to pretrained
 DINOv2-S/14 at native 224-pixel input.
 All existing teacher feature caches remain usable. The four teachers shape the
 shared representation through feature and relation distillation. The stable
-L1 annotations define teacher-specific four-class prototypes and online
-student-space class centroids. Their responses provide both HCC semantic
+L1 annotations define teacher-specific four-class prototypes and periodically
+recomputed student-space class centroids. Every student refresh re-encodes the
+complete fixed 3,000-tile bank with the current encoder; a compute mini-batch
+is only a memory chunk and never defines the anchor pool. Their responses provide both HCC semantic
 supervision and per-tile PAMT-D teacher reliability, while direct L1
 cross-entropy anchors the human boundary.
 
 L2 follows the same small-to-large premise: sparse expert spatial constraints
-update local positive/negative component centroids and reshape the local
+define exact full-bank local positive/negative component centroids and reshape the local
 features and shared encoder while four-teacher distillation anchors `z_hcc`.
 Teacher-space component centroids participate only in per-tile reliability
 adjudication. Teacher features never generate L2 centres, brush masks, or
@@ -122,8 +124,10 @@ z = normalize(project(CLS))
 l1_logits[k] = cosine(z, centroid_l1[k]) / temperature
 ```
 
-Human L1 labels update the centroids and use cross entropy on the resulting
-response. Semantic distillation and PAMT-D use only the four primary teacher
+Human L1 labels define the complete centroid bank and use cross entropy on the
+resulting response. Centroids are no-gradient coordinates recomputed from the
+current student between optimizer steps; gradients from the response update
+`z_hcc`, not the centroid buffers. Semantic distillation and PAMT-D use only the four primary teacher
 prototypes; legacy L2 attributes in old prototype packages are ignored.
 
 ### Dense local branch
@@ -239,7 +243,7 @@ sparse positive or explicit-negative supervision mechanically.
 The explicit-negative and implicit-background mechanisms have intentionally
 different roles. Explicit negatives receive unit direct-loss weight and define
 the prototype boundary whenever available. Unmarked background receives a
-0.05 direct-loss weight; its pair-averaged EMA centroid is only the fallback
+0.05 direct-loss weight; its exact full-bank pair-averaged centroid is only the fallback
 contrastive coordinate when no explicit-negative centroid exists. The
 coefficient of a contrastive coordinate is not a label-confidence weight, so
 the 0.05 direct-loss weight must not be reapplied to centroid subtraction and
@@ -265,11 +269,15 @@ are diagnostics, not dynamic loss weights.
 The fixed L1/L2 expert-tile union is replayed at a configured interval among
 population batches. This keeps both dynamic prototype systems and direct
 human supervision active throughout training without changing the full-corpus
-four-teacher objective.
+four-teacher objective. The union is decoded once into a host-memory bank;
+replay and prototype refreshes use deterministic views of that same bank, so
+random package reads cannot stall the GPU between expert updates.
 
-Online student prototypes are updated only after the corresponding optimizer
-step. Thus a batch cannot first enter a centroid and then use that same
-centroid to supervise itself. Explicit-negative centroids define the local
+Student prototypes are refreshed periodically from their complete fixed banks
+using the current encoder state between optimizer steps. Replay mini-batches
+never perform EMA updates and never redefine the bank. Thus the semantic
+coordinate is independent of replay batch composition while still following
+the evolving student. Explicit-negative centroids define the local
 decision boundary when available; weak implicit-background centroids are used
 only as a fallback.
 
@@ -398,8 +406,10 @@ V2 contributes one HCC-specific representation with:
   dense-cell brush bags, positive-area loss, and capability-routed negatives.
 - `training/pamtd.py`: per-tile four-teacher adjudication and shared semantic
   response target.
-- `training/engine.py`: active objective and L2-supervised-step warm-up.
-- `training/train.py`: L1/L2 ingestion, fixed expert-tile replay, and frozen
+- `training/engine.py`: active objective, exact full-bank dynamic prototype
+  refresh, and L2-supervised-step warm-up.
+- `training/train.py`: L1/L2 ingestion, fixed expert-tile replay and anchor
+  loaders, and frozen
   optimizer/supervision contracts.
 - `training/spatial_validation.py`: independent completeness-aware calibration
   and aggregate spatial validation.

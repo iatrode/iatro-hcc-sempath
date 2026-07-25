@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -9,6 +10,8 @@ import torch
 from hcc_sempath.modeling.models import (
     HCCSemPathModel,
     SpatialMorphometryHead,
+    _depthwise_conv_as_shift_sum,
+    _pointwise_conv_as_linear,
     decode_spatial_morphometry,
     load_hcc_sempath_release,
     model_state_sha256,
@@ -18,6 +21,74 @@ from hcc_sempath.spatial_schema import DEFAULT_SPATIAL_COMPONENTS
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 from hcc_sempath.training.losses import multi_teacher_distillation_loss
 from hcc_sempath.training.engine import _objective_gradient_diagnostics
+
+
+def _replace_spatial_prototypes(
+    head: SpatialMorphometryHead,
+    features: torch.Tensor,
+    *,
+    point_centers: torch.Tensor,
+    brush_bag_ids: torch.Tensor,
+    area_positive: torch.Tensor,
+    explicit_negative: torch.Tensor,
+    implicit_negative: torch.Tensor,
+) -> None:
+    head.replace_prototypes(
+        head.prototype_observation_sums(
+            features,
+            point_centers=point_centers,
+            brush_bag_ids=brush_bag_ids,
+            area_positive=area_positive,
+            explicit_negative=explicit_negative,
+            implicit_negative=implicit_negative,
+        )
+    )
+
+
+@pytest.mark.parametrize("route", ["pointwise", "depthwise"])
+def test_spatial_convolution_routes_preserve_values_and_gradients(route: str) -> None:
+    torch.manual_seed(5)
+    features = torch.randn(2, 4, 9, 9, requires_grad=True)
+    if route == "pointwise":
+        reference_layer = torch.nn.Conv2d(4, 7, kernel_size=1)
+        routed = _pointwise_conv_as_linear
+    else:
+        reference_layer = torch.nn.Conv2d(
+            4,
+            4,
+            kernel_size=3,
+            padding=2,
+            dilation=2,
+            groups=4,
+        )
+        routed = _depthwise_conv_as_shift_sum
+    routed_layer = copy.deepcopy(reference_layer)
+    routed_features = features.detach().clone().requires_grad_(True)
+
+    reference = reference_layer(features)
+    actual = routed(routed_layer, routed_features)
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
+
+    reference.square().mean().backward()
+    actual.square().mean().backward()
+    torch.testing.assert_close(
+        routed_features.grad,
+        features.grad,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        routed_layer.weight.grad,
+        reference_layer.weight.grad,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        routed_layer.bias.grad,
+        reference_layer.bias.grad,
+        rtol=1e-5,
+        atol=1e-6,
+    )
 
 
 def test_hcc_sempath_model_returns_shared_embedding_and_teacher_outputs() -> None:
@@ -55,6 +126,28 @@ def test_spatial_model_exposes_instance_and_abundance_maps_without_changing_enco
     assert outputs["l1_logits"].shape == (2, 4)
     assert outputs["l2_instance_logits"].shape == (2, 3, 31, 31)
     assert outputs["l2_abundance_logits"].shape == (2, 3, 31, 31)
+
+
+def test_spatial_model_only_materializes_selected_supervised_rows() -> None:
+    model = HCCSemPathModel(
+        backbone_name="vit_tiny_patch16_224",
+        embedding_dim=11,
+        teacher_dims={"teacher": 5},
+        pretrained=False,
+        spatial_num_components=3,
+        spatial_dim=13,
+    ).eval()
+    images = torch.randn(3, 3, 224, 224)
+    with torch.no_grad():
+        outputs = model(
+            images,
+            spatial_sample_mask=torch.tensor([False, True, False]),
+        )
+
+    assert outputs["embedding"].shape == (3, 11)
+    assert outputs["teacher_outputs"]["teacher"].shape == (3, 5)
+    assert outputs["l2_instance_logits"].shape == (1, 3, 31, 31)
+    assert outputs["l2_abundance_logits"].shape == (1, 3, 31, 31)
 
 
 def test_spatial_head_warmup_detaches_backbone_but_trains_geometry_heads() -> None:
@@ -121,14 +214,14 @@ def test_spatial_gradient_diagnostic_uses_real_shared_backbone_tokens() -> None:
     point_centers[0, 0, grid[0] // 2, grid[1] // 2] = 1
     implicit_negative = torch.zeros((1, 2, *grid), dtype=torch.bool)
     implicit_negative[0, 0, 0, 0] = True
-    model.spatial_head.update_prototypes(
+    _replace_spatial_prototypes(
+        model.spatial_head,
         outputs["l2_spatial_features"],
         point_centers=point_centers,
         brush_bag_ids=torch.zeros((1, 2, *grid), dtype=torch.long),
         area_positive=torch.zeros((1, 2, *grid), dtype=torch.bool),
         explicit_negative=torch.zeros((1, 2, *grid), dtype=torch.bool),
         implicit_negative=implicit_negative,
-        momentum=0.9,
     )
     _, abundance_logits = model.spatial_head.prototype_logits(
         outputs["l2_spatial_features"]
@@ -158,14 +251,14 @@ def test_spatial_prototypes_separate_positive_and_negative_local_patterns() -> N
     )
     point = torch.tensor([[[[1.0, 0.0]]]])
     negative = torch.tensor([[[[False, True]]]])
-    head.update_prototypes(
+    _replace_spatial_prototypes(
+        head,
         features,
         point_centers=point,
         brush_bag_ids=torch.zeros((1, 1, 1, 2), dtype=torch.long),
         area_positive=torch.zeros((1, 1, 1, 2), dtype=torch.bool),
         explicit_negative=negative,
         implicit_negative=torch.zeros_like(negative),
-        momentum=0.9,
     )
 
     instance, measurement = head.prototype_logits(features)
@@ -180,9 +273,15 @@ def test_vectorized_spatial_centroids_match_pair_balanced_reference() -> None:
     mask = torch.rand(3, 5, 3, 3) > 0.65
     mask[:, 4] = False
 
-    actual, actual_counts = SpatialMorphometryHead._masked_pair_centroids(
-        features,
-        mask,
+    actual_sums, actual_counts = (
+        SpatialMorphometryHead._masked_pair_centroid_sums(
+            features,
+            mask,
+        )
+    )
+    actual = torch.nn.functional.normalize(
+        actual_sums / actual_counts.clamp_min(1).unsqueeze(-1),
+        dim=1,
     )
 
     normalized = torch.nn.functional.normalize(features.float(), dim=1)
@@ -207,47 +306,36 @@ def test_vectorized_spatial_centroids_match_pair_balanced_reference() -> None:
     torch.testing.assert_close(actual_counts, reference_counts)
 
 
-def test_vectorized_prototype_ema_matches_component_reference() -> None:
+def test_spatial_prototype_replacement_uses_exact_bank_statistics() -> None:
     torch.manual_seed(23)
-    destination = torch.nn.functional.normalize(
-        torch.randn(4, 6),
-        dim=1,
+    head = SpatialMorphometryHead(
+        student_dim=6,
+        component_count=4,
+        spatial_dim=6,
     )
-    destination_counts = torch.tensor([3.0, 0.0, 8.0, 2.0])
-    observations = torch.nn.functional.normalize(
-        torch.randn(4, 6),
-        dim=1,
-    )
-    observation_counts = torch.tensor([2.0, 4.0, 0.0, 1.0])
-    reference = destination.clone()
-    reference_counts = destination_counts.clone()
-    momentum = 0.85
-    for component_idx in range(4):
-        count = observation_counts[component_idx]
-        if count <= 0:
-            continue
-        candidate = observations[component_idx]
-        if reference_counts[component_idx] > 0:
-            candidate = (
-                momentum * reference[component_idx]
-                + (1.0 - momentum) * candidate
-            )
-        reference[component_idx] = torch.nn.functional.normalize(
-            candidate,
-            dim=0,
+    sums = torch.randn(4, 6)
+    counts = torch.tensor([2.0, 4.0, 0.0, 1.0])
+    observations = {
+        name: (sums.clone(), counts.clone())
+        for name in (
+            "instance",
+            "measurement",
+            "instance_negative",
+            "measurement_negative",
+            "instance_implicit_negative",
+            "measurement_implicit_negative",
         )
-        reference_counts[component_idx] += count
+    }
 
-    SpatialMorphometryHead._ema_update(
-        destination,
-        destination_counts,
-        observations,
-        observation_counts,
-        momentum,
+    head.replace_prototypes(observations)
+
+    expected = torch.nn.functional.normalize(
+        sums / counts.clamp_min(1).unsqueeze(-1),
+        dim=1,
     )
-
-    torch.testing.assert_close(destination, reference)
-    torch.testing.assert_close(destination_counts, reference_counts)
+    expected[2] = 0
+    torch.testing.assert_close(head.instance_prototypes, expected)
+    torch.testing.assert_close(head.instance_prototype_counts, counts)
 
 
 def test_structure_point_does_not_update_unknown_measurement_negative_prototype() -> None:
@@ -263,7 +351,8 @@ def test_structure_point_does_not_update_unknown_measurement_negative_prototype(
     implicit[0, 6] = True
     implicit[0, 6, 1:4, 1:4] = False
 
-    head.update_prototypes(
+    _replace_spatial_prototypes(
+        head,
         features,
         point_centers=point,
         brush_bag_ids=torch.zeros((1, 9, 5, 5), dtype=torch.long),

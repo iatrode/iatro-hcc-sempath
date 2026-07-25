@@ -64,7 +64,6 @@ loss:
   prototype_consensus_weight: 0.4
   prototype_label_weight: 0.4
   prototype_student_weight: 0.2
-  prototype_momentum: 0.9
   zhcc_response_weight: 0.15
   zhcc_response_start_step: 2000
   zhcc_response_ramp_steps: 1000
@@ -85,6 +84,9 @@ loss:
 
 train:
   batch_size: 512
+  compile: true
+  fused_optimizer: true
+  fused_image_prepare: true
   epochs: 100
   lr: 0.0001
   scheduler: cosine
@@ -100,6 +102,11 @@ train:
   progress: tqdm
   tensorboard: true
   tensorboard_batch_interval: 20
+  # Re-encode the complete fixed expert banks in the evolving student.
+  # Batch sizes are compute chunks only; every refresh uses every bank tile.
+  dynamic_prototype_refresh_steps: 500
+  dynamic_prototype_batch_size: 512
+  dynamic_spatial_prototype_refresh_steps: 500
   # Spatial selection is frozen after training on an independent validation
   # asset; teacher-alignment plateaus must not terminate spatial learning.
   early_stop_teacher_alignment: false

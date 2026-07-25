@@ -1,10 +1,11 @@
 inherits: tenth_duration_full_population.yaml
 
-# A5: A0 with prototypes frozen after the 200-step bootstrap interval.
+# A5: A0 with student anchors computed once before optimization and then fixed.
 # All other settings, including prototype_filter_weight=0.5, inherit from A0.
 
 runtime:
   output_dir: outputs/experiments/ablation/a5_static_prototypes
 
-loss:
-  prototype_update_until_step: 200
+train:
+  dynamic_prototype_refresh_steps: 0
+  dynamic_spatial_prototype_refresh_steps: 0

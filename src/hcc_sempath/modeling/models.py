@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
+from safetensors.torch import load_file as load_safetensors_file
 from timm.models.vision_transformer import checkpoint_filter_fn
 
 from hcc_sempath.spatial_schema import (
@@ -31,16 +32,43 @@ STUDENT_IMAGE_SIZE = 224
 STUDENT_PATCH_SIZE = 14
 SPATIAL_OUTPUT_STRIDE = 7
 SPATIAL_PATCH_PADDING = 4
-STUDENT_PRETRAINED_PATH = (
-    Path(__file__).resolve().parents[3] / "artifacts" / "pretrained" / "dinov2_vits14_pretrain.pth"
+STUDENT_PRETRAINED_DIR = Path(__file__).resolve().parents[3] / "artifacts" / "pretrained"
+STUDENT_PRETRAINED_ARTIFACTS = (
+    (
+        STUDENT_PRETRAINED_DIR / "dinov2_vits14_pretrain.safetensors",
+        "04d27f3400d059fc0cfd7d17dd1909a75bf3ea8fb3eeb48b97cb99e57ee20081",
+    ),
+    (
+        STUDENT_PRETRAINED_DIR / "dinov2_vits14_pretrain.pth",
+        "b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9",
+    ),
 )
-STUDENT_PRETRAINED_SHA256 = "b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9"
+
+
+def _resolve_fixed_student_pretraining(
+    artifacts: Sequence[tuple[Path, str]] = STUDENT_PRETRAINED_ARTIFACTS,
+) -> tuple[Path, str]:
+    for path, digest in artifacts:
+        if path.is_file():
+            return path, digest
+    return artifacts[0]
+
+
+STUDENT_PRETRAINED_PATH, STUDENT_PRETRAINED_SHA256 = _resolve_fixed_student_pretraining()
+
+
+def _read_fixed_student_pretraining(path: Path) -> dict[str, torch.Tensor]:
+    if path.suffix == ".safetensors":
+        return load_safetensors_file(str(path), device="cpu")
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    return state.get("model", state)
 
 
 def _load_fixed_student_pretraining(backbone: nn.Module) -> None:
     if not STUDENT_PRETRAINED_PATH.is_file():
+        expected = ", ".join(str(path) for path, _ in STUDENT_PRETRAINED_ARTIFACTS)
         raise FileNotFoundError(
-            f"fixed DINOv2-S/14 pretrained weight is missing: {STUDENT_PRETRAINED_PATH}"
+            f"fixed DINOv2-S/14 pretrained weight is missing; expected one of: {expected}"
         )
     with STUDENT_PRETRAINED_PATH.open("rb") as handle:
         digest = hashlib.file_digest(handle, "sha256").hexdigest()
@@ -49,8 +77,7 @@ def _load_fixed_student_pretraining(backbone: nn.Module) -> None:
             "fixed DINOv2-S/14 pretrained weight checksum mismatch: "
             f"expected={STUDENT_PRETRAINED_SHA256} got={digest} path={STUDENT_PRETRAINED_PATH}"
         )
-    state = torch.load(STUDENT_PRETRAINED_PATH, map_location="cpu", weights_only=True)
-    state = state.get("model", state)
+    state = _read_fixed_student_pretraining(STUDENT_PRETRAINED_PATH)
     state = checkpoint_filter_fn(state, backbone)
     backbone.load_state_dict(state, strict=True)
 
@@ -151,6 +178,68 @@ class TeacherProjectionHead(nn.Module):
         return self.net(embedding)
 
 
+def _pointwise_conv_as_linear(
+    convolution: nn.Conv2d,
+    features: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate a 1x1 convolution as one GEMM without changing its state."""
+
+    if convolution.kernel_size != (1, 1) or convolution.groups != 1:
+        raise ValueError("pointwise linear route requires an ungrouped 1x1 convolution")
+    channels_last = features.permute(0, 2, 3, 1)
+    projected = F.linear(
+        channels_last,
+        convolution.weight[:, :, 0, 0],
+        convolution.bias,
+    )
+    return projected.permute(0, 3, 1, 2)
+
+
+def _depthwise_conv_as_shift_sum(
+    convolution: nn.Conv2d,
+    features: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate the fixed 3x3 depthwise kernel without fragmented cuDNN calls."""
+
+    if (
+        convolution.kernel_size != (3, 3)
+        or convolution.groups != features.shape[1]
+        or convolution.in_channels != convolution.out_channels
+    ):
+        raise ValueError("shift-sum route requires a channel-preserving 3x3 depthwise convolution")
+    dilation_h, dilation_w = convolution.dilation
+    padding_h, padding_w = convolution.padding
+    if (padding_h, padding_w) != (dilation_h, dilation_w):
+        raise ValueError("shift-sum route expects same-size dilated padding")
+    padded = F.pad(
+        features,
+        (padding_w, padding_w, padding_h, padding_h),
+    )
+    height, width = features.shape[-2:]
+    weight = convolution.weight[:, 0]
+    result = None
+    for kernel_row in range(3):
+        row_start = kernel_row * dilation_h
+        for kernel_col in range(3):
+            col_start = kernel_col * dilation_w
+            shifted = padded[
+                :,
+                :,
+                row_start : row_start + height,
+                col_start : col_start + width,
+            ]
+            term = shifted * weight[
+                :,
+                kernel_row,
+                kernel_col,
+            ].view(1, -1, 1, 1)
+            result = term if result is None else result + term
+    assert result is not None
+    if convolution.bias is not None:
+        result = result + convolution.bias.view(1, -1, 1, 1)
+    return result
+
+
 class SpatialContextBlock(nn.Module):
     """Residual multi-cell context at the dense L2 output grid."""
 
@@ -174,8 +263,14 @@ class SpatialContextBlock(nn.Module):
         residual = features
         features = self.norm(features)
         features = F.gelu(features)
-        features = self.depthwise(features)
-        features = self.pointwise(features)
+        features = _depthwise_conv_as_shift_sum(
+            self.depthwise,
+            features,
+        )
+        features = _pointwise_conv_as_linear(
+            self.pointwise,
+            features,
+        )
         return residual + features
 
 
@@ -317,14 +412,16 @@ class SpatialMorphometryHead(nn.Module):
         )
 
     @staticmethod
-    def _masked_pair_centroids(
+    def _masked_pair_centroid_sums(
         features: torch.Tensor,
         mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Average one observation per supervised tile/component pair.
+        """Return additive sufficient statistics for exact bank centroids.
 
-        Pair-level averaging prevents a large brush from dominating the
-        prototype merely because it covers more grid cells.
+        Every supervised tile/component pair contributes one local observation
+        irrespective of marked area. Keeping the unnormalised sum makes the
+        result invariant to how the fixed expert bank is split into compute
+        batches.
         """
 
         normalized = F.normalize(features.detach().float(), dim=1)
@@ -338,41 +435,14 @@ class SpatialMorphometryHead(nn.Module):
             selected_float,
         )
         pair_centroids = pair_sums / cell_counts.clamp_min(1).unsqueeze(-1)
-        counts = pair_valid.sum(dim=0).to(dtype=torch.float32)
-        centroids = (
+        sums = (
             pair_centroids
             * pair_valid.to(dtype=pair_centroids.dtype).unsqueeze(-1)
-        ).sum(dim=0) / counts.clamp_min(1).unsqueeze(-1)
-        return F.normalize(centroids, dim=1), counts
+        ).sum(dim=0)
+        counts = pair_valid.sum(dim=0).to(dtype=torch.float32)
+        return sums, counts
 
-    @staticmethod
-    def _ema_update(
-        destination: torch.Tensor,
-        destination_counts: torch.Tensor,
-        observations: torch.Tensor,
-        observation_counts: torch.Tensor,
-        momentum: float,
-    ) -> None:
-        if not 0.0 <= float(momentum) < 1.0:
-            raise ValueError(
-                f"prototype momentum must be in [0, 1), got {momentum}"
-            )
-        active = observation_counts > 0
-        initialized = destination_counts > 0
-        blended = torch.where(
-            initialized.unsqueeze(1),
-            float(momentum) * destination
-            + (1.0 - float(momentum)) * observations,
-            observations,
-        )
-        updated = F.normalize(blended, dim=1)
-        destination.copy_(
-            torch.where(active.unsqueeze(1), updated, destination)
-        )
-        destination_counts.add_(observation_counts)
-
-    @torch.no_grad()
-    def update_prototypes(
+    def prototype_observation_sums(
         self,
         features: torch.Tensor,
         *,
@@ -381,8 +451,9 @@ class SpatialMorphometryHead(nn.Module):
         area_positive: torch.Tensor,
         explicit_negative: torch.Tensor,
         implicit_negative: torch.Tensor,
-        momentum: float = 0.9,
-    ) -> None:
+    ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Collect exact local-anchor sufficient statistics for one chunk."""
+
         countable = self.instance_valid.view(1, -1, 1, 1)
         density = self.density_valid.view(1, -1, 1, 1)
         instance_positive = (point_centers > 0) & countable
@@ -407,78 +478,88 @@ class SpatialMorphometryHead(nn.Module):
             measurement_positive.flatten(2).any(dim=2)
             | full_implicit
         ).view(*full_implicit.shape, 1, 1)
+        return {
+            "instance": self._masked_pair_centroid_sums(
+                features,
+                instance_positive,
+            ),
+            "measurement": self._masked_pair_centroid_sums(
+                features,
+                measurement_positive,
+            ),
+            "instance_negative": self._masked_pair_centroid_sums(
+                features,
+                explicit & countable,
+            ),
+            "measurement_negative": self._masked_pair_centroid_sums(
+                features,
+                explicit,
+            ),
+            "instance_implicit_negative": (
+                self._masked_pair_centroid_sums(
+                    features,
+                    implicit & countable & instance_pair_valid,
+                )
+            ),
+            "measurement_implicit_negative": (
+                self._masked_pair_centroid_sums(
+                    features,
+                    implicit & measurement_pair_valid,
+                )
+            ),
+        }
 
-        instance, instance_counts = self._masked_pair_centroids(
-            features,
-            instance_positive,
-        )
-        measurement, measurement_counts = self._masked_pair_centroids(
-            features,
-            measurement_positive,
-        )
-        instance_negative, instance_negative_counts = (
-            self._masked_pair_centroids(features, explicit & countable)
-        )
-        measurement_negative, measurement_negative_counts = (
-            self._masked_pair_centroids(features, explicit)
-        )
-        instance_implicit_negative, instance_implicit_negative_counts = (
-            self._masked_pair_centroids(
-                features,
-                implicit & countable & instance_pair_valid,
+    @torch.no_grad()
+    def replace_prototypes(
+        self,
+        observations: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Replace local anchors with exact current-bank centroids."""
+
+        expected = {
+            "instance",
+            "measurement",
+            "instance_negative",
+            "measurement_negative",
+            "instance_implicit_negative",
+            "measurement_implicit_negative",
+        }
+        if set(observations) != expected:
+            raise ValueError(
+                "spatial prototype observations differ from the fixed "
+                f"contract: got={sorted(observations)}"
             )
-        )
-        (
-            measurement_implicit_negative,
-            measurement_implicit_negative_counts,
-        ) = (
-            self._masked_pair_centroids(
-                features,
-                implicit & measurement_pair_valid,
+        for name, (sums, counts) in observations.items():
+            destination = getattr(self, f"{name}_prototypes")
+            destination_counts = getattr(self, f"{name}_prototype_counts")
+            sums = sums.to(device=destination.device, dtype=torch.float32)
+            counts = counts.to(
+                device=destination_counts.device,
+                dtype=torch.float32,
             )
-        )
-        self._ema_update(
-            self.instance_prototypes,
-            self.instance_prototype_counts,
-            instance,
-            instance_counts,
-            momentum,
-        )
-        self._ema_update(
-            self.measurement_prototypes,
-            self.measurement_prototype_counts,
-            measurement,
-            measurement_counts,
-            momentum,
-        )
-        self._ema_update(
-            self.instance_negative_prototypes,
-            self.instance_negative_prototype_counts,
-            instance_negative,
-            instance_negative_counts,
-            momentum,
-        )
-        self._ema_update(
-            self.measurement_negative_prototypes,
-            self.measurement_negative_prototype_counts,
-            measurement_negative,
-            measurement_negative_counts,
-            momentum,
-        )
-        self._ema_update(
-            self.instance_implicit_negative_prototypes,
-            self.instance_implicit_negative_prototype_counts,
-            instance_implicit_negative,
-            instance_implicit_negative_counts,
-            momentum,
-        )
-        self._ema_update(
-            self.measurement_implicit_negative_prototypes,
-            self.measurement_implicit_negative_prototype_counts,
-            measurement_implicit_negative,
-            measurement_implicit_negative_counts,
-            momentum,
-        )
+            if sums.shape != destination.shape:
+                raise ValueError(
+                    f"{name} prototype shape mismatch: "
+                    f"got={tuple(sums.shape)} expected={tuple(destination.shape)}"
+                )
+            if counts.shape != destination_counts.shape:
+                raise ValueError(
+                    f"{name} prototype-count shape mismatch: "
+                    f"got={tuple(counts.shape)} "
+                    f"expected={tuple(destination_counts.shape)}"
+                )
+            normalized = F.normalize(
+                sums / counts.clamp_min(1).unsqueeze(-1),
+                dim=1,
+            )
+            destination.copy_(
+                torch.where(
+                    (counts > 0).unsqueeze(1),
+                    normalized,
+                    torch.zeros_like(normalized),
+                )
+            )
+            destination_counts.copy_(counts)
 
     @staticmethod
     def _prototype_response(
@@ -516,7 +597,7 @@ class SpatialMorphometryHead(nn.Module):
         # Explicit expert negatives define the decision boundary whenever they
         # exist. Weak implicit background is a fallback, not a centroid pool
         # that may dilute the explicit evidence. "Weak" refers to its direct
-        # per-cell loss weight. This pair-averaged EMA is a contrastive
+        # per-cell loss weight. This full-bank pair-averaged anchor is a contrastive
         # coordinate, not another set of strong negative labels, so its
         # similarity must not be scaled by the direct-loss coefficient.
         negative_response = torch.where(
@@ -612,12 +693,27 @@ class SpatialMorphometryHead(nn.Module):
         )
         features = torch.cat(
             [
-                self.local_projection(local_tokens),
-                self.semantic_projection(semantic_map),
+                _pointwise_conv_as_linear(
+                    self.local_projection,
+                    local_tokens,
+                ),
+                _pointwise_conv_as_linear(
+                    self.semantic_projection,
+                    semantic_map,
+                ),
             ],
             dim=1,
         )
-        features = self.context(self.fusion(features))
+        features = self.context(
+            F.gelu(
+                self.fusion[1](
+                    _pointwise_conv_as_linear(
+                        self.fusion[0],
+                        features,
+                    )
+                )
+            )
+        )
         instance_logits, abundance_logits = self.prototype_logits(features)
         outputs = {
             "l2_instance_logits": instance_logits,
@@ -648,31 +744,38 @@ class TeacherL2PrototypeState(nn.Module):
         )
 
     @torch.no_grad()
-    def update(
+    def replace(
         self,
-        features: torch.Tensor,
-        positive: torch.Tensor,
-        *,
-        momentum: float,
+        sums: torch.Tensor,
+        counts: torch.Tensor,
     ) -> None:
-        normalized = F.normalize(features.detach().float(), dim=-1)
-        selected = positive.to(
-            device=normalized.device,
-            dtype=normalized.dtype,
-        )
-        counts = selected.sum(dim=0)
-        candidates = F.normalize(
-            selected.transpose(0, 1) @ normalized
-            / counts.clamp_min(1).unsqueeze(1),
+        """Install exact frozen-teacher centroids from the complete L2 bank."""
+
+        sums = sums.to(device=self.prototypes.device, dtype=torch.float32)
+        counts = counts.to(device=self.counts.device, dtype=torch.float32)
+        if sums.shape != self.prototypes.shape:
+            raise ValueError(
+                "teacher L2 prototype shape mismatch: "
+                f"got={tuple(sums.shape)} "
+                f"expected={tuple(self.prototypes.shape)}"
+            )
+        if counts.shape != self.counts.shape:
+            raise ValueError(
+                "teacher L2 prototype-count shape mismatch: "
+                f"got={tuple(counts.shape)} expected={tuple(self.counts.shape)}"
+            )
+        normalized = F.normalize(
+            sums / counts.clamp_min(1).unsqueeze(-1),
             dim=1,
         )
-        SpatialMorphometryHead._ema_update(
-            self.prototypes,
-            self.counts,
-            candidates,
-            counts,
-            momentum,
+        self.prototypes.copy_(
+            torch.where(
+                (counts > 0).unsqueeze(1),
+                normalized,
+                torch.zeros_like(normalized),
+            )
         )
+        self.counts.copy_(counts)
 
 
 class HCCSemPathModel(nn.Module):
@@ -791,37 +894,42 @@ class HCCSemPathModel(nn.Module):
         return {name: head(embedding) for name, head in self.teacher_heads.items()}
 
     @torch.no_grad()
-    def update_l1_prototypes(
+    def replace_l1_prototypes(
         self,
-        embedding_norm: torch.Tensor,
-        mask: torch.Tensor,
-        targets: torch.Tensor,
-        *,
-        momentum: float = 0.9,
+        sums: torch.Tensor,
+        counts: torch.Tensor,
     ) -> None:
+        """Install exact current-student L1 centroids from the full bank."""
+
         if self.l1_prototypes is None or self.l1_prototype_counts is None:
             return
-        normalized = F.normalize(embedding_norm.detach().float(), dim=-1)
-        mask = mask.to(device=normalized.device, dtype=torch.bool)
-        targets = targets.to(device=normalized.device, dtype=torch.long)
-        selected = F.one_hot(
-            targets.clamp(0, self.l1_num_classes - 1),
-            num_classes=self.l1_num_classes,
-        ).to(dtype=normalized.dtype)
-        selected = selected * mask.to(dtype=normalized.dtype).unsqueeze(1)
-        counts = selected.sum(dim=0)
-        candidates = F.normalize(
-            selected.transpose(0, 1) @ normalized
-            / counts.clamp_min(1).unsqueeze(1),
-            dim=1,
+        sums = sums.to(device=self.l1_prototypes.device, dtype=torch.float32)
+        counts = counts.to(
+            device=self.l1_prototype_counts.device,
+            dtype=torch.float32,
         )
-        SpatialMorphometryHead._ema_update(
-            self.l1_prototypes,
-            self.l1_prototype_counts,
-            candidates,
-            counts,
-            momentum,
+        if sums.shape != self.l1_prototypes.shape:
+            raise ValueError(
+                f"L1 prototype shape mismatch: got={tuple(sums.shape)} "
+                f"expected={tuple(self.l1_prototypes.shape)}"
+            )
+        if counts.shape != self.l1_prototype_counts.shape:
+            raise ValueError(
+                "L1 prototype-count shape mismatch: "
+                f"got={tuple(counts.shape)} "
+                f"expected={tuple(self.l1_prototype_counts.shape)}"
+            )
+        if bool((counts <= 0).any()):
+            raise ValueError(
+                "the complete expert bank must contain every L1 class"
+            )
+        self.l1_prototypes.copy_(
+            F.normalize(
+                sums / counts.unsqueeze(-1),
+                dim=1,
+            )
         )
+        self.l1_prototype_counts.copy_(counts)
 
     def l1_prototype_logits(
         self,
@@ -859,44 +967,59 @@ class HCCSemPathModel(nn.Module):
         return similarity
 
     @torch.no_grad()
-    def update_global_l2_prototypes(
+    def replace_global_l2_prototypes(
         self,
-        embedding_norm: torch.Tensor,
-        teacher_features: dict[str, torch.Tensor],
-        positive: torch.Tensor,
-        *,
-        momentum: float = 0.9,
+        student_sums: torch.Tensor,
+        counts: torch.Tensor,
+        teacher_sums: dict[str, torch.Tensor],
     ) -> None:
+        """Install exact global L2 reliability anchors from the full bank."""
+
         if (
             self.global_l2_prototypes is None
             or self.global_l2_prototype_counts is None
         ):
             return
-        normalized = F.normalize(embedding_norm.detach().float(), dim=-1)
-        selected = positive.to(
-            device=normalized.device,
-            dtype=normalized.dtype,
+        if set(teacher_sums) != set(self.teacher_l2_prototypes):
+            raise ValueError(
+                "teacher L2 anchor names differ from model teachers: "
+                f"got={sorted(teacher_sums)} "
+                f"expected={sorted(self.teacher_l2_prototypes)}"
+            )
+        student_sums = student_sums.to(
+            device=self.global_l2_prototypes.device,
+            dtype=torch.float32,
         )
-        counts = selected.sum(dim=0)
-        candidates = F.normalize(
-            selected.transpose(0, 1) @ normalized
-            / counts.clamp_min(1).unsqueeze(1),
-            dim=1,
+        counts = counts.to(
+            device=self.global_l2_prototype_counts.device,
+            dtype=torch.float32,
         )
-        SpatialMorphometryHead._ema_update(
-            self.global_l2_prototypes,
-            self.global_l2_prototype_counts,
-            candidates,
-            counts,
-            momentum,
+        if student_sums.shape != self.global_l2_prototypes.shape:
+            raise ValueError(
+                "global L2 prototype shape mismatch: "
+                f"got={tuple(student_sums.shape)} "
+                f"expected={tuple(self.global_l2_prototypes.shape)}"
+            )
+        if counts.shape != self.global_l2_prototype_counts.shape:
+            raise ValueError(
+                "global L2 prototype-count shape mismatch: "
+                f"got={tuple(counts.shape)} "
+                f"expected={tuple(self.global_l2_prototype_counts.shape)}"
+            )
+        if bool((counts <= 0).any()):
+            raise ValueError(
+                "the complete spatial expert bank must contain every L2 "
+                "component"
+            )
+        self.global_l2_prototypes.copy_(
+            F.normalize(
+                student_sums / counts.unsqueeze(-1),
+                dim=1,
+            )
         )
-        for name, features in teacher_features.items():
-            if name in self.teacher_l2_prototypes:
-                self.teacher_l2_prototypes[name].update(
-                    features,
-                    positive,
-                    momentum=momentum,
-                )
+        self.global_l2_prototype_counts.copy_(counts)
+        for name, state in self.teacher_l2_prototypes.items():
+            state.replace(teacher_sums[name], counts)
 
     def global_l2_response(
         self,
@@ -930,6 +1053,7 @@ class HCCSemPathModel(nn.Module):
         spatial_detach_backbone: bool = False,
         return_spatial_features: bool = False,
         run_spatial: bool = True,
+        spatial_sample_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
         if self.spatial_head is None or not run_spatial:
             embedding = self.encode(images)
@@ -944,10 +1068,36 @@ class HCCSemPathModel(nn.Module):
             "teacher_outputs": self.project_teachers(embedding),
         }
         if patch_tokens is not None and patch_grid is not None and self.spatial_head is not None:
+            spatial_images = images
+            spatial_patch_tokens = patch_tokens
+            if spatial_sample_mask is not None:
+                spatial_sample_mask = spatial_sample_mask.to(
+                    device=images.device,
+                    dtype=torch.bool,
+                )
+                if spatial_sample_mask.shape != (images.shape[0],):
+                    raise ValueError(
+                        "spatial_sample_mask must have shape "
+                        f"({images.shape[0]},), got "
+                        f"{tuple(spatial_sample_mask.shape)}"
+                    )
+                if not torch.compiler.is_compiling():
+                    has_spatial_sample = spatial_sample_mask.any()
+                    if spatial_sample_mask.device.type == "cuda":
+                        torch._assert_async(
+                            has_spatial_sample,
+                            "spatial_sample_mask must select at least one sample",
+                        )
+                    elif not bool(has_spatial_sample):
+                        raise ValueError(
+                            "spatial_sample_mask must select at least one sample"
+                        )
+                spatial_images = images[spatial_sample_mask]
+                spatial_patch_tokens = patch_tokens[spatial_sample_mask]
             outputs.update(
                 self.spatial_head(
-                    images,
-                    patch_tokens,
+                    spatial_images,
+                    spatial_patch_tokens,
                     patch_grid,
                     self.encoder.backbone.patch_embed.proj,
                     detach_backbone=spatial_detach_backbone,

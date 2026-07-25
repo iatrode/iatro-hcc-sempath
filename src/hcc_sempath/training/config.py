@@ -355,6 +355,20 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
             "legacy tile-level L2/ROI loss route was removed; replace these keys "
             f"with spatial_* objectives: {obsolete_loss_keys}"
         )
+    obsolete_online_prototype_keys = sorted(
+        key
+        for key in (
+            "prototype_momentum",
+            "prototype_update_until_step",
+        )
+        if key in loss_cfg
+    )
+    if obsolete_online_prototype_keys:
+        raise ValueError(
+            "mini-batch EMA prototypes were replaced by exact full-bank "
+            "dynamic refresh; remove loss keys: "
+            f"{obsolete_online_prototype_keys}"
+        )
     obsolete_data_keys = sorted(
         key
         for key in (
@@ -452,16 +466,6 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
             "PAMT-D population tiles can have zero reliability mass when "
             "alpha_min, consensus, and student-agreement coefficients are all zero"
         )
-    prototype_momentum = float(loss_cfg.get("prototype_momentum", 0.9))
-    if not math.isfinite(prototype_momentum) or not (
-        0.0 <= prototype_momentum < 1.0
-    ):
-        raise ValueError("loss.prototype_momentum must be in [0, 1)")
-    if int(loss_cfg.get("prototype_update_until_step", -1)) < -1:
-        raise ValueError(
-            "loss.prototype_update_until_step must be -1 (dynamic) or "
-            "a non-negative optimizer step"
-        )
     point_tolerance = int(loss_cfg.get("spatial_point_tolerance_cells", 1))
     if point_tolerance < 0:
         raise ValueError("loss.spatial_point_tolerance_cells must be non-negative")
@@ -482,6 +486,19 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
         and int(cfg["data"]["expert_batch_size"]) <= 0
     ):
         raise ValueError("data.expert_batch_size must be positive")
+    for key in (
+        "dynamic_prototype_refresh_steps",
+        "dynamic_spatial_prototype_refresh_steps",
+    ):
+        if key in cfg.get("train", {}) and int(cfg["train"][key]) < 0:
+            raise ValueError(f"train.{key} must be non-negative")
+    if (
+        "dynamic_prototype_batch_size" in cfg.get("train", {})
+        and int(cfg["train"]["dynamic_prototype_batch_size"]) <= 0
+    ):
+        raise ValueError(
+            "train.dynamic_prototype_batch_size must be positive"
+        )
     if (
         cfg.get("data", {}).get("spatial_manifest_path")
         and bool(cfg.get("train", {}).get("early_stop_teacher_alignment", False))

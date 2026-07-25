@@ -6,6 +6,7 @@ import pytest
 
 from hcc_sempath.training.config import teacher_dims, teacher_names, validate_training_config
 from hcc_sempath.training.engine import (
+    _normalize_uint8_images_fp16,
     _objective_gradient_diagnostics,
     _optimizer_step,
     _should_stop_for_alignment,
@@ -16,10 +17,48 @@ from hcc_sempath.training.engine import (
 )
 from hcc_sempath.training.losses import feature_distillation_loss_per_sample
 from hcc_sempath.training.prototype_labels import DEFAULT_L1_CLASSES
-from hcc_sempath.training.train import _resume_contract
+from hcc_sempath.training.train import _build_optimizer, _resume_contract
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 import torch
+
+
+def test_fused_image_normalization_matches_existing_amp_input() -> None:
+    images = torch.arange(2 * 3 * 5 * 7, dtype=torch.uint8).reshape(2, 3, 5, 7)
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    expected = (
+        images.to(torch.float32).div_(255.0).sub_(mean).div_(std)
+    ).to(torch.float16)
+
+    actual = _normalize_uint8_images_fp16(images, mean, std)
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+def test_fused_optimizer_is_cuda_only(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_adamw(parameters, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(torch.optim, "AdamW", fake_adamw)
+    model = torch.nn.Linear(2, 2)
+    cfg = {
+        "train": {
+            "lr": 1e-4,
+            "weight_decay": 1e-2,
+            "fused_optimizer": True,
+        }
+    }
+
+    _build_optimizer(model, cfg, torch.device("cuda"))
+    assert captured["fused"] is True
+
+    captured.clear()
+    _build_optimizer(model, cfg, torch.device("cpu"))
+    assert "fused" not in captured
 
 
 class _CountingScaler:
@@ -184,7 +223,7 @@ def test_optimizer_helper_rejects_nonfinite_loss_without_step(
     assert parameter.grad is None
 
 
-def test_run_epoch_joint_l1_l2_route_updates_after_optimizer() -> None:
+def test_run_epoch_joint_l1_l2_route_keeps_full_bank_anchors_fixed() -> None:
     model = HCCSemPathModel(
         backbone_name="vit_tiny_patch16_224",
         embedding_dim=8,
@@ -231,6 +270,29 @@ def test_run_epoch_joint_l1_l2_route_updates_after_optimizer() -> None:
             [[True] + [False] * 8]
         ),
     }
+    model.replace_l1_prototypes(
+        torch.randn(4, 8),
+        torch.ones(4),
+    )
+    model.replace_global_l2_prototypes(
+        torch.randn(9, 8),
+        torch.ones(9),
+        {"teacher": torch.randn(9, 4)},
+    )
+    spatial_observations = {
+        name: (torch.randn(9, 12), torch.ones(9))
+        for name in (
+            "instance",
+            "measurement",
+            "instance_negative",
+            "measurement_negative",
+            "instance_implicit_negative",
+            "measurement_implicit_negative",
+        )
+    }
+    model.spatial_head.replace_prototypes(spatial_observations)
+    l1_before = model.l1_prototypes.clone()
+    spatial_before = model.spatial_head.instance_prototypes.clone()
     cfg = {
         "runtime": {"device": "cpu", "seed": 13},
         "data": {
@@ -271,17 +333,10 @@ def test_run_epoch_joint_l1_l2_route_updates_after_optimizer() -> None:
 
     assert result["global_step_end"] == 1
     assert result["l2_supervised_step_end"] == 1
-    assert model.l1_prototype_counts[0].item() == 1
-    assert model.global_l2_prototype_counts[0].item() == 1
-    assert (
-        model.spatial_head.instance_prototype_counts[0].item()
-        == 1
-    )
-    assert (
-        model.spatial_head.instance_implicit_negative_prototype_counts[
-            0
-        ].item()
-        == 1
+    torch.testing.assert_close(model.l1_prototypes, l1_before)
+    torch.testing.assert_close(
+        model.spatial_head.instance_prototypes,
+        spatial_before,
     )
 
 
@@ -425,10 +480,14 @@ def test_training_config_accepts_active_pamtd_controls() -> None:
             "prototype_consensus_weight": 0.4,
             "prototype_label_weight": 0.4,
             "prototype_student_weight": 0.2,
-            "prototype_momentum": 0.9,
             "zhcc_response_weight": 0.15,
             "pamtd_primary_temperature": 0.1,
             "l2_global_temperature": 0.1,
+        },
+        "train": {
+            "dynamic_prototype_refresh_steps": 500,
+            "dynamic_prototype_batch_size": 512,
+            "dynamic_spatial_prototype_refresh_steps": 500,
         },
     }
 
