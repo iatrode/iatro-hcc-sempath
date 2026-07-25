@@ -125,7 +125,18 @@ def _optimizer_step(
 ) -> bool:
     """Backpropagate once and report whether the optimizer actually stepped."""
 
-    if loss.numel() != 1 or not bool(torch.isfinite(loss.detach())):
+    if loss.numel() != 1:
+        raise FloatingPointError(
+            "training loss must be one finite scalar before backward"
+        )
+    finite = torch.isfinite(loss.detach())
+    assert_async = getattr(torch, "_assert_async", None)
+    if finite.device.type == "cuda" and assert_async is not None:
+        assert_async(
+            finite,
+            "training loss must be one finite scalar before backward",
+        )
+    elif not bool(finite):
         raise FloatingPointError(
             "training loss must be one finite scalar before backward"
         )
@@ -156,25 +167,29 @@ def _optimizer_step(
 def _move_teachers(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
     result: dict[str, torch.Tensor] = {}
     for name, value in batch["teacher_features"].items():
+        finite = torch.isfinite(value).all()
+        assert_async = getattr(torch, "_assert_async", None)
+        if finite.device.type == "cuda" and assert_async is not None:
+            assert_async(
+                finite,
+                f"teacher cache contains non-finite values: teacher={name}",
+            )
+        elif not bool(finite):
+            raise FloatingPointError(
+                f"teacher cache contains non-finite values: teacher={name}"
+            )
         feature = value.to(
             device,
             non_blocking=device.type == "cuda",
         )
-        if not bool(torch.isfinite(feature).all()):
-            raise FloatingPointError(
-                f"teacher cache contains non-finite values: teacher={name}"
-            )
         result[name] = feature
     return result
 
 
-def _prepare_images(batch: dict, cfg: dict, device: torch.device) -> torch.Tensor:
-    images = batch["images"].to(device, non_blocking=device.type == "cuda")
-    if not bool(batch.get("images_uint8", False)):
-        return images
-    if bool(batch.get("images_hwc", False)):
-        images = images.permute(0, 3, 1, 2)
-    images = images.to(torch.float32).div_(255.0)
+def _image_normalization(
+    cfg: dict,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
     mean = torch.tensor(
         cfg["data"].get("mean", [0.0, 0.0, 0.0]),
         dtype=torch.float32,
@@ -185,17 +200,53 @@ def _prepare_images(batch: dict, cfg: dict, device: torch.device) -> torch.Tenso
         dtype=torch.float32,
         device=device,
     ).view(1, 3, 1, 1)
+    return mean, std
+
+
+def _prepare_images(
+    batch: dict,
+    cfg: dict,
+    device: torch.device,
+    *,
+    normalization: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    images = batch["images"].to(device, non_blocking=device.type == "cuda")
+    if not bool(batch.get("images_uint8", False)):
+        return images
+    if bool(batch.get("images_hwc", False)):
+        images = images.permute(0, 3, 1, 2)
+    images = images.to(torch.float32).div_(255.0)
+    mean, std = (
+        _image_normalization(cfg, device)
+        if normalization is None
+        else normalization
+    )
     return images.sub_(mean).div_(std)
 
 
 def _move_l1_batch(
     batch: dict,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
     size = len(batch["tile_id"])
+    mask = batch.get(
+        "prototype_mask",
+        torch.zeros(size, dtype=torch.bool),
+    )
+    target = batch.get(
+        "prototype_level1",
+        torch.full((size,), -1, dtype=torch.long),
+    )
     return (
-        batch.get("prototype_mask", torch.zeros(size, dtype=torch.bool)).to(device),
-        batch.get("prototype_level1", torch.full((size,), -1, dtype=torch.long)).to(device),
+        mask.to(
+            device,
+            non_blocking=device.type == "cuda",
+        ),
+        target.to(
+            device,
+            non_blocking=device.type == "cuda",
+        ),
+        bool(mask.any()),
     )
 
 
@@ -557,6 +608,10 @@ def run_epoch(
     start = time.perf_counter()
     interval_start = start
     interval_tiles = 0
+    progress_detail_interval = float(
+        cfg["train"].get("progress_interval_sec", 5.0)
+    )
+    last_progress_detail = start - progress_detail_interval
     phase = "train" if train else "val"
     log_interval = int(cfg["train"].get("log_interval", 0) or 0)
     tensorboard_batch_interval = int(
@@ -569,6 +624,7 @@ def run_epoch(
         global_step=global_step,
         l2_supervised_step=l2_supervised_step,
     )
+    image_normalization = _image_normalization(cfg, device)
     embeddings_data = None
     if collect_embeddings:
         embeddings_data = {
@@ -607,14 +663,22 @@ def run_epoch(
             )
             batch_start = time.perf_counter()
             image_prepare_start = time.perf_counter()
-            images = _prepare_images(batch, cfg, device)
+            images = _prepare_images(
+                batch,
+                cfg,
+                device,
+                normalization=image_normalization,
+            )
             if will_log and device.type == "cuda":
                 torch.cuda.synchronize(device)
             image_prepare = time.perf_counter() - image_prepare_start
             n_tiles += int(images.shape[0])
             interval_tiles += int(images.shape[0])
             teachers = _move_teachers(batch, device)
-            l1_mask, l1_target = _move_l1_batch(batch, device)
+            l1_mask, l1_target, l1_is_active = _move_l1_batch(
+                batch,
+                device,
+            )
             spatial_is_active = bool(batch["l2_spatial_supervised"].any())
             spatial = (
                 _move_spatial_batch(batch, device)
@@ -770,7 +834,7 @@ def run_epoch(
                     else:
                         response_loss = distillation_loss.new_zeros(())
                         alpha_mean = distillation_loss.new_ones(())
-                    if "l1_logits" in outputs:
+                    if "l1_logits" in outputs and l1_is_active:
                         l1_loss, l1_parts = l1_classification_loss(
                             outputs["l1_logits"],
                             l1_mask,
@@ -973,11 +1037,17 @@ def run_epoch(
                 )
             if progress_bar is not None:
                 elapsed = max(time.perf_counter() - start, 1e-9)
-                progress_bar.set_postfix(
-                    loss=f"{float(loss.detach().cpu()):.4f}",
-                    tiles_s=f"{n_tiles / elapsed:.0f}",
-                    refresh=False,
-                )
+                now = time.perf_counter()
+                if (
+                    now - last_progress_detail
+                    >= progress_detail_interval
+                ):
+                    progress_bar.set_postfix(
+                        loss=f"{float(loss.detach().cpu()):.4f}",
+                        tiles_s=f"{n_tiles / elapsed:.0f}",
+                        refresh=False,
+                    )
+                    last_progress_detail = now
                 progress_bar.update(1)
             if will_log:
                 if device.type == "cuda":
@@ -1073,11 +1143,21 @@ def collect_embeddings(
     l1_logits = []
     students_by_teacher: dict[str, list[torch.Tensor]] = {}
     teachers_by_name: dict[str, list[torch.Tensor]] = {}
+    image_normalization = (
+        None
+        if cfg is None
+        else _image_normalization(cfg, device)
+    )
     for batch_idx, batch in enumerate(loader):
         if max_batches is not None and batch_idx >= max_batches:
             break
         if cfg is not None:
-            images = _prepare_images(batch, cfg, device)
+            images = _prepare_images(
+                batch,
+                cfg,
+                device,
+                normalization=image_normalization,
+            )
         else:
             images = batch["images"].to(
                 device,
@@ -1089,7 +1169,7 @@ def collect_embeddings(
                 images = images.to(torch.float32).div_(255.0)
         outputs = model(images, run_spatial=False)
         embeddings.append(outputs["embedding_norm"].cpu())
-        mask, target = _move_l1_batch(batch, torch.device("cpu"))
+        mask, target, _ = _move_l1_batch(batch, torch.device("cpu"))
         masks.append(mask)
         level1.append(target)
         if "l1_logits" in outputs:
@@ -1339,8 +1419,6 @@ def fit(
                     f"alignment_gain_threshold={EARLY_STOP_ALIGNMENT_GAIN}"
                 )
                 break
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
             _release_host_memory()
     finally:
         if writer is not None:

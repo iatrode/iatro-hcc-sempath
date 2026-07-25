@@ -100,6 +100,41 @@ def test_spatial_component_response_only_adjudicates_teacher_reliability() -> No
     assert population_result.primary_target.shape == (2, 4)
 
 
+def test_uninitialized_l2_prototypes_are_exactly_l1_only() -> None:
+    teacher = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    )
+    common = {
+        "teacher_by_name": {"a": teacher},
+        "prototypes_by_teacher": {"a": _registry()},
+        "student_primary_response": torch.full((2, 4), 0.25),
+        "class_names": DEFAULT_L1_CLASSES,
+        "primary_temperature": 0.1,
+        "l2_temperature": 0.1,
+    }
+    baseline = prototype_adjudicated_teacher_target(**common)
+    with_empty_l2 = prototype_adjudicated_teacher_target(
+        **common,
+        teacher_l2_prototypes={
+            "a": (torch.randn(9, 4), torch.zeros(9))
+        },
+        student_l2_response=torch.rand(2, 9),
+    )
+
+    torch.testing.assert_close(
+        with_empty_l2.primary_target,
+        baseline.primary_target,
+    )
+    torch.testing.assert_close(
+        with_empty_l2.response_sample_weight,
+        baseline.response_sample_weight,
+    )
+    torch.testing.assert_close(
+        with_empty_l2.teacher_sample_weights["a"],
+        baseline.teacher_sample_weights["a"],
+    )
+
+
 def test_response_distillation_does_not_apply_fixed_temperature_twice() -> None:
     logits = torch.tensor([[2.0, -1.0]])
     target = torch.tensor([[0.25, 0.75]])

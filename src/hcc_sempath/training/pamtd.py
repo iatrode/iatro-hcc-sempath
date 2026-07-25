@@ -14,6 +14,16 @@ from ..modeling.models import (
 from ..modeling.prototypes import PrototypeRegistry
 
 
+def _raise_if_true(condition: torch.Tensor, message: str) -> None:
+    reduced = condition.any()
+    assert_async = getattr(torch, "_assert_async", None)
+    if reduced.device.type == "cuda" and assert_async is not None:
+        assert_async(~reduced, message)
+        return
+    if bool(reduced):
+        raise ValueError(message)
+
+
 @dataclass(frozen=True)
 class PAMTDAdjudication:
     """Per-tile teacher reliability and the shared semantic response target."""
@@ -51,13 +61,21 @@ def _primary_response(
         / float(temperature)
     )
     response = F.softmax(logits, dim=-1)
-    order = torch.tensor(
-        [positions[name] for name in class_names],
-        device=features.device,
-        dtype=torch.long,
+    order = [positions[name] for name in class_names]
+    ordered_response = (
+        response
+        if order == list(range(len(order)))
+        else response.index_select(
+            1,
+            torch.tensor(
+                order,
+                device=features.device,
+                dtype=torch.long,
+            ),
+        )
     )
     return clamp_probability(
-        response.index_select(1, order),
+        ordered_response,
         normalize=True,
     )
 
@@ -231,9 +249,11 @@ def prototype_adjudicated_teacher_target(
             ],
             dim=0,
         ).all(dim=0)
-        use_l2 = bool(valid_components.any())
+        l2_available = valid_components.any()
+        use_l2 = True
     else:
         valid_components = None
+        l2_available = None
         use_l2 = False
     l2_stack = (
         torch.stack(
@@ -290,8 +310,10 @@ def prototype_adjudicated_teacher_target(
         (l1_target_value < 0)
         | (l1_target_value >= primary_stack.shape[-1])
     )
-    if bool(invalid_l1.any()):
-        raise ValueError("L1 expert target is outside the prototype response range")
+    _raise_if_true(
+        invalid_l1,
+        "L1 expert target is outside the prototype response range",
+    )
     l2_target_value = (
         None
         if l2_target is None
@@ -336,6 +358,17 @@ def prototype_adjudicated_teacher_target(
                 student_l2_response,
                 l2_valid,
             )
+            assert l2_available is not None
+            l2_consensus = torch.where(
+                l2_available,
+                l2_consensus,
+                consensus,
+            )
+            l2_student = torch.where(
+                l2_available,
+                l2_student,
+                student_agreement,
+            )
             axis_weight = float(l1_agreement_weight) + float(l2_agreement_weight)
             if axis_weight > 0:
                 consensus = (
@@ -349,18 +382,22 @@ def prototype_adjudicated_teacher_target(
 
         expert_sum = torch.zeros_like(consensus)
         expert_denominator = torch.zeros_like(consensus)
-        if bool(l1_mask_value.any()):
-            safe_target = l1_target_value.clamp_min(0)
-            l1_expert = primary[name].gather(
-                1,
-                safe_target.view(-1, 1),
-            ).squeeze(1)
-            expert_sum = expert_sum + torch.where(
-                l1_mask_value,
-                l1_expert,
-                torch.zeros_like(l1_expert),
-            )
-            expert_denominator = expert_denominator + l1_mask_value.float()
+        safe_target = l1_target_value.clamp(
+            0,
+            primary_stack.shape[-1] - 1,
+        )
+        l1_expert = primary[name].gather(
+            1,
+            safe_target.view(-1, 1),
+        ).squeeze(1)
+        expert_sum = expert_sum + torch.where(
+            l1_mask_value,
+            l1_expert,
+            torch.zeros_like(l1_expert),
+        )
+        expert_denominator = (
+            expert_denominator + l1_mask_value.float()
+        )
         if (
             use_l2
             and l2_target_value is not None
@@ -489,12 +526,19 @@ def prototype_response_distillation_loss(
                 f"weight={tuple(weight.shape)} "
                 f"expected={tuple(per_sample.shape)}"
             )
-        if not bool(torch.isfinite(weight).all()) or bool((weight < 0).any()):
-            raise ValueError(
-                "response sample weights must be finite and non-negative"
-            )
+        _raise_if_true(
+            ~torch.isfinite(weight) | (weight < 0),
+            "response sample weights must be finite and non-negative",
+        )
         denominator = weight.sum()
-        if float(denominator) <= 0:
+        invalid = denominator <= 0
+        assert_async = getattr(torch, "_assert_async", None)
+        if invalid.device.type == "cuda" and assert_async is not None:
+            assert_async(
+                ~invalid,
+                "response sample weights have zero total mass",
+            )
+        elif bool(invalid):
             raise ValueError("response sample weights have zero total mass")
         loss = (per_sample * weight).sum() / denominator
     return loss * float(temperature) ** 2

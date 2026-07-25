@@ -214,13 +214,16 @@ class SpatialMorphometryHead(nn.Module):
         self.output_stride = int(output_stride)
         self.patch_padding = int(patch_padding)
         if self.component_count == len(DEFAULT_SPATIAL_COMPONENTS):
+            specs = spatial_component_specs(DEFAULT_SPATIAL_COMPONENTS)
             instance_valid = torch.tensor(
                 [
                     spec.supports_instance_count
-                    for spec in spatial_component_specs(
-                        DEFAULT_SPATIAL_COMPONENTS
-                    )
+                    for spec in specs
                 ],
+                dtype=torch.bool,
+            )
+            density_valid = torch.tensor(
+                [spec.supports_density for spec in specs],
                 dtype=torch.bool,
             )
         else:
@@ -228,10 +231,19 @@ class SpatialMorphometryHead(nn.Module):
                 self.component_count,
                 dtype=torch.bool,
             )
+            density_valid = torch.ones(
+                self.component_count,
+                dtype=torch.bool,
+            )
         self.register_buffer(
             "instance_valid",
             instance_valid,
             persistent=True,
+        )
+        self.register_buffer(
+            "density_valid",
+            density_valid,
+            persistent=False,
         )
         groups = min(32, spatial_dim)
         while spatial_dim % groups:
@@ -316,27 +328,22 @@ class SpatialMorphometryHead(nn.Module):
         """
 
         normalized = F.normalize(features.detach().float(), dim=1)
-        mask = mask.to(device=features.device, dtype=torch.bool)
-        centroids = features.new_zeros(
-            (mask.shape[1], features.shape[1]),
-            dtype=torch.float32,
+        selected = mask.to(device=features.device, dtype=torch.bool)
+        selected_float = selected.to(dtype=normalized.dtype)
+        cell_counts = selected_float.flatten(2).sum(dim=2)
+        pair_valid = cell_counts > 0
+        pair_sums = torch.einsum(
+            "bdhw,bkhw->bkd",
+            normalized,
+            selected_float,
         )
-        counts = features.new_zeros((mask.shape[1],), dtype=torch.float32)
-        for component_idx in range(mask.shape[1]):
-            observations: list[torch.Tensor] = []
-            for batch_idx in range(mask.shape[0]):
-                selected = mask[batch_idx, component_idx]
-                if bool(selected.any()):
-                    observations.append(
-                        normalized[batch_idx, :, selected].mean(dim=1)
-                    )
-            if observations:
-                centroids[component_idx] = F.normalize(
-                    torch.stack(observations).mean(dim=0),
-                    dim=0,
-                )
-                counts[component_idx] = float(len(observations))
-        return centroids, counts
+        pair_centroids = pair_sums / cell_counts.clamp_min(1).unsqueeze(-1)
+        counts = pair_valid.sum(dim=0).to(dtype=torch.float32)
+        centroids = (
+            pair_centroids
+            * pair_valid.to(dtype=pair_centroids.dtype).unsqueeze(-1)
+        ).sum(dim=0) / counts.clamp_min(1).unsqueeze(-1)
+        return F.normalize(centroids, dim=1), counts
 
     @staticmethod
     def _ema_update(
@@ -350,21 +357,19 @@ class SpatialMorphometryHead(nn.Module):
             raise ValueError(
                 f"prototype momentum must be in [0, 1), got {momentum}"
             )
-        for component_idx in range(destination.shape[0]):
-            if float(observation_counts[component_idx]) <= 0:
-                continue
-            candidate = observations[component_idx]
-            if float(destination_counts[component_idx]) <= 0:
-                updated = candidate
-            else:
-                updated = (
-                    float(momentum) * destination[component_idx]
-                    + (1.0 - float(momentum)) * candidate
-                )
-            destination[component_idx].copy_(F.normalize(updated, dim=0))
-            destination_counts[component_idx].add_(
-                observation_counts[component_idx]
-            )
+        active = observation_counts > 0
+        initialized = destination_counts > 0
+        blended = torch.where(
+            initialized.unsqueeze(1),
+            float(momentum) * destination
+            + (1.0 - float(momentum)) * observations,
+            observations,
+        )
+        updated = F.normalize(blended, dim=1)
+        destination.copy_(
+            torch.where(active.unsqueeze(1), updated, destination)
+        )
+        destination_counts.add_(observation_counts)
 
     @torch.no_grad()
     def update_prototypes(
@@ -379,15 +384,7 @@ class SpatialMorphometryHead(nn.Module):
         momentum: float = 0.9,
     ) -> None:
         countable = self.instance_valid.view(1, -1, 1, 1)
-        if self.component_count == len(DEFAULT_SPATIAL_COMPONENTS):
-            specs = spatial_component_specs(DEFAULT_SPATIAL_COMPONENTS)
-            density = torch.tensor(
-                [spec.supports_density for spec in specs],
-                device=features.device,
-                dtype=torch.bool,
-            ).view(1, -1, 1, 1)
-        else:
-            density = torch.ones_like(countable)
+        density = self.density_valid.view(1, -1, 1, 1)
         instance_positive = (point_centers > 0) & countable
         measurement_positive = (
             ((point_centers > 0) & density)
@@ -659,20 +656,23 @@ class TeacherL2PrototypeState(nn.Module):
         momentum: float,
     ) -> None:
         normalized = F.normalize(features.detach().float(), dim=-1)
-        for component_idx in range(positive.shape[1]):
-            selected = positive[:, component_idx].to(dtype=torch.bool)
-            if not bool(selected.any()):
-                continue
-            candidate = F.normalize(normalized[selected].mean(dim=0), dim=0)
-            if float(self.counts[component_idx]) <= 0:
-                updated = candidate
-            else:
-                updated = (
-                    float(momentum) * self.prototypes[component_idx]
-                    + (1.0 - float(momentum)) * candidate
-                )
-            self.prototypes[component_idx].copy_(F.normalize(updated, dim=0))
-            self.counts[component_idx].add_(selected.sum())
+        selected = positive.to(
+            device=normalized.device,
+            dtype=normalized.dtype,
+        )
+        counts = selected.sum(dim=0)
+        candidates = F.normalize(
+            selected.transpose(0, 1) @ normalized
+            / counts.clamp_min(1).unsqueeze(1),
+            dim=1,
+        )
+        SpatialMorphometryHead._ema_update(
+            self.prototypes,
+            self.counts,
+            candidates,
+            counts,
+            momentum,
+        )
 
 
 class HCCSemPathModel(nn.Module):
@@ -804,22 +804,24 @@ class HCCSemPathModel(nn.Module):
         normalized = F.normalize(embedding_norm.detach().float(), dim=-1)
         mask = mask.to(device=normalized.device, dtype=torch.bool)
         targets = targets.to(device=normalized.device, dtype=torch.long)
-        for class_idx in range(self.l1_num_classes):
-            selected = mask & (targets == class_idx)
-            if not bool(selected.any()):
-                continue
-            candidate = F.normalize(normalized[selected].mean(dim=0), dim=0)
-            if float(self.l1_prototype_counts[class_idx]) <= 0:
-                updated = candidate
-            else:
-                updated = (
-                    float(momentum) * self.l1_prototypes[class_idx]
-                    + (1.0 - float(momentum)) * candidate
-                )
-            self.l1_prototypes[class_idx].copy_(
-                F.normalize(updated, dim=0)
-            )
-            self.l1_prototype_counts[class_idx].add_(selected.sum())
+        selected = F.one_hot(
+            targets.clamp(0, self.l1_num_classes - 1),
+            num_classes=self.l1_num_classes,
+        ).to(dtype=normalized.dtype)
+        selected = selected * mask.to(dtype=normalized.dtype).unsqueeze(1)
+        counts = selected.sum(dim=0)
+        candidates = F.normalize(
+            selected.transpose(0, 1) @ normalized
+            / counts.clamp_min(1).unsqueeze(1),
+            dim=1,
+        )
+        SpatialMorphometryHead._ema_update(
+            self.l1_prototypes,
+            self.l1_prototype_counts,
+            candidates,
+            counts,
+            momentum,
+        )
 
     def l1_prototype_logits(
         self,
@@ -871,24 +873,23 @@ class HCCSemPathModel(nn.Module):
         ):
             return
         normalized = F.normalize(embedding_norm.detach().float(), dim=-1)
-        for component_idx in range(positive.shape[1]):
-            selected = positive[:, component_idx].to(dtype=torch.bool)
-            if not bool(selected.any()):
-                continue
-            candidate = F.normalize(normalized[selected].mean(dim=0), dim=0)
-            if float(self.global_l2_prototype_counts[component_idx]) <= 0:
-                updated = candidate
-            else:
-                updated = (
-                    float(momentum) * self.global_l2_prototypes[component_idx]
-                    + (1.0 - float(momentum)) * candidate
-                )
-            self.global_l2_prototypes[component_idx].copy_(
-                F.normalize(updated, dim=0)
-            )
-            self.global_l2_prototype_counts[component_idx].add_(
-                selected.sum()
-            )
+        selected = positive.to(
+            device=normalized.device,
+            dtype=normalized.dtype,
+        )
+        counts = selected.sum(dim=0)
+        candidates = F.normalize(
+            selected.transpose(0, 1) @ normalized
+            / counts.clamp_min(1).unsqueeze(1),
+            dim=1,
+        )
+        SpatialMorphometryHead._ema_update(
+            self.global_l2_prototypes,
+            self.global_l2_prototype_counts,
+            candidates,
+            counts,
+            momentum,
+        )
         for name, features in teacher_features.items():
             if name in self.teacher_l2_prototypes:
                 self.teacher_l2_prototypes[name].update(
@@ -1017,9 +1018,17 @@ def clamp_probability(value: torch.Tensor, *, normalize: bool = False, eps: floa
             )
         value = value.clamp_min(0.0)
         denominator = value.sum(dim=-1, keepdim=True)
-        if bool((denominator <= 0).any()) or not bool(
-            torch.isfinite(denominator).all()
-        ):
+        invalid = (
+            (denominator <= 0)
+            | ~torch.isfinite(denominator)
+        ).any()
+        assert_async = getattr(torch, "_assert_async", None)
+        if invalid.device.type == "cuda" and assert_async is not None:
+            assert_async(
+                ~invalid,
+                "categorical probabilities must have positive finite mass",
+            )
+        elif bool(invalid):
             raise ValueError(
                 "categorical probabilities must have positive finite mass"
             )

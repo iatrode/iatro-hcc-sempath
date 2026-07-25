@@ -9,6 +9,19 @@ from ..modeling.models import bounded_logits, clamp_probability, normalized_prot
 from ..modeling.prototypes import PrototypeRegistry
 
 
+def _validate_nonnegative_finite(
+    value: torch.Tensor,
+    message: str,
+) -> None:
+    invalid = (~torch.isfinite(value) | (value < 0)).any()
+    assert_async = getattr(torch, "_assert_async", None)
+    if invalid.device.type == "cuda" and assert_async is not None:
+        assert_async(~invalid, message)
+        return
+    if bool(invalid):
+        raise ValueError(message)
+
+
 def feature_distillation_loss(
     student: torch.Tensor,
     teacher: torch.Tensor,
@@ -157,10 +170,10 @@ def _validated_sample_weight(
             f"weight={tuple(weight.shape)} "
             f"expected={(expected_size,)}"
         )
-    if not bool(torch.isfinite(weight).all()) or bool((weight < 0).any()):
-        raise ValueError(
-            f"{label} sample weights must be finite and non-negative"
-        )
+    _validate_nonnegative_finite(
+        weight,
+        f"{label} sample weights must be finite and non-negative",
+    )
     return weight
 
 
@@ -179,7 +192,14 @@ def _weighted_sample_mean(
         label=label,
     )
     denominator = weight.sum()
-    if float(denominator.detach()) <= 0:
+    invalid = denominator <= 0
+    assert_async = getattr(torch, "_assert_async", None)
+    if invalid.device.type == "cuda" and assert_async is not None:
+        assert_async(
+            ~invalid,
+            f"{label} sample weights have zero total mass",
+        )
+    elif bool(invalid):
         raise ValueError(f"{label} sample weights have zero total mass")
     return (values * weight).sum() / denominator
 

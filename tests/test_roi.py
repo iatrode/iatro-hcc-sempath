@@ -13,6 +13,7 @@ from hcc_sempath.training.roi import (
 )
 from hcc_sempath.training.spatial_losses import (
     _maximum_cardinality_score_matching,
+    l1_classification_loss,
     spatial_morphometry_loss,
 )
 
@@ -34,6 +35,30 @@ def test_spatial_geometry_supports_point_brush_circle_and_polygon() -> None:
 
 def _write_records(path: Path, records: list[dict]) -> None:
     path.write_text(json.dumps(records), encoding="utf-8")
+
+
+def test_masked_l1_loss_matches_selected_cross_entropy_and_handles_empty() -> None:
+    logits = torch.tensor(
+        [[2.0, -1.0], [-0.5, 1.5], [1.0, 0.0]],
+        requires_grad=True,
+    )
+    mask = torch.tensor([True, False, True])
+    targets = torch.tensor([0, -1, 1])
+    loss, parts = l1_classification_loss(logits, mask, targets)
+    expected = torch.nn.functional.cross_entropy(
+        logits[mask],
+        targets[mask],
+    )
+    torch.testing.assert_close(loss, expected)
+    assert parts["l1_supervised_tiles"].item() == 2
+
+    empty, empty_parts = l1_classification_loss(
+        logits,
+        torch.zeros(3, dtype=torch.bool),
+        torch.full((3,), -1, dtype=torch.long),
+    )
+    assert empty.item() == 0.0
+    assert empty_parts["l1_accuracy"].item() == 0.0
 
 
 def test_validation_completeness_is_explicit_and_geometry_preserved(

@@ -19,9 +19,22 @@ def _mean_supervised_pair(
     zero_source: torch.Tensor,
 ) -> torch.Tensor:
     supervised = supervised.to(device=values.device, dtype=torch.bool)
-    if not bool(supervised.any()):
-        return zero_source.sum() * 0.0
-    return values[supervised].mean()
+    weight = supervised.to(dtype=values.dtype)
+    count = weight.sum()
+    mean = (values * weight).sum() / count.clamp_min(1)
+    return torch.where(count > 0, mean, zero_source.sum() * 0.0)
+
+
+def _raise_if_true(condition: torch.Tensor, message: str) -> None:
+    """Validate a device tensor without synchronizing the CUDA hot path."""
+
+    reduced = condition.any()
+    assert_async = getattr(torch, "_assert_async", None)
+    if reduced.device.type == "cuda" and assert_async is not None:
+        assert_async(~reduced, message)
+        return
+    if bool(reduced):
+        raise ValueError(message)
 
 
 def l1_classification_loss(
@@ -30,28 +43,31 @@ def l1_classification_loss(
     prototype_level1: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     mask = prototype_mask.to(device=l1_logits.device, dtype=torch.bool)
-    if not bool(mask.any()):
-        zero = l1_logits.sum() * 0.0
-        return zero, {
-            "l1": zero.detach(),
-            "l1_supervised_tiles": mask.sum().detach(),
-            "l1_accuracy": zero.detach(),
-        }
     targets = prototype_level1.to(
         device=l1_logits.device,
         dtype=torch.long,
-    )[mask]
-    logits = l1_logits[mask]
-    if int(targets.min()) < 0 or int(targets.max()) >= l1_logits.shape[1]:
-        raise ValueError(
-            f"L1 target out of range: min={int(targets.min())} "
-            f"max={int(targets.max())} classes={l1_logits.shape[1]}"
-        )
-    loss = F.cross_entropy(logits, targets)
-    accuracy = (logits.argmax(dim=1) == targets).float().mean()
+    )
+    _raise_if_true(
+        mask
+        & ((targets < 0) | (targets >= l1_logits.shape[1])),
+        f"L1 target out of range for {l1_logits.shape[1]} classes",
+    )
+    weight = mask.to(dtype=l1_logits.dtype)
+    supervised_count = weight.sum()
+    safe_targets = torch.where(mask, targets, torch.zeros_like(targets))
+    per_tile = F.cross_entropy(
+        l1_logits,
+        safe_targets,
+        reduction="none",
+    )
+    loss = (per_tile * weight).sum() / supervised_count.clamp_min(1)
+    accuracy = (
+        (l1_logits.argmax(dim=1) == safe_targets).to(dtype=l1_logits.dtype)
+        * weight
+    ).sum() / supervised_count.clamp_min(1)
     return loss, {
         "l1": loss.detach(),
-        "l1_supervised_tiles": mask.sum().detach(),
+        "l1_supervised_tiles": supervised_count.detach(),
         "l1_accuracy": accuracy.detach(),
     }
 
@@ -185,19 +201,55 @@ def _point_peak_loss(
     supervised = point_count > 0
     pair_loss = logits.new_zeros(point_count.shape)
     height, width = logits.shape[-2:]
-    for batch_idx, component_idx in supervised.nonzero().tolist():
+    centers_cpu = centers.detach().to(device="cpu")
+    supervised_cpu = (
+        centers_cpu.flatten(2).sum(dim=2) > 0
+    )
+    if not bool(supervised_cpu.any()):
+        return (
+            _mean_supervised_pair(pair_loss, supervised, logits),
+            supervised,
+            point_count,
+        )
+    supervised_pairs = supervised_cpu.nonzero()
+    pair_batch = supervised_pairs[:, 0].to(device=logits.device)
+    pair_component = supervised_pairs[:, 1].to(device=logits.device)
+    scores_cpu = logits.detach()[
+        pair_batch,
+        pair_component,
+    ].float().to(device="cpu")
+    exclusion_cpu = None
+    if exclusion_support is not None:
+        exclusion_cpu = exclusion_support.detach()[
+            pair_batch,
+            pair_component,
+        ].to(device="cpu")
+    for pair_idx, (batch_idx, component_idx) in enumerate(
+        supervised_pairs.tolist()
+    ):
         click_cells: list[tuple[int, int]] = []
         for row, col in (
-            centers[batch_idx, component_idx] > 0
+            centers_cpu[batch_idx, component_idx] > 0
         ).nonzero().tolist():
             multiplicity = max(
                 1,
-                int(round(float(centers[batch_idx, component_idx, row, col]))),
+                int(
+                    round(
+                        float(
+                            centers_cpu[
+                                batch_idx,
+                                component_idx,
+                                row,
+                                col,
+                            ]
+                        )
+                    )
+                ),
             )
             click_cells.extend([(int(row), int(col))] * multiplicity)
 
         candidates: list[list[int]] = []
-        scores = logits[batch_idx, component_idx].detach()
+        scores = scores_cpu[pair_idx]
         for row, col in click_cells:
             cells = [
                 candidate_row * width + candidate_col
@@ -247,13 +299,10 @@ def _point_peak_loss(
             exclusive_cells = {
                 cell for choices in candidates for cell in choices
             }
-            if exclusion_support is not None:
+            if exclusion_cpu is not None:
                 exclusive_cells.update(
                     int(row) * width + int(col)
-                    for row, col in exclusion_support[
-                        batch_idx,
-                        component_idx,
-                    ].nonzero().tolist()
+                    for row, col in exclusion_cpu[pair_idx].nonzero().tolist()
                 )
             extra_cells = sorted(exclusive_cells - selected_cells)
             if extra_cells:
@@ -367,20 +416,32 @@ def _brush_bag_loss(
             f"brush top_fraction must be in (0, 1], got {top_fraction}"
         )
     ids = bag_ids.to(device=logits.device, dtype=torch.long)
+    ids_cpu = ids.detach().to(device="cpu")
     pair_losses: list[torch.Tensor] = []
     bag_count = 0
     pair_count = 0
     for batch_idx in range(logits.shape[0]):
         for component_idx in range(logits.shape[1]):
-            component_ids = torch.unique(ids[batch_idx, component_idx])
+            component_ids = torch.unique(
+                ids_cpu[batch_idx, component_idx]
+            )
             component_ids = component_ids[component_ids > 0]
             if component_ids.numel() == 0:
                 continue
             losses: list[torch.Tensor] = []
             for bag_id in component_ids.tolist():
-                values = logits[batch_idx, component_idx][
-                    ids[batch_idx, component_idx] == int(bag_id)
-                ]
+                flat_indices = (
+                    ids_cpu[batch_idx, component_idx]
+                    .eq(int(bag_id))
+                    .flatten()
+                    .nonzero()
+                    .flatten()
+                    .to(device=logits.device)
+                )
+                values = logits[
+                    batch_idx,
+                    component_idx,
+                ].flatten().index_select(0, flat_indices)
                 if values.numel() == 0:  # pragma: no cover - guarded by unique
                     continue
                 keep = max(1, int(math.ceil(values.numel() * top_fraction)))
@@ -490,22 +551,34 @@ def spatial_morphometry_loss(
     point_bool = point_centers > 0
     bag_bool = brush_bag_ids > 0
     area_bool = area_positive.to(dtype=torch.bool)
-    if bool((point_bool & ~countable).any()):
-        raise ValueError("non-countable component received instance centres")
-    if bool((bag_bool & ~density).any()):
-        raise ValueError("non-density component received a brush density bag")
-    if bool((area_bool & ~area).any()):
-        raise ValueError("non-area component received occupied-area support")
+    _raise_if_true(
+        point_bool & ~countable,
+        "non-countable component received instance centres",
+    )
+    _raise_if_true(
+        bag_bool & ~density,
+        "non-density component received a brush density bag",
+    )
+    _raise_if_true(
+        area_bool & ~area,
+        "non-area component received occupied-area support",
+    )
 
     positive_support = point_bool | bag_bool | area_bool
     explicit_bool = explicit_negative.to(dtype=torch.bool)
     implicit_bool = implicit_negative.to(dtype=torch.bool)
-    if bool((positive_support & explicit_bool).any()):
-        raise ValueError("positive and explicit-negative spatial targets overlap")
-    if bool((positive_support & implicit_bool).any()):
-        raise ValueError("positive and implicit-negative spatial targets overlap")
-    if bool((explicit_bool & implicit_bool).any()):
-        raise ValueError("explicit and implicit negative targets overlap")
+    _raise_if_true(
+        positive_support & explicit_bool,
+        "positive and explicit-negative spatial targets overlap",
+    )
+    _raise_if_true(
+        positive_support & implicit_bool,
+        "positive and implicit-negative spatial targets overlap",
+    )
+    _raise_if_true(
+        explicit_bool & implicit_bool,
+        "explicit and implicit negative targets overlap",
+    )
 
     instance_point, point_pairs, point_counts = _point_peak_loss(
         instance_logits,

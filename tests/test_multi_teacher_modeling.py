@@ -174,6 +174,82 @@ def test_spatial_prototypes_separate_positive_and_negative_local_patterns() -> N
     assert measurement[0, 0, 0, 0] > measurement[0, 0, 0, 1]
 
 
+def test_vectorized_spatial_centroids_match_pair_balanced_reference() -> None:
+    torch.manual_seed(17)
+    features = torch.randn(3, 4, 3, 3)
+    mask = torch.rand(3, 5, 3, 3) > 0.65
+    mask[:, 4] = False
+
+    actual, actual_counts = SpatialMorphometryHead._masked_pair_centroids(
+        features,
+        mask,
+    )
+
+    normalized = torch.nn.functional.normalize(features.float(), dim=1)
+    reference = torch.zeros(5, 4)
+    reference_counts = torch.zeros(5)
+    for component_idx in range(5):
+        pair_centroids = []
+        for batch_idx in range(3):
+            selected = mask[batch_idx, component_idx]
+            if bool(selected.any()):
+                pair_centroids.append(
+                    normalized[batch_idx, :, selected].mean(dim=1)
+                )
+        if pair_centroids:
+            reference[component_idx] = torch.nn.functional.normalize(
+                torch.stack(pair_centroids).mean(dim=0),
+                dim=0,
+            )
+            reference_counts[component_idx] = len(pair_centroids)
+
+    torch.testing.assert_close(actual, reference)
+    torch.testing.assert_close(actual_counts, reference_counts)
+
+
+def test_vectorized_prototype_ema_matches_component_reference() -> None:
+    torch.manual_seed(23)
+    destination = torch.nn.functional.normalize(
+        torch.randn(4, 6),
+        dim=1,
+    )
+    destination_counts = torch.tensor([3.0, 0.0, 8.0, 2.0])
+    observations = torch.nn.functional.normalize(
+        torch.randn(4, 6),
+        dim=1,
+    )
+    observation_counts = torch.tensor([2.0, 4.0, 0.0, 1.0])
+    reference = destination.clone()
+    reference_counts = destination_counts.clone()
+    momentum = 0.85
+    for component_idx in range(4):
+        count = observation_counts[component_idx]
+        if count <= 0:
+            continue
+        candidate = observations[component_idx]
+        if reference_counts[component_idx] > 0:
+            candidate = (
+                momentum * reference[component_idx]
+                + (1.0 - momentum) * candidate
+            )
+        reference[component_idx] = torch.nn.functional.normalize(
+            candidate,
+            dim=0,
+        )
+        reference_counts[component_idx] += count
+
+    SpatialMorphometryHead._ema_update(
+        destination,
+        destination_counts,
+        observations,
+        observation_counts,
+        momentum,
+    )
+
+    torch.testing.assert_close(destination, reference)
+    torch.testing.assert_close(destination_counts, reference_counts)
+
+
 def test_structure_point_does_not_update_unknown_measurement_negative_prototype() -> None:
     head = SpatialMorphometryHead(
         student_dim=2,
