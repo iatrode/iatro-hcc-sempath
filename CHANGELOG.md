@@ -19,6 +19,10 @@
   per-pass completion and strict end-of-list navigation.
 - Prevent native browser image dragging in the location overview and keep
   pointer-captured pan interaction responsive.
+- Move the location overview into a navigation overlay that loads on demand,
+  and reserve tile-wheel brush-width control for the active Brush tool so
+  ordinary scrolling remains available elsewhere.
+- Add visible `1`–`9` shortcuts for selecting the first nine L1 classes.
 
 Model constructor signatures, checkpoint state-dict topology, spatial output
 semantics, and IAC dependencies are unchanged. Configurations using the removed

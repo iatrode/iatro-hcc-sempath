@@ -186,6 +186,11 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "document.getElementById('l1Section').style.display=l1Mode?'block':'none'" in HTML
     assert "document.getElementById('l2Section').style.display='none'" in HTML
     assert "MODE==='l1'?'L1 classification':'L2 ROI annotation'" in HTML
+    assert "index<9?String(index+1):''" in HTML
+    assert "class=chipShortcut" in HTML
+    assert "MODE==='l1'&&!mod&&!editing&&!document.querySelector('dialog[open]')" in HTML
+    assert "/^[1-9]$/.test(ev.key)" in HTML
+    assert "l1=L1[index];renderLabels()" in HTML
     assert "All ROI classes visible. Select one L2 class before drawing." in HTML
     assert "currentCandidate" not in HTML
     assert "function hasPositiveRoi(attribute)" in HTML
@@ -210,11 +215,13 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert ".roiClassBar{display:flex;flex-wrap:wrap" in HTML
     assert ".roiClassBar{flex-wrap:nowrap;max-width:min(100%,760px);overflow-x:auto" in HTML
     assert 'id="tileZoom"' in HTML
-    assert 'class="imageControlRow overviewControlRow"' in HTML
-    assert '<h3>Location overview</h3><label class="rangeControl">Zoom' in HTML
+    assert 'id="overviewBtn" type="button">Overview' in HTML
+    assert 'id="overviewOverlay" class="contextOverlay hidden"' in HTML
+    assert 'class="imageControlRow overviewControlRow"' not in HTML
+    assert '<b>Location overview</b>' in HTML
     assert 'id="overviewZoom"' in HTML
-    assert ".thumbWrap{position:relative;min-height:220px" in HTML
-    assert "overflow:hidden;overscroll-behavior:contain" in HTML
+    assert ".thumbWrap{position:relative;width:100%;height:100%;min-height:0" in HTML
+    assert ".overviewStage{min-height:0;flex:1;overflow:auto" in HTML
     assert 'id="tileZoomIn"' not in HTML
     assert 'id="roiRedo"' in HTML
     assert "undoRoi()" in HTML
@@ -228,7 +235,9 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert 'max="0.500"' in HTML
     assert "updateBrushWidth()" in HTML
     assert "brushWidth()" in HTML
-    assert "if(ROI_MODE)setBrushWidth(brushWidth()" in HTML
+    assert "getElementById('roiCanvas').addEventListener('wheel'" in HTML
+    assert "if(!ROI_MODE||roiTool!=='brush')return;ev.preventDefault();setBrushWidth(brushWidth()" in HTML
+    assert "getElementById('tileViewport').addEventListener('wheel'" not in HTML
     assert "function selectRoiTool(tool,remember=true)" in HTML
     assert 'data-roi-tool="eraser">Eraser' in HTML
     assert "['point','brush','eraser','circle']" in HTML
@@ -257,7 +266,11 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "pushUndo();roiPlan=null;roiDrawing={tool:'eraser'" in HTML
     assert "syncPositiveLabels();renderRoi()" in HTML
     assert "wheelZoom:false,doubleClickReset:false,onScale:syncOverviewZoom" in HTML
+    assert "if(!wheelZoom)return;ev.preventDefault();setScale(" in HTML
     assert "overviewZoom.addEventListener('input'" in HTML
+    assert "function openOverview()" in HTML
+    assert "function closeOverview()" in HTML
+    assert "if(!overviewIsOpen())return" in HTML
     assert 'id="contextViewport"' in HTML
     assert "const CONTEXT_RADIUS=5,CONTEXT_RECENTER_DELTA=2" in HTML
     assert "requestAnimationFrame(paintContextPan)" in HTML
