@@ -297,6 +297,7 @@ def multi_teacher_distillation_loss(
     relation_denominator = zero
     semantic_numerator = zero
     semantic_denominator = zero
+    teacher_alignment: dict[str, torch.Tensor] = {}
     positive_teacher_count = 0
     for name in sorted(student_by_teacher):
         teacher_weight = float((teacher_weights or {}).get(name, 1.0))
@@ -324,6 +325,18 @@ def multi_teacher_distillation_loss(
             teacher,
             loss_type=feature_loss_type,
         )
+        cosine_distance = (
+            feature_values
+            if feature_loss_type == "cosine"
+            else feature_distillation_loss_per_sample(
+                student,
+                teacher,
+                loss_type="cosine",
+            )
+        )
+        teacher_alignment[f"{name}_feature_cosine"] = (
+            1.0 - cosine_distance.mean()
+        ).detach()
         alpha = _validated_sample_weight(
             sample_weight,
             student.shape[0],
@@ -398,4 +411,5 @@ def multi_teacher_distillation_loss(
         "feature": feature.detach(),
         "relation": relation.detach(),
         "semantic": semantic.detach(),
+        **teacher_alignment,
     }

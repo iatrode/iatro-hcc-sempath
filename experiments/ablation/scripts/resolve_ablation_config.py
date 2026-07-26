@@ -27,9 +27,6 @@ def resolve_ablation_config(
 
     base = load_config(base_path)
     full_epochs = int(base["train"]["epochs"])
-    full_warmup_epochs = int(
-        base["train"].get("warmup_epochs", 0)
-    )
     condition_path = Path(condition_path)
     condition = _raw_config(condition_path)
     parent = condition.get("inherits")
@@ -55,15 +52,6 @@ def resolve_ablation_config(
         1,
         int(math.ceil(full_epochs / 10.0)),
     )
-    resolved["train"]["warmup_epochs"] = (
-        0
-        if full_warmup_epochs <= 0
-        else max(
-            1,
-            int(math.ceil(full_warmup_epochs / 10.0)),
-        )
-    )
-
     # A single-teacher condition reuses that teacher's deployment asset. The
     # repository-relative path in the tracked overlay is only documentation.
     condition_prototypes = condition.get("data", {}).get(

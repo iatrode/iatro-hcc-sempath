@@ -195,49 +195,29 @@ def _pointwise_conv_as_linear(
     return projected.permute(0, 3, 1, 2)
 
 
-def _depthwise_conv_as_shift_sum(
+def _depthwise_conv_fused(
     convolution: nn.Conv2d,
     features: torch.Tensor,
 ) -> torch.Tensor:
-    """Evaluate the fixed 3x3 depthwise kernel without fragmented cuDNN calls."""
+    """Evaluate one channel-preserving depthwise convolution kernel."""
 
     if (
         convolution.kernel_size != (3, 3)
         or convolution.groups != features.shape[1]
         or convolution.in_channels != convolution.out_channels
     ):
-        raise ValueError("shift-sum route requires a channel-preserving 3x3 depthwise convolution")
-    dilation_h, dilation_w = convolution.dilation
-    padding_h, padding_w = convolution.padding
-    if (padding_h, padding_w) != (dilation_h, dilation_w):
-        raise ValueError("shift-sum route expects same-size dilated padding")
-    padded = F.pad(
+        raise ValueError(
+            "depthwise route requires a channel-preserving 3x3 convolution"
+        )
+    return F.conv2d(
         features,
-        (padding_w, padding_w, padding_h, padding_h),
+        convolution.weight,
+        convolution.bias,
+        stride=convolution.stride,
+        padding=convolution.padding,
+        dilation=convolution.dilation,
+        groups=convolution.groups,
     )
-    height, width = features.shape[-2:]
-    weight = convolution.weight[:, 0]
-    result = None
-    for kernel_row in range(3):
-        row_start = kernel_row * dilation_h
-        for kernel_col in range(3):
-            col_start = kernel_col * dilation_w
-            shifted = padded[
-                :,
-                :,
-                row_start : row_start + height,
-                col_start : col_start + width,
-            ]
-            term = shifted * weight[
-                :,
-                kernel_row,
-                kernel_col,
-            ].view(1, -1, 1, 1)
-            result = term if result is None else result + term
-    assert result is not None
-    if convolution.bias is not None:
-        result = result + convolution.bias.view(1, -1, 1, 1)
-    return result
 
 
 class SpatialContextBlock(nn.Module):
@@ -263,7 +243,7 @@ class SpatialContextBlock(nn.Module):
         residual = features
         features = self.norm(features)
         features = F.gelu(features)
-        features = _depthwise_conv_as_shift_sum(
+        features = _depthwise_conv_fused(
             self.depthwise,
             features,
         )

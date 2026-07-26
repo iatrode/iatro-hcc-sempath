@@ -1,10 +1,12 @@
 inherits: tenth_duration_full_population.yaml
 
-# Ablation A3 — single-teacher student distillation, no prototype supervision.
+# Ablation A3 — single-teacher student distillation without the global HCC
+# prototype coordinate or L1 supervision; matched L2 spatial supervision
+# remains active.
 # Design doc §7 item 3.
 #
 # Single conceptual change vs A1: only one teacher is distilled. Combined with
-# no prototype supervision, this is the "plain single-teacher student" floor.
+# no global prototype supervision, this is the single-teacher reference.
 # Teacher choice is frozen to virchow2 for the matched A3/A4 contrast. It is a
 # design constant for the matched comparison.
 #

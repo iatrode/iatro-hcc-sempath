@@ -3,7 +3,7 @@ inherits: tenth_duration_full_population.yaml
 # Ablation A2 — PAMT-D WITHOUT prototype-adjudicated teacher reliability.
 # Design doc §7 item 5.
 #
-# Single variable vs A6: prototype semantic supervision, L1 supervision, and
+# Single variable vs A0: prototype semantic supervision, L1 supervision, and
 # the student response objective are retained, but reliability filtering is
 # disabled. Multi-teacher distillation therefore uses the configured base
 # teacher weights rather than per-tile adjudicated reliability. This isolates

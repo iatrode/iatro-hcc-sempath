@@ -13,6 +13,16 @@ DINOv2-S/14 tile encoder:
    supporting component location, instance count, local abundance, and
    calibrated area where the supervision permits it.
 
+L1 and L2 are parallel expert-supervision axes over the shared representation.
+Neither head consumes the other head's features, logits, labels, or outputs.
+
+```text
+image -> shared DINOv2-S/14 encoder
+      -> z_hcc -> four teacher projection heads
+               -> L1 global prototype readout
+      -> patch/local features -> L2 spatial prototype readouts
+```
+
 The L2 branch produces spatial component maps and calibrated morphometric
 measurements. No-gradient global component centroids provide the PAMT-D
 reliability coordinate during training.
@@ -101,9 +111,9 @@ is only a memory chunk and never defines the prototype pool. Their responses pro
 supervision and per-tile PAMT-D teacher reliability, while direct L1
 cross-entropy supervises the human boundary.
 
-L2 follows the same small-to-large premise: sparse expert spatial constraints
-define exact full-bank local positive/negative component centroids and reshape the local
-features and shared encoder while four-teacher distillation stabilizes `z_hcc`.
+In parallel, sparse L2 spatial constraints define exact full-bank local
+positive/negative component prototypes and reshape local features and the
+shared encoder while four-teacher distillation stabilizes `z_hcc`.
 Teacher-space component centroids participate in per-tile reliability
 adjudication. Expert point, circle, and brush geometry supplies the L2 spatial
 targets.
@@ -237,19 +247,27 @@ coordinate.
 
 ## 7. Optimization
 
-The spatial head starts with detached backbone signals, then the spatial
-weight ramps and the backbone is released. These counters advance only on
-L2-supervised updates:
+Training begins with four-teacher feature and relation distillation alone.
+After the teacher-only interval, prototype-semantic, L1, and L2 supervision
+enter together and ramp on one global optimizer-step clock:
 
 ```text
-spatial_start_step           0
-spatial_ramp_steps           1000
-spatial_backbone_start_step  1000
+expert_supervision_start_step  3000
+expert_supervision_ramp_steps  1000
 ```
 
-After release, the global and spatial gradient norms, spatial gradient share,
-and gradient cosine are measured on the final shared Transformer block as
-training diagnostics.
+Both L1 and L2 reach the shared encoder from their first non-zero supervised
+update. Detaching L2 from the shared encoder is restricted to the named A8
+mechanism ablation. PAMT-D reliability filtering and student-response matching
+begin after the common expert ramp and then increase to their configured
+strength. Global and spatial gradient norms, spatial gradient share, and
+gradient cosine are measured on the final shared Transformer block.
+
+`step_metrics.csv` stores every optimizer step through buffered GPU-to-host
+transfers. `development_metrics.csv` stores loss components on the same fixed
+development subset every 1,000 optimizer steps. Epoch summaries remain in
+`metrics.csv`; they are not the sole source for convergence or stopping
+analysis.
 
 The fixed L1/L2 expert-tile union is replayed at a configured interval among
 population batches. This keeps both dynamic prototype systems and direct
@@ -385,7 +403,8 @@ HCC-SemPath contributes one HCC-specific representation with:
 - `training/pamtd.py`: per-tile four-teacher adjudication and shared semantic
   response target.
 - `training/engine.py`: active objective, exact full-bank dynamic prototype
-  refresh, and L2-supervised-step warm-up.
+  refresh, common L1/L2 intervention schedule, step-level metrics, and fixed
+  intra-epoch development probes.
 - `training/train.py`: L1/L2 ingestion, fixed expert-tile replay and prototype
   loaders, and frozen
   optimizer/supervision contracts.
@@ -404,8 +423,8 @@ Implementation conformance requires:
 2. capability masks exclude biological instance counts from area-only and
    pigment components;
 3. unresolved mixtures retain weak-background semantics;
-4. L2 reaches the shared encoder after supervised-step warm-up while
-   four-teacher distillation remains active;
+4. teacher-only distillation precedes a simultaneous L1/L2 ramp, and both
+   expert objectives reach the shared encoder from their first active update;
 5. undefined component/measurement pairs remain invalid;
 6. annotation sufficiency is determined by component-wise information
    plateaus, not a preset tile quota;

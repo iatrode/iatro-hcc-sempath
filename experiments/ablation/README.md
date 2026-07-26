@@ -9,9 +9,11 @@ replay frequency stay matched.
 
 The prespecified contrasts are:
 
-- A1 versus A3: multi-teacher contribution without prototype supervision;
-- A2 versus A1: contribution of the complete expert prototype coordinate,
-  including direct L1 and prototype-response supervision;
+- A1 versus A3: multi-teacher contribution without the global prototype
+  coordinate or L1 supervision, with matched L2 supervision retained;
+- A2 versus A1: contribution of the global expert prototype coordinate,
+  including direct L1, teacher-space semantic, and prototype-response
+  supervision;
 - A4 versus A3: expert prototype contribution in a single-teacher background;
 - A0 versus A4: multi-teacher contribution with prototype supervision;
 - A0 versus A2: per-tile teacher adjudication at the deployed filter strength;

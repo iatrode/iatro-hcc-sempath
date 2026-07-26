@@ -1,6 +1,6 @@
-# A8: A0 with the spatial head trained throughout while L2 gradients remain
-# detached from the shared encoder. The value is intentionally unreachable
-# within the prescribed reduced-duration schedule.
+# A8: A0 with L2 gradients deliberately detached from the shared encoder.
+# L1 and L2 retain the same activation and weight ramp as A0; only L2 feedback
+# into zhcc is removed.
 
 inherits: tenth_duration_full_population.yaml
 
@@ -8,4 +8,4 @@ runtime:
   output_dir: outputs/experiments/ablation/a8_detached_spatial_backbone
 
 loss:
-  spatial_backbone_start_step: 2147483647
+  spatial_detach_shared_encoder: true

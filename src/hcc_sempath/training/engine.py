@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import csv
 import ctypes
 from dataclasses import dataclass
 import gc
 import math
 from numbers import Number
+from pathlib import Path
 import random
 import time
+from typing import Callable
 
 import numpy as np
 import torch
@@ -30,6 +33,131 @@ EARLY_STOP_CHECK_INTERVAL_EPOCHS = 10
 EARLY_STOP_WINDOW_EPOCHS = 20
 EARLY_STOP_ALIGNMENT_GAIN = 0.002
 EARLY_STOP_PER_TEACHER_GAIN = 0.003
+
+STEP_METRIC_PARTS = (
+    "feature",
+    "relation",
+    "semantic",
+    "pamtd_response",
+    "teacher_alpha_mean",
+    "l1",
+    "l1_accuracy",
+    "l1_supervised_tiles",
+    "l2_spatial",
+    "l2_instance_point",
+    "l2_abundance_point",
+    "l2_brush_bag",
+    "l2_area_positive",
+    "l2_explicit_negative",
+    "l2_implicit_negative",
+    "l2_point_supervised_pairs",
+    "l2_brush_supervised_pairs",
+    "l2_area_supervised_pairs",
+)
+STEP_METRIC_FIELDS = (
+    "epoch",
+    "global_step",
+    "l2_supervised_step",
+    "tiles_seen_in_epoch",
+    "lr",
+    "scheduled_semantic_weight",
+    "scheduled_l1_weight",
+    "scheduled_spatial_weight",
+    "scheduled_filter_weight",
+    "scheduled_response_weight",
+    "l1_active",
+    "l2_active",
+    "loss",
+    *STEP_METRIC_PARTS,
+)
+
+
+class StepMetricsWriter:
+    """Buffer per-step scalars and transfer them to one append-only CSV in groups."""
+
+    def __init__(self, path: str | Path, flush_steps: int = 50) -> None:
+        self.path = Path(path)
+        self.flush_steps = max(1, int(flush_steps))
+        self.rows: list[dict[str, float | int]] = []
+        self.tensor_buffer: torch.Tensor | None = None
+
+    def append(
+        self,
+        *,
+        epoch: int,
+        global_step: int,
+        l2_supervised_step: int,
+        tiles_seen_in_epoch: int,
+        lr: float,
+        loss_cfg: dict,
+        l1_active: bool,
+        l2_active: bool,
+        loss: torch.Tensor,
+        parts: dict[str, torch.Tensor],
+    ) -> None:
+        row: dict[str, float | int] = {
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "l2_supervised_step": int(l2_supervised_step),
+            "tiles_seen_in_epoch": int(tiles_seen_in_epoch),
+            "lr": float(lr),
+            "scheduled_semantic_weight": float(loss_cfg["semantic_weight"]),
+            "scheduled_l1_weight": float(loss_cfg["l1_weight"]),
+            "scheduled_spatial_weight": float(loss_cfg["spatial_weight"]),
+            "scheduled_filter_weight": float(
+                loss_cfg["prototype_filter_weight"]
+            ),
+            "scheduled_response_weight": float(
+                loss_cfg["zhcc_response_weight"]
+            ),
+            "l1_active": int(l1_active),
+            "l2_active": int(l2_active),
+        }
+        reference = loss.detach()
+        tensor_values = torch.stack(
+            [
+                reference,
+                *[
+                    parts.get(key, reference.new_zeros(())).detach()
+                    for key in STEP_METRIC_PARTS
+                ],
+            ]
+        ).float()
+        if self.tensor_buffer is None:
+            self.tensor_buffer = torch.empty(
+                (self.flush_steps, len(tensor_values)),
+                device=tensor_values.device,
+                dtype=tensor_values.dtype,
+            )
+        elif self.tensor_buffer.device != tensor_values.device:
+            raise RuntimeError("step metrics device changed within one run")
+        self.tensor_buffer[len(self.rows)].copy_(tensor_values)
+        self.rows.append(row)
+        if len(self.rows) >= self.flush_steps:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.rows:
+            return
+        tensor_fields = ("loss", *STEP_METRIC_PARTS)
+        assert self.tensor_buffer is not None
+        tensor_rows = self.tensor_buffer[: len(self.rows)].cpu().tolist()
+        materialized: list[dict[str, float | int]] = []
+        for index, row in enumerate(self.rows):
+            materialized.append(
+                {
+                    **row,
+                    **dict(zip(tensor_fields, tensor_rows[index], strict=True)),
+                }
+            )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        exists = self.path.exists()
+        with self.path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=STEP_METRIC_FIELDS)
+            if not exists:
+                writer.writeheader()
+            writer.writerows(materialized)
+        self.rows.clear()
 
 
 @dataclass
@@ -573,12 +701,6 @@ def _amp_enabled(device: torch.device, cfg: dict, train: bool) -> bool:
     return bool(train and cfg["train"].get("amp", False) and device.type == "cuda")
 
 
-def _linear_warmup(base_value: float, epoch: int, warmup_epochs: int) -> float:
-    if warmup_epochs <= 0:
-        return base_value
-    return base_value * min(1.0, max(0.0, epoch / warmup_epochs))
-
-
 def _step_ramp(target: float, global_step: int, start_step: int, ramp_steps: int) -> float:
     if global_step < start_step:
         return 0.0
@@ -593,32 +715,24 @@ def scheduled_loss_config(
     *,
     epoch: int,
     global_step: int,
-    l2_supervised_step: int | None = None,
 ) -> dict[str, float | dict | bool]:
-    """Resolve the active L1-classification and L2-spatial objective schedule."""
+    """Resolve the teacher-prior and parallel L1/L2 objective schedule."""
 
     loss_cfg = cfg["loss"]
+    del epoch
     semantic_temperature = float(loss_cfg.get("semantic_temperature", 1.0))
-    l1_start = int(loss_cfg.get("l1_start_step", 0))
-    spatial_start = int(loss_cfg.get("spatial_start_step", 0))
-    spatial_ramp = int(loss_cfg.get("spatial_ramp_steps", 1000))
-    spatial_backbone_start = int(
-        loss_cfg.get("spatial_backbone_start_step", spatial_start + spatial_ramp)
-    )
-    spatial_schedule_step = (
-        int(global_step)
-        if l2_supervised_step is None
-        else int(l2_supervised_step)
-    )
+    expert_start = int(loss_cfg.get("expert_supervision_start_step", 0))
+    expert_ramp = int(loss_cfg.get("expert_supervision_ramp_steps", 0))
     filter_start = int(loss_cfg.get("prototype_filter_start_step", 0))
     filter_ramp = int(loss_cfg.get("prototype_filter_ramp_steps", 1000))
     return {
         "teacher_weights": loss_cfg.get("teacher_weights"),
         "relation_weight": float(loss_cfg.get("relation_weight", 0.0)),
-        "semantic_weight": _linear_warmup(
+        "semantic_weight": _step_ramp(
             float(loss_cfg.get("semantic_weight", 0.0)),
-            epoch,
-            int(loss_cfg.get("semantic_warmup_epochs", 0)),
+            int(global_step),
+            expert_start,
+            expert_ramp,
         ),
         "semantic_temperature": semantic_temperature,
         "primary_temperature": float(
@@ -658,14 +772,14 @@ def scheduled_loss_config(
         "l1_weight": _step_ramp(
             float(loss_cfg.get("l1_weight", 1.0)),
             int(global_step),
-            l1_start,
-            int(loss_cfg.get("l1_ramp_steps", 0)),
+            expert_start,
+            expert_ramp,
         ),
         "spatial_weight": _step_ramp(
             float(loss_cfg.get("spatial_weight", 0.1)),
-            spatial_schedule_step,
-            spatial_start,
-            spatial_ramp,
+            int(global_step),
+            expert_start,
+            expert_ramp,
         ),
         "spatial_point_tolerance_cells": int(
             loss_cfg.get("spatial_point_tolerance_cells", 1)
@@ -685,8 +799,8 @@ def scheduled_loss_config(
         "spatial_implicit_negative_weight": float(
             loss_cfg.get("spatial_implicit_negative_weight", 0.05)
         ),
-        "spatial_detach_backbone": (
-            spatial_schedule_step < spatial_backbone_start
+        "spatial_detach_backbone": bool(
+            loss_cfg.get("spatial_detach_shared_encoder", False)
         ),
     }
 
@@ -699,10 +813,7 @@ def build_lr_scheduler(
     if str(cfg["train"].get("scheduler", "none")).lower() != "cosine":
         return None
     total_steps = max(1, int(cfg["train"]["epochs"]) * max(1, int(steps_per_epoch)))
-    warmup_steps = max(
-        0,
-        int(cfg["train"].get("warmup_epochs", 0)) * max(1, int(steps_per_epoch)),
-    )
+    warmup_steps = max(0, int(cfg["train"].get("lr_warmup_steps", 0)))
     base_lr = float(cfg["train"]["lr"])
     min_factor = float(cfg["train"].get("min_lr", 0.0)) / base_lr if base_lr > 0 else 0.0
 
@@ -874,6 +985,8 @@ def run_epoch(
     max_eval_batches: int | None = None,
     prefetched_iterator=None,
     prototype_refresh_state: PrototypeRefreshState | None = None,
+    step_metrics_writer: StepMetricsWriter | None = None,
+    development_probe: Callable[[int, int, int], None] | None = None,
 ) -> dict[str, float] | tuple[dict[str, float], tuple]:
     model.train(train)
     totals: dict[str, torch.Tensor | float] = {
@@ -923,7 +1036,6 @@ def run_epoch(
         cfg,
         epoch=epoch,
         global_step=global_step,
-        l2_supervised_step=l2_supervised_step,
     )
     image_normalization = _image_normalization(cfg, device)
     embeddings_data = None
@@ -1005,15 +1117,22 @@ def run_epoch(
                 if spatial_is_active
                 else None
             )
+            optimizer_stepped = False
 
             with torch.set_grad_enabled(train):
                 loss_cfg = scheduled_loss_config(
                     cfg,
                     epoch=epoch,
                     global_step=global_step,
-                    l2_supervised_step=l2_supervised_step,
                 )
                 last_loss_cfg = loss_cfg
+                l1_objective_active = bool(
+                    l1_is_active and float(loss_cfg["l1_weight"]) > 0
+                )
+                spatial_objective_active = bool(
+                    spatial_is_active
+                    and float(loss_cfg["spatial_weight"]) > 0
+                )
                 if train:
                     _maybe_refresh_prototypes(
                         model=model,
@@ -1033,12 +1152,12 @@ def run_epoch(
                             loss_cfg["spatial_detach_backbone"]
                         ),
                         return_spatial_features=bool(
-                            train and spatial_is_active
+                            train and spatial_objective_active
                         ),
-                        run_spatial=spatial_is_active,
+                        run_spatial=spatial_objective_active,
                         spatial_sample_mask=(
                             spatial_sample_mask
-                            if spatial_is_active
+                            if spatial_objective_active
                             else None
                         ),
                     )
@@ -1152,7 +1271,14 @@ def run_epoch(
                                 loss_cfg["l2_global_temperature"]
                             ),
                         )
-                        if prototypes and pamtd_student_logits is not None
+                        if (
+                            prototypes
+                            and pamtd_student_logits is not None
+                            and (
+                                float(loss_cfg["prototype_filter_weight"]) > 0
+                                or float(loss_cfg["zhcc_response_weight"]) > 0
+                            )
+                        )
                         else None
                     )
                     distillation_loss, distillation_parts = multi_teacher_distillation_loss(
@@ -1316,7 +1442,7 @@ def run_epoch(
                         scheduler.step()
                     if optimizer_stepped:
                         global_step += 1
-                        if spatial_is_active:
+                        if spatial_objective_active:
                             l2_supervised_step += 1
 
             parts = {
@@ -1327,11 +1453,30 @@ def run_epoch(
                 "teacher_alpha_mean": alpha_mean.detach(),
             }
             totals["loss"] = totals["loss"] + loss.detach()
+            for key, value in parts.items():
+                if key.endswith("_feature_cosine") and key not in totals:
+                    totals[key] = value.detach().new_zeros(())
             for key in totals:
                 if key == "loss":
                     continue
                 if key in parts:
                     totals[key] = totals[key] + parts[key].detach()
+
+            if train and optimizer_stepped and step_metrics_writer is not None:
+                step_metrics_writer.append(
+                    epoch=epoch,
+                    global_step=global_step,
+                    l2_supervised_step=l2_supervised_step,
+                    tiles_seen_in_epoch=n_tiles,
+                    lr=float(optimizer.param_groups[0]["lr"]),
+                    loss_cfg=loss_cfg,
+                    l1_active=l1_objective_active,
+                    l2_active=spatial_objective_active,
+                    loss=loss,
+                    parts=parts,
+                )
+            if train and optimizer_stepped and development_probe is not None:
+                development_probe(global_step, l2_supervised_step, epoch)
 
             if collect_embeddings and (
                 max_eval_batches is None or n_batches < max_eval_batches
@@ -1404,6 +1549,8 @@ def run_epoch(
                 interval_start = now
                 interval_tiles = 0
     finally:
+        if step_metrics_writer is not None:
+            step_metrics_writer.flush()
         close_iterator = getattr(iterator, "close", None)
         if callable(close_iterator):
             close_iterator()
@@ -1603,6 +1750,79 @@ def fit(
         else None
     )
     writer = _build_summary_writer(cfg, output_dir)
+    step_metrics_writer = StepMetricsWriter(
+        output_dir / "step_metrics.csv",
+        flush_steps=int(cfg["train"].get("step_metrics_flush_steps", 50)),
+    )
+    development_probe_interval = int(
+        cfg["train"].get("development_probe_interval_steps", 0) or 0
+    )
+    development_probe_batches = int(
+        cfg["train"].get("development_probe_batches", 64)
+    )
+    development_probe_cfg = {
+        **cfg,
+        "train": {
+            **cfg["train"],
+            "progress": False,
+            "log_interval": 0,
+            "tensorboard_batch_interval": 0,
+        },
+    }
+    _set_loader_epoch(val_loader, 0)
+
+    def run_development_probe(
+        step: int,
+        spatial_step: int,
+        current_epoch: int,
+    ) -> None:
+        if (
+            development_probe_interval <= 0
+            or step % development_probe_interval != 0
+        ):
+            return
+        was_training = bool(model.training)
+        try:
+            probe_metrics = run_epoch(
+                model,
+                val_loader,
+                prototypes,
+                optimizer,
+                device,
+                development_probe_cfg,
+                train=False,
+                max_batches=development_probe_batches,
+                epoch=current_epoch,
+                global_step=step,
+                l2_supervised_step=spatial_step,
+            )
+        finally:
+            model.train(was_training)
+        probe_loss_cfg = scheduled_loss_config(
+            cfg,
+            epoch=current_epoch,
+            global_step=step,
+        )
+        append_csv(
+            output_dir / "development_metrics.csv",
+            {
+                "epoch": current_epoch,
+                "global_step": step,
+                "l2_supervised_step": spatial_step,
+                "probe_batches": development_probe_batches,
+                "scheduled_semantic_weight": float(
+                    probe_loss_cfg["semantic_weight"]
+                ),
+                "scheduled_l1_weight": float(
+                    probe_loss_cfg["l1_weight"]
+                ),
+                "scheduled_spatial_weight": float(
+                    probe_loss_cfg["spatial_weight"]
+                ),
+                **probe_metrics,
+            },
+        )
+
     try:
         for epoch in range(start_epoch, int(cfg["train"]["epochs"]) + 1):
             _set_loader_epoch(train_loader, epoch - 1)
@@ -1622,6 +1842,8 @@ def fit(
                 l2_supervised_step=l2_supervised_step,
                 summary_writer=writer,
                 prototype_refresh_state=prototype_refresh_state,
+                step_metrics_writer=step_metrics_writer,
+                development_probe=run_development_probe,
             )
             global_step = int(train_metrics["global_step_end"])
             l2_supervised_step = int(
@@ -1687,7 +1909,6 @@ def fit(
                 cfg,
                 epoch=epoch,
                 global_step=global_step,
-                l2_supervised_step=l2_supervised_step,
             )
             row = {
                 "epoch": epoch,
@@ -1787,6 +2008,7 @@ def fit(
                 break
             _release_host_memory()
     finally:
+        step_metrics_writer.flush()
         if writer is not None:
             writer.close()
     spatial_route = bool(cfg["data"].get("spatial_manifest_path"))

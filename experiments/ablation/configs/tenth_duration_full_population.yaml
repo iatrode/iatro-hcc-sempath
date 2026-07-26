@@ -8,14 +8,6 @@ data:
   train_tile_fraction: 1.0
   val_tile_fraction: 1.0
 
-loss:
-  prototype_filter_start_step: 200
-  prototype_filter_ramp_steps: 100
-  zhcc_response_start_step: 200
-  zhcc_response_ramp_steps: 100
-  spatial_ramp_steps: 100
-  spatial_backbone_start_step: 100
-
 train:
   max_val_batches: 256
   max_eval_batches: 64

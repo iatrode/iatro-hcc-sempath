@@ -5,8 +5,8 @@ inherits: tenth_duration_full_population.yaml
 #
 # This historical reference condition is retained specifically for the A0-A5
 # dynamic-versus-static prototype contrast. It is not the universal reference
-# for the full ablation matrix; A6 is the matched complete-filter condition for
-# A6-A2.
+# for the full ablation matrix. A0-A2 is the adjudication contrast; A7 is the
+# separate complete-filter sensitivity analysis.
 
 runtime:
   output_dir: outputs/experiments/ablation/a0_full_pamtd

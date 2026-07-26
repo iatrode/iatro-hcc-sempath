@@ -44,7 +44,7 @@ def _local_base(tmp_path: Path) -> Path:
                         "virchow2": 1.0,
                     }
                 },
-                "train": {"epochs": 100, "warmup_epochs": 3},
+                "train": {"epochs": 100, "lr_warmup_steps": 1000},
             },
             sort_keys=False,
         ),
@@ -64,7 +64,7 @@ def test_ablation_resolver_preserves_full_population_and_full_replay(
     assert resolved["data"]["train_tile_fraction"] == 1.0
     assert resolved["data"]["val_tile_fraction"] == 1.0
     assert resolved["train"]["epochs"] == 10
-    assert resolved["train"]["warmup_epochs"] == 1
+    assert resolved["train"]["lr_warmup_steps"] == 1000
     assert resolved["data"]["prototype_supervision_manifest_path"] is None
     assert (
         resolved["data"]["expert_replay_prototype_manifest_path"]

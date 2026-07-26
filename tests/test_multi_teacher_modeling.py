@@ -10,7 +10,7 @@ import torch
 from hcc_sempath.modeling.models import (
     HCCSemPathModel,
     SpatialMorphometryHead,
-    _depthwise_conv_as_shift_sum,
+    _depthwise_conv_fused,
     _pointwise_conv_as_linear,
     _sparse_connected_components_8,
     decode_spatial_morphometry,
@@ -62,7 +62,7 @@ def test_spatial_convolution_routes_preserve_values_and_gradients(route: str) ->
             dilation=2,
             groups=4,
         )
-        routed = _depthwise_conv_as_shift_sum
+        routed = _depthwise_conv_fused
     routed_layer = copy.deepcopy(reference_layer)
     routed_features = features.detach().clone().requires_grad_(True)
 
@@ -151,7 +151,7 @@ def test_spatial_model_only_materializes_selected_supervised_rows() -> None:
     assert outputs["l2_abundance_logits"].shape == (1, 3, 31, 31)
 
 
-def test_spatial_head_warmup_detaches_backbone_but_trains_geometry_heads() -> None:
+def test_spatial_detach_ablation_trains_head_without_shared_encoder() -> None:
     model = HCCSemPathModel(
         backbone_name="vit_tiny_patch16_224",
         embedding_dim=11,
@@ -168,6 +168,31 @@ def test_spatial_head_warmup_detaches_backbone_but_trains_geometry_heads() -> No
 
     assert any(parameter.grad is not None for parameter in model.spatial_head.parameters())
     assert all(parameter.grad is None for parameter in model.encoder.backbone.parameters())
+
+
+def test_spatial_objective_reaches_shared_encoder_by_default() -> None:
+    model = HCCSemPathModel(
+        backbone_name="vit_tiny_patch16_224",
+        embedding_dim=11,
+        teacher_dims={},
+        pretrained=False,
+        spatial_num_components=2,
+        spatial_dim=13,
+    )
+    outputs = model(torch.randn(1, 3, 224, 224))
+    (
+        outputs["l2_instance_logits"].sum()
+        + outputs["l2_abundance_logits"].sum()
+    ).backward()
+
+    assert any(
+        parameter.grad is not None
+        for parameter in model.spatial_head.parameters()
+    )
+    assert any(
+        parameter.grad is not None
+        for parameter in model.encoder.backbone.parameters()
+    )
 
 
 def test_fixed_nine_class_head_suppresses_non_countable_instance_channels() -> None:
@@ -725,7 +750,17 @@ def test_multi_teacher_distillation_loss_aggregates_named_heads() -> None:
     )
 
     assert loss.ndim == 0
-    assert set(parts) == {"feature", "relation", "semantic"}
+    assert set(parts) == {
+        "feature",
+        "relation",
+        "semantic",
+        "teacher_a_feature_cosine",
+        "teacher_b_feature_cosine",
+    }
+    assert all(
+        -1.0 <= float(parts[key]) <= 1.0
+        for key in ("teacher_a_feature_cosine", "teacher_b_feature_cosine")
+    )
     loss.backward()
     assert student_by_teacher["teacher_a"].grad is not None
     assert student_by_teacher["teacher_b"].grad is not None

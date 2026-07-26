@@ -55,21 +55,24 @@ loss:
   semantic_weight: 0.02
   semantic_temperature: 1.0
   primary_temperature: 1.0
+  # Teacher-only representation shaping precedes all expert supervision.
+  # L1 and L2 then enter together and ramp on the same global-step clock.
+  expert_supervision_start_step: 3000
+  expert_supervision_ramp_steps: 1000
   # PAMT-D teacher adjudication and dynamic student-prototype response.
   pamtd_primary_temperature: 0.1
   prototype_filter_weight: 0.5
   prototype_filter_alpha_min: 0.25
-  prototype_filter_start_step: 2000
+  prototype_filter_start_step: 4000
   prototype_filter_ramp_steps: 1000
   prototype_consensus_weight: 0.4
   prototype_label_weight: 0.4
   prototype_student_weight: 0.2
   zhcc_response_weight: 0.15
-  zhcc_response_start_step: 2000
+  zhcc_response_start_step: 4000
   zhcc_response_ramp_steps: 1000
   l2_global_temperature: 0.1
   l1_weight: 1.0
-  l1_start_step: 0
   spatial_weight: 0.1
   spatial_point_tolerance_cells: 1
   spatial_abundance_point_weight: 0.5
@@ -77,10 +80,9 @@ loss:
   spatial_brush_top_fraction: 0.25
   spatial_explicit_negative_weight: 1.0
   spatial_implicit_negative_weight: 0.05
-  spatial_start_step: 0
-  # These steps count L2-supervised updates, not population batches.
-  spatial_ramp_steps: 1000
-  spatial_backbone_start_step: 1000
+  # Default training always feeds both expert objectives back into zhcc.
+  # The detached setting exists only for the matched A8 mechanism ablation.
+  spatial_detach_shared_encoder: false
 
 train:
   batch_size: 512
@@ -90,7 +92,7 @@ train:
   epochs: 100
   lr: 0.0001
   scheduler: cosine
-  warmup_epochs: 3
+  lr_warmup_steps: 1000
   min_lr: 0.000001
   weight_decay: 0.01
   max_grad_norm: 1.0
@@ -102,6 +104,11 @@ train:
   progress: tqdm
   tensorboard: true
   tensorboard_batch_interval: 20
+  # Every optimizer step is retained in a buffered append-only CSV. The fixed
+  # development probe supplies intra-epoch loss curves on an unchanged subset.
+  step_metrics_flush_steps: 50
+  development_probe_interval_steps: 1000
+  development_probe_batches: 64
   # Re-encode the complete fixed expert banks in the evolving student.
   # Batch sizes are compute chunks only; every refresh uses every bank tile.
   dynamic_prototype_refresh_steps: 500

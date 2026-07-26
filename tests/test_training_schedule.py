@@ -14,6 +14,7 @@ from hcc_sempath.training.engine import (
     fit,
     run_epoch,
     scheduled_loss_config,
+    StepMetricsWriter,
 )
 from hcc_sempath.training.losses import feature_distillation_loss_per_sample
 from hcc_sempath.training.prototype_labels import DEFAULT_L1_CLASSES
@@ -65,6 +66,37 @@ def test_fused_optimizer_is_cuda_only(monkeypatch) -> None:
     assert "fused" not in captured
 
 
+def test_step_metrics_writer_buffers_complete_optimizer_steps(tmp_path) -> None:
+    path = tmp_path / "step_metrics.csv"
+    writer = StepMetricsWriter(path, flush_steps=2)
+    loss_cfg = {
+        "semantic_weight": 0.1,
+        "l1_weight": 0.2,
+        "spatial_weight": 0.3,
+        "prototype_filter_weight": 0.4,
+        "zhcc_response_weight": 0.5,
+    }
+    for step in (1, 2):
+        writer.append(
+            epoch=1,
+            global_step=step,
+            l2_supervised_step=step - 1,
+            tiles_seen_in_epoch=step * 8,
+            lr=1e-4,
+            loss_cfg=loss_cfg,
+            l1_active=step == 2,
+            l2_active=step == 2,
+            loss=torch.tensor(float(step)),
+            parts={"feature": torch.tensor(float(step) / 10)},
+        )
+
+    rows = path.read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 3
+    assert "global_step" in rows[0]
+    assert rows[1].split(",")[1] == "1"
+    assert rows[2].split(",")[1] == "2"
+
+
 def test_compiled_training_disables_incompatible_buffer_donation() -> None:
     from torch._functorch import config as functorch_config
 
@@ -101,36 +133,38 @@ class _CountingScaler:
         return None
 
 
-def test_scheduled_loss_config_warms_semantic_l1_and_spatial_terms() -> None:
+def test_scheduled_loss_config_warms_parallel_expert_terms_together() -> None:
     cfg = {
         "loss": {
             "relation_weight": 0.25,
             "semantic_weight": 0.4,
-            "semantic_warmup_epochs": 4,
             "semantic_temperature": 1.0,
             "l1_weight": 1.0,
-            "l1_start_step": 0,
             "spatial_weight": 0.2,
-            "spatial_start_step": 100,
-            "spatial_ramp_steps": 100,
-            "spatial_backbone_start_step": 200,
+            "expert_supervision_start_step": 100,
+            "expert_supervision_ramp_steps": 100,
         }
     }
 
-    epoch_1 = scheduled_loss_config(cfg, epoch=1, global_step=0)
-    epoch_4 = scheduled_loss_config(cfg, epoch=4, global_step=150)
+    teacher_only = scheduled_loss_config(cfg, epoch=1, global_step=99)
+    ramping = scheduled_loss_config(cfg, epoch=4, global_step=150)
+    active = scheduled_loss_config(cfg, epoch=4, global_step=200)
 
-    assert epoch_1["semantic_weight"] == pytest.approx(0.1)
-    assert epoch_1["feature_loss_type"] == "cosine"
-    assert epoch_1["l1_weight"] == pytest.approx(1.0)
-    assert epoch_1["spatial_weight"] == pytest.approx(0.0)
-    assert epoch_1["spatial_point_tolerance_cells"] == 1
-    assert epoch_1["spatial_abundance_point_weight"] == pytest.approx(0.5)
-    assert epoch_1["spatial_brush_top_fraction"] == pytest.approx(0.25)
-    assert epoch_1["spatial_implicit_negative_weight"] == pytest.approx(0.05)
-    assert epoch_1["spatial_detach_backbone"] is True
-    assert epoch_4["semantic_weight"] == pytest.approx(0.4)
-    assert epoch_4["spatial_weight"] == pytest.approx(0.1)
+    assert teacher_only["semantic_weight"] == pytest.approx(0.0)
+    assert teacher_only["l1_weight"] == pytest.approx(0.0)
+    assert teacher_only["spatial_weight"] == pytest.approx(0.0)
+    assert ramping["semantic_weight"] == pytest.approx(0.2)
+    assert ramping["l1_weight"] == pytest.approx(0.5)
+    assert ramping["spatial_weight"] == pytest.approx(0.1)
+    assert active["semantic_weight"] == pytest.approx(0.4)
+    assert active["l1_weight"] == pytest.approx(1.0)
+    assert active["spatial_weight"] == pytest.approx(0.2)
+    assert active["feature_loss_type"] == "cosine"
+    assert active["spatial_point_tolerance_cells"] == 1
+    assert active["spatial_abundance_point_weight"] == pytest.approx(0.5)
+    assert active["spatial_brush_top_fraction"] == pytest.approx(0.25)
+    assert active["spatial_implicit_negative_weight"] == pytest.approx(0.05)
+    assert active["spatial_detach_backbone"] is False
 
 
 def test_feature_loss_type_defaults_to_cosine() -> None:
@@ -144,40 +178,40 @@ def test_feature_loss_type_defaults_to_cosine() -> None:
     assert float(norm_mse[1]) > float(cosine[1])
 
 
-def test_spatial_schedule_warms_head_before_backbone() -> None:
+def test_spatial_supervision_reaches_shared_encoder_during_common_ramp() -> None:
     cfg = {
         "loss": {
             "relation_weight": 0.0,
+            "l1_weight": 1.0,
             "spatial_weight": 0.1,
-            "spatial_start_step": 0,
-            "spatial_ramp_steps": 100,
-            "spatial_backbone_start_step": 100,
+            "expert_supervision_start_step": 100,
+            "expert_supervision_ramp_steps": 100,
         }
     }
-    warmup = scheduled_loss_config(cfg, epoch=1, global_step=50)
+    teacher_only = scheduled_loss_config(cfg, epoch=1, global_step=50)
     joint = scheduled_loss_config(cfg, epoch=1, global_step=150)
 
-    assert warmup["spatial_weight"] == pytest.approx(0.05)
-    assert warmup["spatial_detach_backbone"] is True
-    assert joint["spatial_weight"] == pytest.approx(0.1)
+    assert teacher_only["l1_weight"] == pytest.approx(0.0)
+    assert teacher_only["spatial_weight"] == pytest.approx(0.0)
+    assert joint["l1_weight"] == pytest.approx(0.5)
+    assert joint["spatial_weight"] == pytest.approx(0.05)
     assert joint["spatial_detach_backbone"] is False
 
 
-def test_spatial_schedule_counts_only_l2_supervised_updates() -> None:
+def test_detached_spatial_encoder_is_an_explicit_ablation_only() -> None:
     cfg = {
         "loss": {
             "spatial_weight": 0.2,
-            "spatial_start_step": 0,
-            "spatial_ramp_steps": 100,
-            "spatial_backbone_start_step": 100,
+            "expert_supervision_start_step": 0,
+            "expert_supervision_ramp_steps": 100,
+            "spatial_detach_shared_encoder": True,
         }
     }
 
     scheduled = scheduled_loss_config(
         cfg,
         epoch=1,
-        global_step=50_000,
-        l2_supervised_step=20,
+        global_step=20,
     )
 
     assert scheduled["spatial_weight"] == pytest.approx(0.04)
@@ -187,7 +221,7 @@ def test_spatial_schedule_counts_only_l2_supervised_updates() -> None:
 def test_cosine_scheduler_warms_up_and_decays() -> None:
     parameter = torch.nn.Parameter(torch.ones(()))
     optimizer = torch.optim.AdamW([parameter], lr=0.1)
-    cfg = {"train": {"scheduler": "cosine", "epochs": 3, "warmup_epochs": 1, "min_lr": 0.01, "lr": 0.1}}
+    cfg = {"train": {"scheduler": "cosine", "epochs": 3, "lr_warmup_steps": 2, "min_lr": 0.01, "lr": 0.1}}
     scheduler = build_lr_scheduler(optimizer, cfg, steps_per_epoch=2)
 
     lrs = []
@@ -326,8 +360,9 @@ def test_run_epoch_joint_l1_l2_route_keeps_full_bank_prototypes_fixed() -> None:
             "zhcc_response_weight": 0.0,
             "l1_weight": 1.0,
             "spatial_weight": 0.1,
-            "spatial_ramp_steps": 0,
-            "spatial_backbone_start_step": 0,
+            "expert_supervision_start_step": 0,
+            "expert_supervision_ramp_steps": 0,
+            "spatial_detach_shared_encoder": False,
         },
         "train": {
             "log_interval": 0,
@@ -447,6 +482,18 @@ def test_training_config_rejects_backbone_configuration() -> None:
         validate_training_config(cfg, ["teacher"])
 
 
+def test_training_config_rejects_epoch_scaled_lr_warmup() -> None:
+    cfg = {
+        "data": {"teachers": ["teacher"]},
+        "model": {"teacher_dims": {"teacher": 8}},
+        "loss": {},
+        "train": {"warmup_epochs": 1},
+    }
+
+    with pytest.raises(ValueError, match="lr_warmup_steps"):
+        validate_training_config(cfg, ["teacher"])
+
+
 def test_training_config_rejects_unsupported_exact_area_spatial_loss() -> None:
     cfg = {
         "data": {"teachers": ["teacher"]},
@@ -455,6 +502,30 @@ def test_training_config_rejects_unsupported_exact_area_spatial_loss() -> None:
     }
 
     with pytest.raises(ValueError, match="spatial_region_dice_weight"):
+        validate_training_config(cfg, ["teacher"])
+
+
+@pytest.mark.parametrize(
+    "obsolete_key",
+    (
+        "semantic_warmup_epochs",
+        "l1_start_step",
+        "l1_ramp_steps",
+        "spatial_start_step",
+        "spatial_ramp_steps",
+        "spatial_backbone_start_step",
+    ),
+)
+def test_training_config_rejects_asynchronous_expert_schedules(
+    obsolete_key: str,
+) -> None:
+    cfg = {
+        "data": {"teachers": ["teacher"]},
+        "model": {"teacher_dims": {"teacher": 8}},
+        "loss": {obsolete_key: 1},
+    }
+
+    with pytest.raises(ValueError, match=obsolete_key):
         validate_training_config(cfg, ["teacher"])
 
 

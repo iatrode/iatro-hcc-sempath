@@ -312,6 +312,11 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
             "unsupported profiling keys; use tqdm and TensorBoard metrics: "
             f"{unsupported_train_keys}"
         )
+    if "warmup_epochs" in cfg.get("train", {}):
+        raise ValueError(
+            "train.warmup_epochs is unsupported for population-scale runs; "
+            "use train.lr_warmup_steps"
+        )
 
     semantic_weight = float(cfg.get("loss", {}).get("semantic_weight", 0.0))
     loss_cfg = cfg.get("loss", {})
@@ -347,6 +352,12 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
             "prototype_ramp_steps",
             "filter_ramp_steps",
             "proto_to_filter_delay_steps",
+            "semantic_warmup_epochs",
+            "l1_start_step",
+            "l1_ramp_steps",
+            "spatial_start_step",
+            "spatial_ramp_steps",
+            "spatial_backbone_start_step",
         )
         if key in loss_cfg
     )
@@ -417,6 +428,23 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
             or float(loss_cfg[key]) < 0
         ):
             raise ValueError(f"loss.{key} must be finite and non-negative")
+    for key in (
+        "expert_supervision_start_step",
+        "expert_supervision_ramp_steps",
+        "prototype_filter_start_step",
+        "prototype_filter_ramp_steps",
+        "zhcc_response_start_step",
+        "zhcc_response_ramp_steps",
+    ):
+        if key in loss_cfg and int(loss_cfg[key]) < 0:
+            raise ValueError(f"loss.{key} must be non-negative")
+    if (
+        "spatial_detach_shared_encoder" in loss_cfg
+        and not isinstance(loss_cfg["spatial_detach_shared_encoder"], bool)
+    ):
+        raise ValueError(
+            "loss.spatial_detach_shared_encoder must be boolean"
+        )
     for key in (
         "semantic_temperature",
         "primary_temperature",
@@ -491,6 +519,18 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
     ):
         if key in cfg.get("train", {}) and int(cfg["train"][key]) < 0:
             raise ValueError(f"train.{key} must be non-negative")
+    if int(cfg.get("train", {}).get("step_metrics_flush_steps", 50)) <= 0:
+        raise ValueError("train.step_metrics_flush_steps must be positive")
+    if int(
+        cfg.get("train", {}).get("development_probe_interval_steps", 0)
+    ) < 0:
+        raise ValueError(
+            "train.development_probe_interval_steps must be non-negative"
+        )
+    if int(cfg.get("train", {}).get("development_probe_batches", 64)) <= 0:
+        raise ValueError("train.development_probe_batches must be positive")
+    if int(cfg.get("train", {}).get("lr_warmup_steps", 0)) < 0:
+        raise ValueError("train.lr_warmup_steps must be non-negative")
     if (
         "dynamic_prototype_batch_size" in cfg.get("train", {})
         and int(cfg["train"]["dynamic_prototype_batch_size"]) <= 0
