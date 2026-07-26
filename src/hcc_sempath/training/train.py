@@ -1225,6 +1225,17 @@ def _build_optimizer(
     return torch.optim.AdamW(model.parameters(), **kwargs)
 
 
+def _configure_compiled_training_for_gradient_diagnostics() -> None:
+    """Allow diagnostic autograd passes before the optimizing backward pass."""
+
+    from torch._functorch import config as functorch_config
+
+    # AOTAutograd buffer donation requires one non-retained backward. The
+    # scientific diagnostic intentionally takes two retained gradients from
+    # the same forward graph before the optimizing backward.
+    functorch_config.donated_buffer = False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train HCC-SemPath distillation model.")
     parser.add_argument("--config", required=True)
@@ -1756,6 +1767,7 @@ def main() -> None:
         }
         model.load_state_dict(state)
     if bool(cfg["train"].get("compile", False)):
+        _configure_compiled_training_for_gradient_diagnostics()
         model = torch.compile(model)
     optimizer = _build_optimizer(model, cfg, device)
     if resume_state and "optimizer" in resume_state:

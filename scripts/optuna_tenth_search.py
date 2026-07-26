@@ -564,6 +564,9 @@ def main() -> None:
         catch=(RuntimeError, ValueError),
     )
     export_study_artifacts(study, output_root=output_root, manifest=manifest)
+    if not study.best_trials:
+        print("optuna_search_complete completed_trials=0")
+        return
     best = study.best_trial
     print(f"best_trial={best.number} value={best.value:.6f}")
     print(f"best_params={best.params}")

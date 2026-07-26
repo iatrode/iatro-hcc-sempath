@@ -17,7 +17,11 @@ from hcc_sempath.training.engine import (
 )
 from hcc_sempath.training.losses import feature_distillation_loss_per_sample
 from hcc_sempath.training.prototype_labels import DEFAULT_L1_CLASSES
-from hcc_sempath.training.train import _build_optimizer, _resume_contract
+from hcc_sempath.training.train import (
+    _build_optimizer,
+    _configure_compiled_training_for_gradient_diagnostics,
+    _resume_contract,
+)
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 import torch
@@ -59,6 +63,18 @@ def test_fused_optimizer_is_cuda_only(monkeypatch) -> None:
     captured.clear()
     _build_optimizer(model, cfg, torch.device("cpu"))
     assert "fused" not in captured
+
+
+def test_compiled_training_disables_incompatible_buffer_donation() -> None:
+    from torch._functorch import config as functorch_config
+
+    previous = functorch_config.donated_buffer
+    try:
+        functorch_config.donated_buffer = True
+        _configure_compiled_training_for_gradient_diagnostics()
+        assert functorch_config.donated_buffer is False
+    finally:
+        functorch_config.donated_buffer = previous
 
 
 class _CountingScaler:
