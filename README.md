@@ -131,6 +131,27 @@ shared priority boundary. Existing component-presence labels prioritize the L2
 queue, and the four-teacher information report increases priority for spatial
 components that still need coverage.
 
+An explicit re-review pass can give each workspace its own ordered, read-only
+tile boundary:
+
+```bash
+hcc-sempath annotate-prototypes \
+  --input /path/to/image_tile_iac_root \
+  --l1-state annotations/hcc_tumor_differentiation_review.json \
+  --l2-state annotations/hcc_l2_roi_v2.json \
+  --priority-manifest annotations/hcc_shared_priority_tiles.json \
+  --roi-candidate-manifest annotations/hcc_l2_roi_v2_candidates.json \
+  --l1-review-manifest annotations/hcc_tumor_differentiation_review_manifest.json \
+  --l2-review-manifest annotations/hcc_l2_roi_rereview_manifest.json
+```
+
+Each review manifest contains a stable `review_id` and the ordered
+`tile_id`/`iac`/`row` records. Review completion is stored by `review_id` in
+the corresponding annotation state. Existing marks remain visible during the
+pass, skipped review items retain their source annotations, and navigation
+stops at the end of the supplied list. Ordinary runs that omit these arguments
+retain the mutable shared-priority behavior.
+
 The command-line state is the `Main` version. UI-created versions are stored
 under `<state-stem>.versions/<version-id>.json`, with
 `<state-stem>.versions.json` as their index. Each version owns its marks, skips,

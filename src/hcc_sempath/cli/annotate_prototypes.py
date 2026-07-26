@@ -579,6 +579,53 @@ class SharedPriorityQueue:
         tmp_path.replace(self.path)
 
 
+class StrictReviewQueue:
+    """A read-only, ordered tile boundary for one explicit review pass."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        candidates = payload.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError("strict review manifest requires a non-empty candidates list")
+        self.review_id = str(payload.get("review_id") or self.path.stem).strip()
+        if not self.review_id:
+            raise ValueError("strict review manifest requires a non-empty review_id")
+        self.candidates: list[dict] = []
+        self.by_tile_id: dict[str, dict] = {}
+        for rank, item in enumerate(candidates):
+            tile_id = str(item.get("tile_id") or "").strip()
+            iac = str(item.get("iac") or item.get("iac_path") or "").strip()
+            row = int(item.get("row", -1))
+            if not tile_id or not iac or row < 0:
+                raise ValueError(f"invalid strict review tile: {item!r}")
+            if tile_id in self.by_tile_id:
+                raise ValueError(f"duplicate strict review tile_id: {tile_id}")
+            record = {
+                "tile_id": tile_id,
+                "iac": iac,
+                "row": row,
+                "slide": str(item.get("slide") or item.get("slide_id") or ""),
+                "rank": rank,
+            }
+            self.candidates.append(record)
+            self.by_tile_id[tile_id] = record
+
+    def progress(self, state: AnnotationState) -> dict[str, int | str]:
+        reviewed, skipped = state.review_completion(self.review_id)
+        candidate_ids = set(self.by_tile_id)
+        reviewed_count = len(candidate_ids & reviewed)
+        skipped_count = len((candidate_ids & skipped) - reviewed)
+        total = len(candidate_ids)
+        return {
+            "review_id": self.review_id,
+            "reviewed": reviewed_count,
+            "skipped": skipped_count,
+            "total": total,
+            "remaining": max(0, total - reviewed_count - skipped_count),
+        }
+
+
 @dataclass(frozen=True)
 class AnnotationPackage:
     path: Path
@@ -822,6 +869,40 @@ class AnnotationState:
     def labels_json(self) -> dict:
         return {"revision": self.revision, "levels": self.label_definitions}
 
+    def review_completion(self, review_id: str) -> tuple[set[str], set[str]]:
+        passes = self.extra_payload.get("review_passes")
+        if not isinstance(passes, dict):
+            return set(), set()
+        value = passes.get(review_id)
+        if not isinstance(value, dict):
+            return set(), set()
+        return (
+            {str(item) for item in value.get("reviewed", [])},
+            {str(item) for item in value.get("skipped", [])},
+        )
+
+    def _mark_review_completion(
+        self,
+        review_id: str | None,
+        tile_id: str,
+        *,
+        skipped: bool,
+    ) -> None:
+        if not review_id:
+            return
+        reviewed, skipped_ids = self.review_completion(review_id)
+        if skipped:
+            reviewed.discard(tile_id)
+            skipped_ids.add(tile_id)
+        else:
+            skipped_ids.discard(tile_id)
+            reviewed.add(tile_id)
+        passes = self.extra_payload.setdefault("review_passes", {})
+        passes[review_id] = {
+            "reviewed": sorted(reviewed),
+            "skipped": sorted(skipped_ids),
+        }
+
     def _label_references(self, level: str, label_id: str) -> int:
         if level == "l1":
             return sum(1 for item in self.annotations.values() if item.get("l1") == label_id)
@@ -935,6 +1016,8 @@ class AnnotationState:
         l1: str,
         l2: list[str],
         roi: list[dict] | None = None,
+        *,
+        review_id: str | None = None,
     ) -> None:
         known_l1 = {item["id"] for item in self.label_definitions["l1"]}
         known_l2 = {item["id"] for item in self.label_definitions["l2"]}
@@ -996,6 +1079,11 @@ class AnnotationState:
         key = _annotation_key(package, record)
         self.annotations[key] = payload
         self.skipped.discard(key)
+        self._mark_review_completion(
+            review_id,
+            record.tile_id,
+            skipped=False,
+        )
         self.last_iac = package.rel_path
         self.last_row = record.row
         self.revision += 1
@@ -1012,8 +1100,32 @@ class AnnotationState:
             len(self.annotations),
         )
 
-    def save_skip(self, package: AnnotationPackage, record: IacRecord) -> None:
+    def save_skip(
+        self,
+        package: AnnotationPackage,
+        record: IacRecord,
+        *,
+        review_id: str | None = None,
+    ) -> None:
         key = _annotation_key(package, record)
+        if review_id:
+            self._mark_review_completion(
+                review_id,
+                record.tile_id,
+                skipped=True,
+            )
+            self.last_iac = package.rel_path
+            self.last_row = record.row
+            self.revision += 1
+            self.flush()
+            LOG.info(
+                "review_skip review_id=%s iac=%s row=%d tile_id=%s",
+                review_id,
+                package.rel_path,
+                record.row,
+                record.tile_id,
+            )
+            return
         if key in self.annotations:
             return
         self.skipped.add(key)
@@ -1089,6 +1201,7 @@ class AnnotationData:
         roi_priority_attributes: list[str] | tuple[str, ...] | None = None,
         roi_mode: bool = False,
         priority_queue: SharedPriorityQueue | None = None,
+        review_queue: StrictReviewQueue | None = None,
         min_tissue_fraction: float = 0.30,
     ) -> None:
         self.input_root = Path(input_path).resolve()
@@ -1116,6 +1229,7 @@ class AnnotationData:
             raise ValueError(f"unknown ROI navigation priority attributes: {sorted(unknown_priority)}")
         self.roi_priority_attributes = requested_priority
         self.priority_queue = priority_queue
+        self.review_queue = review_queue
         if not 0.0 <= min_tissue_fraction <= 1.0:
             raise ValueError("min_tissue_fraction must be between 0 and 1")
         self.min_tissue_fraction = float(min_tissue_fraction)
@@ -1416,9 +1530,13 @@ class AnnotationData:
         allowed_tile_ids = (
             {
                 str(item["tile_id"])
-                for item in self.priority_queue.candidates
+                for item in (
+                    self.review_queue.candidates
+                    if self.review_queue is not None
+                    else self.priority_queue.candidates
+                )
             }
-            if self.priority_queue is not None
+            if self.review_queue is not None or self.priority_queue is not None
             else None
         )
         return {
@@ -1446,6 +1564,7 @@ class AnnotationData:
             ),
             "auto_filtered": sum(auto_filtered_by_package.values()),
             "priority": self.priority_queue.progress(self.state) if self.priority_queue else None,
+            "review": self.review_queue.progress(self.state) if self.review_queue else None,
         }
 
     def _find_package_for_tile(self, tile_id: str, candidate_dict: dict, packages: list[AnnotationPackage]) -> tuple[int, AnnotationPackage] | None:
@@ -1489,6 +1608,56 @@ class AnnotationData:
                         return idx, p
         return None
 
+    def _strict_review_record(
+        self,
+        packages: list[AnnotationPackage],
+        *,
+        package_index: int | None,
+        exclude_tile_id: str | None,
+    ) -> dict:
+        if self.review_queue is None:
+            raise RuntimeError("strict review queue is not configured")
+        reviewed, skipped = self.state.review_completion(
+            self.review_queue.review_id
+        )
+        processed = reviewed | skipped
+        for candidate in self.review_queue.candidates:
+            tile_id = candidate["tile_id"]
+            if tile_id in processed or tile_id == exclude_tile_id:
+                continue
+            found = self._find_package_for_tile(tile_id, candidate, packages)
+            if found is None:
+                raise FileNotFoundError(
+                    f"strict review tile is absent from the input packages: {tile_id}"
+                )
+            selected_index, package = found
+            if package_index is not None and selected_index != package_index:
+                continue
+            viewer = self.viewer(selected_index)
+            record = viewer._by_row.get(int(candidate["row"]))
+            if record is None or record.tile_id != tile_id:
+                record = next(
+                    (item for item in viewer.records if item.tile_id == tile_id),
+                    None,
+                )
+            if record is None:
+                raise FileNotFoundError(
+                    f"strict review tile row is absent from its package: {tile_id}"
+                )
+            return {
+                "record": viewer._record_json(record),
+                "package_index": selected_index,
+                "selection": "strict_review_manifest",
+            }
+        return {
+            "record": None,
+            "done": (
+                "review_complete"
+                if package_index is None
+                else "review_package_complete"
+            ),
+        }
+
     def random_record(
         self,
         index: int | str,
@@ -1508,6 +1677,13 @@ class AnnotationData:
                 target_package = packages[pkg_idx]
             except (ValueError, IndexError):
                 global_mode = True
+
+        if self.review_queue is not None:
+            return self._strict_review_record(
+                packages,
+                package_index=None if global_mode else pkg_idx,
+                exclude_tile_id=exclude_tile_id,
+            )
 
         if not global_mode:
             viewer = self.viewer(pkg_idx)
@@ -2115,6 +2291,7 @@ class AnnotationArchive:
         roi_priority_attributes: list[str] | tuple[str, ...] | None = None,
         roi_mode: bool | None = None,
         priority_queue: SharedPriorityQueue | None = None,
+        review_queue: StrictReviewQueue | None = None,
         min_tissue_fraction: float = 0.30,
     ) -> None:
         self.input_path = str(Path(input_path).resolve())
@@ -2127,6 +2304,7 @@ class AnnotationArchive:
         self.roi_priority_attributes = tuple(roi_priority_attributes or initial.roi_priority_attributes)
         self.roi_mode = initial.roi_mode if roi_mode is None else bool(roi_mode)
         self.priority_queue = priority_queue if priority_queue is not None else initial.priority_queue
+        self.review_queue = review_queue if review_queue is not None else initial.review_queue
         self.min_tissue_fraction = float(min_tissue_fraction)
         self.base_state_path = initial.state.state_path
         self.manifest_path = self.base_state_path.with_name(f"{self.base_state_path.stem}.versions.json")
@@ -2150,6 +2328,7 @@ class AnnotationArchive:
                     roi_priority_attributes=self.roi_priority_attributes,
                     roi_mode=self.roi_mode,
                     priority_queue=self.priority_queue,
+                    review_queue=self.review_queue,
                     min_tissue_fraction=self.min_tissue_fraction,
                 )
                 self._names[version_id] = str(item.get("name") or version_id)
@@ -2228,6 +2407,7 @@ class AnnotationArchive:
             roi_priority_attributes=self.roi_priority_attributes,
             roi_mode=self.roi_mode,
             priority_queue=self.priority_queue,
+            review_queue=self.review_queue,
             min_tissue_fraction=self.min_tissue_fraction,
         )
         self._names[version_id] = clean_name
@@ -2278,8 +2458,8 @@ aside{overflow:hidden;background:var(--panel);border-right:1px solid var(--line)
 main{min-width:0;display:grid;grid-template-rows:auto auto minmax(0,1fr);height:100svh}.topbar{display:grid;grid-template-columns:auto auto minmax(160px,1fr) auto;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel)}.topbarTitle{min-width:0;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.topTools{display:flex;align-items:center;gap:6px}.topTools button{min-height:32px;padding:4px 10px}.subbar{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:42px;padding:5px 12px;border-bottom:1px solid var(--line);background:#fafbfc}.versionGroup{display:flex;align-items:center;gap:6px;min-width:0}.versionLabel{color:var(--muted);font-size:12px}.topProgress{min-width:300px;text-align:right;font-size:12px;color:var(--muted)}.topProgress b{color:var(--text)}
 .workspace{min-height:0;overflow:auto;padding:12px}.primaryWorkspace{display:grid;grid-template-columns:minmax(420px,680px) minmax(300px,1fr);grid-template-rows:auto auto;column-gap:20px;align-items:start}.pkg{position:relative;padding:8px;border:1px solid var(--line);margin-bottom:6px;cursor:pointer;background:#fff;overflow:hidden}.pkg.active{border-color:var(--blue);background:var(--blue-soft)}
 .pkg>*{position:relative;z-index:1}.pkg::before{content:"";position:absolute;inset:0 auto 0 0;width:var(--pct,0%);background:#dff3eb;z-index:0}
-.muted{color:var(--muted);font-size:12px}.thumbWrap{position:relative;min-height:220px;border:1px solid #c7cbd1;background:white;overflow:hidden;overscroll-behavior:contain}.imageControlRow{display:flex;align-items:center;gap:8px;margin:0 0 6px}.tileControlRow{grid-column:1;grid-row:1;width:100%;justify-content:space-between}.overviewControlRow{margin-top:14px}.overviewControlRow h3{margin:0}
-.thumb{display:block;width:auto;height:auto;max-width:none;background:white;cursor:crosshair}.loading{padding:18px;color:#6b7280;font-size:12px}
+.muted{color:var(--muted);font-size:12px}.thumbWrap{position:relative;min-height:220px;border:1px solid #c7cbd1;background:white;overflow:hidden;overscroll-behavior:contain;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}.imageControlRow{display:flex;align-items:center;gap:8px;margin:0 0 6px}.tileControlRow{grid-column:1;grid-row:1;width:100%;justify-content:space-between}.overviewControlRow{margin-top:14px}.overviewControlRow h3{margin:0}
+.thumb{display:block;width:auto;height:auto;max-width:none;background:white;cursor:crosshair;-webkit-user-drag:none;user-drag:none;touch-action:none;-webkit-user-select:none;user-select:none}.loading{padding:18px;color:#6b7280;font-size:12px}
 .tileViewport{grid-column:1;grid-row:2;width:100%;height:520px;overflow:auto;border:1px solid #c7cbd1;background:#f8fafc}.tileViewport,.tileStage,.tile,.roiCanvas{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}.tileStage{position:relative;width:224px;height:224px;background:#fff;transform-origin:0 0}.tile{position:absolute;inset:0;width:224px;height:224px;object-fit:contain;background:#fff;-webkit-user-drag:none}.roiCanvas{position:absolute;inset:0;width:224px;height:224px;touch-action:none;cursor:crosshair}.roiClassBar{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;max-width:none;overflow:visible;padding-bottom:0}.roiClassButton{min-height:32px;padding:4px 8px;border-left-width:8px;white-space:nowrap;flex:0 0 auto}.roiClassButton.selected{background:#111827;color:#fff}.roiTools{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin:8px 0}.roiTools button{min-height:32px;padding:4px 8px}.roiTools button.selected{background:var(--blue);color:#fff}.roiPlan{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:8px 0;padding:8px;border:1px solid var(--line);background:#f8fafc}.roiPlanStatus{flex:1 1 260px}.roiPlanDecision{display:flex;flex-wrap:wrap;gap:6px}.roiPlanDecision button{min-height:32px;padding:4px 9px}.rangeControl{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:#fff;padding:4px 8px;min-height:32px}.rangeControl input{width:130px}.rangeValue{min-width:38px;text-align:right;font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px}.chips{display:grid;grid-template-columns:1fr;gap:6px;margin:8px 0 16px}
 .panzoom{touch-action:none;transform-origin:0 0;will-change:transform;cursor:grab}.panzoom.dragging{cursor:grabbing}
 button.chip{position:relative;text-align:left;border:1px solid #c7cbd1;background:#fff;padding:8px;cursor:pointer;overflow:hidden}button.chip::before{content:"";position:absolute;inset:0 auto 0 0;width:var(--pct,0%);background:#eef4ff;z-index:0}button.chip.selected{background:#1a73e8;color:white;border-color:#1a73e8}button.chip.selected::before{background:rgba(255,255,255,.18)}button.chip span{position:relative;z-index:1}.chipRow{display:flex;justify-content:space-between;gap:8px}.chipCount{font-variant-numeric:tabular-nums;color:#374151}button.chip.selected .chipCount{color:white}
@@ -2303,7 +2483,7 @@ pre{white-space:pre-wrap;font-size:12px;background:#f1f3f4;padding:8px}
 <body><div id="authGate" class="authGate"><div class="authBox"><h3>Annotation token</h3><input id="authInput" autocomplete="off"><button id="authSubmit" class="primary" type="button">Open</button><div id="authStatus" class="status"></div></div></div>
 <div id="layout" class="layout"><aside><div class="panelHead"><div><div class="panelTitle">IAC packages</div><div id="packageSummary" class="muted"></div></div><button id="hideQueue" class="ghost" type="button">Hide</button></div><div id="packages" class="panelBody packageBody"></div><details id="reviewedDetails" class="reviewedPanel"><summary>Marked tiles (<span id="reviewedCount">0</span>)</summary><div id="reviewedList" class="reviewedList"><div class="muted">Expand to load saved annotations.</div></div></details></aside>
 <main><div class="topbar"><button id="toggleQueue" type="button">Tiles</button><div id="modeNav" class="modeNav"></div><div id="title" class="topbarTitle">Prototype annotation</div><div class="topTools"><button id="contextBtn" type="button">Context</button><button id="manageLabels" class="labelManage" type="button">Labels</button></div></div><div class="subbar"><div class="versionGroup"><span class="versionLabel">Version</span><select id="versionSelect" class="versionSelect" title="Annotation version"></select><button id="newVersion" class="compactButton" type="button">New</button></div><div id="progress" class="topProgress"></div></div><section class="workspace"><div class="primaryWorkspace"><div class="imageControlRow tileControlRow"><div class="muted" id="recordMeta"></div><label class="rangeControl">Tile zoom <input id="tileZoom" type="range" min="1" max="6" step="0.1" value="2"><span id="tileZoomValue" class="rangeValue">2.0×</span></label></div>
-<div id="tileViewport" class="tileViewport"><div id="tileStage" class="tileStage"><img id="tile" class="tile" draggable="false"><canvas id="roiCanvas" class="roiCanvas" width="224" height="224"></canvas></div></div><div class="annotationControls"><div id="prototypeLabels"><div id="l1Section"><div id="l1" class="chips"></div></div><div id="l2Section"><div id="l2" class="chips"></div></div></div><div id="roiClassBar" class="roiClassBar"></div><div id="roiStatus" class="muted">Select an ROI class, then draw on the tile.</div><div id="roiPlan" class="roiPlan"><button type="button" id="roiPlanGenerate">Find similar marks</button><label id="roiSimilarityControl" class="rangeControl hidden">Similarity <input id="roiSimilarity" type="range" min="0.20" max="0.99" step="0.01" value="0.70"><span id="roiSimilarityValue" class="rangeValue">70%</span></label><label id="roiExclusionControl" class="rangeControl hidden">Exclusion <input id="roiExclusion" type="range" min="3" max="40" step="1" value="7"><span id="roiExclusionValue" class="rangeValue">7 px</span></label><div id="roiPlanStatus" class="roiPlanStatus muted">Select one class and add 1–3 reliable point or circle seeds.</div><div id="roiPlanDecision" class="roiPlanDecision hidden"><button type="button" id="roiPlanAccept" class="primary">Accept visible matches</button><button type="button" id="roiPlanRestart">Start from scratch</button></div></div><div id="roiNavigationNotice" class="roiNavigationNotice hidden"></div><details id="roiCountDetails" class="muted"><summary>ROI positive tile counts</summary><div id="roiCountProgress"></div></details><div id="roiTools" class="roiTools"><button type="button" data-roi-tool="point">Point</button><button type="button" data-roi-tool="brush">Brush</button><button type="button" data-roi-tool="eraser">Eraser</button><button type="button" data-roi-tool="circle">Circle</button><label class="rangeControl">Brush / eraser width <input id="brushWidth" type="range" min="0.012" max="0.500" step="0.002" value="0.035"><span id="brushWidthValue" class="rangeValue">3.5%</span></label><button type="button" id="roiUndo">Undo</button><button type="button" id="roiRedo">Redo</button><button type="button" id="roiClear">Clear selected class</button><button type="button" id="tileGridToggle">Grid</button></div><div class="actions"><button onclick="save()" class="primary">Save + next</button><button onclick="nextRandom(true)">Skip + next</button><button onclick="reviewed()">Browse saved tiles</button></div><div id="status" class="statusLine"></div></div></div><div class="imageControlRow overviewControlRow"><h3>Location overview</h3><label class="rangeControl">Zoom <input id="overviewZoom" type="range" min="0.25" max="12" step="0.25" value="1"><span id="overviewZoomValue" class="rangeValue">1.0×</span></label></div><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom"></div></section></main>
+<div id="tileViewport" class="tileViewport"><div id="tileStage" class="tileStage"><img id="tile" class="tile" draggable="false"><canvas id="roiCanvas" class="roiCanvas" width="224" height="224"></canvas></div></div><div class="annotationControls"><div id="prototypeLabels"><div id="l1Section"><div id="l1" class="chips"></div></div><div id="l2Section"><div id="l2" class="chips"></div></div></div><div id="roiClassBar" class="roiClassBar"></div><div id="roiStatus" class="muted">Select an ROI class, then draw on the tile.</div><div id="roiPlan" class="roiPlan"><button type="button" id="roiPlanGenerate">Find similar marks</button><label id="roiSimilarityControl" class="rangeControl hidden">Similarity <input id="roiSimilarity" type="range" min="0.20" max="0.99" step="0.01" value="0.70"><span id="roiSimilarityValue" class="rangeValue">70%</span></label><label id="roiExclusionControl" class="rangeControl hidden">Exclusion <input id="roiExclusion" type="range" min="3" max="40" step="1" value="7"><span id="roiExclusionValue" class="rangeValue">7 px</span></label><div id="roiPlanStatus" class="roiPlanStatus muted">Select one class and add 1–3 reliable point or circle seeds.</div><div id="roiPlanDecision" class="roiPlanDecision hidden"><button type="button" id="roiPlanAccept" class="primary">Accept visible matches</button><button type="button" id="roiPlanRestart">Start from scratch</button></div></div><div id="roiNavigationNotice" class="roiNavigationNotice hidden"></div><details id="roiCountDetails" class="muted"><summary>ROI positive tile counts</summary><div id="roiCountProgress"></div></details><div id="roiTools" class="roiTools"><button type="button" data-roi-tool="point">Point</button><button type="button" data-roi-tool="brush">Brush</button><button type="button" data-roi-tool="eraser">Eraser</button><button type="button" data-roi-tool="circle">Circle</button><label class="rangeControl">Brush / eraser width <input id="brushWidth" type="range" min="0.012" max="0.500" step="0.002" value="0.035"><span id="brushWidthValue" class="rangeValue">3.5%</span></label><button type="button" id="roiUndo">Undo</button><button type="button" id="roiRedo">Redo</button><button type="button" id="roiClear">Clear selected class</button><button type="button" id="tileGridToggle">Grid</button></div><div class="actions"><button onclick="save()" class="primary">Save + next</button><button onclick="nextRandom(true)">Skip + next</button><button onclick="reviewed()">Browse saved tiles</button></div><div id="status" class="statusLine"></div></div></div><div class="imageControlRow overviewControlRow"><h3>Location overview</h3><label class="rangeControl">Zoom <input id="overviewZoom" type="range" min="0.25" max="12" step="0.25" value="1"><span id="overviewZoomValue" class="rangeValue">1.0×</span></label></div><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom" draggable="false"></div></section></main>
 </div>
 <div id="contextOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>5×5 context</b><div id="contextMeta" class="muted"></div><div class="contextHint">Drag freely to explore · click a tile to annotate it</div></div><button id="contextClose" type="button">Close</button></div><div id="contextStage" class="contextStage"><div id="contextViewport" class="contextViewport"><img id="contextImg" class="contextImg" draggable="false"><div id="contextLoading" class="contextLoading hidden">Loading nearby tiles…</div></div></div></div>
 <dialog id="labelDialog" class="labelDialog"><div class="dialogHead"><b id="labelDialogTitle">Label management</b><button id="closeLabels" type="button">Close</button></div><div class="dialogBody"><div id="labelEditor"></div><div class="addLabelRow"><input id="newLabelName" placeholder="New label name"><button id="addLabel" class="primary" type="button">Add</button><button id="saveLabels" type="button">Save label configuration</button></div><div id="labelStatus" class="muted"></div></div></dialog>
@@ -2345,11 +2525,13 @@ function setupPanZoom(el,onClick,options={}){
     const paint=()=>{frame=0;el.style.transform=`translate3d(${tx}px,${ty}px,0) scale(${scale})`;if(onScale)onScale(scale)};
     const apply=()=>{clamp();if(!frame)frame=requestAnimationFrame(paint)};
     const setScale=next=>{scale=Math.min(12,Math.max(.25,next));measure();apply()};
+    el.draggable=false;
+    el.addEventListener('dragstart',ev=>ev.preventDefault());
     el.addEventListener('load',()=>{measure();apply()});
     el.addEventListener('wheel',ev=>{ev.preventDefault();if(wheelZoom)setScale(scale*(ev.deltaY<0?1.15:.87))},{passive:false});
-    el.addEventListener('pointerdown',ev=>{measure();drag=true;moved=0;sx=ev.clientX;sy=ev.clientY;stx=tx;sty=ty;el.classList.add('dragging');el.setPointerCapture(ev.pointerId)});
-    el.addEventListener('pointermove',ev=>{if(!drag)return;const dx=ev.clientX-sx,dy=ev.clientY-sy;moved=Math.max(moved,Math.abs(dx)+Math.abs(dy));tx=stx+dx;ty=sty+dy;apply()});
-    el.addEventListener('pointerup',ev=>{if(!drag)return;drag=false;el.classList.remove('dragging');if(moved<6&&onClick)onClick(ev)});
+    el.addEventListener('pointerdown',ev=>{if(ev.button!==0)return;ev.preventDefault();measure();drag=true;moved=0;sx=ev.clientX;sy=ev.clientY;stx=tx;sty=ty;el.classList.add('dragging');el.setPointerCapture(ev.pointerId)});
+    el.addEventListener('pointermove',ev=>{if(!drag)return;ev.preventDefault();const dx=ev.clientX-sx,dy=ev.clientY-sy;moved=Math.max(moved,Math.abs(dx)+Math.abs(dy));tx=stx+dx;ty=sty+dy;apply()});
+    el.addEventListener('pointerup',ev=>{if(!drag)return;ev.preventDefault();drag=false;el.classList.remove('dragging');if(el.hasPointerCapture(ev.pointerId))el.releasePointerCapture(ev.pointerId);if(moved<6&&onClick)onClick(ev)});
     el.addEventListener('pointercancel',()=>{drag=false;el.classList.remove('dragging')});
     if(doubleClickReset)el.addEventListener('dblclick',ev=>{ev.preventDefault();tx=0;ty=0;setScale(1)});
     el.setPanZoomScale=setScale;el.resetPanZoom=()=>{tx=0;ty=0;setScale(1)};
@@ -2471,7 +2653,7 @@ async function refreshPackage(){
         console.error(e);
     }
 }
-async function progress(){const p=await api('/api/progress?package='+pkg);l1Counts=p.l1;l2Counts=p.roi_counts&&Object.keys(p.roi_counts).length?p.roi_counts:p.l2;renderLabels();const filtered=p.auto_filtered?` · ${p.auto_filtered} blank filtered`:'';const priority=p.priority;const handled=priority?priority.reviewed+priority.skipped:0;const progressPct=priority&&priority.total?Math.round(handled/priority.total*100):0;const priorityLine=priority?`<b>Priority list ${priority.reviewed}/${priority.total}</b> reviewed · ${priority.remaining} remaining · ${priority.skipped} skipped<div class=bar><div style="width:${progressPct}%"></div></div>`:'';document.getElementById('progress').innerHTML=`${priorityLine}<div>All tiles: ${p.overall.annotated}/${p.overall.total} reviewed · ${p.overall.remaining} remaining · ${p.overall.skipped} skipped${filtered}</div>`;document.getElementById('reviewedCount').textContent=p.overall.annotated;const active=new Set(p.roi_priority_attributes||[]);document.getElementById('roiCountProgress').innerHTML=Object.keys(p.roi_counts||{}).map(x=>`${active.has(x)?'●':'○'} ${labelName('l2',x)}: ${p.roi_counts[x]||0}`).join('<br>');const exhausted=[...active].filter(x=>p.roi_navigation_status&&p.roi_navigation_status[x]&&p.roi_navigation_status[x].exhausted);const notice=document.getElementById('roiNavigationNotice');notice.textContent=exhausted.map(x=>`${labelName('l2',x)}: all ${p.roi_navigation_status[x].total} candidates reviewed; the information curve needs more coverage.`).join('\n');notice.classList.toggle('hidden',!exhausted.length);}
+async function progress(){const p=await api('/api/progress?package='+pkg);l1Counts=p.l1;l2Counts=p.roi_counts&&Object.keys(p.roi_counts).length?p.roi_counts:p.l2;renderLabels();const filtered=p.auto_filtered?` · ${p.auto_filtered} blank filtered`:'';const priority=p.priority;const review=p.review;const activeProgress=review||priority;const handled=activeProgress?activeProgress.reviewed+activeProgress.skipped:0;const progressPct=activeProgress&&activeProgress.total?Math.round(handled/activeProgress.total*100):0;const progressLine=review?`<b>Review list ${review.reviewed}/${review.total}</b> completed · ${review.remaining} remaining · ${review.skipped} skipped<div class=bar><div style="width:${progressPct}%"></div></div>`:priority?`<b>Priority list ${priority.reviewed}/${priority.total}</b> reviewed · ${priority.remaining} remaining · ${priority.skipped} skipped<div class=bar><div style="width:${progressPct}%"></div></div>`:'';document.getElementById('progress').innerHTML=`${progressLine}<div>All tiles: ${p.overall.annotated}/${p.overall.total} reviewed · ${p.overall.remaining} remaining · ${p.overall.skipped} skipped${filtered}</div>`;document.getElementById('reviewedCount').textContent=p.overall.annotated;const active=new Set(p.roi_priority_attributes||[]);document.getElementById('roiCountProgress').innerHTML=Object.keys(p.roi_counts||{}).map(x=>`${active.has(x)?'●':'○'} ${labelName('l2',x)}: ${p.roi_counts[x]||0}`).join('<br>');const exhausted=[...active].filter(x=>p.roi_navigation_status&&p.roi_navigation_status[x]&&p.roi_navigation_status[x].exhausted);const notice=document.getElementById('roiNavigationNotice');notice.textContent=exhausted.map(x=>`${labelName('l2',x)}: all ${p.roi_navigation_status[x].total} candidates reviewed; the information curve needs more coverage.`).join('\n');notice.classList.toggle('hidden',!exhausted.length);}
 async function showRecord(rec){current=rec; l1=""; l2=new Set();roi=[];roiClassState={};roiExclusionOverrides={};undoStack=[];redoStack=[];roiPreview=null;roiCursor=null;roiPlan=null;roiPlanLoading=false;roiAttribute=ROI_MODE?ROI_ALL:'';roiAllComplete=true;renderLabels();renderRoi(); if(!rec){document.getElementById('recordMeta').textContent='No unreviewed tile to show.'; document.getElementById('tile').removeAttribute('src'); return;}const saved=await api(`/api/annotation-state?package=${pkg}&row=${rec.row}`);if(saved.annotation){l1=saved.annotation.l1||'';l2=new Set(saved.annotation.l2||[]);roi=(saved.annotation.roi||[]).filter(item=>item.geometry);(saved.annotation.roi||[]).filter(item=>item.review_complete&&item.state==='negative'&&!item.geometry).forEach(item=>{roiClassState[item.attribute]='negative'});const complete=new Set((saved.annotation.roi||[]).filter(item=>item.review_complete).map(item=>item.attribute));roiAllComplete=L2.every(name=>complete.has(name))}renderLabels();renderRoi();document.getElementById('recordMeta').textContent=`Package ${pkg+1} · tile ${rec.row+1} · x=${rec.x} y=${rec.y}`; const tile=document.getElementById('tile'); tile.src=authed(scoped(`/api/tile?package=${pkg}&row=${rec.row}`)); applyTileZoom(); setThumbnailSrc();}
 async function nextRandom(isSkip=false){
     try {
@@ -2502,6 +2684,8 @@ async function nextRandom(isSkip=false){
             }
         }
         if(r.done==='no_tissue_candidates')document.getElementById('status').textContent='No remaining tile meets the tissue threshold.';
+        if(r.done==='review_complete')document.getElementById('status').textContent='This review list is complete.';
+        if(r.done==='review_package_complete')document.getElementById('status').textContent='This package has no remaining review tile. Switch to All Packages to continue.';
         resumeAfterRow=null;
         await showRecord(r.record);
     } catch(e) {
@@ -2746,6 +2930,7 @@ def make_handler(
             roi_priority_attributes=tuple(item.roi_priority_attributes),
             roi_mode=item.roi_mode,
             priority_queue=item.priority_queue,
+            review_queue=item.review_queue,
             min_tissue_fraction=item.min_tissue_fraction,
         )
         for mode, item in raw_datasets.items()
@@ -2984,7 +3169,10 @@ def make_handler(
                     record = viewer._by_row[row]
                     package = selected_data.package(index)
                     LOG.info("annotation_request iac=%s row=%d l1=%s l2=%s", package.rel_path, row, payload.get("l1"), payload.get("l2", []))
-                    if selected_data.priority_queue is not None:
+                    if (
+                        selected_data.priority_queue is not None
+                        and selected_data.review_queue is None
+                    ):
                         selected_data.priority_queue.add(package, record)
                     selected_data.state.save_annotation(
                         package,
@@ -2992,6 +3180,11 @@ def make_handler(
                         str(payload["l1"]),
                         list(payload.get("l2", [])),
                         list(payload.get("roi", [])),
+                        review_id=(
+                            selected_data.review_queue.review_id
+                            if selected_data.review_queue
+                            else None
+                        ),
                     )
                     _json_response(self, {"ok": True})
                 except Exception as exc:
@@ -3011,9 +3204,20 @@ def make_handler(
                     record = viewer._by_row[row]
                     package = selected_data.package(index)
                     LOG.info("skip_request iac=%s row=%d", package.rel_path, row)
-                    if selected_data.priority_queue is not None:
+                    if (
+                        selected_data.priority_queue is not None
+                        and selected_data.review_queue is None
+                    ):
                         selected_data.priority_queue.add(package, record)
-                    selected_data.state.save_skip(package, record)
+                    selected_data.state.save_skip(
+                        package,
+                        record,
+                        review_id=(
+                            selected_data.review_queue.review_id
+                            if selected_data.review_queue
+                            else None
+                        ),
+                    )
                     _json_response(self, {"ok": True})
                 except Exception as exc:
                     LOG.exception("api_skip_failed path=%s", parsed.path)
@@ -3076,6 +3280,22 @@ def _annotation_parser() -> argparse.ArgumentParser:
         help="Shared mutable tile-priority manifest used by both L1 classification and L2 ROI.",
     )
     parser.add_argument(
+        "--l1-review-manifest",
+        default="",
+        help=(
+            "Optional read-only strict tile list for an L1 review pass. "
+            "Navigation stops when this list is complete."
+        ),
+    )
+    parser.add_argument(
+        "--l2-review-manifest",
+        default="",
+        help=(
+            "Optional read-only strict tile list for an L2 review pass. "
+            "Navigation stops when this list is complete."
+        ),
+    )
+    parser.add_argument(
         "--roi-candidate-manifest",
         default="",
         help=(
@@ -3104,6 +3324,16 @@ def main() -> None:
     from hcc_sempath.modeling.roi_plan import RoiPlanGenerator
 
     priority_queue = SharedPriorityQueue(args.priority_manifest)
+    l1_review_queue = (
+        StrictReviewQueue(args.l1_review_manifest)
+        if args.l1_review_manifest
+        else None
+    )
+    l2_review_queue = (
+        StrictReviewQueue(args.l2_review_manifest)
+        if args.l2_review_manifest
+        else None
+    )
     roi_priority_attributes = [
         value.strip() for value in args.roi_priority_attributes.split(",") if value.strip()
     ]
@@ -3116,6 +3346,7 @@ def main() -> None:
         args.input,
         args.l1_state,
         priority_queue=priority_queue,
+        review_queue=l1_review_queue,
         min_tissue_fraction=args.min_tissue_fraction,
     )
     l2_initial = AnnotationData(
@@ -3126,6 +3357,7 @@ def main() -> None:
         roi_priority_attributes=roi_priority_attributes,
         roi_mode=True,
         priority_queue=priority_queue,
+        review_queue=l2_review_queue,
         min_tissue_fraction=args.min_tissue_fraction,
     )
     datasets = {
@@ -3133,6 +3365,7 @@ def main() -> None:
             l1_initial,
             input_path=args.input,
             priority_queue=priority_queue,
+            review_queue=l1_review_queue,
             min_tissue_fraction=args.min_tissue_fraction,
         ),
         "l2": AnnotationArchive(
@@ -3143,6 +3376,7 @@ def main() -> None:
             roi_priority_attributes=roi_priority_attributes,
             roi_mode=True,
             priority_queue=priority_queue,
+            review_queue=l2_review_queue,
             min_tissue_fraction=args.min_tissue_fraction,
         ),
     }

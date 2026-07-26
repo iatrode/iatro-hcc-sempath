@@ -23,6 +23,7 @@ from hcc_sempath.cli.annotate_prototypes import (
     ROI_L2_PROTOTYPES,
     RoiCandidateQueue,
     SharedPriorityQueue,
+    StrictReviewQueue,
     _annotation_parser,
     _auth_ok,
     _annotation_key,
@@ -152,6 +153,8 @@ def test_annotation_cli_always_requires_l1_and_l2_roi_workspaces() -> None:
         "--l1-state", "l1.json",
         "--l2-state", "l2.json",
         "--priority-manifest", "priority.json",
+        "--l1-review-manifest", "l1-review.json",
+        "--l2-review-manifest", "l2-review.json",
         "--roi-candidate-manifest", "roi-candidates.json",
         "--roi-priority-attributes", "vascular-structure-present,ductular-portal-present",
     ])
@@ -160,6 +163,8 @@ def test_annotation_cli_always_requires_l1_and_l2_roi_workspaces() -> None:
     )
     assert not any("--state" in action.option_strings for action in parser._actions)
     assert args.roi_candidate_manifest == "roi-candidates.json"
+    assert args.l1_review_manifest == "l1-review.json"
+    assert args.l2_review_manifest == "l2-review.json"
     assert args.roi_priority_attributes == "vascular-structure-present,ductular-portal-present"
     assert not any("--roi-plan-config" in action.option_strings for action in parser._actions)
     assert not any("--roi-plan-checkpoint" in action.option_strings for action in parser._actions)
@@ -188,6 +193,11 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "hasPositiveRoi(attribute)?'●':'○'" in HTML
     assert "Positive ROI present" in HTML
     assert "overflow-x:auto" in HTML
+    assert 'id="thumb" class="thumb panzoom" draggable="false"' in HTML
+    assert "el.addEventListener('dragstart',ev=>ev.preventDefault())" in HTML
+    assert "if(ev.button!==0)return;ev.preventDefault();measure()" in HTML
+    assert "This review list is complete." in HTML
+    assert "Review list ${review.reviewed}/${review.total}" in HTML
     assert 'class="imageControlRow tileControlRow"' in HTML
     assert 'class="primaryWorkspace"' in HTML
     assert ".tileViewport,.tileStage,.tile,.roiCanvas{-webkit-user-select:none;user-select:none" in HTML
@@ -380,6 +390,107 @@ def test_shared_priority_list_drives_roi_then_expands_to_fallback_tile(tmp_path:
             )
     finally:
         data.close()
+
+
+def test_strict_review_list_revisits_existing_tiles_and_stops_without_fallback(
+    tmp_path: Path,
+) -> None:
+    iac_path = tmp_path / "tiles.iac"
+    state_path = tmp_path / "l1.json"
+    priority_path = tmp_path / "priority.json"
+    review_path = tmp_path / "review.json"
+    _write_iac(iac_path)
+    priority_payload = {
+        "version": 1,
+        "candidates": [
+            {
+                "tile_id": f"s1_{row:07d}",
+                "iac": "tiles.iac",
+                "row": row,
+                "slide": "s1",
+            }
+            for row in range(4)
+        ],
+    }
+    priority_path.write_text(json.dumps(priority_payload), encoding="utf-8")
+    review_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "review_id": "tumor-differentiation-v1",
+                "candidates": priority_payload["candidates"][:2],
+            }
+        ),
+        encoding="utf-8",
+    )
+    priority_before = priority_path.read_text(encoding="utf-8")
+    priority = SharedPriorityQueue(priority_path)
+    review = StrictReviewQueue(review_path)
+    seed = AnnotationData(iac_path, state_path)
+    package = seed.package(0)
+    first_record = seed.viewer(0)._by_row[0]
+    seed.state.save_annotation(
+        package,
+        first_record,
+        L1_PROTOTYPES[0],
+        [],
+    )
+    seed.close()
+
+    data = AnnotationData(
+        iac_path,
+        state_path,
+        priority_queue=priority,
+        review_queue=review,
+    )
+    try:
+        first = data.random_record("all")
+        assert first["record"]["tile_id"] == "s1_0000000"
+        assert first["selection"] == "strict_review_manifest"
+        data.state.save_skip(
+            data.package(0),
+            data.viewer(0)._by_row[0],
+            review_id=review.review_id,
+        )
+        assert data.state.annotation_for(
+            data.package(0),
+            data.viewer(0)._by_row[0],
+        )["l1"] == L1_PROTOTYPES[0]
+
+        second = data.random_record("all")
+        assert second["record"]["tile_id"] == "s1_0000001"
+        second_record = data.viewer(0)._by_row[1]
+        data.state.save_annotation(
+            data.package(0),
+            second_record,
+            L1_PROTOTYPES[1],
+            [],
+            review_id=review.review_id,
+        )
+        assert data.random_record("all") == {
+            "record": None,
+            "done": "review_complete",
+        }
+        assert data.progress(0)["review"] == {
+            "review_id": "tumor-differentiation-v1",
+            "reviewed": 1,
+            "skipped": 1,
+            "total": 2,
+            "remaining": 0,
+        }
+        assert priority_path.read_text(encoding="utf-8") == priority_before
+    finally:
+        data.close()
+
+    reloaded = AnnotationData(
+        iac_path,
+        state_path,
+        review_queue=StrictReviewQueue(review_path),
+    )
+    try:
+        assert reloaded.random_record("all")["done"] == "review_complete"
+    finally:
+        reloaded.close()
 
 
 def test_brush_validation_keeps_edge_overlap_and_rejects_invalid_geometry() -> None:

@@ -15,6 +15,10 @@
   and LR schedules.
 - Use one grouped depthwise convolution per spatial context block without
   changing module topology or checkpoint parameter names.
+- Add independent, read-only L1 and L2 review manifests with persistent
+  per-pass completion and strict end-of-list navigation.
+- Prevent native browser image dragging in the location overview and keep
+  pointer-captured pan interaction responsive.
 
 Model constructor signatures, checkpoint state-dict topology, spatial output
 semantics, and IAC dependencies are unchanged. Configurations using the removed
