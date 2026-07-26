@@ -12,10 +12,39 @@ from hcc_sempath.training.roi import (
     load_spatial_validation_metadata,
 )
 from hcc_sempath.training.spatial_losses import (
+    _brush_bag_loss,
     _maximum_cardinality_score_matching,
+    _point_peak_loss,
     l1_classification_loss,
     spatial_morphometry_loss,
 )
+
+
+def _reference_brush_bag_loss(
+    logits: torch.Tensor,
+    bag_ids: torch.Tensor,
+    top_fraction: float,
+) -> tuple[torch.Tensor, int, int]:
+    pair_losses = []
+    bag_count = 0
+    for batch_idx in range(logits.shape[0]):
+        for component_idx in range(logits.shape[1]):
+            bag_losses = []
+            ids = bag_ids[batch_idx, component_idx]
+            for bag_id in torch.unique(ids[ids > 0]).tolist():
+                values = logits[batch_idx, component_idx][ids == bag_id]
+                keep = max(
+                    1,
+                    int(torch.ceil(torch.tensor(values.numel() * top_fraction))),
+                )
+                evidence = torch.topk(values, keep, sorted=False).values.mean()
+                bag_losses.append(torch.nn.functional.softplus(-evidence))
+                bag_count += 1
+            if bag_losses:
+                pair_losses.append(torch.stack(bag_losses).mean())
+    if not pair_losses:
+        return logits.sum() * 0.0, 0, 0
+    return torch.stack(pair_losses).mean(), bag_count, len(pair_losses)
 
 
 def test_spatial_geometry_supports_point_brush_circle_and_polygon() -> None:
@@ -638,6 +667,90 @@ def test_spatial_loss_routes_point_brush_and_negative_gradients() -> None:
     assert parts["l2_brush_bag_count"].item() == 1
     assert parts["l2_explicit_negative_pairs"].item() == 1
     assert parts["l2_implicit_negative_pairs"].item() == 1
+
+
+@pytest.mark.parametrize("top_fraction", [0.25, 0.5, 1.0])
+def test_vectorized_brush_bag_loss_matches_reference_values_and_gradients(
+    top_fraction: float,
+) -> None:
+    torch.manual_seed(19)
+    bag_ids = torch.zeros((2, 3, 5, 6), dtype=torch.long)
+    bag_ids[0, 0, :2, :3] = 1
+    bag_ids[0, 0, 3:, 1:5] = 2
+    bag_ids[0, 2, 1:5, 2:4] = 7
+    bag_ids[1, 1, 0, 0] = 1
+    bag_ids[1, 1, 2:5, 3:6] = 4
+    reference_logits = torch.randn(
+        bag_ids.shape,
+        requires_grad=True,
+    )
+    routed_logits = reference_logits.detach().clone().requires_grad_(True)
+
+    expected, expected_bags, expected_pairs = _reference_brush_bag_loss(
+        reference_logits,
+        bag_ids,
+        top_fraction,
+    )
+    actual, actual_bags, actual_pairs = _brush_bag_loss(
+        routed_logits,
+        bag_ids,
+        top_fraction=top_fraction,
+        bag_ids_host=bag_ids,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+    assert actual_bags == expected_bags
+    assert actual_pairs == expected_pairs
+    expected.backward()
+    actual.backward()
+    torch.testing.assert_close(
+        routed_logits.grad,
+        reference_logits.grad,
+        rtol=1e-6,
+        atol=1e-7,
+    )
+
+
+def test_point_peak_host_targets_preserve_matching_and_gradients() -> None:
+    torch.manual_seed(23)
+    centers = torch.zeros((2, 2, 7, 7))
+    centers[0, 0, 2, 2] = 1
+    centers[0, 0, 2, 3] = 1
+    centers[1, 1, 5, 5] = 1
+    exclusion = torch.zeros_like(centers, dtype=torch.bool)
+    exclusion[0, 0, 1:4, 1:5] = True
+    reference_logits = torch.randn(
+        centers.shape,
+        requires_grad=True,
+    )
+    routed_logits = reference_logits.detach().clone().requires_grad_(True)
+
+    expected, expected_pairs, expected_counts = _point_peak_loss(
+        reference_logits,
+        centers,
+        tolerance_cells=1,
+        exclusion_support=exclusion,
+    )
+    actual, actual_pairs, actual_counts = _point_peak_loss(
+        routed_logits,
+        centers,
+        tolerance_cells=1,
+        exclusion_support=exclusion,
+        point_centers_host=centers,
+        exclusion_support_host=exclusion,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(actual_pairs, expected_pairs)
+    torch.testing.assert_close(actual_counts, expected_counts)
+    expected.backward()
+    actual.backward()
+    torch.testing.assert_close(
+        routed_logits.grad,
+        reference_logits.grad,
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def test_implicit_background_direct_gradient_is_twenty_times_weaker() -> None:

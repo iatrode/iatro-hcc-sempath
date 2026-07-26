@@ -425,13 +425,17 @@ def _refresh_spatial_prototype_anchors(
                 run_spatial=True,
                 spatial_sample_mask=spatial_sample_mask,
             )
-            spatial = _move_spatial_batch(batch, device)
-            active = {
-                key: value[
-                    spatial_sample_mask.to(value.device)
-                ]
-                for key, value in spatial.items()
+            active_host = {
+                key: batch[key][spatial_sample_mask]
+                for key in (
+                    "l2_point_centers",
+                    "l2_brush_bag_ids",
+                    "l2_area_positive",
+                    "l2_explicit_negative",
+                    "l2_implicit_negative",
+                )
             }
+            active = _move_spatial_batch(active_host, device)
             observations = head.prototype_observation_sums(
                 outputs["l2_spatial_features"],
                 point_centers=active["l2_point_centers"],
@@ -983,19 +987,23 @@ def run_epoch(
             )
             spatial_sample_mask = batch["l2_spatial_supervised"].any(dim=1)
             spatial_is_active = bool(spatial_sample_mask.any())
-            spatial = (
-                _move_spatial_batch(batch, device)
-                if spatial_is_active
-                else {
-                    key: batch[key]
-                    for key in (
-                        "l2_point_centers",
-                        "l2_brush_bag_ids",
-                        "l2_area_positive",
-                        "l2_explicit_negative",
-                        "l2_implicit_negative",
-                    )
+            spatial_host = {
+                key: batch[key]
+                for key in (
+                    "l2_point_centers",
+                    "l2_brush_bag_ids",
+                    "l2_area_positive",
+                    "l2_explicit_negative",
+                    "l2_implicit_negative",
+                )
+            }
+            active_spatial_host = (
+                {
+                    key: value[spatial_sample_mask]
+                    for key, value in spatial_host.items()
                 }
+                if spatial_is_active
+                else None
             )
 
             with torch.set_grad_enabled(train):
@@ -1039,14 +1047,45 @@ def run_epoch(
                     l2_known = None
                     l2_target = None
                     if spatial_is_active:
-                        l2_positive = (
-                            (spatial["l2_point_centers"] > 0)
-                            | (spatial["l2_brush_bag_ids"] > 0)
-                            | spatial["l2_area_positive"].to(dtype=torch.bool)
+                        if active_spatial_host is None:  # pragma: no cover
+                            raise RuntimeError(
+                                "active spatial targets were not prepared"
+                            )
+                        active_l2_positive = (
+                            (active_spatial_host["l2_point_centers"] > 0)
+                            | (active_spatial_host["l2_brush_bag_ids"] > 0)
+                            | active_spatial_host["l2_area_positive"].to(
+                                dtype=torch.bool
+                            )
                         ).flatten(2).any(dim=2)
-                        l2_explicit_negative = spatial[
+                        active_l2_explicit_negative = active_spatial_host[
                             "l2_explicit_negative"
                         ].to(dtype=torch.bool).flatten(2).any(dim=2)
+                        summary_shape = (
+                            spatial_sample_mask.shape[0],
+                            active_l2_positive.shape[1],
+                        )
+                        l2_positive_host = torch.zeros(
+                            summary_shape,
+                            dtype=torch.bool,
+                        )
+                        l2_explicit_negative_host = torch.zeros_like(
+                            l2_positive_host
+                        )
+                        l2_positive_host[spatial_sample_mask] = (
+                            active_l2_positive
+                        )
+                        l2_explicit_negative_host[spatial_sample_mask] = (
+                            active_l2_explicit_negative
+                        )
+                        l2_positive = l2_positive_host.to(
+                            device,
+                            non_blocking=device.type == "cuda",
+                        )
+                        l2_explicit_negative = l2_explicit_negative_host.to(
+                            device,
+                            non_blocking=device.type == "cuda",
+                        )
                         l2_known = l2_positive | l2_explicit_negative
                         l2_target = l2_positive.to(dtype=torch.float32)
                     student_by_teacher = outputs["teacher_outputs"]
@@ -1163,14 +1202,16 @@ def run_epoch(
                         }
                     if (
                         "l2_instance_logits" in outputs
-                        and spatial["l2_point_centers"].numel() > 0
+                        and spatial_host["l2_point_centers"].numel() > 0
                     ):
-                        active_spatial = {
-                            key: value[
-                                spatial_sample_mask.to(value.device)
-                            ]
-                            for key, value in spatial.items()
-                        }
+                        if active_spatial_host is None:  # pragma: no cover
+                            raise RuntimeError(
+                                "active spatial targets were not prepared"
+                            )
+                        active_spatial = _move_spatial_batch(
+                            active_spatial_host,
+                            device,
+                        )
                         spatial_loss, spatial_parts = spatial_morphometry_loss(
                             instance_logits=outputs["l2_instance_logits"],
                             abundance_logits=outputs["l2_abundance_logits"],
@@ -1179,6 +1220,15 @@ def run_epoch(
                             area_positive=active_spatial["l2_area_positive"],
                             explicit_negative=active_spatial["l2_explicit_negative"],
                             implicit_negative=active_spatial["l2_implicit_negative"],
+                            point_centers_host=active_spatial_host[
+                                "l2_point_centers"
+                            ],
+                            brush_bag_ids_host=active_spatial_host[
+                                "l2_brush_bag_ids"
+                            ],
+                            area_positive_host=active_spatial_host[
+                                "l2_area_positive"
+                            ],
                             component_names=cfg["data"].get(
                                 "spatial_component_names"
                             ),

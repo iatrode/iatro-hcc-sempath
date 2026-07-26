@@ -178,6 +178,8 @@ def _point_peak_loss(
     tolerance_cells: int,
     exclusive: bool = True,
     exclusion_support: torch.Tensor | None = None,
+    point_centers_host: torch.Tensor | None = None,
+    exclusion_support_host: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Match each click to one peak and suppress extras in known object support."""
 
@@ -200,7 +202,19 @@ def _point_peak_loss(
     point_count = centers.flatten(2).sum(dim=2)
     supervised = point_count > 0
     height, width = logits.shape[-2:]
-    centers_cpu = centers.detach().to(device="cpu")
+    centers_cpu = (
+        centers.detach().to(device="cpu")
+        if point_centers_host is None
+        else point_centers_host.detach().to(
+            device="cpu",
+            dtype=torch.float32,
+        )
+    )
+    if centers_cpu.shape != logits.shape:
+        raise ValueError(
+            "host point-centre shape mismatch: "
+            f"host={tuple(centers_cpu.shape)} logits={tuple(logits.shape)}"
+        )
     supervised_cpu = (
         centers_cpu.flatten(2).sum(dim=2) > 0
     )
@@ -219,10 +233,23 @@ def _point_peak_loss(
     ].float().to(device="cpu")
     exclusion_cpu = None
     if exclusion_support is not None:
-        exclusion_cpu = exclusion_support.detach()[
-            pair_batch,
-            pair_component,
-        ].to(device="cpu")
+        host_exclusion = (
+            exclusion_support.detach().to(device="cpu")
+            if exclusion_support_host is None
+            else exclusion_support_host.detach().to(
+                device="cpu",
+                dtype=torch.bool,
+            )
+        )
+        if host_exclusion.shape != logits.shape:
+            raise ValueError(
+                "host point-exclusion shape mismatch: "
+                f"host={tuple(host_exclusion.shape)} logits={tuple(logits.shape)}"
+            )
+        exclusion_cpu = host_exclusion[
+            supervised_pairs[:, 0],
+            supervised_pairs[:, 1],
+        ]
     selected_flat_indices: list[int] = []
     selected_pair_indices: list[int] = []
     extra_flat_indices: list[int] = []
@@ -441,6 +468,7 @@ def _brush_bag_loss(
     bag_ids: torch.Tensor,
     *,
     top_fraction: float,
+    bag_ids_host: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int, int]:
     """Positive multiple-instance loss over dense-cell brush bags.
 
@@ -453,45 +481,97 @@ def _brush_bag_loss(
         raise ValueError(
             f"brush top_fraction must be in (0, 1], got {top_fraction}"
         )
-    ids = bag_ids.to(device=logits.device, dtype=torch.long)
-    ids_cpu = ids.detach().to(device="cpu")
-    pair_losses: list[torch.Tensor] = []
-    bag_count = 0
-    pair_count = 0
+    ids_cpu = (
+        bag_ids.detach().to(device="cpu", dtype=torch.long)
+        if bag_ids_host is None
+        else bag_ids_host.detach().to(device="cpu", dtype=torch.long)
+    )
+    if ids_cpu.shape != logits.shape:
+        raise ValueError(
+            "host brush-bag shape mismatch: "
+            f"host={tuple(ids_cpu.shape)} logits={tuple(logits.shape)}"
+        )
+    component_count = logits.shape[1]
+    plane_size = logits.shape[2] * logits.shape[3]
+    flat_indices: list[torch.Tensor] = []
+    bag_sizes: list[int] = []
+    keep_counts: list[int] = []
+    bag_pairs: list[int] = []
+    supervised_pairs: set[int] = set()
     for batch_idx in range(logits.shape[0]):
-        for component_idx in range(logits.shape[1]):
-            component_ids = torch.unique(
-                ids_cpu[batch_idx, component_idx]
-            )
-            component_ids = component_ids[component_ids > 0]
-            if component_ids.numel() == 0:
-                continue
-            losses: list[torch.Tensor] = []
-            for bag_id in component_ids.tolist():
-                flat_indices = (
-                    ids_cpu[batch_idx, component_idx]
-                    .eq(int(bag_id))
-                    .flatten()
-                    .nonzero()
-                    .flatten()
-                    .to(device=logits.device)
+        for component_idx in range(component_count):
+            pair_index = batch_idx * component_count + component_idx
+            pair_ids = ids_cpu[batch_idx, component_idx].flatten()
+            for bag_id in torch.unique(pair_ids[pair_ids > 0]).tolist():
+                local = pair_ids.eq(int(bag_id)).nonzero().flatten()
+                size = int(local.numel())
+                flat_indices.append(local + pair_index * plane_size)
+                bag_sizes.append(size)
+                keep_counts.append(
+                    max(1, int(math.ceil(size * top_fraction)))
                 )
-                values = logits[
-                    batch_idx,
-                    component_idx,
-                ].flatten().index_select(0, flat_indices)
-                if values.numel() == 0:  # pragma: no cover - guarded by unique
-                    continue
-                keep = max(1, int(math.ceil(values.numel() * top_fraction)))
-                evidence = torch.topk(values, keep, sorted=False).values.mean()
-                losses.append(F.softplus(-evidence))
-                bag_count += 1
-            if losses:
-                pair_losses.append(torch.stack(losses).mean())
-                pair_count += 1
-    if not pair_losses:
+                bag_pairs.append(pair_index)
+                supervised_pairs.add(pair_index)
+    bag_count = len(flat_indices)
+    pair_count = len(supervised_pairs)
+    if bag_count == 0:
         return logits.sum() * 0.0, 0, 0
-    return torch.stack(pair_losses).mean(), bag_count, pair_count
+
+    device = logits.device
+    indices = torch.cat(flat_indices).to(device=device)
+    sizes = torch.tensor(bag_sizes, device=device, dtype=torch.long)
+    keep = torch.tensor(keep_counts, device=device, dtype=torch.long)
+    pairs = torch.tensor(bag_pairs, device=device, dtype=torch.long)
+    values = logits.flatten().index_select(0, indices)
+    bag_index = torch.repeat_interleave(
+        torch.arange(bag_count, device=device),
+        sizes,
+    )
+    # Stable value sort followed by stable bag sort is a lexicographic
+    # (bag ascending, score descending) ordering without one topk launch per
+    # brush bag.
+    score_order = torch.argsort(
+        values,
+        descending=True,
+        stable=True,
+    )
+    grouped_order = score_order[
+        torch.argsort(bag_index[score_order], stable=True)
+    ]
+    sorted_values = values[grouped_order]
+    offsets = torch.cumsum(sizes, dim=0) - sizes
+    rank = torch.arange(values.numel(), device=device) - torch.repeat_interleave(
+        offsets,
+        sizes,
+    )
+    selected = rank < torch.repeat_interleave(keep, sizes)
+    sorted_bag_index = bag_index[grouped_order]
+    bag_sums = logits.new_zeros((bag_count,)).scatter_add(
+        0,
+        sorted_bag_index,
+        torch.where(selected, sorted_values, torch.zeros_like(sorted_values)),
+    )
+    evidence = bag_sums / keep.to(dtype=logits.dtype)
+    bag_losses = F.softplus(-evidence)
+    flat_pair_loss = logits.new_zeros(
+        (logits.shape[0] * component_count,)
+    ).scatter_add(0, pairs, bag_losses)
+    flat_pair_count = torch.bincount(
+        pairs,
+        minlength=flat_pair_loss.numel(),
+    ).to(dtype=logits.dtype)
+    pair_loss = (
+        flat_pair_loss / flat_pair_count.clamp_min(1)
+    ).view(logits.shape[0], component_count)
+    supervised = flat_pair_count.view(
+        logits.shape[0],
+        component_count,
+    ) > 0
+    return (
+        _mean_supervised_pair(pair_loss, supervised, logits),
+        bag_count,
+        pair_count,
+    )
 
 
 def spatial_morphometry_loss(
@@ -503,6 +583,9 @@ def spatial_morphometry_loss(
     area_positive: torch.Tensor,
     explicit_negative: torch.Tensor,
     implicit_negative: torch.Tensor,
+    point_centers_host: torch.Tensor | None = None,
+    brush_bag_ids_host: torch.Tensor | None = None,
+    area_positive_host: torch.Tensor | None = None,
     component_names: list[str] | tuple[str, ...] | None = None,
     point_tolerance_cells: int = 1,
     abundance_point_weight: float = 0.5,
@@ -570,8 +653,9 @@ def spatial_morphometry_loss(
         dtype=torch.bool,
         device=instance_logits.device,
     ).view(1, -1, 1, 1)
+    density_flags = [spec.supports_density for spec in specs]
     density = torch.tensor(
-        [spec.supports_density for spec in specs],
+        density_flags,
         dtype=torch.bool,
         device=instance_logits.device,
     ).view(1, -1, 1, 1)
@@ -580,11 +664,35 @@ def spatial_morphometry_loss(
         dtype=torch.bool,
         device=instance_logits.device,
     ).view(1, -1, 1, 1)
+    structure_flags = [
+        spec.mode == STRUCTURE_INSTANCE_AREA for spec in specs
+    ]
     structure = torch.tensor(
-        [spec.mode == STRUCTURE_INSTANCE_AREA for spec in specs],
+        structure_flags,
         dtype=torch.bool,
         device=instance_logits.device,
     ).view(1, -1, 1, 1)
+    density_host = torch.tensor(
+        density_flags,
+        dtype=torch.bool,
+    ).view(1, -1, 1, 1)
+    structure_host = torch.tensor(
+        structure_flags,
+        dtype=torch.bool,
+    ).view(1, -1, 1, 1)
+    resolved_point_host = (
+        None
+        if point_centers_host is None
+        else point_centers_host.detach().to(device="cpu")
+    )
+    resolved_area_host = (
+        None
+        if area_positive_host is None
+        else area_positive_host.detach().to(
+            device="cpu",
+            dtype=torch.bool,
+        )
+    )
 
     point_bool = point_centers > 0
     bag_bool = brush_bag_ids > 0
@@ -623,17 +731,30 @@ def spatial_morphometry_loss(
         point_centers,
         tolerance_cells=point_tolerance_cells,
         exclusion_support=area_bool & structure,
+        point_centers_host=resolved_point_host,
+        exclusion_support_host=(
+            None
+            if resolved_area_host is None
+            else resolved_area_host & structure_host
+        ),
     )
     abundance_point, _, _ = _point_peak_loss(
         abundance_logits,
         point_centers * density.to(dtype=point_centers.dtype),
         tolerance_cells=point_tolerance_cells,
         exclusive=False,
+        point_centers_host=(
+            None
+            if resolved_point_host is None
+            else resolved_point_host
+            * density_host.to(dtype=resolved_point_host.dtype)
+        ),
     )
     brush_bag, brush_bags, brush_pairs = _brush_bag_loss(
         abundance_logits,
         brush_bag_ids,
         top_fraction=brush_top_fraction,
+        bag_ids_host=brush_bag_ids_host,
     )
     area_positive_loss, area_pairs = _positive_area_loss(
         abundance_logits,
