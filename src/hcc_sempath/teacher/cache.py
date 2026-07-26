@@ -13,14 +13,13 @@ import threading
 import time
 from pathlib import Path
 
-import numpy as np
 import timm
 import torch
 from safetensors.torch import load_file as load_safetensors_file
 from timm.data import create_transform, resolve_model_data_config
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from iatro.iac.adapters.features import build_teacher_feature_package, build_teacher_feature_package_from_tile_package
+from iatro.iac.adapters.features import build_teacher_feature_package
 from iatro.iac import read_tables
 from iatro.iac.adapters.manifests import TileRecord
 from iatro.iac.adapters.tiles import TilePackageReader, read_package_manifest, read_package_metadata

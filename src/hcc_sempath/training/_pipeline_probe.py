@@ -18,7 +18,6 @@ import os
 import tempfile
 import threading
 from collections import defaultdict
-from contextlib import contextmanager
 from time import perf_counter
 
 ON = bool(os.environ.get("HCC_PIPELINE_PROBE"))

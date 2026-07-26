@@ -70,13 +70,7 @@ class SpatialRoiTarget:
 
 @dataclass(frozen=True)
 class SpatialValidationMetadata:
-    """Validation-only completeness and geometry provenance for one tile.
-
-    Ordinary training ROI marks are intentionally weak and do not imply that
-    every instance or every occupied cell was exhaustively annotated.
-    Independent decoder calibration must opt in explicitly, per component, via
-    ``roi_count_complete`` and ``roi_measurement_complete``.
-    """
+    """Per-component completeness and geometry provenance for calibration."""
 
     count_complete: torch.Tensor  # [K], bool
     measurement_complete: torch.Tensor  # [K], bool
@@ -100,14 +94,7 @@ def empty_spatial_roi_target(
 def _load_records(
     path: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Load ROI records and tile-level completion metadata.
-
-    ``roi_reviewed`` records that the tile was visited/saved. It does not mean
-    every absent component is a confirmed negative. Only ``roi_complete_all``
-    supplies a tile-level completeness statement, and even then unmarked space
-    is retained as weak implicit background rather than promoted to a strong
-    negative.
-    """
+    """Load ROI records and tile-level completion metadata."""
 
     text = path.read_text(encoding="utf-8")
     if path.suffix.lower() == ".jsonl":
@@ -349,7 +336,7 @@ def load_spatial_validation_metadata(
 
 
 def spatial_component_names(manifest_path: str | Path) -> list[str]:
-    """Read the active nine-component contract without legacy L2 prototypes."""
+    """Read the active nine-component spatial contract."""
 
     payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     definitions = (

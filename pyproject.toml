@@ -6,7 +6,25 @@ build-backend = "setuptools.build_meta"
 name = "hcc-sempath"
 version = "0.1.0"
 description = "Lightweight vertical pathology representation model for HCC"
-requires-python = ">=3.11"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = [
+  "computational-pathology",
+  "hepatocellular-carcinoma",
+  "knowledge-distillation",
+  "spatial-morphometry",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
 dependencies = [
   "torch",
   "torchvision",
@@ -16,7 +34,8 @@ dependencies = [
   "matplotlib",
   "Pillow",
   "tqdm",
-  "imagecodecs",
+  "imagecodecs<2025.8.2; python_version < '3.11'",
+  "imagecodecs; python_version >= '3.11'",
   "huggingface_hub",
   "safetensors",
   "openslide-python",
@@ -36,6 +55,11 @@ search = [
 
 [project.scripts]
 hcc-sempath = "hcc_sempath.cli.main:main"
+
+[project.urls]
+Homepage = "https://github.com/iatrode/iatro-hcc-sempath"
+Repository = "https://github.com/iatrode/iatro-hcc-sempath"
+Issues = "https://github.com/iatrode/iatro-hcc-sempath/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

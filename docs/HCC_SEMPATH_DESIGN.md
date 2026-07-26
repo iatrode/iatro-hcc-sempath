@@ -1,11 +1,11 @@
-# HCC-SemPath V2: L1 Classification and L2 Spatial Morphometry
+# HCC-SemPath: L1 Classification and L2 Spatial Morphometry
 
-Status: active design of record. This is the single binding scientific,
-supervision, implementation, validation, and release contract for V2.
+Status: active design of record. This is the scientific, supervision,
+implementation, validation, and release contract.
 
 ## 1. Research problem
 
-HCC-SemPath V2 learns two different pathology objects from one fixed
+HCC-SemPath learns two complementary pathology representations from one fixed
 DINOv2-S/14 tile encoder:
 
 1. a four-class, mutually exclusive Level-1 tissue-state classification;
@@ -13,11 +13,9 @@ DINOv2-S/14 tile encoder:
    supporting component location, instance count, local abundance, and
    calibrated area where the supervision permits it.
 
-Level 2 is not a tile-classification task. The former deployable global L2
-scores, attribute-classification loss, Top-Q pooling, and local/global score
-consistency are outside the V2 path. Global component centroids exist only as
-a no-gradient PAMT-D reliability coordinate during training; they are neither
-an L2 output nor a spatial pseudo-label.
+The L2 branch produces spatial component maps and calibrated morphometric
+measurements. No-gradient global component centroids provide the PAMT-D
+reliability coordinate during training.
 
 ## 2. Core hypothesis
 
@@ -62,8 +60,6 @@ The spatial components, in fixed order, are:
 8. `vascular-structure-present`
 9. `ductular-portal-present`
 
-Hyaline change belongs only to the deprecated tile-level V1 asset.
-
 ## 4. Component-and-geometry annotation contract
 
 Tool meaning is resolved jointly with component biology:
@@ -75,9 +71,8 @@ Tool meaning is resolved jointly with component biology:
 | Necrosis, fibrous stroma | Invalid for positive annotation | Positive extent | Positive extent | Area/coverage only |
 | Bile pigment | Small positive pigment seed, not an instance | Larger positive focus with approximate extent | Irregular/fused positive pigment extent | Pigment burden/area; derived focus density only |
 
-A circle is never treated as a generic brush bag. It is a large point for
-countable components and supplies one countable centre; for bile pigment it
-supplies focus extent without claiming a biological instance. A brush is
+A circle supplies one countable centre for countable components and supplies
+focus extent for bile pigment. A brush is
 class-routed: dense-cell bag, connected large discrete structure, or
 continuous positive area. Brush input events are annotation mechanics:
 overlapping strokes on the same discrete structure form one instance.
@@ -86,8 +81,7 @@ Explicit negatives are strong negative evidence. Ordinary unmarked space is
 usually background but can contain deliberately unresolved mixtures, so it
 must not receive the same confidence as an explicit negative.
 
-`roi_reviewed` records that a tile was visited and saved; it is not promoted to
-a complete nine-component review. A geometry-free `state=negative,
+`roi_reviewed` records that a tile was visited and saved. A geometry-free `state=negative,
 review_complete=true` record supplies a strong tile-wide negative. Unmentioned
 components remain ignored unless an explicit completeness field says
 otherwise.
@@ -110,9 +104,9 @@ cross-entropy anchors the human boundary.
 L2 follows the same small-to-large premise: sparse expert spatial constraints
 define exact full-bank local positive/negative component centroids and reshape the local
 features and shared encoder while four-teacher distillation anchors `z_hcc`.
-Teacher-space component centroids participate only in per-tile reliability
-adjudication. Teacher features never generate L2 centres, brush masks, or
-spatial pseudo-labels.
+Teacher-space component centroids participate in per-tile reliability
+adjudication. Expert point, circle, and brush geometry supplies the L2 spatial
+targets.
 
 ### L1 head
 
@@ -127,8 +121,8 @@ l1_logits[k] = cosine(z, centroid_l1[k]) / temperature
 Human L1 labels define the complete centroid bank and use cross entropy on the
 resulting response. Centroids are no-gradient coordinates recomputed from the
 current student between optimizer steps; gradients from the response update
-`z_hcc`, not the centroid buffers. Semantic distillation and PAMT-D use only the four primary teacher
-prototypes; legacy L2 attributes in old prototype packages are ignored.
+`z_hcc`. Semantic distillation and PAMT-D use the four primary teacher
+prototypes.
 
 ### Dense local branch
 
@@ -163,19 +157,16 @@ cell brushes update density prototypes; circle/brush extent updates discrete
 structure area prototypes; continuous and pigment extent updates burden/area
 prototypes. A structure point never supplies an inferred extent.
 
-A single prototype is a semantic readout coordinate after the trainable local,
-semantic, fusion, and nonlinear context transformations. It is not a claim
-that one component has a single raw-image morphology. Distinct appearances,
-including heterogeneous hepatocellular nuclei, receive independent spatial
-loss at their annotated locations and may map to the same component direction.
-The L2 annotation gate likewise measures fixed-probe coverage rather than
-distance to one global centre. A multi-prototype morphology bank is not part of
-the primary model because it would partition the small expert asset into
-unidentified latent subtypes without changing the required component output.
+A component prototype is a semantic readout coordinate after the trainable
+local, semantic, fusion, and nonlinear context transformations. Morphological
+variants, including heterogeneous hepatocellular nuclei, receive independent
+spatial loss at their annotated locations and map into the shared component
+coordinate. The L2 annotation gate measures fixed-probe coverage across the
+four teacher spaces.
 
-The instance tensor retains fixed nine-class topology, but non-countable
-channels are deterministically suppressed and marked invalid in both model
-output and decoder metadata; they are not trained as latent pseudo-counts.
+The instance tensor retains fixed nine-class topology. Capability masks
+deterministically suppress count outputs for non-countable channels in model
+output and decoder metadata.
 
 Decoded outputs are capability-masked:
 
@@ -184,12 +175,10 @@ Decoded outputs are capability-masked:
 - density mass/mean only for the three cell/density components;
 - area fraction/pixels only for continuous, pigment, and discrete-structure
   components;
-- thresholded bile-pigment focus density as a secondary morphology descriptor,
-  not an instance count or direct loss target.
+- thresholded bile-pigment focus density as a secondary morphology descriptor.
 
-Count and density/area remain separate measurements. They are not summed into a
-fabricated global L2 confidence score, and unsupported measurements are emitted
-as invalid rather than zero.
+Count, density, and area remain separate measurements. Capability masks mark
+undefined component/measurement pairs as invalid.
 
 ## 6. Targets and losses
 
@@ -240,15 +229,11 @@ extent marks supervise the area head. Negative loss reaches the instance head
 only for countable components. Ordinary unmarked background cannot dominate
 sparse positive or explicit-negative supervision mechanically.
 
-The explicit-negative and implicit-background mechanisms have intentionally
-different roles. Explicit negatives receive unit direct-loss weight and define
-the prototype boundary whenever available. Unmarked background receives a
-0.05 direct-loss weight; its exact full-bank pair-averaged centroid is only the fallback
-contrastive coordinate when no explicit-negative centroid exists. The
-coefficient of a contrastive coordinate is not a label-confidence weight, so
-the 0.05 direct-loss weight must not be reapplied to centroid subtraction and
-the fallback centroid must not be removed on the premise that it is strong
-per-cell supervision.
+Explicit negatives receive unit direct-loss weight and define the prototype
+boundary whenever available. Unmarked background receives a 0.05 direct-loss
+weight; its exact full-bank pair-averaged centroid supplies the fallback
+contrastive coordinate. Contrastive centroid subtraction uses the unscaled
+coordinate.
 
 ## 7. Optimization
 
@@ -263,8 +248,8 @@ spatial_backbone_start_step  1000
 ```
 
 After release, the global and spatial gradient norms, spatial gradient share,
-and gradient cosine are measured on the final shared Transformer block. These
-are diagnostics, not dynamic loss weights.
+and gradient cosine are measured on the final shared Transformer block as
+training diagnostics.
 
 The fixed L1/L2 expert-tile union is replayed at a configured interval among
 population batches. This keeps both dynamic prototype systems and direct
@@ -296,13 +281,12 @@ only as a fallback.
 - The shared priority list serves the stable 3,000 tiles first and expands
   outside that boundary only when still-growing component curves require more
   examples.
-- L2 has no preset class quota or total tile count. Per-component sufficiency is
-  measured separately in each of the four frozen teacher feature spaces on one
+- Per-component annotation sufficiency is measured separately in each of the
+  four frozen teacher feature spaces on one
   fixed, slide-separated probe while a nested reference set grows. Remaining
   task-space novelty is therefore monotone non-increasing. Annotation stops
   only after every teacher has consecutive low-information-gain tail
-  increments and slide/geometry QC passes; a teacher average cannot hide an
-  under-covered teacher.
+  increments and slide/geometry QC passes in every teacher space.
 - The L2 curve x-axis is unique component-positive tiles rather than clicks or
   strokes. Point/circle/brush counts, component-specific measurement
   capabilities, slide balance, rasterization failures, and annotation
@@ -314,8 +298,7 @@ only as a fallback.
 - The final L2 tile count is the union required for all nine component curves
   to pass. Early-saturating components stop consuming annotation effort;
   still-growing components drive subsequent tile selection.
-- Old L2 tile labels may prioritize which image is shown next; they never enter
-  the target tensor.
+- Existing component-presence labels prioritize the annotation queue.
 - Training consumes all configured image IAC packages and the four existing
   teacher-feature IAC streams.
 - Patient/slide separation remains the split unit.
@@ -323,11 +306,9 @@ only as a fallback.
 ## 9. Validation
 
 Training records validation loss, L1 accuracy when validation labels exist,
-and retained teacher alignment. None of these substitutes for spatial
-validation. Consequently, teacher-alignment plateau stopping is disabled for
-the spatial route, and the terminal checkpoint after the prescribed schedule
-is the pre-validation spatial candidate. The training-side L2 annotation asset
-is not reused as a spatial validation set.
+and retained teacher alignment. The terminal checkpoint after the prescribed
+schedule enters independent spatial validation on a slide-separated expert
+asset.
 
 After checkpoint freezing, spatial validation is performed on an independent,
 slide-separated expert sample:
@@ -365,27 +346,24 @@ the exact terminal model-state digest, research contract, annotation,
 protocol, and validation cohort. The release exporter rejects a calibration
 from any other checkpoint.
 
-The comparison is against the deprecated global-L2 baseline only as a
-historical control. The confirmatory claim concerns spatial measurement, not
-tile-level attribute classification.
+The confirmatory comparison evaluates the spatial measurement endpoint against
+the prespecified baseline.
 
 ## 10. Release and downstream boundary
 
 The released pathology tower owns the frozen encoder, normalized `z_hcc`, L1
 readout, spatial instance/measurement maps, capability masks, calibrated
-measurements, preprocessing metadata, and provenance. Downstream systems may
-consume these outputs through a one-way, versioned interface. Their token,
-language, routing, or task losses cannot modify the released V2 checkpoint or
-be required to reproduce it.
+measurements, preprocessing metadata, and provenance. Downstream systems
+consume these outputs through a one-way, versioned interface while the released
+checkpoint remains frozen.
 
 Continuous-token adapters, language alignment, whole-slide aggregation,
 patient-level diagnosis, staging, prognosis, and treatment recommendation are
-separate research objects. They do not change V2 training or its confirmatory
-evidence boundary.
+separate research objects with independent evidence boundaries.
 
 ## 11. Expected contribution
 
-V2 contributes one HCC-specific representation with:
+HCC-SemPath contributes one HCC-specific representation with:
 
 - retained multi-teacher foundation features;
 - stable four-class global tissue state;
@@ -418,17 +396,17 @@ V2 contributes one HCC-specific representation with:
 - `scripts/roi_information_curve.py`: executable four-teacher,
   component-wise annotation sufficiency/QC curve.
 - `scripts/calibrate_spatial_decoder.py`: terminal-checkpoint decoder freeze.
-- `scripts/export_release_sempath.py`: provenance-bound V2 release without
-  teacher heads.
+- `scripts/export_release_sempath.py`: provenance-bound release package.
 
-The implementation is acceptable only while:
+Implementation conformance requires:
 
 1. point, circle, and brush follow the component table above;
-2. area-only and pigment components never export biological instance counts;
-3. unresolved mixtures are not promoted to strong negative truth;
+2. capability masks exclude biological instance counts from area-only and
+   pigment components;
+3. unresolved mixtures retain weak-background semantics;
 4. L2 reaches the shared encoder after supervised-step warm-up while
    four-teacher distillation remains active;
-5. unsupported measurements remain invalid;
+5. undefined component/measurement pairs remain invalid;
 6. annotation sufficiency is determined by component-wise information
    plateaus, not a preset tile quota;
 7. reduced-duration ablations retain the full population and complete expert

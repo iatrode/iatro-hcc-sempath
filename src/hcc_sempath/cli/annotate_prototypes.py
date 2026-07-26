@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 
 from PIL import Image, ImageDraw
 
-from hcc_sempath.cli.view_iac import IacRecord, IacViewerData
+from hcc_sempath.cli._annotation_tiles import AnnotationTilePackageReader, IacRecord
 from iatro.iac import read_header
 from iatro.iac.adapters.tiles import decode_jxl
 
@@ -61,8 +61,7 @@ L2_PROTOTYPES = [
     "ductular-portal-present",
 ]
 
-# V2 ROI taxonomy. V1 tile-level assets retain hyaline-change for historical
-# compatibility, but it is not part of the ROI branch.
+# Spatial ROI taxonomy.
 ROI_L2_PROTOTYPES = [name for name in L2_PROTOTYPES if name != "hyaline-change-present"]
 DEFAULT_ROI_INFORMATION_REPORT = (
     Path(__file__).resolve().parents[3]
@@ -336,13 +335,12 @@ class RoiCandidateQueue:
         allowed_tile_ids: set[str] | None = None,
         exclude_tile_id: str | None = None,
     ) -> list[dict]:
-        """Return a dynamically weighted order of old-L2 navigation hints.
+        """Return a dynamically weighted order of component-presence hints.
 
-        Old tile-level L2 labels are used only to choose which image is shown
-        next. They never enter the ROI annotation state or pre-fill a label.
+        Component-presence labels choose which image is shown next.
         Current information-curve deficits set the target urgency. The
-        observed mapping from historical L2 hints to current spatial positives
-        is updated after every review, allowing related historical labels to
+        observed mapping from presence hints to spatial positives
+        is updated after every review, allowing related labels to
         recover a target whose direct hint inventory has been exhausted.
         """
         explicit_priority = bool(priority_attributes)
@@ -1131,7 +1129,7 @@ class AnnotationData:
         )
         if self.priority_queue is not None:
             self.priority_queue.add_annotations(list(self.state.annotations.values()))
-        self._viewers: OrderedDict[int, IacViewerData] = OrderedDict()
+        self._viewers: OrderedDict[int, AnnotationTilePackageReader] = OrderedDict()
         self._lock = threading.RLock()
         self._scan_done = False
         self._scan_error = ""
@@ -1183,7 +1181,7 @@ class AnnotationData:
     def activate_thumbnail_token(self, token: str) -> None:
         with self._lock:
             if token and token != self._thumbnail_token:
-                LOG.info("thumbnail_token_activate token=%s", token)
+                LOG.info("thumbnail_token_activate")
                 self._thumbnail_token = token
 
     def thumbnail_token_active(self, token: str | None) -> bool:
@@ -1197,7 +1195,7 @@ class AnnotationData:
         name = f"{Path(package.rel_path).stem}.{digest}.overview.jpg"
         return self.cache_root / name
 
-    def viewer(self, index: int) -> IacViewerData:
+    def viewer(self, index: int) -> AnnotationTilePackageReader:
         with self._lock:
             package = self.packages[index]
             cached = self._viewers.get(index)
@@ -1207,7 +1205,7 @@ class AnnotationData:
         if cached is None:
             start = perf_counter()
             LOG.info("iac_open_start index=%d rel_path=%s path=%s", index, package.rel_path, package.path)
-            viewer = IacViewerData(package.path)
+            viewer = AnnotationTilePackageReader(package.path)
             if viewer.payload_type != "image_tiles":
                 viewer.close()
                 raise ValueError(f"annotation requires image-tile IAC package: {package.path}")
@@ -1554,7 +1552,7 @@ class AnnotationData:
                     return {
                         "record": viewer._record_json(record),
                         "package_index": pkg_idx,
-                        "selection": "legacy_l2_navigation_hint",
+                        "selection": "component_presence_navigation_hint",
                     }
             priority_remaining = (
                 [record for record in remaining if self.priority_queue.contains(record.tile_id)]
@@ -1582,9 +1580,8 @@ class AnnotationData:
                     skipped_tile_ids.add(parts[1])
             processed_tile_ids = annotated_tile_ids | skipped_tile_ids
 
-            # 2. Within the shared 3000-tile boundary, let old L2 morphology
-            # records make L2 random navigation purposeful. These are image
-            # retrieval hints only; no old label is exposed as an annotation.
+            # 2. Within the shared 3000-tile boundary, component-presence
+            # records make L2 random navigation purposeful.
             if self.priority_queue is not None:
                 shared_remaining_ids = {
                     item["tile_id"] for item in self.priority_queue.candidates
@@ -1624,7 +1621,7 @@ class AnnotationData:
                         return {
                             "record": viewer._record_json(record),
                             "package_index": p_idx,
-                            "selection": "legacy_l2_navigation_hint",
+                            "selection": "component_presence_navigation_hint",
                         }
 
             # 3. Both L1 classification and L2 ROI exhaust the same shared tile boundary first.
@@ -2474,7 +2471,7 @@ async function refreshPackage(){
         console.error(e);
     }
 }
-async function progress(){const p=await api('/api/progress?package='+pkg);l1Counts=p.l1;l2Counts=p.roi_counts&&Object.keys(p.roi_counts).length?p.roi_counts:p.l2;renderLabels();const filtered=p.auto_filtered?` · ${p.auto_filtered} blank filtered`:'';const priority=p.priority;const handled=priority?priority.reviewed+priority.skipped:0;const progressPct=priority&&priority.total?Math.round(handled/priority.total*100):0;const priorityLine=priority?`<b>Priority list ${priority.reviewed}/${priority.total}</b> reviewed · ${priority.remaining} remaining · ${priority.skipped} skipped<div class=bar><div style="width:${progressPct}%"></div></div>`:'';document.getElementById('progress').innerHTML=`${priorityLine}<div>All tiles: ${p.overall.annotated}/${p.overall.total} reviewed · ${p.overall.remaining} remaining · ${p.overall.skipped} skipped${filtered}</div>`;document.getElementById('reviewedCount').textContent=p.overall.annotated;const active=new Set(p.roi_priority_attributes||[]);document.getElementById('roiCountProgress').innerHTML=Object.keys(p.roi_counts||{}).map(x=>`${active.has(x)?'●':'○'} ${labelName('l2',x)}: ${p.roi_counts[x]||0}`).join('<br>');const exhausted=[...active].filter(x=>p.roi_navigation_status&&p.roi_navigation_status[x]&&p.roi_navigation_status[x].exhausted);const notice=document.getElementById('roiNavigationNotice');notice.textContent=exhausted.map(x=>`${labelName('l2',x)}: all ${p.roi_navigation_status[x].total} old-L2 candidates reviewed, but the information curve is not ready.`).join('\n');notice.classList.toggle('hidden',!exhausted.length);}
+async function progress(){const p=await api('/api/progress?package='+pkg);l1Counts=p.l1;l2Counts=p.roi_counts&&Object.keys(p.roi_counts).length?p.roi_counts:p.l2;renderLabels();const filtered=p.auto_filtered?` · ${p.auto_filtered} blank filtered`:'';const priority=p.priority;const handled=priority?priority.reviewed+priority.skipped:0;const progressPct=priority&&priority.total?Math.round(handled/priority.total*100):0;const priorityLine=priority?`<b>Priority list ${priority.reviewed}/${priority.total}</b> reviewed · ${priority.remaining} remaining · ${priority.skipped} skipped<div class=bar><div style="width:${progressPct}%"></div></div>`:'';document.getElementById('progress').innerHTML=`${priorityLine}<div>All tiles: ${p.overall.annotated}/${p.overall.total} reviewed · ${p.overall.remaining} remaining · ${p.overall.skipped} skipped${filtered}</div>`;document.getElementById('reviewedCount').textContent=p.overall.annotated;const active=new Set(p.roi_priority_attributes||[]);document.getElementById('roiCountProgress').innerHTML=Object.keys(p.roi_counts||{}).map(x=>`${active.has(x)?'●':'○'} ${labelName('l2',x)}: ${p.roi_counts[x]||0}`).join('<br>');const exhausted=[...active].filter(x=>p.roi_navigation_status&&p.roi_navigation_status[x]&&p.roi_navigation_status[x].exhausted);const notice=document.getElementById('roiNavigationNotice');notice.textContent=exhausted.map(x=>`${labelName('l2',x)}: all ${p.roi_navigation_status[x].total} candidates reviewed; the information curve needs more coverage.`).join('\n');notice.classList.toggle('hidden',!exhausted.length);}
 async function showRecord(rec){current=rec; l1=""; l2=new Set();roi=[];roiClassState={};roiExclusionOverrides={};undoStack=[];redoStack=[];roiPreview=null;roiCursor=null;roiPlan=null;roiPlanLoading=false;roiAttribute=ROI_MODE?ROI_ALL:'';roiAllComplete=true;renderLabels();renderRoi(); if(!rec){document.getElementById('recordMeta').textContent='No unreviewed tile to show.'; document.getElementById('tile').removeAttribute('src'); return;}const saved=await api(`/api/annotation-state?package=${pkg}&row=${rec.row}`);if(saved.annotation){l1=saved.annotation.l1||'';l2=new Set(saved.annotation.l2||[]);roi=(saved.annotation.roi||[]).filter(item=>item.geometry);(saved.annotation.roi||[]).filter(item=>item.review_complete&&item.state==='negative'&&!item.geometry).forEach(item=>{roiClassState[item.attribute]='negative'});const complete=new Set((saved.annotation.roi||[]).filter(item=>item.review_complete).map(item=>item.attribute));roiAllComplete=L2.every(name=>complete.has(name))}renderLabels();renderRoi();document.getElementById('recordMeta').textContent=`Package ${pkg+1} · tile ${rec.row+1} · x=${rec.x} y=${rec.y}`; const tile=document.getElementById('tile'); tile.src=authed(scoped(`/api/tile?package=${pkg}&row=${rec.row}`)); applyTileZoom(); setThumbnailSrc();}
 async function nextRandom(isSkip=false){
     try {
@@ -3082,16 +3079,16 @@ def _annotation_parser() -> argparse.ArgumentParser:
         "--roi-candidate-manifest",
         default="",
         help=(
-            "Optional old-L2 candidate manifest used only to bias L2 random navigation within "
-            "the shared tile boundary; it never pre-fills ROI labels."
+            "Optional component-presence candidate manifest used to prioritize "
+            "L2 navigation within the shared tile boundary."
         ),
     )
     parser.add_argument(
         "--roi-priority-attributes",
         default="",
         help=(
-            "Optional comma-separated target restriction for old-L2 navigation. "
-            "Related historical labels may still be used as retrieval hints for "
+            "Optional comma-separated target restriction for component-presence navigation. "
+            "Related labels may be used as retrieval hints for "
             "the selected targets. "
             "Normal annotation should leave this empty so the current "
             "information report selects deficient ROI attributes dynamically."

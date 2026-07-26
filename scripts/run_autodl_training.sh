@@ -17,19 +17,12 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
   exit 2
 fi
 
-PYTHON_BIN="${HCC_SEMPATH_PYTHON:-/root/miniconda3/envs/hcc-sempath/bin/python}"
-if [[ ! -x "${PYTHON_BIN}" ]]; then
+PYTHON_BIN="${HCC_SEMPATH_PYTHON:-python}"
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1 \
+  && [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "AutoDL training Python is not executable: ${PYTHON_BIN}" >&2
   exit 2
 fi
-
-if [[ $# -eq 2 ]]; then
-  LOG_PATH="$2"
-else
-  CONFIG_NAME="$(basename -- "${CONFIG_PATH}")"
-  LOG_PATH="/root/autodl-tmp/hcc-sempath-runtime/logs/${CONFIG_NAME%.yaml}.log"
-fi
-mkdir -p -- "$(dirname -- "${LOG_PATH}")"
 
 export PYTHONPATH="${REPO_DIR}/src"
 export PYTHONUNBUFFERED=1
@@ -38,15 +31,20 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 
-echo "training_start config=${CONFIG_PATH} log=${LOG_PATH}"
-echo "attach_to_tmux_for_live_output=true"
-
 cd "${REPO_DIR}"
+if [[ $# -eq 1 ]]; then
+  echo "training_start config=${CONFIG_PATH} log=none"
+  exec "${PYTHON_BIN}" -m hcc_sempath.training.train \
+    --config "${CONFIG_PATH}"
+fi
+
+LOG_PATH="$2"
+mkdir -p -- "$(dirname -- "${LOG_PATH}")"
+echo "training_start config=${CONFIG_PATH} log=${LOG_PATH}"
 set +e
 "${PYTHON_BIN}" -m hcc_sempath.training.train \
   --config "${CONFIG_PATH}" 2>&1 | tee -a "${LOG_PATH}"
 TRAIN_STATUS=${PIPESTATUS[0]}
 set -e
-
 echo "training_exit status=${TRAIN_STATUS}"
 exit "${TRAIN_STATUS}"

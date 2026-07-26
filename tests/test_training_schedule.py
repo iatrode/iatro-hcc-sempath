@@ -447,7 +447,7 @@ def test_training_config_rejects_backbone_configuration() -> None:
         validate_training_config(cfg, ["teacher"])
 
 
-def test_training_config_rejects_retired_exact_area_spatial_loss() -> None:
+def test_training_config_rejects_unsupported_exact_area_spatial_loss() -> None:
     cfg = {
         "data": {"teachers": ["teacher"]},
         "model": {"teacher_dims": {"teacher": 8}},
@@ -469,7 +469,7 @@ def test_training_config_validates_brush_bag_fraction() -> None:
         validate_training_config(cfg, ["teacher"])
 
 
-def test_training_config_rejects_ignored_legacy_schedule_keys() -> None:
+def test_training_config_rejects_unsupported_schedule_keys() -> None:
     cfg = {
         "data": {"teachers": ["teacher"]},
         "model": {"teacher_dims": {"teacher": 8}},
@@ -574,7 +574,7 @@ def test_resume_contract_freezes_data_seed_preprocessing_and_epochs() -> None:
         assert _resume_contract(changed) != baseline
 
 
-def test_training_config_rejects_obsolete_profiling_controls() -> None:
+def test_training_config_rejects_unsupported_profiling_controls() -> None:
     cfg = {
         "data": {"teachers": ["teacher"]},
         "model": {"teacher_dims": {"teacher": 8}},
@@ -582,7 +582,7 @@ def test_training_config_rejects_obsolete_profiling_controls() -> None:
         "train": {"pipeline_profile_interval": 10},
     }
 
-    with pytest.raises(ValueError, match="obsolete profiling"):
+    with pytest.raises(ValueError, match="unsupported profiling"):
         validate_training_config(cfg, ["teacher"])
 
 

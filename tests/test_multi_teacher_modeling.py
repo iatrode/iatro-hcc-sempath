@@ -668,7 +668,7 @@ def test_release_loader_uses_checkpoint_backbone_configuration(tmp_path: Path) -
     )
 
 
-def test_release_loader_rejects_legacy_classifier_format(
+def test_release_loader_rejects_unsupported_classifier_format(
     tmp_path: Path,
 ) -> None:
     checkpoint = tmp_path / "release.pt"

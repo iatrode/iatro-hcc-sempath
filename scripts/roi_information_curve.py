@@ -939,9 +939,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     report = {
         "audit_type": "roi_annotation_information_curve",
-        "claim_scope": "pre-training annotation information coverage; not downstream model performance",
-        "does_not_train": True,
-        "legacy_tile_level_l2_used": False,
+        "claim_scope": "pre-training annotation information coverage",
         "annotation_json": str(annotation_path),
         "annotation_state_version": payload.get("version"),
         "annotation_tile_count": len(items),

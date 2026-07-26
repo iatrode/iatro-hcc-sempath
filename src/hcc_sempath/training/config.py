@@ -260,13 +260,13 @@ def _existing_merged_feature_package_for_tile(
 def validate_training_config(cfg: dict, names: list[str]) -> None:
     validate_teacher_names(names)
     expected = set(names)
-    obsolete_model_keys = sorted(
+    unsupported_model_keys = sorted(
         key for key in ("backbone_name", "pretrained", "roi_patch_size") if key in cfg.get("model", {})
     )
-    if obsolete_model_keys:
+    if unsupported_model_keys:
         raise ValueError(
             "student backbone is a fixed pretrained DINOv2-S/14 research invariant; "
-            f"remove model keys: {obsolete_model_keys}"
+            f"remove model keys: {unsupported_model_keys}"
         )
     _unexpected_keys(cfg.get("model", {}).get("teacher_dims"), expected, "model.teacher_dims")
     _unexpected_keys(cfg.get("loss", {}).get("teacher_weights"), expected, "loss.teacher_weights")
@@ -287,7 +287,7 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
                 "loss.teacher_weights requires at least one positive teacher"
             )
 
-    obsolete_train_keys = sorted(
+    unsupported_train_keys = sorted(
         key
         for key in (
             "pipeline_profile_interval",
@@ -307,10 +307,10 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
         )
         if key in cfg.get("train", {})
     )
-    if obsolete_train_keys:
+    if unsupported_train_keys:
         raise ValueError(
-            "obsolete profiling keys are no longer implemented; use tqdm and "
-            f"TensorBoard metrics instead: {obsolete_train_keys}"
+            "unsupported profiling keys; use tqdm and TensorBoard metrics: "
+            f"{unsupported_train_keys}"
         )
 
     semantic_weight = float(cfg.get("loss", {}).get("semantic_weight", 0.0))
@@ -320,7 +320,7 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
         or float(loss_cfg.get("prototype_filter_weight", 0.0)) > 0
         or float(loss_cfg.get("zhcc_response_weight", 0.0)) > 0
     )
-    obsolete_loss_keys = sorted(
+    unsupported_loss_keys = sorted(
         key
         for key in (
             "scale_relation_by_alpha",
@@ -350,12 +350,12 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
         )
         if key in loss_cfg
     )
-    if obsolete_loss_keys:
+    if unsupported_loss_keys:
         raise ValueError(
-            "legacy tile-level L2/ROI loss route was removed; replace these keys "
-            f"with spatial_* objectives: {obsolete_loss_keys}"
+            "unsupported loss keys; use spatial_* objectives: "
+            f"{unsupported_loss_keys}"
         )
-    obsolete_online_prototype_keys = sorted(
+    unsupported_online_prototype_keys = sorted(
         key
         for key in (
             "prototype_momentum",
@@ -363,13 +363,12 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
         )
         if key in loss_cfg
     )
-    if obsolete_online_prototype_keys:
+    if unsupported_online_prototype_keys:
         raise ValueError(
-            "mini-batch EMA prototypes were replaced by exact full-bank "
-            "dynamic refresh; remove loss keys: "
-            f"{obsolete_online_prototype_keys}"
+            "prototype refresh uses the exact full bank; remove loss keys: "
+            f"{unsupported_online_prototype_keys}"
         )
-    obsolete_data_keys = sorted(
+    unsupported_data_keys = sorted(
         key
         for key in (
             "zhcc_prototype_path",
@@ -379,12 +378,12 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
         )
         if key in cfg.get("data", {})
     )
-    if obsolete_data_keys:
+    if unsupported_data_keys:
         raise ValueError(
-            "legacy tile-level L2/ROI data route was removed; use "
-            f"data.spatial_manifest_path/spatial_train_splits: {obsolete_data_keys}"
+            "unsupported data keys; use "
+            f"data.spatial_manifest_path/spatial_train_splits: {unsupported_data_keys}"
         )
-    obsolete_spatial_model_keys = sorted(
+    unsupported_spatial_model_keys = sorted(
         key
         for key in (
             "roi_patch_dim",
@@ -394,10 +393,10 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
         )
         if key in cfg.get("model", {})
     )
-    if obsolete_spatial_model_keys:
+    if unsupported_spatial_model_keys:
         raise ValueError(
-            "legacy Top-Q ROI head was removed; use model.spatial_* keys: "
-            f"{obsolete_spatial_model_keys}"
+            "unsupported model keys; use model.spatial_* keys: "
+            f"{unsupported_spatial_model_keys}"
         )
     for key in (
         "relation_weight",

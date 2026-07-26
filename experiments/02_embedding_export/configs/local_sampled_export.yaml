@@ -1,8 +1,0 @@
-inherits: ../../shared/configs/local_sampled_eval.yaml
-
-runtime:
-  output_dir: experiments/02_embedding_export/results
-
-train:
-  batch_size: 16
-  max_eval_batches: 8

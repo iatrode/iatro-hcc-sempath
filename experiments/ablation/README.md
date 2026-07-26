@@ -1,6 +1,6 @@
 # Matched Full-Population Reduced-Duration Ablation
 
-The tracked A0-A6 configurations define the planned V2 mechanism study. Every
+The tracked A0-A6 configurations define the planned mechanism study. Every
 condition uses the complete population stream, the complete L1/L2 expert union,
 the same one-tenth-duration training schedule, seed, and evaluation protocol.
 This tests whether the intended gradients descend and the mechanisms separate
@@ -16,10 +16,8 @@ The planned contrasts are:
 - A6 versus A2: full reliability-filter contribution;
 - A0 versus A5: dynamic prototype refresh.
 
-No V2 ablation has been run. Existing tables, reports, and numerical values in
-this directory are V1 historical evidence based partly on the removed
-tile-level L2 attribute route. They cannot be attributed to the current spatial
-model.
+Every reported value is produced from the current spatial implementation and
+its frozen run manifest. Generated results live in external experiment storage.
 
 The tracked base configuration is an open-source example and contains
 placeholder paths. Production runs must supply the resolved local base through

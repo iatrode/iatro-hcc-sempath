@@ -2,7 +2,7 @@
 
 Only unfinished work belongs here. Implemented behavior and scientific
 semantics are maintained in
-[`docs/HCC_SEMPATH_V2_DESIGN.md`](docs/HCC_SEMPATH_V2_DESIGN.md).
+[`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md).
 
 ## Annotation freeze
 
@@ -14,7 +14,7 @@ semantics are maintained in
 
 ## Training and evidence
 
-- Run full V2 training with the fixed L1/L2 expert union.
+- Run full training with the fixed L1/L2 expert union.
 - Confirm spatial gradients reshape the shared encoder while retaining L1 and
   four-teacher alignment.
 - Run the matched full-population, one-tenth-duration A0-A6 mechanism study.

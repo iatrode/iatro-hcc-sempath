@@ -105,7 +105,7 @@ def build_roi_candidate_queue(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build an old-L2 navigation-hint pool for V2 ROI annotation."
+        description="Build a component-presence navigation pool for ROI annotation."
     )
     parser.add_argument("--annotations", action="append", required=True, help="Tile-level annotation JSON or supplemental candidate JSON; repeatable. Existing L2 labels are optional and only affect priority.")
     parser.add_argument("--output", required=True)

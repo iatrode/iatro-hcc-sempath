@@ -2,12 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 import yaml
 
-from hcc_sempath.modeling.build_prototypes import main as build_prototypes_main
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 from hcc_sempath.modeling.prototypes import load_prototype_registry, load_prototypes
 from hcc_sempath.training.prototype_labels import load_prototype_labels
@@ -158,92 +156,6 @@ def test_load_prototype_registry_requires_primary_level(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="level-1"):
         load_prototype_registry(package_path)
-
-
-def test_build_prototypes_writes_two_level_package(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    primary_dir = tmp_path / "primary"
-    attribute_dir = tmp_path / "attributes"
-    for concept_dir in [
-        primary_dir / "primary_tumor",
-        primary_dir / "primary_non_tumor",
-        attribute_dir / "lymphocyte_rich",
-    ]:
-        concept_dir.mkdir(parents=True)
-        np.save(concept_dir / "example.npy", np.ones((4,), dtype=np.float32))
-    output = tmp_path / "prototypes.pt"
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "hcc-sempath build-prototypes",
-            "--primary-dir",
-            str(primary_dir),
-            "--attribute-dir",
-            str(attribute_dir),
-            "--output",
-            str(output),
-        ],
-    )
-
-    build_prototypes_main()
-    registry = load_prototype_registry(output, expected_dim=4)
-
-    assert registry.names == ["primary_non_tumor", "primary_tumor", "lymphocyte_rich"]
-    assert registry.levels == [1, 1, 2]
-    assert registry.exclusive == [True, True, False]
-    assert torch.linalg.norm(registry.prototypes, dim=1).tolist() == pytest.approx([1.0, 1.0, 1.0])
-
-
-def test_hcc_taxonomy_package_loads_with_expected_levels(tmp_path: Path) -> None:
-    names = [
-        "HCC-tumor",
-        "Background-liver",
-        "Inflammatory-stromal",
-        "Degenerative-material",
-        "hepatocellular-parenchyma-present",
-        "necrosis-present",
-        "hemorrhage-present",
-        "bile-pigment-present",
-        "inflammatory-cell-present",
-        "fibrous-stroma-present",
-        "steatosis-vacuolation-present",
-        "hyaline-change-present",
-        "vascular-structure-present",
-        "ductular-portal-present",
-    ]
-    package_path = tmp_path / "taxonomy.pt"
-    torch.save(
-        {
-            "version": 1,
-            "prototypes": torch.randn(len(names), 8),
-            "names": names,
-            "groups": [
-                "hcc_tumor",
-                "background_liver",
-                "inflammatory_stroma",
-                "degenerative_material",
-                "hepatocellular_parenchyma",
-                "necrosis",
-                "hemorrhage",
-                "pigment",
-                "inflammation",
-                "fibrous_stroma",
-                "steatosis_vacuolation",
-                "hyaline_change",
-                "vascular_structure",
-                "ductular_portal",
-            ],
-            "levels": [1] * 4 + [2] * 10,
-            "exclusive": [True] * 4 + [False] * 10,
-        },
-        package_path,
-    )
-
-    registry = load_prototype_registry(package_path, expected_dim=8)
-
-    assert registry.primary_indices == list(range(4))
-    assert registry.attribute_indices == list(range(4, 14))
-    assert registry.names[0] == "HCC-tumor"
-    assert registry.names[-1] == "ductular-portal-present"
 
 
 def test_l1_supervision_manifest_is_resolved_by_registry_names(tmp_path: Path) -> None:

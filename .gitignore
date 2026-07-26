@@ -1,13 +1,16 @@
 __pycache__/
 *.pyc
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
 *.local.sh
 configs/local/
 artifacts/*
 !artifacts/README.md
 outputs/
-annotations/*
-!annotations/README.md
+annotations/
 smoke_data/
 data/*
 !data/manifests/
@@ -21,14 +24,18 @@ results/**/tile_manifest.csv
 .DS_Store
 **/.DS_Store
 
-# Manuscript experiment code and reports are tracked; generated runs are local.
+# Experiment protocols are tracked; generated runs are local.
 experiments/**/logs/
 experiments/**/results/
+experiments/**/reports/
+experiments/**/tables/
 
-# Local release links point into ignored artifacts.
-release/hcc-sempath/*
-!release/hcc-sempath/README.md
-!release/hcc-sempath/model.pt
+# Numbered local workflows stay outside the public source tree.
+experiments/[0-9][0-9]_*/
+experiments/shared/
+
+# Checkpoints and exported release bundles are generated artifacts.
+release/
 
 # Local review plugin
 scripts/visuals_plugin.py
@@ -43,22 +50,3 @@ scripts/visuals_plugin.py
 /manuscript/*.synctex.gz
 /.apc/
 /AGENTS.md
-
-# Ignore local exhibit selector state and reviewed case selections
-experiments/06_attention_qc/configs/exval_selector_*
-experiments/06_attention_qc/configs/reviewed_attention_*
-experiments/06_attention_qc/reports/figure5_microscopic_attribution.pdf
-
-# Locally rendered output-morphology exhibit panels and their selection tables
-experiments/07_full_exval_cache/reports/output_morphology_*.png
-experiments/07_full_exval_cache/reports/output_morphology_*_selection.csv
-experiments/07_full_exval_cache/scripts/render_output_morphology_panel.py
-
-# Locally generated experiment summaries, tables, and figures
-experiments/07_full_exval_cache/reports/exval_iac_inference_benchmark*.json
-experiments/09_representation_audit/tables/
-experiments/10_teacher_disagreement_review/reports/figures/
-experiments/10_teacher_disagreement_review/tables/
-experiments/ablation/reports/figures/
-experiments/ablation/tables/
-experiments/reports/

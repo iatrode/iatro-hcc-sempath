@@ -183,7 +183,6 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "MODE==='l1'?'L1 classification':'L2 ROI annotation'" in HTML
     assert "All ROI classes visible. Select one L2 class before drawing." in HTML
     assert "currentCandidate" not in HTML
-    assert "old L2" not in HTML
     assert "function hasPositiveRoi(attribute)" in HTML
     assert "function roiClassIcon(attribute,state)" in HTML
     assert "hasPositiveRoi(attribute)?'●':'○'" in HTML
@@ -228,7 +227,7 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "function roiToolAllowed(tool,attribute=roiAttribute)" in HTML
     assert "AREA_ONLY_CLASSES.has(name)?'brush':'point'" in HTML
     assert 'id="roiNavigationNotice"' in HTML
-    assert "old-L2 candidates reviewed, but the information curve is not ready" in HTML
+    assert "candidates reviewed; the information curve needs more coverage" in HTML
     assert "Brush / eraser width" in HTML
     assert "function densifyPath(points,maxStep)" in HTML
     assert "function eraseBrushGeometry(item,center,eraserRadius)" in HTML
@@ -456,7 +455,7 @@ def test_old_l2_candidates_bias_random_navigation_without_prefilling_labels(tmp_
     try:
         result = data.random_record(0)
         assert result["record"]["tile_id"] == "s1_0000001"
-        assert result["selection"] == "legacy_l2_navigation_hint"
+        assert result["selection"] == "component_presence_navigation_hint"
         assert "source_l2" not in result
         assert data.state.annotations == {}
     finally:
@@ -852,7 +851,7 @@ def test_roi_navigation_hints_stay_inside_shared_priority_boundary(tmp_path: Pat
     try:
         result = data.random_record("all")
         assert result["record"]["tile_id"] == "s1_0000002"
-        assert result["selection"] == "legacy_l2_navigation_hint"
+        assert result["selection"] == "component_presence_navigation_hint"
     finally:
         data.close()
 
@@ -887,7 +886,7 @@ def test_build_priority_manifest_keeps_only_tile_identity_and_deduplicates(tmp_p
     first = tmp_path / "first.json"
     second = tmp_path / "second.json"
     first.write_text(
-        json.dumps({"annotations": {"a": {"tile_id": "t1", "iac": "a.iac", "row": 1, "slide": "s1", "l1": "x", "l2": ["legacy"]}}}),
+        json.dumps({"annotations": {"a": {"tile_id": "t1", "iac": "a.iac", "row": 1, "slide": "s1", "l1": "x", "l2": ["auxiliary-label"]}}}),
         encoding="utf-8",
     )
     second.write_text(

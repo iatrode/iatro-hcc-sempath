@@ -6,7 +6,7 @@ inherits: tenth_duration_full_population.yaml
 # Single conceptual change vs A1: only one teacher is distilled. Combined with
 # no prototype supervision, this is the "plain single-teacher student" floor.
 # Teacher choice is frozen to virchow2 for the matched A3/A4 contrast. It is a
-# design constant; no V1 result is used as V2 evidence.
+# design constant for the matched comparison.
 #
 # Teacher-keyed mappings use replacement semantics, so this file states the
 # complete single-teacher set.

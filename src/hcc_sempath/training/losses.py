@@ -89,12 +89,7 @@ def semantic_distillation_loss(
     primary_temperature: float = 1.0,
     sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Preserve the four-class L1 semantic axis only.
-
-    Legacy tile-level L2 attributes are deliberately excluded. The nine spatial
-    components receive supervision only from expert point/circle/brush
-    geometry under the fixed component measurement schema.
-    """
+    """Preserve the four-class L1 semantic axis."""
 
     per_sample = primary_prototype_kl_loss_per_sample(
         student,

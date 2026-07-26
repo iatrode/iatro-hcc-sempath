@@ -1,4 +1,4 @@
-# Shared V2 ablation overlay.
+# Shared reduced-duration ablation overlay.
 #
 # "One-tenth" refers to training duration, not cohort sampling. Every condition
 # consumes the full population stream and the complete fixed L1/L2 expert union

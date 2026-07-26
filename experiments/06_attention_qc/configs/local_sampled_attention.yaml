@@ -1,4 +1,0 @@
-inherits: ../../shared/configs/local_sampled_eval.yaml
-
-runtime:
-  output_dir: experiments/06_attention_qc/results
