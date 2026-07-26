@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_L1_ANNOTATION = (
     REPO_ROOT
     / "annotations"
-    / "hcc_prototype_review.final_3000_inflammatory_stromal.json"
+    / "hcc_prototype_review.final_l1.json"
 )
 DEFAULT_L2_ANNOTATION = REPO_ROOT / "annotations" / "hcc_l2_roi_v2.json"
 DEFAULT_MANIFEST = REPO_ROOT / "configs" / "local" / "mac" / "manifest.yaml"

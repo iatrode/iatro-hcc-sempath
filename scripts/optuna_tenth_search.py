@@ -418,7 +418,7 @@ def main() -> None:
     parser.add_argument("--storage", default="sqlite:///runtime/optuna/hcc_sempath_tenth_spatial.db")
     parser.add_argument("--output-root", default="runtime/optuna_runs")
     parser.add_argument("--annotation-json", default="")
-    parser.add_argument("--prototype-asset-dir", default="artifacts/prototypes/hcc_annotation_final_3000")
+    parser.add_argument("--prototype-asset-dir", default="artifacts/prototypes/hcc_annotation_final_l1")
     parser.add_argument("--python", default="python")
     parser.add_argument("--n-trials", type=int, default=24)
     parser.add_argument("--epochs", type=int, default=10)

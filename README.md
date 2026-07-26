@@ -102,7 +102,7 @@ The local `annotations/` directory stores review state and may contain local
 paths or case identifiers, so the complete directory is excluded from Git. The
 active files are:
 
-- `hcc_prototype_review.final_3000_inflammatory_stromal.json`: stable L1
+- `hcc_prototype_review.final_l1.json`: stable L1
   supervision;
 - `hcc_shared_priority_tiles.json`: shared L1/L2 priority boundary;
 - `hcc_l2_roi_v2.json`: nine-component point/circle/brush L2 state.
@@ -111,7 +111,7 @@ Seed the shared boundary once:
 
 ```bash
 hcc-sempath build-priority-list \
-  --annotations annotations/hcc_prototype_review.final_3000_inflammatory_stromal.json \
+  --annotations annotations/hcc_prototype_review.final_l1.json \
   --output annotations/hcc_shared_priority_tiles.json
 ```
 
@@ -120,7 +120,7 @@ Start the combined annotation service:
 ```bash
 hcc-sempath annotate-prototypes \
   --input /path/to/image_tile_iac_root \
-  --l1-state annotations/hcc_prototype_review.final_3000_inflammatory_stromal.json \
+  --l1-state annotations/hcc_prototype_review.final_l1.json \
   --l2-state annotations/hcc_l2_roi_v2.json \
   --priority-manifest annotations/hcc_shared_priority_tiles.json \
   --roi-candidate-manifest annotations/hcc_l2_roi_v2_candidates.json
