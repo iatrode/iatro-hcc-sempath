@@ -239,7 +239,7 @@ def test_optimizer_helper_rejects_nonfinite_loss_without_step(
     assert parameter.grad is None
 
 
-def test_run_epoch_joint_l1_l2_route_keeps_full_bank_anchors_fixed() -> None:
+def test_run_epoch_joint_l1_l2_route_keeps_full_bank_prototypes_fixed() -> None:
     model = HCCSemPathModel(
         backbone_name="vit_tiny_patch16_224",
         embedding_dim=8,

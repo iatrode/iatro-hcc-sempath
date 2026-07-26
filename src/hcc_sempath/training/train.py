@@ -1645,8 +1645,8 @@ def main() -> None:
     replay_interval = int(
         cfg["data"].get("expert_replay_interval_batches", 16)
     )
-    prototype_anchor_loader = None
-    spatial_prototype_anchor_loader = None
+    prototype_refresh_loader = None
+    spatial_prototype_refresh_loader = None
     if expert_tile_ids:
         expert_ds = PackageSampledDistillationDataset(
             expert_tile_packages,
@@ -1690,7 +1690,7 @@ def main() -> None:
             ),
         )
         if train_prototype_labels:
-            prototype_anchor_loader = _InMemoryExpertBatchLoader(
+            prototype_refresh_loader = _InMemoryExpertBatchLoader(
                 expert_bank,
                 indices=None,
                 batch_size=prototype_batch_size,
@@ -1701,7 +1701,7 @@ def main() -> None:
                 expert_bank.index_by_tile_id[tile_id]
                 for tile_id in sorted(train_spatial_targets)
             ]
-            spatial_prototype_anchor_loader = (
+            spatial_prototype_refresh_loader = (
                 _InMemoryExpertBatchLoader(
                     expert_bank,
                     indices=spatial_indices,
@@ -1733,8 +1733,8 @@ def main() -> None:
             expert_tile_ids
             and (
                 replay_interval > 0
-                or prototype_anchor_loader is not None
-                or spatial_prototype_anchor_loader is not None
+                or prototype_refresh_loader is not None
+                or spatial_prototype_refresh_loader is not None
             )
         ),
     )
@@ -1785,9 +1785,9 @@ def main() -> None:
         cfg,
         scheduler=scheduler,
         resume_state=resume_state,
-        prototype_anchor_loader=prototype_anchor_loader,
-        spatial_prototype_anchor_loader=(
-            spatial_prototype_anchor_loader
+        prototype_refresh_loader=prototype_refresh_loader,
+        spatial_prototype_refresh_loader=(
+            spatial_prototype_refresh_loader
         ),
     )
     print("train_ok " + " ".join(f"{k}={v}" for k, v in metrics.items()))

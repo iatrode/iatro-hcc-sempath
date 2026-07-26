@@ -452,7 +452,7 @@ class SpatialMorphometryHead(nn.Module):
         explicit_negative: torch.Tensor,
         implicit_negative: torch.Tensor,
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        """Collect exact local-anchor sufficient statistics for one chunk."""
+        """Collect exact local-prototype sufficient statistics for one chunk."""
 
         countable = self.instance_valid.view(1, -1, 1, 1)
         density = self.density_valid.view(1, -1, 1, 1)
@@ -514,7 +514,7 @@ class SpatialMorphometryHead(nn.Module):
         self,
         observations: dict[str, tuple[torch.Tensor, torch.Tensor]],
     ) -> None:
-        """Replace local anchors with exact current-bank centroids."""
+        """Replace local prototypes with exact current-bank centroids."""
 
         expected = {
             "instance",
@@ -597,7 +597,7 @@ class SpatialMorphometryHead(nn.Module):
         # Explicit expert negatives define the decision boundary whenever they
         # exist. Weak implicit background is a fallback, not a centroid pool
         # that may dilute the explicit evidence. "Weak" refers to its direct
-        # per-cell loss weight. This full-bank pair-averaged anchor is a contrastive
+        # per-cell loss weight. This full-bank pair-averaged prototype is a contrastive
         # coordinate, not another set of strong negative labels, so its
         # similarity must not be scaled by the direct-loss coefficient.
         negative_response = torch.where(
@@ -973,7 +973,7 @@ class HCCSemPathModel(nn.Module):
         counts: torch.Tensor,
         teacher_sums: dict[str, torch.Tensor],
     ) -> None:
-        """Install exact global L2 reliability anchors from the full bank."""
+        """Install exact global L2 reliability prototypes from the full bank."""
 
         if (
             self.global_l2_prototypes is None
@@ -982,7 +982,7 @@ class HCCSemPathModel(nn.Module):
             return
         if set(teacher_sums) != set(self.teacher_l2_prototypes):
             raise ValueError(
-                "teacher L2 anchor names differ from model teachers: "
+                "teacher L2 prototype names differ from model teachers: "
                 f"got={sorted(teacher_sums)} "
                 f"expected={sorted(self.teacher_l2_prototypes)}"
             )

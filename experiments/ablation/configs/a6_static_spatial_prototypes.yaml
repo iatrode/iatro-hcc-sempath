@@ -1,0 +1,10 @@
+# A6: A0 with local spatial prototypes computed once before optimization and
+# then fixed. Global L1/L2 reliability prototypes continue to track z_hcc.
+
+inherits: tenth_duration_full_population.yaml
+
+runtime:
+  output_dir: outputs/experiments/ablation/a6_static_spatial_prototypes
+
+train:
+  dynamic_spatial_prototype_refresh_steps: 0

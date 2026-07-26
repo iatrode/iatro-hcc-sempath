@@ -17,7 +17,5 @@ loss:
   spatial_backbone_start_step: 100
 
 train:
-  epochs: 10
-  warmup_epochs: 1
   max_val_batches: 256
   max_eval_batches: 64

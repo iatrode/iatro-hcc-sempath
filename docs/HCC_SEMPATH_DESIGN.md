@@ -97,13 +97,13 @@ shared representation through feature and relation distillation. The stable
 L1 annotations define teacher-specific four-class prototypes and periodically
 recomputed student-space class centroids. Every student refresh re-encodes the
 complete fixed 3,000-tile bank with the current encoder; a compute mini-batch
-is only a memory chunk and never defines the anchor pool. Their responses provide both HCC semantic
+is only a memory chunk and never defines the prototype pool. Their responses provide both HCC semantic
 supervision and per-tile PAMT-D teacher reliability, while direct L1
-cross-entropy anchors the human boundary.
+cross-entropy supervises the human boundary.
 
 L2 follows the same small-to-large premise: sparse expert spatial constraints
 define exact full-bank local positive/negative component centroids and reshape the local
-features and shared encoder while four-teacher distillation anchors `z_hcc`.
+features and shared encoder while four-teacher distillation stabilizes `z_hcc`.
 Teacher-space component centroids participate in per-tile reliability
 adjudication. Expert point, circle, and brush geometry supplies the L2 spatial
 targets.
@@ -275,9 +275,9 @@ only as a fallback.
   the full corpus.
 - The union of their training tiles is replayed throughout population
   distillation; newly annotated tiles enter the same union automatically.
-- Reduced-scale ablations subsample only the population stream. They retain the
-  complete fixed L1/L2 expert union so supervision coverage is identical across
-  matched conditions.
+- Reduced-duration ablations retain the full population stream and complete
+  fixed L1/L2 expert union. Only training duration and the named mechanism
+  differ across matched conditions.
 - The shared priority list serves the stable 3,000 tiles first and expands
   outside that boundary only when still-growing component curves require more
   examples.
@@ -386,7 +386,7 @@ HCC-SemPath contributes one HCC-specific representation with:
   response target.
 - `training/engine.py`: active objective, exact full-bank dynamic prototype
   refresh, and L2-supervised-step warm-up.
-- `training/train.py`: L1/L2 ingestion, fixed expert-tile replay and anchor
+- `training/train.py`: L1/L2 ingestion, fixed expert-tile replay and prototype
   loaders, and frozen
   optimizer/supervision contracts.
 - `training/spatial_validation.py`: independent completeness-aware calibration

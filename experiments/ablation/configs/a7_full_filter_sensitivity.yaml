@@ -1,0 +1,12 @@
+inherits: tenth_duration_full_population.yaml
+
+# A7: A0 with complete application of the computed reliability weights.
+# This is a prespecified filter-strength sensitivity analysis. The deployed
+# half-strength A0 versus A2 comparison remains the primary adjudication
+# contrast.
+
+runtime:
+  output_dir: outputs/experiments/ablation/a7_full_filter_sensitivity
+
+loss:
+  prototype_filter_weight: 1.0

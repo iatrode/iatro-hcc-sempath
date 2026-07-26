@@ -2554,7 +2554,7 @@ function paintContextPan(){
 function scheduleContextPan(){
     if(!contextFrame)contextFrame=requestAnimationFrame(paintContextPan);
 }
-function layoutContext(anchor={fx:.5,fy:.5}){
+function layoutContext(focus={fx:.5,fy:.5}){
     if(!contextData)return;
     const stage=document.getElementById('contextStage'),viewport=document.getElementById('contextViewport'),img=document.getElementById('contextImg');
     const visible=contextData.visible_grid_size,availableW=Math.max(80,stage.clientWidth-24),availableH=Math.max(80,stage.clientHeight-24);
@@ -2567,8 +2567,8 @@ function layoutContext(anchor={fx:.5,fy:.5}){
     viewport.style.setProperty('--context-cell-w',`${contextCellW}px`);
     viewport.style.setProperty('--context-cell-h',`${contextCellH}px`);
     img.style.width=`${contextImageW}px`;img.style.height=`${contextImageH}px`;
-    contextTx=viewportW/2-(contextData.radius+anchor.fx)*contextCellW;
-    contextTy=viewportH/2-(contextData.radius+anchor.fy)*contextCellH;
+    contextTx=viewportW/2-(contextData.radius+focus.fx)*contextCellW;
+    contextTy=viewportH/2-(contextData.radius+focus.fy)*contextCellH;
     clampContextPan();scheduleContextPan();
 }
 function contextCellAtLocal(x,y){
@@ -2580,14 +2580,14 @@ function contextCenterPosition(){
     const imageX=(contextViewportW/2-contextTx)/contextCellW,imageY=(contextViewportH/2-contextTy)/contextCellH;
     return{imageX,imageY,column:Math.floor(imageX),row:Math.floor(imageY),fx:imageX-Math.floor(imageX),fy:imageY-Math.floor(imageY)};
 }
-function installContextWindow(data,image,centerRow,anchor){
+function installContextWindow(data,image,centerRow,focus){
     contextData=data;contextCenterRow=centerRow;
     contextCellMap=new Map(data.cells.map(cell=>[`${cell.dx}:${cell.dy}`,cell]));
     document.getElementById('contextImg').src=image.src;
-    layoutContext(anchor);
+    layoutContext(focus);
     document.getElementById('contextMeta').textContent=`Package ${contextSelected.package+1} · selected tile ${contextSelected.row+1} · view center ${data.center.row+1}`;
 }
-async function loadContextWindow(centerRow,anchor={fx:.5,fy:.5}){
+async function loadContextWindow(centerRow,focus={fx:.5,fy:.5}){
     if(!contextSelected)return;
     const request=++contextRequest,loading=document.getElementById('contextLoading');
     contextPendingWindow=null;
@@ -2601,9 +2601,9 @@ async function loadContextWindow(centerRow,anchor={fx:.5,fy:.5}){
         const [data,image]=await Promise.all([metadataPromise,imagePromise]);
         if(request!==contextRequest)return;
         if(contextDrag){
-            contextPendingWindow={data,image,centerRow,anchor};
+            contextPendingWindow={data,image,centerRow,focus};
         }else{
-            installContextWindow(data,image,centerRow,anchor);
+            installContextWindow(data,image,centerRow,focus);
         }
     }finally{
         if(request===contextRequest)loading.classList.add('hidden');

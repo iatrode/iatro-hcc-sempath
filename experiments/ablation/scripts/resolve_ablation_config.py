@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import yaml
@@ -19,10 +20,16 @@ def _raw_config(path: Path) -> dict:
 def resolve_ablation_config(
     base_path: str | Path,
     condition_path: str | Path,
+    *,
+    seed: int | None = None,
 ) -> dict:
     """Overlay one matched full-population, tenth-duration ablation condition."""
 
     base = load_config(base_path)
+    full_epochs = int(base["train"]["epochs"])
+    full_warmup_epochs = int(
+        base["train"].get("warmup_epochs", 0)
+    )
     condition_path = Path(condition_path)
     condition = _raw_config(condition_path)
     parent = condition.get("inherits")
@@ -44,6 +51,18 @@ def resolve_ablation_config(
     base_prototypes = base.get("data", {}).get("prototype_paths")
     resolved = _deep_merge(base, parent_overlay)
     resolved = _deep_merge(resolved, condition)
+    resolved["train"]["epochs"] = max(
+        1,
+        int(math.ceil(full_epochs / 10.0)),
+    )
+    resolved["train"]["warmup_epochs"] = (
+        0
+        if full_warmup_epochs <= 0
+        else max(
+            1,
+            int(math.ceil(full_warmup_epochs / 10.0)),
+        )
+    )
 
     # A single-teacher condition reuses that teacher's deployment asset. The
     # repository-relative path in the tracked overlay is only documentation.
@@ -72,6 +91,11 @@ def resolve_ablation_config(
             raise ValueError(
                 f"matched ablation requires data.{key}=1.0"
             )
+    if seed is not None:
+        resolved["runtime"]["seed"] = int(seed)
+        resolved["runtime"]["output_dir"] = str(
+            Path(resolved["runtime"]["output_dir"]) / f"seed_{int(seed)}"
+        )
     return resolved
 
 
@@ -82,9 +106,14 @@ def main() -> None:
     parser.add_argument("--base", required=True)
     parser.add_argument("--condition", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--seed", type=int)
     args = parser.parse_args()
 
-    resolved = resolve_ablation_config(args.base, args.condition)
+    resolved = resolve_ablation_config(
+        args.base,
+        args.condition,
+        seed=args.seed,
+    )
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

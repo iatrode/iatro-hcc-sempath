@@ -5,11 +5,11 @@ import torch.nn.functional as F
 
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.training.engine import (
-    _refresh_global_prototype_anchors,
+    _refresh_global_prototypes,
 )
 
 
-def _anchor_batch(
+def _prototype_batch(
     images: torch.Tensor,
     labels: torch.Tensor,
     positives: torch.Tensor,
@@ -41,7 +41,7 @@ def _anchor_batch(
     }
 
 
-def test_full_bank_anchor_refresh_is_chunk_invariant_and_tracks_student() -> None:
+def test_full_bank_prototype_refresh_is_chunk_invariant_and_tracks_student() -> None:
     torch.manual_seed(31)
     model = HCCSemPathModel(
         backbone_name="vit_tiny_patch16_224",
@@ -63,8 +63,8 @@ def test_full_bank_anchor_refresh_is_chunk_invariant_and_tracks_student() -> Non
         ]
     )
     loader = [
-        _anchor_batch(images[:2], labels[:2], positives[:2]),
-        _anchor_batch(images[2:], labels[2:], positives[2:]),
+        _prototype_batch(images[:2], labels[:2], positives[:2]),
+        _prototype_batch(images[2:], labels[2:], positives[2:]),
     ]
     cfg = {
         "data": {
@@ -73,7 +73,7 @@ def test_full_bank_anchor_refresh_is_chunk_invariant_and_tracks_student() -> Non
         }
     }
 
-    metrics = _refresh_global_prototype_anchors(
+    metrics = _refresh_global_prototypes(
         model,
         loader,
         cfg,
@@ -97,7 +97,7 @@ def test_full_bank_anchor_refresh_is_chunk_invariant_and_tracks_student() -> Non
         model.encoder.projector[1].weight.add_(
             torch.randn_like(model.encoder.projector[1].weight) * 0.1
         )
-    _refresh_global_prototype_anchors(
+    _refresh_global_prototypes(
         model,
         loader,
         cfg,
@@ -108,7 +108,7 @@ def test_full_bank_anchor_refresh_is_chunk_invariant_and_tracks_student() -> Non
     torch.testing.assert_close(model.l1_prototype_counts, torch.ones(4))
 
 
-def test_anchor_response_updates_zhcc_but_not_detached_centroids() -> None:
+def test_prototype_response_updates_zhcc_but_not_detached_centroids() -> None:
     torch.manual_seed(37)
     model = HCCSemPathModel(
         backbone_name="vit_tiny_patch16_224",

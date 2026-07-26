@@ -33,7 +33,7 @@ EARLY_STOP_PER_TEACHER_GAIN = 0.003
 
 
 @dataclass
-class PrototypeAnchorRefreshState:
+class PrototypeRefreshState:
     """Fixed expert banks and their last exact student-space refresh."""
 
     global_loader: object | None
@@ -269,17 +269,17 @@ def _l2_positive_from_batch(batch: dict) -> torch.Tensor:
 
 
 @torch.inference_mode()
-def _refresh_global_prototype_anchors(
+def _refresh_global_prototypes(
     model,
     loader,
     cfg: dict,
     device: torch.device,
 ) -> dict[str, int | float]:
-    """Recompute exact L1 and global L2 anchors from the complete bank."""
+    """Recompute exact L1 and global L2 prototypes from the complete bank."""
 
     raw_model = getattr(model, "_orig_mod", model)
     if raw_model.l1_prototypes is None:
-        raise RuntimeError("dynamic anchor refresh requires an L1 readout")
+        raise RuntimeError("dynamic prototype refresh requires an L1 readout")
     embedding_dim = int(raw_model.l1_prototypes.shape[1])
     l1_sums = torch.zeros(
         raw_model.l1_num_classes,
@@ -374,18 +374,18 @@ def _refresh_global_prototype_anchors(
 
 
 @torch.inference_mode()
-def _refresh_spatial_prototype_anchors(
+def _refresh_spatial_prototypes(
     model,
     loader,
     cfg: dict,
     device: torch.device,
 ) -> dict[str, int | float]:
-    """Recompute exact local anchors from all spatially annotated tiles."""
+    """Recompute exact local prototypes from all spatially annotated tiles."""
 
     raw_model = getattr(model, "_orig_mod", model)
     head = raw_model.spatial_head
     if head is None:
-        raise RuntimeError("spatial anchor refresh requires the spatial head")
+        raise RuntimeError("spatial prototype refresh requires the spatial head")
     accumulated = {
         name: (
             torch.zeros_like(getattr(head, f"{name}_prototypes")),
@@ -462,12 +462,12 @@ def _refresh_spatial_prototype_anchors(
     }
 
 
-def _maybe_refresh_prototype_anchors(
+def _maybe_refresh_prototypes(
     *,
     model,
     cfg: dict,
     device: torch.device,
-    state: PrototypeAnchorRefreshState | None,
+    state: PrototypeRefreshState | None,
     global_step: int,
     l2_supervised_step: int,
 ) -> None:
@@ -484,7 +484,7 @@ def _maybe_refresh_prototype_anchors(
         )
     )
     if refresh_global:
-        metrics = _refresh_global_prototype_anchors(
+        metrics = _refresh_global_prototypes(
             model,
             state.global_loader,
             cfg,
@@ -516,7 +516,7 @@ def _maybe_refresh_prototype_anchors(
         )
     )
     if refresh_spatial:
-        metrics = _refresh_spatial_prototype_anchors(
+        metrics = _refresh_spatial_prototypes(
             model,
             state.spatial_loader,
             cfg,
@@ -873,7 +873,7 @@ def run_epoch(
     collect_embeddings: bool = False,
     max_eval_batches: int | None = None,
     prefetched_iterator=None,
-    prototype_anchor_state: PrototypeAnchorRefreshState | None = None,
+    prototype_refresh_state: PrototypeRefreshState | None = None,
 ) -> dict[str, float] | tuple[dict[str, float], tuple]:
     model.train(train)
     totals: dict[str, torch.Tensor | float] = {
@@ -1015,11 +1015,11 @@ def run_epoch(
                 )
                 last_loss_cfg = loss_cfg
                 if train:
-                    _maybe_refresh_prototype_anchors(
+                    _maybe_refresh_prototypes(
                         model=model,
                         cfg=cfg,
                         device=device,
-                        state=prototype_anchor_state,
+                        state=prototype_refresh_state,
                         global_step=global_step,
                         l2_supervised_step=l2_supervised_step,
                     )
@@ -1552,8 +1552,8 @@ def fit(
     *,
     scheduler=None,
     resume_state: dict | None = None,
-    prototype_anchor_loader=None,
-    spatial_prototype_anchor_loader=None,
+    prototype_refresh_loader=None,
+    spatial_prototype_refresh_loader=None,
 ) -> dict:
     output_dir = ensure_dir(cfg["runtime"]["output_dir"])
     checkpoints = ensure_dir(output_dir / "checkpoints")
@@ -1585,10 +1585,10 @@ def fit(
     if resume_state and "scaler" in resume_state:
         scaler.load_state_dict(resume_state["scaler"])
     _restore_rng_state((resume_state or {}).get("rng_state"))
-    prototype_anchor_state = (
-        PrototypeAnchorRefreshState(
-            global_loader=prototype_anchor_loader,
-            spatial_loader=spatial_prototype_anchor_loader,
+    prototype_refresh_state = (
+        PrototypeRefreshState(
+            global_loader=prototype_refresh_loader,
+            spatial_loader=spatial_prototype_refresh_loader,
             last_global_step=(resume_state or {}).get(
                 "dynamic_prototype_step"
             ),
@@ -1597,8 +1597,8 @@ def fit(
             ),
         )
         if (
-            prototype_anchor_loader is not None
-            or spatial_prototype_anchor_loader is not None
+            prototype_refresh_loader is not None
+            or spatial_prototype_refresh_loader is not None
         )
         else None
     )
@@ -1621,7 +1621,7 @@ def fit(
                 global_step=global_step,
                 l2_supervised_step=l2_supervised_step,
                 summary_writer=writer,
-                prototype_anchor_state=prototype_anchor_state,
+                prototype_refresh_state=prototype_refresh_state,
             )
             global_step = int(train_metrics["global_step_end"])
             l2_supervised_step = int(
@@ -1694,13 +1694,13 @@ def fit(
                 "global_step": global_step,
                 "l2_supervised_step": l2_supervised_step,
                 "dynamic_prototype_step": (
-                    prototype_anchor_state.last_global_step
-                    if prototype_anchor_state is not None
+                    prototype_refresh_state.last_global_step
+                    if prototype_refresh_state is not None
                     else None
                 ),
                 "dynamic_spatial_prototype_step": (
-                    prototype_anchor_state.last_spatial_step
-                    if prototype_anchor_state is not None
+                    prototype_refresh_state.last_spatial_step
+                    if prototype_refresh_state is not None
                     else None
                 ),
                 "feature_loss_type": str(loss_cfg["feature_loss_type"]),

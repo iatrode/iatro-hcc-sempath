@@ -258,7 +258,7 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "repeating-linear-gradient(135deg" in HTML
     assert "--context-grid-x" in HTML
     assert "if(contextDrag){" in HTML
-    assert "contextPendingWindow={data,image,centerRow,anchor}" in HTML
+    assert "contextPendingWindow={data,image,centerRow,focus}" in HTML
     assert "/api/context-center?" in HTML
     assert "contextTx=contextDrag.startTx+dx;contextTy=contextDrag.startTy+dy;\n        scheduleContextPan()" in HTML
     assert "viewport.clientWidth-baseW*scale" in HTML
