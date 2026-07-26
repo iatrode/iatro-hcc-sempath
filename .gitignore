@@ -7,14 +7,11 @@ build/
 dist/
 *.local.sh
 configs/local/
-artifacts/*
-!artifacts/README.md
+artifacts/
 outputs/
 annotations/
 smoke_data/
-data/*
-!data/manifests/
-!data/manifests/*.freeze.yaml
+data/
 real_smoke/
 results/
 results/**/*.iac

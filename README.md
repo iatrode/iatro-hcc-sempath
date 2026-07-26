@@ -196,6 +196,5 @@ new-batch novelty remains a secondary discovery diagnostic.
 - [`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md): active
   scientific, supervision, validation, and release contract.
 - [`TODO.md`](TODO.md): unfinished empirical and release gates only.
-- [`artifacts/README.md`](artifacts/README.md): local/private artifact boundary.
 - [`experiments/README.md`](experiments/README.md): tracked experiment
   protocols and generated-output boundary.
