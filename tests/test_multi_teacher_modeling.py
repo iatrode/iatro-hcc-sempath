@@ -12,6 +12,7 @@ from hcc_sempath.modeling.models import (
     SpatialMorphometryHead,
     _depthwise_conv_as_shift_sum,
     _pointwise_conv_as_linear,
+    _sparse_connected_components_8,
     decode_spatial_morphometry,
     load_hcc_sempath_release,
     model_state_sha256,
@@ -488,6 +489,42 @@ def test_spatial_decoder_collapses_a_flat_peak_to_one_instance() -> None:
 
     assert decoded["instance_counts"].tolist() == [[1.0]]
     assert len(decoded["instance_coordinates"][0][0]) == 1
+    assert decoded["instance_coordinates"][0][0][0][:2] == (17.5, 17.5)
+
+
+def test_sparse_components_preserve_diagonal_eight_connectivity() -> None:
+    mask = torch.zeros((6, 6), dtype=torch.bool)
+    mask[0, 0] = True
+    mask[1, 1] = True
+    mask[2, 2] = True
+    mask[5, 5] = True
+
+    components = _sparse_connected_components_8(mask)
+
+    assert [len(component) for component in components] == [3, 1]
+    assert set(components[0]) == {(0, 0), (1, 1), (2, 2)}
+
+
+def test_spatial_decoder_focus_minimum_uses_eight_connected_extent() -> None:
+    instance = torch.zeros((1, 9, 5, 5))
+    measurement = torch.zeros_like(instance)
+    measurement[0, 3, 1, 1] = 0.9
+    measurement[0, 3, 2, 2] = 0.9
+    measurement[0, 3, 4, 4] = 0.9
+
+    decoded = decode_spatial_morphometry(
+        {
+            "l2_instance_probabilities": instance,
+            "l2_abundance_probabilities": measurement,
+        },
+        instance_threshold=0.5,
+        abundance_threshold=0.5,
+        output_stride=7,
+        nms_kernel=3,
+        minimum_focus_cells=2,
+    )
+
+    assert decoded["focus_counts"][0, 3].item() == 1
 
 
 def test_spatial_decoder_requires_frozen_analysis_values() -> None:

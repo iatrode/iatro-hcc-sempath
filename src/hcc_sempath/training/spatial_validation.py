@@ -6,7 +6,10 @@ from collections.abc import Sequence
 import torch
 import torch.nn.functional as F
 
-from hcc_sempath.modeling.models import _collapse_peak_plateaus
+from hcc_sempath.modeling.models import (
+    _collapse_peak_plateaus,
+    _sparse_connected_components_8,
+)
 from hcc_sempath.spatial_schema import (
     DEFAULT_SPATIAL_COMPONENTS,
     spatial_component_specs,
@@ -76,39 +79,10 @@ def _connected_component_count(
     *,
     minimum_cells: int,
 ) -> int:
-    mask = mask.to(device="cpu", dtype=torch.bool)
-    visited = torch.zeros_like(mask)
-    height, width = mask.shape
-    count = 0
-    for start_row, start_col in mask.nonzero().tolist():
-        if bool(visited[start_row, start_col]):
-            continue
-        stack = [(int(start_row), int(start_col))]
-        visited[start_row, start_col] = True
-        size = 0
-        while stack:
-            row, col = stack.pop()
-            size += 1
-            for delta_row in (-1, 0, 1):
-                for delta_col in (-1, 0, 1):
-                    if delta_row == 0 and delta_col == 0:
-                        continue
-                    next_row = row + delta_row
-                    next_col = col + delta_col
-                    if not (
-                        0 <= next_row < height
-                        and 0 <= next_col < width
-                    ):
-                        continue
-                    if (
-                        bool(mask[next_row, next_col])
-                        and not bool(visited[next_row, next_col])
-                    ):
-                        visited[next_row, next_col] = True
-                        stack.append((next_row, next_col))
-        if size >= minimum_cells:
-            count += 1
-    return count
+    return sum(
+        len(component) >= minimum_cells
+        for component in _sparse_connected_components_8(mask)
+    )
 
 
 def _point_locations(

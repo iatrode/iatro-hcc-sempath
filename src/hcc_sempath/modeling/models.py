@@ -1379,6 +1379,45 @@ def validate_spatial_decoder_calibration(
     }
 
 
+def _sparse_connected_components_8(
+    mask: torch.Tensor,
+) -> list[list[tuple[int, int]]]:
+    """Return row-major 8-connected components without tensor scalar access."""
+
+    if mask.ndim != 2:
+        raise ValueError(
+            f"connected-component mask must be 2-D, got {tuple(mask.shape)}"
+        )
+    ordered_points = [
+        (int(row), int(col))
+        for row, col in mask.detach()
+        .to(device="cpu", dtype=torch.bool)
+        .nonzero()
+        .tolist()
+    ]
+    remaining = set(ordered_points)
+    components: list[list[tuple[int, int]]] = []
+    for start in ordered_points:
+        if start not in remaining:
+            continue
+        remaining.remove(start)
+        stack = [start]
+        component: list[tuple[int, int]] = []
+        while stack:
+            row, col = stack.pop()
+            component.append((row, col))
+            for delta_row in (-1, 0, 1):
+                for delta_col in (-1, 0, 1):
+                    if delta_row == 0 and delta_col == 0:
+                        continue
+                    neighbor = (row + delta_row, col + delta_col)
+                    if neighbor in remaining:
+                        remaining.remove(neighbor)
+                        stack.append(neighbor)
+        components.append(component)
+    return components
+
+
 def _collapse_peak_plateaus(
     candidates: torch.Tensor,
     probabilities: torch.Tensor,
@@ -1391,58 +1430,38 @@ def _collapse_peak_plateaus(
         dtype=torch.float32,
     )
     selected = torch.zeros_like(candidate_cpu)
+    selected_points: list[tuple[int, int, int, int]] = []
     for batch_idx in range(candidate_cpu.shape[0]):
         for component_idx in range(candidate_cpu.shape[1]):
-            mask = candidate_cpu[batch_idx, component_idx]
-            visited = torch.zeros_like(mask)
-            height, width = mask.shape
-            for start_row, start_col in mask.nonzero().tolist():
-                if bool(visited[start_row, start_col]):
-                    continue
-                stack = [(int(start_row), int(start_col))]
-                visited[start_row, start_col] = True
-                plateau: list[tuple[int, int]] = []
-                while stack:
-                    row, col = stack.pop()
-                    plateau.append((row, col))
-                    for delta_row in (-1, 0, 1):
-                        for delta_col in (-1, 0, 1):
-                            if delta_row == 0 and delta_col == 0:
-                                continue
-                            next_row = row + delta_row
-                            next_col = col + delta_col
-                            if not (
-                                0 <= next_row < height
-                                and 0 <= next_col < width
-                            ):
-                                continue
-                            if (
-                                bool(mask[next_row, next_col])
-                                and not bool(visited[next_row, next_col])
-                            ):
-                                visited[next_row, next_col] = True
-                                stack.append((next_row, next_col))
+            probability_plane = probability_cpu[
+                batch_idx,
+                component_idx,
+            ].tolist()
+            for plateau in _sparse_connected_components_8(
+                candidate_cpu[batch_idx, component_idx]
+            ):
                 best_row, best_col = max(
                     plateau,
                     key=lambda point: (
-                        float(
-                            probability_cpu[
-                                batch_idx,
-                                component_idx,
-                                point[0],
-                                point[1],
-                            ]
-                        ),
+                        float(probability_plane[point[0]][point[1]]),
                         -point[0],
                         -point[1],
                     ),
                 )
-                selected[
-                    batch_idx,
-                    component_idx,
-                    best_row,
-                    best_col,
-                ] = True
+                selected_points.append(
+                    (
+                        batch_idx,
+                        component_idx,
+                        best_row,
+                        best_col,
+                    )
+                )
+    if selected_points:
+        indices = tuple(
+            torch.tensor(values, dtype=torch.long)
+            for values in zip(*selected_points, strict=True)
+        )
+        selected[indices] = True
     return selected.to(device=candidates.device)
 
 
@@ -1666,39 +1685,12 @@ def decode_spatial_morphometry(
     )
     for batch_idx in range(instance_probability.shape[0]):
         for component_idx in focus_valid.nonzero(as_tuple=False).flatten().tolist():
-            mask = high_abundance_mask[batch_idx, component_idx].detach().cpu()
-            visited = torch.zeros_like(mask, dtype=torch.bool)
-            component_total = 0
-            height, width = mask.shape
-            for row in range(height):
-                for col in range(width):
-                    if not bool(mask[row, col]) or bool(visited[row, col]):
-                        continue
-                    stack = [(row, col)]
-                    visited[row, col] = True
-                    cell_count = 0
-                    while stack:
-                        current_row, current_col = stack.pop()
-                        cell_count += 1
-                        for delta_row in (-1, 0, 1):
-                            for delta_col in (-1, 0, 1):
-                                if delta_row == 0 and delta_col == 0:
-                                    continue
-                                next_row = current_row + delta_row
-                                next_col = current_col + delta_col
-                                if not (
-                                    0 <= next_row < height
-                                    and 0 <= next_col < width
-                                ):
-                                    continue
-                                if bool(visited[next_row, next_col]) or not bool(
-                                    mask[next_row, next_col]
-                                ):
-                                    continue
-                                visited[next_row, next_col] = True
-                                stack.append((next_row, next_col))
-                    if cell_count >= int(minimum_focus_cells):
-                        component_total += 1
+            component_total = sum(
+                len(component) >= int(minimum_focus_cells)
+                for component in _sparse_connected_components_8(
+                    high_abundance_mask[batch_idx, component_idx]
+                )
+            )
             focus_counts[batch_idx, component_idx] = float(component_total)
     decoded_pixel_area = (
         float(instance_probability.shape[-2])
