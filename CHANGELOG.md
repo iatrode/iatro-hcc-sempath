@@ -22,7 +22,8 @@
 - Move the location overview into a navigation overlay that loads on demand,
   and reserve tile-wheel brush-width control for the active Brush tool so
   ordinary scrolling remains available elsewhere.
-- Add visible `1`–`9` shortcuts for selecting the first nine L1 classes.
+- Add visible `1`–`9` shortcuts for selecting the first nine L1 classes and
+  use Space to save the current L1 annotation and advance.
 
 Model constructor signatures, checkpoint state-dict topology, spatial output
 semantics, and IAC dependencies are unchanged. Configurations using the removed

@@ -188,9 +188,12 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "MODE==='l1'?'L1 classification':'L2 ROI annotation'" in HTML
     assert "index<9?String(index+1):''" in HTML
     assert "class=chipShortcut" in HTML
-    assert "MODE==='l1'&&!mod&&!editing&&!document.querySelector('dialog[open]')" in HTML
+    assert "dialogOpen=document.querySelector('dialog[open]')" in HTML
+    assert "MODE==='l1'&&!mod&&!editing&&!dialogOpen" in HTML
     assert "/^[1-9]$/.test(ev.key)" in HTML
     assert "l1=L1[index];renderLabels()" in HTML
+    assert "ev.code==='Space'" in HTML
+    assert "if(!ev.repeat)save()" in HTML
     assert "All ROI classes visible. Select one L2 class before drawing." in HTML
     assert "currentCandidate" not in HTML
     assert "function hasPositiveRoi(attribute)" in HTML
