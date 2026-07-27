@@ -122,6 +122,21 @@ def test_discover_iac_packages_supports_direct_file_and_dataset_dirs(tmp_path: P
     assert by_name["cohort_a/nested.iac"].dataset == "cohort_a"
     assert by_name["cohort_a/nested.iac"].total == 4
 
+    included = discover_iac_packages(
+        tmp_path,
+        ("cohort_a/nested.iac",),
+    )
+    assert [package.rel_path for package in included] == [
+        "cohort_a/nested.iac"
+    ]
+    included_by_glob = discover_iac_packages(
+        tmp_path,
+        ("cohort_a/*.iac",),
+    )
+    assert [package.rel_path for package in included_by_glob] == [
+        "cohort_a/nested.iac"
+    ]
+
 
 def test_discover_iac_packages_follows_symlinked_dataset_dirs(tmp_path: Path) -> None:
     source_dir = tmp_path / "source" / "cohort_a"
@@ -155,8 +170,10 @@ def test_annotation_cli_always_requires_l1_and_l2_roi_workspaces() -> None:
         "--priority-manifest", "priority.json",
         "--l1-review-manifest", "l1-review.json",
         "--l2-review-manifest", "l2-review.json",
+        "--include-packages", "301/a.iac,301/b.iac",
         "--roi-candidate-manifest", "roi-candidates.json",
         "--roi-priority-attributes", "vascular-structure-present,ductular-portal-present",
+        "--review-existing",
     ])
     assert (args.l1_state, args.l2_state, args.priority_manifest) == (
         "l1.json", "l2.json", "priority.json",
@@ -165,7 +182,9 @@ def test_annotation_cli_always_requires_l1_and_l2_roi_workspaces() -> None:
     assert args.roi_candidate_manifest == "roi-candidates.json"
     assert args.l1_review_manifest == "l1-review.json"
     assert args.l2_review_manifest == "l2-review.json"
+    assert args.include_packages == "301/a.iac,301/b.iac"
     assert args.roi_priority_attributes == "vascular-structure-present,ductular-portal-present"
+    assert args.review_existing is True
     assert not any("--roi-plan-config" in action.option_strings for action in parser._actions)
     assert not any("--roi-plan-checkpoint" in action.option_strings for action in parser._actions)
     assert not any("--roi-plan-device" in action.option_strings for action in parser._actions)
@@ -188,6 +207,13 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "MODE==='l1'?'L1 classification':'L2 ROI annotation'" in HTML
     assert "index<9?String(index+1):''" in HTML
     assert "class=chipShortcut" in HTML
+    assert "await showRecord(rec.record);closeOverview();" in HTML
+    assert "horizontalWheelPan:true" in HTML
+    assert "Math.abs(ev.deltaX)>=2" in HTML
+    assert "contextTrackpadWheel=true" in HTML
+    assert "if(!contextTrackpadWheel)return" in HTML
+    assert "horizontalWheelUntil" not in HTML
+    assert "ev.key.toLowerCase()==='c'" in HTML
     assert "dialogOpen=document.querySelector('dialog[open]')" in HTML
     assert "MODE==='l1'&&!mod&&!editing&&!dialogOpen" in HTML
     assert "/^[1-9]$/.test(ev.key)" in HTML
@@ -256,9 +282,17 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "function eraseCurrentClassAt(center,eraserRadius)" in HTML
     assert "function eraseCurrentClassAlong(start,end,eraserRadius)" in HTML
     assert "function setupEraser()" in HTML
-    assert "const finalPoint=[p.x,p.y],lastPoint=roiDrawing.points" in HTML
+    assert "function finishRoiStroke(ev=null)" in HTML
+    assert "const finalPoint=[p.x,p.y],lastPoint=drawing.points" in HTML
     assert "pointDistanceSq(lastPoint,finalPoint)>1e-12" in HTML
-    assert "addEventListener('pointercancel'" in HTML
+    assert "window.addEventListener('pointerup',ev=>finishRoiStroke(ev),true)" in HTML
+    assert "window.addEventListener('pointercancel',ev=>finishRoiStroke(ev),true)" in HTML
+    assert "addEventListener('lostpointercapture'" in HTML
+    assert "drawing.last||drawing.start" in HTML
+    assert "p=ev?roiPoint(ev):(drawing.last||drawing.start)" in HTML
+    assert "roiPoint(ev,true)" not in HTML
+    assert "roiDrawing.last=p" in HTML
+    assert "window.addEventListener('mouseup',()=>finishRoiStroke(),true)" in HTML
     assert "function setupTileUndo()" in HTML
     assert "getElementById('tileStage').addEventListener('contextmenu'" in HTML
     assert "ev.preventDefault();ev.stopPropagation();undoRoi()" in HTML
@@ -266,9 +300,9 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "if(ev.button!==0||roiTool!=='eraser')return" in HTML
     assert "setupEraser();setupRoi();setupTileUndo()" in HTML
     assert "item.attribute!==roiAttribute" in HTML
-    assert "pushUndo();roiPlan=null;roiDrawing={tool:'eraser'" in HTML
+    assert "pushUndo();roiPlan=null;roiDrawing={tool:'eraser',pointerId:ev.pointerId" in HTML
     assert "syncPositiveLabels();renderRoi()" in HTML
-    assert "wheelZoom:false,doubleClickReset:false,onScale:syncOverviewZoom" in HTML
+    assert "wheelZoom:false,horizontalWheelPan:true,doubleClickReset:false,onScale:syncOverviewZoom" in HTML
     assert "if(!wheelZoom)return;ev.preventDefault();setScale(" in HTML
     assert "overviewZoom.addEventListener('input'" in HTML
     assert "function openOverview()" in HTML
@@ -1743,12 +1777,24 @@ def test_marked_tile_list_is_collapsed_and_loaded_on_demand() -> None:
     assert "/api/reviewed-list?package=all" in HTML
     assert "async function openReviewed(item)" in HTML
     assert "if(ev.target.open)loadReviewedList()" in HTML
-    assert "let reviewedReturn=null;" in HTML
+    assert "let reviewedReturn=null,reviewedItems=[],reviewedIndex=-1;" in HTML
     assert "async function returnFromReviewed()" in HTML
     assert "else returnFromReviewed()" in HTML
     assert "height:min(36svh,360px);max-height:min(36svh,360px)" in HTML
     assert "overflow-x:hidden;overflow-y:scroll" in HTML
     assert "touch-action:pan-y" in HTML
+
+
+def test_review_mode_is_shared_by_l1_and_l2_and_uses_saved_tile_order() -> None:
+    assert "%REVIEW_MODE_JSON%" in HTML
+    assert 'id="reviewModeBtn"' in HTML
+    assert ".review-mode #packageHeader,.review-mode #packages{display:none}" in HTML
+    assert "let reviewedReturn=null,reviewedItems=[],reviewedIndex=-1;" in HTML
+    assert "async function reviewStep(delta)" in HTML
+    assert "if(REVIEW_MODE){await reviewStep(-1);return}" in HTML
+    assert "if(REVIEW_MODE){await reviewStep(1);return}" in HTML
+    assert "url.searchParams.set('review','1')" in HTML
+    assert "document.getElementById('reviewedDetails').open=true" in HTML
 
 
 def test_clear_selected_roi_class_clears_geometry_negative_and_preview_state() -> None:

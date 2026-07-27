@@ -9,7 +9,7 @@ HCC-SemPath learns two complementary pathology representations from one fixed
 DINOv2-S/14 tile encoder:
 
 1. a four-class, mutually exclusive Level-1 tissue-state classification;
-2. weakly supervised spatial Level-2 morphometry for nine HCC components,
+2. weakly supervised spatial Level-2 morphometry for eleven HCC components,
    supporting component location, instance count, local abundance, and
    calibrated area where the supervision permits it.
 
@@ -60,15 +60,24 @@ The output is one four-way softmax.
 
 The spatial components, in fixed order, are:
 
-1. `hepatocellular-parenchyma-present`
-2. `necrosis-present`
-3. `hemorrhage-present`
-4. `bile-pigment-present`
-5. `inflammatory-cell-present`
-6. `fibrous-stroma-present`
-7. `steatosis-vacuolation-present`
-8. `vascular-structure-present`
-9. `ductular-portal-present`
+1. `hepatocellular-parenchyma`
+2. `necrosis`
+3. `hemorrhage`
+4. `bile-pigment`
+5. `inflammatory-cell`
+6. `fibroblast`
+7. `fibrous-stroma`
+8. `steatosis-vacuolation`
+9. `small-vessel`
+10. `large-vessel`
+11. `ductular-portal`
+
+Fibroblast is a cell class. It is separated from fibrous stroma so spindle-cell
+localization and density do not alter the continuous extracellular-matrix
+target, and fibroblasts are not absorbed into hepatocellular parenchyma.
+Small vessel denotes the predominantly circular cross-sectional vascular ROIs
+in the current asset. Large vessel is a separate extended-structure class whose
+wall, lumen, and context may span several attention cells.
 
 ## 4. Component-and-geometry annotation contract
 
@@ -76,8 +85,8 @@ Tool meaning is resolved jointly with component biology:
 
 | Components | Point | Circle | Brush | Identifiable measurements |
 | --- | --- | --- | --- | --- |
-| Hepatocellular parenchyma, hemorrhage, inflammatory cells | One instance | One larger instance | Dense-cell bag with unknown exact count | Instance count plus local density |
-| Steatosis/vacuolation, vascular structure, ductular/portal structure | One instance with unresolved extent | One large instance with approximate extent | One connected marked structure with approximate extent; overlapping strokes merge | Structure count plus area |
+| Hepatocellular parenchyma, hemorrhage, inflammatory cells, fibroblasts | One instance | One larger instance | Dense-cell bag with unknown exact count | Instance count plus local density |
+| Steatosis/vacuolation, small vessel, large vessel, ductular/portal structure | One instance with unresolved extent | One large instance with approximate extent | One connected marked structure with approximate extent; overlapping strokes merge | Structure count plus area |
 | Necrosis, fibrous stroma | Invalid for positive annotation | Positive extent | Positive extent | Area/coverage only |
 | Bile pigment | Small positive pigment seed, not an instance | Larger positive focus with approximate extent | Irregular/fused positive pigment extent | Pigment burden/area; derived focus density only |
 
@@ -154,10 +163,10 @@ window.
 
 ### Spatial outputs
 
-For each of nine components the head emits:
+For each of eleven components the head emits:
 
-- `l2_instance_logits [B, 9, 32, 32]`;
-- `l2_abundance_logits [B, 9, 32, 32]`.
+- `l2_instance_logits [B, 11, 32, 32]`;
+- `l2_abundance_logits [B, 11, 32, 32]`.
 
 These maps are positive-versus-negative local prototype responses over the
 fused spatial features. One supervised tile/component contributes one centroid
@@ -174,7 +183,7 @@ spatial loss at their annotated locations and map into the shared component
 coordinate. The L2 annotation gate measures fixed-probe coverage across the
 four teacher spaces.
 
-The instance tensor retains fixed nine-class topology. Capability masks
+The instance tensor retains fixed eleven-class topology. Capability masks
 deterministically suppress count outputs for non-countable channels in model
 output and decoder metadata.
 
@@ -182,7 +191,7 @@ Decoded outputs are capability-masked:
 
 - NMS coordinates and counts only for cell-instance and discrete-structure
   components;
-- density mass/mean only for the three cell/density components;
+- density mass/mean only for the four cell/density components;
 - area fraction/pixels only for continuous, pigment, and discrete-structure
   components;
 - thresholded bile-pigment focus density as a secondary morphology descriptor.
@@ -287,7 +296,7 @@ only as a fallback.
 ## 8. Data organization
 
 - L1 uses the stable 3,000-tile expert classification asset.
-- L2 uses the current nine-class spatial annotation manifest.
+- L2 uses the current eleven-class spatial annotation manifest.
 - Both assets are intentionally small expert interventions on the
   population-scale four-teacher representation; neither is expected to label
   the full corpus.
@@ -313,10 +322,10 @@ only as a fallback.
 - The fixed-probe plateau must repeat across slide-aware resamples and
   consecutive tail increments. New-batch discovery novelty may rebound and is
   reported only as a secondary diagnostic, never as a stopping signal.
-- The final L2 tile count is the union required for all nine component curves
+- The final L2 tile count is the union required for all eleven component curves
   to pass. Early-saturating components stop consuming annotation effort;
   still-growing components drive subsequent tile selection.
-- Existing component-presence labels prioritize the annotation queue.
+- Existing component candidates prioritize the annotation queue.
 - Training consumes all configured image IAC packages and the four existing
   teacher-feature IAC streams.
 - Patient/slide separation remains the split unit.
@@ -332,10 +341,10 @@ After checkpoint freezing, spatial validation is performed on an independent,
 slide-separated expert sample:
 
 - instance localization and count metrics only for count-capable components;
-- density calibration for hepatocellular, hemorrhagic, and inflammatory-cell
-  components;
+- density calibration for hepatocellular, hemorrhagic, inflammatory-cell, and
+  fibroblast components;
 - area metrics for necrosis, fibrous stroma, bile pigment, vacuolation,
-  vascular structures, and ductular/portal structures;
+  small vessels, large vessels, and ductular/portal structures;
 - bile-pigment focus-density repeatability only under a frozen threshold,
   connectivity, minimum-area, and spatial-scale definition;
 - results stratified by component mode and annotation geometry;
@@ -385,7 +394,7 @@ HCC-SemPath contributes one HCC-specific representation with:
 
 - retained multi-teacher foundation features;
 - stable four-class global tissue state;
-- nine-component, geometry-aware spatial output;
+- eleven-component, geometry-aware spatial output;
 - native support for class-routed point/circle/brush annotations;
 - cell-scale localization plus multi-grid structural context;
 - count, density, and validated area measurements for downstream spatial
@@ -395,7 +404,7 @@ HCC-SemPath contributes one HCC-specific representation with:
 
 - `modeling/models.py`: dynamic L1/local L2 prototype readouts, dense fused
   spatial features, and decoder.
-- `spatial_schema.py`: fixed nine-class measurement capabilities.
+- `spatial_schema.py`: fixed eleven-class measurement capabilities.
 - `training/roi.py`: instance centres, density bags, positive area, explicit
   negatives, and weak implicit-background targets.
 - `training/spatial_losses.py`: tolerant instance peaks, abundance point peaks,

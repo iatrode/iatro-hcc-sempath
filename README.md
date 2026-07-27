@@ -5,10 +5,10 @@ pathology teachers and a small, fixed expert-supervision stream. The model
 combines:
 
 - four-class global L1 tissue-state classification;
-- nine-component L2 spatial morphometry from class-routed point, circle, and
+- eleven-component L2 spatial morphometry from class-routed point, circle, and
   brush annotations.
 
-The L2 branch maps nine components into annotation-grounded instance count,
+The L2 branch maps eleven components into annotation-grounded instance count,
 local density, occupied area, and bile-pigment focus-density measurements.
 Each component exposes the measurements defined by its biological and
 annotation semantics.
@@ -39,7 +39,7 @@ hcc-sempath --help
 HCC image-tile IAC packages + four teacher-feature IAC streams
   -> shared DINOv2-S/14 HCC representation
   -> L1 four-class global readout
-  -> L2 nine-component spatial instance/measurement maps
+  -> L2 eleven-component spatial instance/measurement maps
   -> independently calibrated count/density/area outputs
 ```
 
@@ -105,7 +105,7 @@ active files are:
 - `hcc_prototype_review.final_l1.json`: stable L1
   supervision;
 - `hcc_shared_priority_tiles.json`: shared L1/L2 priority boundary;
-- `hcc_l2_roi_v2.json`: nine-component point/circle/brush L2 state.
+- `hcc_l2_roi_v2.json`: eleven-component point/circle/brush L2 state.
 
 Seed the shared boundary once:
 
@@ -127,7 +127,7 @@ hcc-sempath annotate-prototypes \
 ```
 
 The interface exposes separate L1 classification and L2 ROI workspaces over a
-shared priority boundary. Existing component-presence labels prioritize the L2
+shared priority boundary. Existing component candidates prioritize the L2
 queue, and the four-teacher information report increases priority for spatial
 components that still need coverage.
 
@@ -160,21 +160,28 @@ changes; CSV exports include both IDs and display names.
 
 Random navigation filters tiles below 30% estimated tissue by default. The
 `--min-tissue-fraction` option changes this threshold, and `0` disables tissue
-filtering. L2 navigation first consumes component-presence candidates, ordered
+filtering. L2 navigation first consumes existing component candidates, ordered
 by the current information-curve deficit. The interface reports exhausted
 candidate inventories that still require additional coverage.
 
 The fixed L2 classes are:
 
-1. `hepatocellular-parenchyma-present`
-2. `necrosis-present`
-3. `hemorrhage-present`
-4. `bile-pigment-present`
-5. `inflammatory-cell-present`
-6. `fibrous-stroma-present`
-7. `steatosis-vacuolation-present`
-8. `vascular-structure-present`
-9. `ductular-portal-present`
+1. `hepatocellular-parenchyma`
+2. `necrosis`
+3. `hemorrhage`
+4. `bile-pigment`
+5. `inflammatory-cell`
+6. `fibroblast`
+7. `fibrous-stroma`
+8. `steatosis-vacuolation`
+9. `small-vessel`
+10. `large-vessel`
+11. `ductular-portal`
+
+Fibroblasts are a cell-localization and density target, distinct from the
+continuous extracellular fibrous-stroma area target. Existing vascular ROI
+annotations define the small-vessel class; large vessels form a separate
+structure class because their identity and extent require multi-grid context.
 
 Point, circle, and brush semantics are defined in
 [`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md). **Find similar
@@ -187,10 +194,10 @@ explicit per-component completeness:
 
 ```json
 {
-  "roi_count_complete": ["inflammatory-cell-present"],
+  "roi_count_complete": ["inflammatory-cell"],
   "roi_measurement_complete": [
-    "inflammatory-cell-present",
-    "fibrous-stroma-present"
+    "inflammatory-cell",
+    "fibrous-stroma"
   ]
 }
 ```

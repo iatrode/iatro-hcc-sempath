@@ -847,7 +847,15 @@ def _plot(
     import matplotlib.pyplot as plt
 
     attributes = [row["attribute"] for row in summary_rows]
-    figure, axes = plt.subplots(3, 3, figsize=(16, 12), constrained_layout=True)
+    column_count = 3
+    row_count = max(1, math.ceil(len(attributes) / column_count))
+    figure, axes = plt.subplots(
+        row_count,
+        column_count,
+        figsize=(16, 4 * row_count),
+        constrained_layout=True,
+        squeeze=False,
+    )
     for attribute, axis in zip(attributes, axes.flat):
         teacher_curves = attribute_report[attribute].get(
             "teacher_curves",
@@ -872,6 +880,8 @@ def _plot(
         axis.set_xlabel("reference positive ROI tiles")
         axis.set_ylabel("remaining novelty", color="#1f77b4")
         axis.grid(alpha=0.2)
+    for axis in axes.flat[len(attributes) :]:
+        axis.set_visible(False)
     handles, labels = axes.flat[0].get_legend_handles_labels()
     if handles:
         figure.legend(

@@ -673,9 +673,36 @@ def _load_or_create_auth_token(state_path: str | Path, provided: str = "") -> st
     return token
 
 
-def _candidate_iac_paths(root: Path) -> list[Path]:
+def _candidate_iac_paths(
+    root: Path,
+    include_packages: tuple[str, ...] = (),
+) -> list[Path]:
     if root.is_file():
         return [root] if root.suffix == ".iac" else []
+
+    if include_packages:
+        paths = []
+        seen: set[Path] = set()
+        for relative in include_packages:
+            matches = sorted(root.glob(relative))
+            if not matches:
+                raise FileNotFoundError(
+                    f"included image-tile IAC package is absent: {root / relative}"
+                )
+            for candidate in matches:
+                if (
+                    candidate.suffix != ".iac"
+                    or not candidate.is_file()
+                    or candidate in seen
+                ):
+                    continue
+                paths.append(candidate)
+                seen.add(candidate)
+        if not paths:
+            raise FileNotFoundError(
+                f"no included image-tile IAC packages found under: {root}"
+            )
+        return paths
 
     paths = []
     visited_dirs: set[str] = set()
@@ -713,11 +740,14 @@ def _package_from_path(root: Path, path: Path) -> AnnotationPackage | None:
     return AnnotationPackage(path=path, rel_path=rel, dataset=dataset, total=total)
 
 
-def discover_iac_packages(input_path: str | Path) -> list[AnnotationPackage]:
+def discover_iac_packages(
+    input_path: str | Path,
+    include_packages: tuple[str, ...] = (),
+) -> list[AnnotationPackage]:
     root = Path(input_path).resolve()
     LOG.info("discover_iac_start input=%s", root)
     packages = []
-    for path in _candidate_iac_paths(root):
+    for path in _candidate_iac_paths(root, include_packages):
         package = _package_from_path(root, path)
         if package is None:
             continue
@@ -1202,6 +1232,7 @@ class AnnotationData:
         roi_mode: bool = False,
         priority_queue: SharedPriorityQueue | None = None,
         review_queue: StrictReviewQueue | None = None,
+        include_packages: list[str] | tuple[str, ...] | None = None,
         min_tissue_fraction: float = 0.30,
     ) -> None:
         self.input_root = Path(input_path).resolve()
@@ -1230,6 +1261,7 @@ class AnnotationData:
         self.roi_priority_attributes = requested_priority
         self.priority_queue = priority_queue
         self.review_queue = review_queue
+        self.include_packages = tuple(dict.fromkeys(include_packages or ()))
         if not 0.0 <= min_tissue_fraction <= 1.0:
             raise ValueError("min_tissue_fraction must be between 0 and 1")
         self.min_tissue_fraction = float(min_tissue_fraction)
@@ -1254,14 +1286,20 @@ class AnnotationData:
             self._scan_thread = threading.Thread(target=self._scan_packages, name="iac-scan", daemon=True)
             self._scan_thread.start()
         else:
-            self.packages = discover_iac_packages(self.input_root)
+            self.packages = discover_iac_packages(
+                self.input_root,
+                self.include_packages,
+            )
             self._scan_done = True
 
     def _scan_packages(self) -> None:
         LOG.info("discover_iac_background_start input=%s", self.input_root)
         try:
             count = 0
-            for path in _candidate_iac_paths(self.input_root):
+            for path in _candidate_iac_paths(
+                self.input_root,
+                self.include_packages,
+            ):
                 package = _package_from_path(self.input_root, path)
                 if package is None:
                     continue
@@ -1481,11 +1519,12 @@ class AnnotationData:
         overall["remaining"] = max(0, overall["total"] - overall["annotated"] - overall["skipped"])
         l1_counts = {name: 0 for name in self.state.l1_prototypes}
         l2_counts = {name: 0 for name in self.state.l2_prototypes}
-        for counted_package in packages:
-            for item in self.state.counted_annotations_for_package(counted_package):
-                l1_counts[item["l1"]] = l1_counts.get(item["l1"], 0) + 1
-                for label in item["l2"]:
-                    l2_counts[label] = l2_counts.get(label, 0) + 1
+        for key, item in self.state.annotations.items():
+            if key in self.state.skipped or not _is_counted_annotation(item):
+                continue
+            l1_counts[item["l1"]] = l1_counts.get(item["l1"], 0) + 1
+            for label in item["l2"]:
+                l2_counts[label] = l2_counts.get(label, 0) + 1
         package_l1_counts = {name: 0 for name in self.state.l1_prototypes}
         package_l2_counts = {name: 0 for name in self.state.l2_prototypes}
         for item in self.state.counted_annotations_for_package(package):
@@ -2292,6 +2331,7 @@ class AnnotationArchive:
         roi_mode: bool | None = None,
         priority_queue: SharedPriorityQueue | None = None,
         review_queue: StrictReviewQueue | None = None,
+        include_packages: list[str] | tuple[str, ...] | None = None,
         min_tissue_fraction: float = 0.30,
     ) -> None:
         self.input_path = str(Path(input_path).resolve())
@@ -2305,6 +2345,7 @@ class AnnotationArchive:
         self.roi_mode = initial.roi_mode if roi_mode is None else bool(roi_mode)
         self.priority_queue = priority_queue if priority_queue is not None else initial.priority_queue
         self.review_queue = review_queue if review_queue is not None else initial.review_queue
+        self.include_packages = tuple(include_packages or initial.include_packages)
         self.min_tissue_fraction = float(min_tissue_fraction)
         self.base_state_path = initial.state.state_path
         self.manifest_path = self.base_state_path.with_name(f"{self.base_state_path.stem}.versions.json")
@@ -2329,6 +2370,7 @@ class AnnotationArchive:
                     roi_mode=self.roi_mode,
                     priority_queue=self.priority_queue,
                     review_queue=self.review_queue,
+                    include_packages=self.include_packages,
                     min_tissue_fraction=self.min_tissue_fraction,
                 )
                 self._names[version_id] = str(item.get("name") or version_id)
@@ -2408,6 +2450,7 @@ class AnnotationArchive:
             roi_mode=self.roi_mode,
             priority_queue=self.priority_queue,
             review_queue=self.review_queue,
+            include_packages=self.include_packages,
             min_tissue_fraction=self.min_tissue_fraction,
         )
         self._names[version_id] = clean_name
@@ -2452,6 +2495,7 @@ HTML = r"""<!doctype html>
 *{box-sizing:border-box}body{margin:0;font:14px system-ui,-apple-system,Segoe UI,sans-serif;color:var(--text);background:var(--bg);height:100svh;overflow:hidden}
 button,input{font:inherit}button{min-height:40px;border:1px solid var(--line);background:var(--panel);color:var(--text);cursor:pointer}button.primary{background:var(--blue);border-color:var(--blue);color:#fff}button.ghost{background:transparent}button:disabled{opacity:.55;cursor:default}
 .layout{display:grid;grid-template-columns:300px minmax(0,1fr);height:100svh}.layout.queue-collapsed{grid-template-columns:0 minmax(0,1fr)}
+.review-mode aside{position:relative;height:100svh;min-height:0}.review-mode #packageHeader,.review-mode #packages{display:none}.review-mode .reviewedPanel{display:block!important;position:absolute;inset:0;width:auto;height:auto;min-height:0;overflow:hidden;border-top:0}.review-mode .reviewedPanel>summary{height:44px;pointer-events:none}.review-mode .reviewedList{display:block;position:absolute;inset:44px 0 0;width:auto;height:auto;max-height:none;overflow-y:auto}
 .modeNav{display:flex;align-items:center;gap:2px;padding:2px;border:1px solid var(--line);background:#f5f7f9}.modeNav button{min-height:32px;padding:4px 12px;border:0;background:transparent}.modeNav button.active{background:#202124;color:#fff}.versionSelect{min-height:32px;border:1px solid var(--line);background:#fff;padding:0 8px}.compactButton{min-height:32px;padding:4px 9px}.labelManage{min-height:32px;padding:4px 10px}
 aside{overflow:hidden;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column}.layout.queue-collapsed aside{border:0}.layout.queue-collapsed aside>*{display:none}
 .panelHead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px;border-bottom:1px solid var(--line)}.panelTitle{font-weight:650}.panelBody{overflow:auto;padding:12px}.packageBody{min-height:0;flex:1}.reviewedPanel{flex:0 0 auto;border-top:1px solid var(--line);background:#fafbfc}.reviewedPanel[open]{display:block}.reviewedPanel summary{cursor:pointer;padding:11px 12px;font-weight:650}.reviewedList{box-sizing:border-box;width:100%;height:min(36svh,360px);max-height:min(36svh,360px);overflow-x:hidden;overflow-y:scroll;overscroll-behavior-y:contain;scrollbar-gutter:stable;touch-action:pan-y;-webkit-overflow-scrolling:touch;padding:0 10px 10px}.reviewedItem{display:block;width:100%;min-height:0;text-align:left;padding:7px 8px;margin-bottom:5px;background:#fff}.reviewedItem.active{border-color:var(--blue);background:var(--blue-soft)}.reviewedItemMeta{display:block;color:var(--muted);font-size:11px;margin-top:2px}.labelBody{min-height:0;flex:1}.labelActions{border-top:1px solid var(--line);padding:10px 12px;background:var(--panel)}
@@ -2478,35 +2522,36 @@ pre{white-space:pre-wrap;font-size:12px;background:#f1f3f4;padding:8px}
   aside{position:fixed;inset:0 0 auto 0;z-index:5;max-height:45svh;border-right:0;border-bottom:1px solid var(--line);box-shadow:0 8px 24px rgba(15,23,42,.16)}.layout.queue-collapsed aside{display:none}
   main{height:100svh;grid-template-rows:auto auto minmax(0,1fr)}.topbar{position:sticky;top:0;z-index:3;grid-template-columns:auto minmax(0,1fr) auto;gap:6px;padding:7px 8px}.topbarTitle{grid-column:1/-1;grid-row:1}.topbar>#toggleQueue{grid-column:1;grid-row:2}.topbar>.modeNav{grid-column:2;grid-row:2;justify-self:start}.topbar>.topTools{grid-column:3;grid-row:2}.subbar{align-items:flex-start;flex-direction:column;gap:5px;padding:6px 8px}.versionGroup{width:100%}.versionSelect{min-width:0;flex:1}.topProgress{width:100%;min-width:0;text-align:left}.workspace{padding:8px}.tileViewport{height:360px}.panelBody{padding:10px}.chips{gap:6px;margin-bottom:10px}button.chip{min-height:38px;padding:7px}
   .reviewedList{height:26svh;max-height:26svh}
+  .review-mode aside{position:fixed;height:45svh}.review-mode .reviewedList{height:auto;max-height:none}
 }
 </style>
 </head>
 <body><div id="authGate" class="authGate"><div class="authBox"><h3>Annotation token</h3><input id="authInput" autocomplete="off"><button id="authSubmit" class="primary" type="button">Open</button><div id="authStatus" class="status"></div></div></div>
-<div id="layout" class="layout"><aside><div class="panelHead"><div><div class="panelTitle">IAC packages</div><div id="packageSummary" class="muted"></div></div><button id="hideQueue" class="ghost" type="button">Hide</button></div><div id="packages" class="panelBody packageBody"></div><details id="reviewedDetails" class="reviewedPanel"><summary>Marked tiles (<span id="reviewedCount">0</span>)</summary><div id="reviewedList" class="reviewedList"><div class="muted">Expand to load saved annotations.</div></div></details></aside>
-<main><div class="topbar"><button id="toggleQueue" type="button">Tiles</button><div id="modeNav" class="modeNav"></div><div id="title" class="topbarTitle">Prototype annotation</div><div class="topTools"><button id="overviewBtn" type="button">Overview</button><button id="contextBtn" type="button">Context</button><button id="manageLabels" class="labelManage" type="button">Labels</button></div></div><div class="subbar"><div class="versionGroup"><span class="versionLabel">Version</span><select id="versionSelect" class="versionSelect" title="Annotation version"></select><button id="newVersion" class="compactButton" type="button">New</button></div><div id="progress" class="topProgress"></div></div><section class="workspace"><div class="primaryWorkspace"><div class="imageControlRow tileControlRow"><div class="muted" id="recordMeta"></div><label class="rangeControl">Tile zoom <input id="tileZoom" type="range" min="1" max="6" step="0.1" value="2"><span id="tileZoomValue" class="rangeValue">2.0×</span></label></div>
-<div id="tileViewport" class="tileViewport"><div id="tileStage" class="tileStage"><img id="tile" class="tile" draggable="false"><canvas id="roiCanvas" class="roiCanvas" width="224" height="224"></canvas></div></div><div class="annotationControls"><div id="prototypeLabels"><div id="l1Section"><div id="l1" class="chips"></div></div><div id="l2Section"><div id="l2" class="chips"></div></div></div><div id="roiClassBar" class="roiClassBar"></div><div id="roiStatus" class="muted">Select an ROI class, then draw on the tile.</div><div id="roiPlan" class="roiPlan"><button type="button" id="roiPlanGenerate">Find similar marks</button><label id="roiSimilarityControl" class="rangeControl hidden">Similarity <input id="roiSimilarity" type="range" min="0.20" max="0.99" step="0.01" value="0.70"><span id="roiSimilarityValue" class="rangeValue">70%</span></label><label id="roiExclusionControl" class="rangeControl hidden">Exclusion <input id="roiExclusion" type="range" min="3" max="40" step="1" value="7"><span id="roiExclusionValue" class="rangeValue">7 px</span></label><div id="roiPlanStatus" class="roiPlanStatus muted">Select one class and add 1–3 reliable point or circle seeds.</div><div id="roiPlanDecision" class="roiPlanDecision hidden"><button type="button" id="roiPlanAccept" class="primary">Accept visible matches</button><button type="button" id="roiPlanRestart">Start from scratch</button></div></div><div id="roiNavigationNotice" class="roiNavigationNotice hidden"></div><details id="roiCountDetails" class="muted"><summary>ROI positive tile counts</summary><div id="roiCountProgress"></div></details><div id="roiTools" class="roiTools"><button type="button" data-roi-tool="point">Point</button><button type="button" data-roi-tool="brush">Brush</button><button type="button" data-roi-tool="eraser">Eraser</button><button type="button" data-roi-tool="circle">Circle</button><label class="rangeControl">Brush / eraser width <input id="brushWidth" type="range" min="0.012" max="0.500" step="0.002" value="0.035"><span id="brushWidthValue" class="rangeValue">3.5%</span></label><button type="button" id="roiUndo">Undo</button><button type="button" id="roiRedo">Redo</button><button type="button" id="roiClear">Clear selected class</button><button type="button" id="tileGridToggle">Grid</button></div><div class="actions"><button onclick="save()" class="primary">Save + next</button><button onclick="nextRandom(true)">Skip + next</button><button onclick="reviewed()">Browse saved tiles</button></div><div id="status" class="statusLine"></div></div></div></section></main>
+<div id="layout" class="layout"><aside><div id="packageHeader" class="panelHead"><div><div class="panelTitle">IAC packages</div><div id="packageSummary" class="muted"></div></div><button id="hideQueue" class="ghost" type="button">Hide</button></div><div id="packages" class="panelBody packageBody"></div><details id="reviewedDetails" class="reviewedPanel"><summary>Marked tiles (<span id="reviewedCount">0</span>)</summary><div id="reviewedList" class="reviewedList"><div class="muted">Expand to load saved annotations.</div></div></details></aside>
+<main><div class="topbar"><button id="toggleQueue" type="button">Tiles</button><div id="modeNav" class="modeNav"></div><div id="title" class="topbarTitle">Prototype annotation</div><div class="topTools"><button id="reviewModeBtn" type="button">Review</button><button id="overviewBtn" type="button">Overview</button><button id="contextBtn" type="button">Context</button><button id="manageLabels" class="labelManage" type="button">Labels</button></div></div><div class="subbar"><div class="versionGroup"><span class="versionLabel">Version</span><select id="versionSelect" class="versionSelect" title="Annotation version"></select><button id="newVersion" class="compactButton" type="button">New</button></div><div id="progress" class="topProgress"></div></div><section class="workspace"><div class="primaryWorkspace"><div class="imageControlRow tileControlRow"><div class="muted" id="recordMeta"></div><label class="rangeControl">Tile zoom <input id="tileZoom" type="range" min="1" max="6" step="0.1" value="2"><span id="tileZoomValue" class="rangeValue">2.0×</span></label></div>
+<div id="tileViewport" class="tileViewport"><div id="tileStage" class="tileStage"><img id="tile" class="tile" draggable="false"><canvas id="roiCanvas" class="roiCanvas" width="224" height="224"></canvas></div></div><div class="annotationControls"><div id="prototypeLabels"><div id="l1Section"><div id="l1" class="chips"></div></div><div id="l2Section"><div id="l2" class="chips"></div></div></div><div id="roiClassBar" class="roiClassBar"></div><div id="roiStatus" class="muted">Select an ROI class, then draw on the tile.</div><div id="roiPlan" class="roiPlan"><button type="button" id="roiPlanGenerate">Find similar marks</button><label id="roiSimilarityControl" class="rangeControl hidden">Similarity <input id="roiSimilarity" type="range" min="0.20" max="0.99" step="0.01" value="0.70"><span id="roiSimilarityValue" class="rangeValue">70%</span></label><label id="roiExclusionControl" class="rangeControl hidden">Exclusion <input id="roiExclusion" type="range" min="3" max="40" step="1" value="7"><span id="roiExclusionValue" class="rangeValue">7 px</span></label><div id="roiPlanStatus" class="roiPlanStatus muted">Select one class and add 1–3 reliable point or circle seeds.</div><div id="roiPlanDecision" class="roiPlanDecision hidden"><button type="button" id="roiPlanAccept" class="primary">Accept visible matches</button><button type="button" id="roiPlanRestart">Start from scratch</button></div></div><div id="roiNavigationNotice" class="roiNavigationNotice hidden"></div><details id="roiCountDetails" class="muted"><summary>ROI positive tile counts</summary><div id="roiCountProgress"></div></details><div id="roiTools" class="roiTools"><button type="button" data-roi-tool="point">Point</button><button type="button" data-roi-tool="brush">Brush</button><button type="button" data-roi-tool="eraser">Eraser</button><button type="button" data-roi-tool="circle">Circle</button><label class="rangeControl">Brush / eraser width <input id="brushWidth" type="range" min="0.012" max="0.500" step="0.002" value="0.035"><span id="brushWidthValue" class="rangeValue">3.5%</span></label><button type="button" id="roiUndo">Undo</button><button type="button" id="roiRedo">Redo</button><button type="button" id="roiClear">Clear selected class</button><button type="button" id="tileGridToggle">Grid</button></div><div class="actions"><button id="saveNext" onclick="save()" class="primary">Save + next</button><button id="skipNext" onclick="nextRandom(true)">Skip + next</button><button id="previousTile" onclick="reviewed()">Browse saved tiles</button></div><div id="status" class="statusLine"></div></div></div></section></main>
 </div>
-<div id="overviewOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>Location overview</b><div class="contextHint">Drag freely to explore · click a location to open its tile</div></div><div class="overviewBarTools"><label class="rangeControl">Zoom <input id="overviewZoom" type="range" min="0.25" max="12" step="0.25" value="1"><span id="overviewZoomValue" class="rangeValue">1.0×</span></label><button id="overviewClose" type="button">Close</button></div></div><div class="overviewStage"><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom" draggable="false"></div></div></div>
-<div id="contextOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>5×5 context</b><div id="contextMeta" class="muted"></div><div class="contextHint">Drag freely to explore · click a tile to annotate it</div></div><button id="contextClose" type="button">Close</button></div><div id="contextStage" class="contextStage"><div id="contextViewport" class="contextViewport"><img id="contextImg" class="contextImg" draggable="false"><div id="contextLoading" class="contextLoading hidden">Loading nearby tiles…</div></div></div></div>
+<div id="overviewOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>Location overview</b><div class="contextHint">Drag or horizontal-scroll to explore · click a location to open its tile</div></div><div class="overviewBarTools"><label class="rangeControl">Zoom <input id="overviewZoom" type="range" min="0.25" max="12" step="0.25" value="1"><span id="overviewZoomValue" class="rangeValue">1.0×</span></label><button id="overviewClose" type="button">Close</button></div></div><div class="overviewStage"><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom" draggable="false"></div></div></div>
+<div id="contextOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>5×5 context</b><div id="contextMeta" class="muted"></div><div class="contextHint">Drag or horizontal-scroll to explore · click a tile to annotate it · C to close</div></div><button id="contextClose" type="button">Close</button></div><div id="contextStage" class="contextStage"><div id="contextViewport" class="contextViewport"><img id="contextImg" class="contextImg" draggable="false"><div id="contextLoading" class="contextLoading hidden">Loading nearby tiles…</div></div></div></div>
 <dialog id="labelDialog" class="labelDialog"><div class="dialogHead"><b id="labelDialogTitle">Label management</b><button id="closeLabels" type="button">Close</button></div><div class="dialogBody"><div id="labelEditor"></div><div class="addLabelRow"><input id="newLabelName" placeholder="New label name"><button id="addLabel" class="primary" type="button">Add</button><button id="saveLabels" type="button">Save label configuration</button></div><div id="labelStatus" class="muted"></div></div></dialog>
 <dialog id="versionDialog" class="labelDialog"><div class="dialogHead"><b>Create annotation version</b><button id="closeVersion" type="button">Close</button></div><div class="dialogBody"><div class="addLabelRow"><input id="newVersionName" placeholder="Version name"><button id="createVersion" class="primary" type="button">Create</button></div><div id="versionStatus" class="muted">The new version starts with no annotations and keeps the current label configuration.</div></div></dialog>
 <script>
 let packages=[], pkg=0, current=null, l1="", l2=new Set(), l1Counts={}, l2Counts={}, restoredLastIac=false, showGrid=false, navigationMode='global', tileHistory=[], tileForward=[], resumeAfterRow=null;
 let roi=[],roiTool='point',roiToolByClass={},roiAttribute='__all__',roiDrawing=null,roiPreview=null,roiCursor=null,roiAllComplete=true,roiPlan=null,roiPlanLoading=false;
 let roiClassState={},roiExclusionOverrides={};
-let reviewedReturn=null;
+let reviewedReturn=null,reviewedItems=[],reviewedIndex=-1;
 let pendingLabelAdds=[];
 const CONTEXT_RADIUS=5,CONTEXT_RECENTER_DELTA=2;
 let contextData=null,contextCellMap=new Map(),contextSelected=null,contextCenterRow=null;
 let contextTx=0,contextTy=0,contextCellW=1,contextCellH=1,contextImageW=1,contextImageH=1;
 let contextViewportW=1,contextViewportH=1;
-let contextDrag=null,contextFrame=0,contextRequest=0,contextPendingWindow=null;
+let contextDrag=null,contextFrame=0,contextRequest=0,contextPendingWindow=null,contextTrackpadWheel=false,contextWheelTimer=0;
 let undoStack=[],redoStack=[];
 let tileScale=2;
 const ROI_ALL='__all__';
 const NUCLEUS_MATCH_CLASSES=new Set(['hepatocellular-parenchyma-present','inflammatory-cell-present']);
 const AREA_ONLY_CLASSES=new Set(['necrosis-present','fibrous-stroma-present']);
-const ROI_COLORS=['#e11d48','#f97316','#eab308','#22c55e','#14b8a6','#06b6d4','#3b82f6','#8b5cf6','#d946ef'];
+const ROI_COLORS=['#e11d48','#f97316','#eab308','#22c55e','#14b8a6','#06b6d4','#3b82f6','#8b5cf6','#d946ef','#84cc16','#64748b'];
 const TOKEN_KEYS=['token','auth_token','access_token'];
 let AUTH_TOKEN='';
 function tokenFromUrl(){const params=new URLSearchParams(location.search); for(const key of TOKEN_KEYS){const value=params.get(key); if(value)return value;} return '';}
@@ -2520,8 +2565,8 @@ function applyModeLayout(){const l1Mode=MODE==='l1';document.getElementById('roi
 async function ensureAuth(){setAuthToken(tokenFromUrl()||localStorage.getItem('hcc_sempath_annotation_token')||''); if(!AUTH_TOKEN){document.getElementById('authGate').style.display='flex'; throw new Error('');}}
 async function submitAuth(){setAuthToken(document.getElementById('authInput').value.trim()); try{await api('/api/scan-status'); document.getElementById('authGate').style.display='none'; refreshPackage().catch(e=>document.getElementById('status').textContent=e.message||String(e));}catch(e){document.getElementById('authStatus').textContent='Invalid token.';}}
 function setupPanZoom(el,onClick,options={}){
-    let scale=1,tx=0,ty=0,drag=false,sx=0,sy=0,stx=0,sty=0,moved=0,minTx=0,minTy=0,frame=0;
-    const wheelZoom=options.wheelZoom!==false,doubleClickReset=options.doubleClickReset!==false,onScale=options.onScale||null;
+    let scale=1,tx=0,ty=0,drag=false,sx=0,sy=0,stx=0,sty=0,moved=0,minTx=0,minTy=0,frame=0,trackpadWheel=false;
+    const wheelZoom=options.wheelZoom!==false,horizontalWheelPan=options.horizontalWheelPan===true,doubleClickReset=options.doubleClickReset!==false,onScale=options.onScale||null;
     const clamp=()=>{tx=Math.min(0,Math.max(minTx,tx));ty=Math.min(0,Math.max(minTy,ty))};
     const measure=()=>{const viewport=el.parentElement,baseW=el.naturalWidth||el.offsetWidth||0,baseH=el.naturalHeight||el.offsetHeight||0;minTx=Math.min(0,viewport.clientWidth-baseW*scale);minTy=Math.min(0,viewport.clientHeight-baseH*scale);clamp()};
     const paint=()=>{frame=0;el.style.transform=`translate3d(${tx}px,${ty}px,0) scale(${scale})`;if(onScale)onScale(scale)};
@@ -2530,7 +2575,7 @@ function setupPanZoom(el,onClick,options={}){
     el.draggable=false;
     el.addEventListener('dragstart',ev=>ev.preventDefault());
     el.addEventListener('load',()=>{measure();apply()});
-    el.addEventListener('wheel',ev=>{if(!wheelZoom)return;ev.preventDefault();setScale(scale*(ev.deltaY<0?1.15:.87))},{passive:false});
+    el.addEventListener('wheel',ev=>{if(horizontalWheelPan&&Math.abs(ev.deltaX)>=2)trackpadWheel=true;if(horizontalWheelPan&&trackpadWheel){ev.preventDefault();measure();tx-=ev.deltaX;ty-=ev.deltaY;apply();return}if(!wheelZoom)return;ev.preventDefault();setScale(scale*(ev.deltaY<0?1.15:.87))},{passive:false});
     el.addEventListener('pointerdown',ev=>{if(ev.button!==0)return;ev.preventDefault();measure();drag=true;moved=0;sx=ev.clientX;sy=ev.clientY;stx=tx;sty=ty;el.classList.add('dragging');el.setPointerCapture(ev.pointerId)});
     el.addEventListener('pointermove',ev=>{if(!drag)return;ev.preventDefault();const dx=ev.clientX-sx,dy=ev.clientY-sy;moved=Math.max(moved,Math.abs(dx)+Math.abs(dy));tx=stx+dx;ty=sty+dy;apply()});
     el.addEventListener('pointerup',ev=>{if(!drag)return;ev.preventDefault();drag=false;el.classList.remove('dragging');if(el.hasPointerCapture(ev.pointerId))el.releasePointerCapture(ev.pointerId);if(moved<6&&onClick)onClick(ev)});
@@ -2554,7 +2599,7 @@ function hasPositiveRoi(attribute){return roi.some(item=>item.attribute===attrib
 function roiClassIcon(attribute,state){return state==='negative'?'−':hasPositiveRoi(attribute)?'●':'○'}
 function renderRoiClassBar(){const bar=document.getElementById('roiClassBar'); if(!bar)return; bar.style.display=ROI_MODE?'flex':'none'; bar.innerHTML=''; if(!ROI_MODE)return; const all=document.createElement('button'); all.type='button'; all.className='roiClassButton'+(roiAttribute===ROI_ALL?' selected':''); all.style.borderLeftColor='#111827'; all.textContent='All'; all.onclick=()=>{roiPlan=null;roiAttribute=ROI_ALL;renderLabels();renderRoi()}; bar.appendChild(all); L2.forEach(x=>{const state=roiClassState[x]||'open';const positive=hasPositiveRoi(x);const b=document.createElement('button'); b.type='button'; b.className='roiClassButton'+(roiAttribute===x?' selected':''); b.style.borderLeftColor=state==='negative'?'#111827':roiColor(x); b.textContent=`${roiClassIcon(x,state)} ${labelName('l2',x)}`; b.title=state==='negative'?'Explicit negative; click again to return to positive/uncertain.':positive?'Positive ROI present; clear its ROI before marking this class negative.':'Positive or uncertain by default; no positive ROI yet. Click selected class again to mark explicit negative.'; b.onclick=()=>toggleRoiClass(x); bar.appendChild(b)})}
 function renderLabels(){renderRoiClassBar();const a=document.getElementById('l1');a.innerHTML='';document.getElementById('l2').innerHTML='';if(MODE==='l1'){const l1Max=Math.max(1,...Object.values(l1Counts));L1.forEach((x,index)=>a.appendChild(prototypeButton('l1',x,l1===x,l1Counts[x]||0,l1Max,()=>{l1=x;renderLabels()},index<9?String(index+1):'')))}document.getElementById('roiStatus').textContent=ROI_MODE?(roiAttribute===ROI_ALL?'All ROI classes visible. Select one L2 class before drawing. Unmarked classes stay unknown/ignored unless explicitly toggled negative.':`Drawing ROI for: ${labelName('l2',roiAttribute)}. Unmarked classes stay unknown/ignored unless explicitly toggled negative.`):'';applyModeLayout();}
-function roiPoint(ev){const r=document.getElementById('roiCanvas').getBoundingClientRect();return{x:(ev.clientX-r.left)/r.width,y:(ev.clientY-r.top)/r.height}}
+function roiPoint(ev,clamp=false){const r=document.getElementById('roiCanvas').getBoundingClientRect();let x=(ev.clientX-r.left)/r.width,y=(ev.clientY-r.top)/r.height;if(clamp){x=Math.max(0,Math.min(1,x));y=Math.max(0,Math.min(1,y))}return{x,y}}
 function applyTileZoom(){const stage=document.getElementById('tileStage'); if(!stage)return; stage.style.transform=`scale(${tileScale})`; stage.style.marginRight=(224*(tileScale-1))+'px'; stage.style.marginBottom=(224*(tileScale-1))+'px'}
 function setTileZoom(scale){tileScale=Math.min(6,Math.max(1,scale));applyTileZoom();const input=document.getElementById('tileZoom'),value=document.getElementById('tileZoomValue');if(input)input.value=tileScale;if(value)value.textContent=`${tileScale.toFixed(1)}×`}
 function brushWidth(){return parseFloat(document.getElementById('brushWidth')?.value||'0.035')}
@@ -2583,10 +2628,12 @@ function densifyPath(points,maxStep){if(!points.length)return[];const dense=[poi
 function eraseBrushGeometry(item,center,eraserRadius){const geometry=item.geometry,threshold=eraserRadius+(geometry.width||.035)/2,points=densifyPath(geometry.points||[],Math.max(.002,Math.min(.008,eraserRadius/2))),runs=[];let run=[];for(const point of points){if(pointDistanceSq(point,center)>threshold**2)run.push(point);else{if(run.length>1)runs.push(run);run=[]}}if(run.length>1)runs.push(run);return runs.map(points=>({...item,geometry:{...geometry,points}}))}
 function eraseCurrentClassAt(center,eraserRadius){const next=[];for(const item of roi){const geometry=item.geometry;if(item.attribute!==roiAttribute||!geometry){next.push(item);continue}if(geometry.type==='point'){if(pointDistanceSq(geometry.point,center)>eraserRadius**2)next.push(item)}else if(geometry.type==='circle'){if(pointDistanceSq(geometry.center,center)>(geometry.radius+eraserRadius)**2)next.push(item)}else if(geometry.type==='brush')next.push(...eraseBrushGeometry(item,center,eraserRadius));else next.push(item)}roi=next}
 function eraseCurrentClassAlong(start,end,eraserRadius){for(const point of densifyPath([start,end],Math.max(.002,eraserRadius/2)))eraseCurrentClassAt(point,eraserRadius)}
-function setupEraser(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerdown',ev=>{if(ev.button!==0||roiTool!=='eraser')return;ev.preventDefault();ev.stopImmediatePropagation();if(roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one L2 ROI class before erasing.';return}if(roiClassState[roiAttribute]==='negative'){document.getElementById('status').textContent='This ROI class is marked negative. Toggle it back before erasing.';return}const p=roiPoint(ev);pushUndo();roiPlan=null;roiDrawing={tool:'eraser',points:[[p.x,p.y]],width:brushWidth()};eraseCurrentClassAt([p.x,p.y],roiDrawing.width/2);c.setPointerCapture(ev.pointerId);renderRoi()},{capture:true});c.addEventListener('pointermove',ev=>{if(roiDrawing?.tool!=='eraser')return;ev.preventDefault();ev.stopImmediatePropagation();const p=roiPoint(ev),next=[p.x,p.y],previous=roiDrawing.points[roiDrawing.points.length-1];roiCursor=p;roiDrawing.points.push(next);eraseCurrentClassAlong(previous,next,roiDrawing.width/2);renderRoi()},{capture:true});c.addEventListener('pointerup',ev=>{if(roiDrawing?.tool!=='eraser')return;ev.preventDefault();ev.stopImmediatePropagation();roiDrawing=null;roiPreview=null;syncPositiveLabels();renderRoi();document.getElementById('status').textContent=`Erased ${labelName('l2',roiAttribute)} within the selected range.`},{capture:true})}
+function finishEraserStroke(ev=null){if(roiDrawing?.tool!=='eraser')return false;if(ev&&roiDrawing.pointerId!==ev.pointerId)return false;const c=document.getElementById('roiCanvas'),pointerId=roiDrawing.pointerId;roiDrawing=null;roiPreview=null;if(c.hasPointerCapture(pointerId))c.releasePointerCapture(pointerId);syncPositiveLabels();renderRoi();document.getElementById('status').textContent=`Erased ${labelName('l2',roiAttribute)} within the selected range.`;return true}
+function setupEraser(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerdown',ev=>{if(ev.button!==0||roiTool!=='eraser')return;ev.preventDefault();ev.stopImmediatePropagation();if(roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one L2 ROI class before erasing.';return}if(roiClassState[roiAttribute]==='negative'){document.getElementById('status').textContent='This ROI class is marked negative. Toggle it back before erasing.';return}const p=roiPoint(ev);pushUndo();roiPlan=null;roiDrawing={tool:'eraser',pointerId:ev.pointerId,points:[[p.x,p.y]],width:brushWidth()};eraseCurrentClassAt([p.x,p.y],roiDrawing.width/2);c.setPointerCapture(ev.pointerId);renderRoi()},{capture:true});c.addEventListener('pointermove',ev=>{if(roiDrawing?.tool!=='eraser'||roiDrawing.pointerId!==ev.pointerId)return;ev.preventDefault();ev.stopImmediatePropagation();const p=roiPoint(ev),next=[p.x,p.y],previous=roiDrawing.points[roiDrawing.points.length-1];roiCursor=p;roiDrawing.points.push(next);eraseCurrentClassAlong(previous,next,roiDrawing.width/2);renderRoi()},{capture:true});window.addEventListener('pointerup',ev=>finishEraserStroke(ev),true);window.addEventListener('pointercancel',ev=>finishEraserStroke(ev),true);window.addEventListener('mouseup',()=>finishEraserStroke(),true);window.addEventListener('blur',()=>finishEraserStroke());c.addEventListener('lostpointercapture',()=>finishEraserStroke())}
 function updateRoiCursor(ev){const p=roiPoint(ev);roiCursor=((roiTool==='brush'||roiTool==='eraser')&&roiAttribute!==ROI_ALL&&roiClassState[roiAttribute]!=='negative')?p:null;renderRoi()}
 function setupTileUndo(){document.getElementById('tileStage').addEventListener('contextmenu',ev=>{if(!ROI_MODE)return;ev.preventDefault();ev.stopPropagation();undoRoi()})}
-function setupRoi(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerenter',ev=>updateRoiCursor(ev));c.addEventListener('pointerleave',()=>{roiCursor=null;renderRoi()});c.addEventListener('pointerdown',ev=>{if(ev.button!==0)return;if(ROI_MODE&&roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one L2 ROI class before drawing.';return}if(!roiAttribute)return;if(roiClassState[roiAttribute]==='negative'){document.getElementById('status').textContent='This ROI class is marked negative. Toggle it back before drawing.';return}if(roiTool==='point'){pushUndo();roiPlan=null;const p=roiPoint(ev);roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'point',coordinate_space:'normalized',point:[p.x,p.y],radius:.018}});syncPositiveLabels();renderRoi();return}const p=roiPoint(ev);roiDrawing={start:p,points:[[p.x,p.y]],width:brushWidth()};roiPreview=null;c.setPointerCapture(ev.pointerId)});c.addEventListener('pointermove',ev=>{updateRoiCursor(ev);if(!roiDrawing)return;const p=roiPoint(ev);if(roiTool==='circle'){const dx=p.x-roiDrawing.start.x,dy=p.y-roiDrawing.start.y;roiPreview={attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'circle',coordinate_space:'normalized',center:[roiDrawing.start.x,roiDrawing.start.y],radius:Math.sqrt(dx*dx+dy*dy)}}}else{roiDrawing.points.push([p.x,p.y]);roiPreview={attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'brush',coordinate_space:'normalized',points:roiDrawing.points,width:roiDrawing.width}}}renderRoi()});c.addEventListener('pointerup',ev=>{if(!roiDrawing)return;const p=roiPoint(ev);pushUndo();roiPlan=null;if(roiTool==='circle'){const dx=p.x-roiDrawing.start.x,dy=p.y-roiDrawing.start.y;roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'circle',coordinate_space:'normalized',center:[roiDrawing.start.x,roiDrawing.start.y],radius:Math.sqrt(dx*dx+dy*dy)}})}else{const finalPoint=[p.x,p.y],lastPoint=roiDrawing.points[roiDrawing.points.length-1];if(!lastPoint||pointDistanceSq(lastPoint,finalPoint)>1e-12)roiDrawing.points.push(finalPoint);roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'brush',coordinate_space:'normalized',points:roiDrawing.points,width:roiDrawing.width}})}roiDrawing=null;roiPreview=null;syncPositiveLabels();renderRoi()});c.addEventListener('pointercancel',()=>{roiDrawing=null;roiPreview=null;roiCursor=null;renderRoi()})}
+function finishRoiStroke(ev=null){if(!roiDrawing||roiDrawing.tool==='eraser')return false;if(ev&&roiDrawing.pointerId!==ev.pointerId)return false;const c=document.getElementById('roiCanvas'),drawing=roiDrawing,pointerId=drawing.pointerId,p=ev?roiPoint(ev):(drawing.last||drawing.start);roiDrawing=null;roiPreview=null;pushUndo();roiPlan=null;if(drawing.tool==='circle'){const dx=p.x-drawing.start.x,dy=p.y-drawing.start.y;roi.push({attribute:drawing.attribute,state:'positive',review_complete:false,geometry:{type:'circle',coordinate_space:'normalized',center:[drawing.start.x,drawing.start.y],radius:Math.sqrt(dx*dx+dy*dy)}})}else{const finalPoint=[p.x,p.y],lastPoint=drawing.points[drawing.points.length-1];if(!lastPoint||pointDistanceSq(lastPoint,finalPoint)>1e-12)drawing.points.push(finalPoint);roi.push({attribute:drawing.attribute,state:'positive',review_complete:false,geometry:{type:'brush',coordinate_space:'normalized',points:drawing.points,width:drawing.width}})}if(c.hasPointerCapture(pointerId))c.releasePointerCapture(pointerId);syncPositiveLabels();renderRoi();return true}
+function setupRoi(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerenter',ev=>updateRoiCursor(ev));c.addEventListener('pointerleave',()=>{roiCursor=null;renderRoi()});c.addEventListener('pointerdown',ev=>{if(ev.button!==0)return;if(ROI_MODE&&roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one L2 ROI class before drawing.';return}if(!roiAttribute)return;if(roiClassState[roiAttribute]==='negative'){document.getElementById('status').textContent='This ROI class is marked negative. Toggle it back before drawing.';return}if(roiTool==='point'){pushUndo();roiPlan=null;const p=roiPoint(ev);roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'point',coordinate_space:'normalized',point:[p.x,p.y],radius:.018}});syncPositiveLabels();renderRoi();return}const p=roiPoint(ev);roiDrawing={tool:roiTool,attribute:roiAttribute,pointerId:ev.pointerId,start:p,last:p,points:[[p.x,p.y]],width:brushWidth()};roiPreview=null;c.setPointerCapture(ev.pointerId)});c.addEventListener('pointermove',ev=>{updateRoiCursor(ev);if(!roiDrawing||roiDrawing.tool==='eraser'||roiDrawing.pointerId!==ev.pointerId)return;const p=roiPoint(ev);roiDrawing.last=p;if(roiDrawing.tool==='circle'){const dx=p.x-roiDrawing.start.x,dy=p.y-roiDrawing.start.y;roiPreview={attribute:roiDrawing.attribute,state:'positive',review_complete:false,geometry:{type:'circle',coordinate_space:'normalized',center:[roiDrawing.start.x,roiDrawing.start.y],radius:Math.sqrt(dx*dx+dy*dy)}}}else{roiDrawing.points.push([p.x,p.y]);roiPreview={attribute:roiDrawing.attribute,state:'positive',review_complete:false,geometry:{type:'brush',coordinate_space:'normalized',points:roiDrawing.points,width:roiDrawing.width}}}renderRoi()});window.addEventListener('pointerup',ev=>finishRoiStroke(ev),true);window.addEventListener('pointercancel',ev=>finishRoiStroke(ev),true);window.addEventListener('mouseup',()=>finishRoiStroke(),true);window.addEventListener('blur',()=>finishRoiStroke());c.addEventListener('lostpointercapture',()=>finishRoiStroke())}
 function overviewIsOpen(){return !document.getElementById('overviewOverlay').classList.contains('hidden')}
 function setThumbnailSrc(){if(!overviewIsOpen())return;const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); const token=`${Date.now()}-${pkg}`; const row=current?`&row=${current.row}`:''; img.dataset.token=String(token); loading.style.display='block'; loading.textContent='Building overview...'; img.style.display='none'; img.onload=()=>{if(img.dataset.token!==String(token)) return; loading.style.display='none'; img.style.display='block'; if(img.resetPanZoom)img.resetPanZoom();}; img.onerror=()=>{if(img.dataset.token===String(token)) loading.textContent='Overview failed to load.';}; img.src=authed(scoped(`/api/thumbnail?package=${pkg}${row}&thumb_token=${encodeURIComponent(token)}&t=${Date.now()}`));}
 function openOverview(){document.getElementById('overviewOverlay').classList.remove('hidden');setThumbnailSrc()}
@@ -2652,7 +2699,12 @@ async function refreshPackage(){
         if(pkg>=packages.length) pkg=0;
         setThumbnailSrc();
         await progress();
-        await nextRandom();
+        if(REVIEW_MODE){
+            document.getElementById('reviewedDetails').open=true;
+            await loadReviewedList();
+            reviewedIndex=reviewedItems.findIndex(item=>item.package_index===pkg&&item.record.row===scan.last_row);
+            await reviewStep(0);
+        }else await nextRandom();
     } catch(e) {
         document.getElementById('status').textContent = 'Error in refreshPackage: ' + (e.message || String(e));
         console.error(e);
@@ -2662,6 +2714,7 @@ async function progress(){const p=await api('/api/progress?package='+pkg);l1Coun
 async function showRecord(rec){current=rec; l1=""; l2=new Set();roi=[];roiClassState={};roiExclusionOverrides={};undoStack=[];redoStack=[];roiPreview=null;roiCursor=null;roiPlan=null;roiPlanLoading=false;roiAttribute=ROI_MODE?ROI_ALL:'';roiAllComplete=true;renderLabels();renderRoi(); if(!rec){document.getElementById('recordMeta').textContent='No unreviewed tile to show.'; document.getElementById('tile').removeAttribute('src'); return;}const saved=await api(`/api/annotation-state?package=${pkg}&row=${rec.row}`);if(saved.annotation){l1=saved.annotation.l1||'';l2=new Set(saved.annotation.l2||[]);roi=(saved.annotation.roi||[]).filter(item=>item.geometry);(saved.annotation.roi||[]).filter(item=>item.review_complete&&item.state==='negative'&&!item.geometry).forEach(item=>{roiClassState[item.attribute]='negative'});const complete=new Set((saved.annotation.roi||[]).filter(item=>item.review_complete).map(item=>item.attribute));roiAllComplete=L2.every(name=>complete.has(name))}renderLabels();renderRoi();document.getElementById('recordMeta').textContent=`Package ${pkg+1} · tile ${rec.row+1} · x=${rec.x} y=${rec.y}`; const tile=document.getElementById('tile'); tile.src=authed(scoped(`/api/tile?package=${pkg}&row=${rec.row}`)); applyTileZoom(); setThumbnailSrc();}
 async function nextRandom(isSkip=false){
     try {
+        if(REVIEW_MODE){await reviewStep(1);return}
         if(current){tileHistory.push({package:pkg,record:current});tileForward=[];}
         if(isSkip&&current){
             await api('/api/skip',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({package:pkg,row:current.row})});
@@ -2698,11 +2751,13 @@ async function nextRandom(isSkip=false){
         console.error(e);
     }
 }
-async function reviewed(){const previous=tileHistory.pop();if(!previous){document.getElementById('status').textContent='No previous tile in this session.';return}if(current)tileForward.push({package:pkg,record:current});pkg=previous.package;navigationMode='local';await progress();await showRecord(previous.record)}
-async function openReviewed(item){if(!reviewedReturn&&current)reviewedReturn={package:pkg,record:current,navigationMode};tileForward=[];pkg=item.package_index;navigationMode='local';await loadPackages();await progress();await showRecord(item.record);if(isMobile())setQueueOpen(false)}
+async function reviewed(){if(REVIEW_MODE){await reviewStep(-1);return}const previous=tileHistory.pop();if(!previous){document.getElementById('status').textContent='No previous tile in this session.';return}if(current)tileForward.push({package:pkg,record:current});pkg=previous.package;navigationMode='local';await progress();await showRecord(previous.record)}
+async function openReviewed(item){if(!REVIEW_MODE&&!reviewedReturn&&current)reviewedReturn={package:pkg,record:current,navigationMode};tileForward=[];reviewedIndex=reviewedItems.findIndex(candidate=>candidate.package_index===item.package_index&&candidate.record.row===item.record.row);pkg=item.package_index;navigationMode='local';if(!REVIEW_MODE)await loadPackages();await progress();await showRecord(item.record);renderReviewedList();if(isMobile())setQueueOpen(false)}
 async function returnFromReviewed(){const target=reviewedReturn;reviewedReturn=null;if(!target)return;pkg=target.package;navigationMode=target.navigationMode;await loadPackages();await progress();await showRecord(target.record)}
-async function loadReviewedList(){const root=document.getElementById('reviewedList');root.innerHTML='<div class="muted">Loading...</div>';try{const result=await api('/api/reviewed-list?package=all');document.getElementById('reviewedCount').textContent=result.total;root.innerHTML='';if(!result.items.length){root.innerHTML='<div class="muted">No saved annotations in this mode and version.</div>';return}result.items.forEach(item=>{const button=document.createElement('button');button.type='button';button.className='reviewedItem'+(current&&pkg===item.package_index&&current.row===item.record.row?' active':'');const title=document.createElement('span');title.textContent=`Package ${item.package_index+1} · tile ${item.record.row+1}`;const meta=document.createElement('span');meta.className='reviewedItemMeta';meta.textContent=MODE==='l1'?labelName('l1',item.l1):`${item.l2.map(x=>labelName('l2',x)).join(', ')||'No positive ROI'} · ${item.roi_count} mark${item.roi_count===1?'':'s'}`;button.append(title,meta);button.onclick=()=>openReviewed(item);root.appendChild(button)})}catch(e){root.innerHTML='';const error=document.createElement('div');error.className='muted';error.textContent=e.message||String(e);root.appendChild(error)}}
-async function forwardTile(){const next=tileForward.pop();if(!next){document.getElementById('status').textContent='No next tile in this session.';return}if(current)tileHistory.push({package:pkg,record:current});pkg=next.package;navigationMode='local';await progress();await showRecord(next.record)}
+function renderReviewedList(){const root=document.getElementById('reviewedList');root.innerHTML='';if(!reviewedItems.length){root.innerHTML='<div class="muted">No saved annotations in this mode and version.</div>';return}reviewedItems.forEach((item,index)=>{const button=document.createElement('button');button.type='button';button.className='reviewedItem'+(current&&pkg===item.package_index&&current.row===item.record.row?' active':'');const title=document.createElement('span');title.textContent=REVIEW_MODE?`${index+1} / ${reviewedItems.length}`:`Package ${item.package_index+1} · tile ${item.record.row+1}`;const meta=document.createElement('span');meta.className='reviewedItemMeta';meta.textContent=MODE==='l1'?labelName('l1',item.l1):`${item.l2.map(x=>labelName('l2',x)).join(', ')||'No positive ROI'} · ${item.roi_count} mark${item.roi_count===1?'':'s'}`;button.append(title,meta);button.onclick=()=>openReviewed(item);root.appendChild(button);if(button.classList.contains('active'))button.scrollIntoView({block:'nearest'})})}
+async function loadReviewedList(){const root=document.getElementById('reviewedList');root.innerHTML='<div class="muted">Loading...</div>';try{const result=await api('/api/reviewed-list?package=all');reviewedItems=result.items||[];document.getElementById('reviewedCount').textContent=result.total;renderReviewedList();return result}catch(e){reviewedItems=[];root.innerHTML='';const error=document.createElement('div');error.className='muted';error.textContent=e.message||String(e);root.appendChild(error);throw e}}
+async function reviewStep(delta){if(!reviewedItems.length){await showRecord(null);document.getElementById('status').textContent='No saved annotations in this mode and version.';return}if(reviewedIndex<0)reviewedIndex=0;else reviewedIndex=Math.min(reviewedItems.length-1,Math.max(0,reviewedIndex+delta));await openReviewed(reviewedItems[reviewedIndex]);document.getElementById('status').textContent=`Review ${reviewedIndex+1}/${reviewedItems.length}.`}
+async function forwardTile(){if(REVIEW_MODE){await reviewStep(1);return}const next=tileForward.pop();if(!next){document.getElementById('status').textContent='No next tile in this session.';return}if(current)tileHistory.push({package:pkg,record:current});pkg=next.package;navigationMode='local';await progress();await showRecord(next.record)}
 async function save(){
     try {
         if(!current){await nextRandom(); return;}
@@ -2722,7 +2777,7 @@ async function save(){
         await loadPackages();
         if(document.getElementById('reviewedDetails').open)await loadReviewedList();
         VERSIONS=(await api('/api/versions')).versions;renderVersions();
-        await nextRandom();
+        if(REVIEW_MODE){reviewedIndex=Math.min(reviewedIndex+1,reviewedItems.length-1);await reviewStep(0)}else await nextRandom();
     } catch(e) {
         document.getElementById('status').textContent = 'Error in save: ' + (e.message || String(e));
         console.error(e);
@@ -2830,6 +2885,7 @@ async function openContextTile(record){
 }
 function closeContext(){
     contextRequest++;
+    if(contextWheelTimer){clearTimeout(contextWheelTimer);contextWheelTimer=0}
     contextDrag=null;contextPendingWindow=null;
     document.getElementById('contextViewport').classList.remove('dragging');
     document.getElementById('contextLoading').classList.add('hidden');
@@ -2845,6 +2901,19 @@ async function openContext(){
 }
 function setupContextNavigator(){
     const viewport=document.getElementById('contextViewport');
+    viewport.addEventListener('wheel',ev=>{
+        if(!contextData)return;
+        if(Math.abs(ev.deltaX)>=2)contextTrackpadWheel=true;
+        if(!contextTrackpadWheel)return;
+        ev.preventDefault();
+        contextRequest++;contextPendingWindow=null;
+        contextTx-=ev.deltaX;contextTy-=ev.deltaY;scheduleContextPan();
+        if(contextWheelTimer)clearTimeout(contextWheelTimer);
+        contextWheelTimer=setTimeout(()=>{
+            contextWheelTimer=0;
+            replenishContextBuffer().catch(error=>{document.getElementById('contextMeta').textContent=error.message||String(error)});
+        },120);
+    },{passive:false});
     viewport.addEventListener('pointerdown',ev=>{
         if(ev.button!==0||!contextData)return;
         ev.preventDefault();
@@ -2887,10 +2956,11 @@ document.getElementById('roiExclusion').addEventListener('input',()=>{if(roiAttr
 document.getElementById('brushWidth').addEventListener('input',updateBrushWidth);updateBrushWidth();
 document.getElementById('tileZoom').addEventListener('input',ev=>setTileZoom(parseFloat(ev.target.value)));setTileZoom(tileScale);document.getElementById('tileGridToggle').onclick=()=>{showGrid=!showGrid;document.getElementById('tileGridToggle').classList.toggle('selected',showGrid);renderRoi();};document.getElementById('roiCanvas').addEventListener('wheel',ev=>{if(!ROI_MODE||roiTool!=='brush')return;ev.preventDefault();setBrushWidth(brushWidth()*(ev.deltaY<0?1.12:1/1.12))},{passive:false});
 setupContextNavigator();
-const overviewZoom=document.getElementById('overviewZoom'),overviewZoomValue=document.getElementById('overviewZoomValue'),thumb=document.getElementById('thumb');function syncOverviewZoom(scale){overviewZoom.value=scale;overviewZoomValue.textContent=`${scale.toFixed(2).replace(/0$/,'')}×`}setupPanZoom(thumb,async ev=>{const img=ev.target, r=img.getBoundingClientRect(); const x=(ev.clientX-r.left)/r.width, y=(ev.clientY-r.top)/r.height; const rec=await api(`/api/nearest?package=${pkg}&rx=${x}&ry=${y}`); await showRecord(rec.record);},{wheelZoom:false,doubleClickReset:false,onScale:syncOverviewZoom});overviewZoom.addEventListener('input',ev=>thumb.setPanZoomScale(parseFloat(ev.target.value)));
+const overviewZoom=document.getElementById('overviewZoom'),overviewZoomValue=document.getElementById('overviewZoomValue'),thumb=document.getElementById('thumb');function syncOverviewZoom(scale){overviewZoom.value=scale;overviewZoomValue.textContent=`${scale.toFixed(2).replace(/0$/,'')}×`}setupPanZoom(thumb,async ev=>{const img=ev.target, r=img.getBoundingClientRect(); const x=(ev.clientX-r.left)/r.width, y=(ev.clientY-r.top)/r.height; const rec=await api(`/api/nearest?package=${pkg}&rx=${x}&ry=${y}`); await showRecord(rec.record);closeOverview();},{wheelZoom:false,horizontalWheelPan:true,doubleClickReset:false,onScale:syncOverviewZoom});overviewZoom.addEventListener('input',ev=>thumb.setPanZoomScale(parseFloat(ev.target.value)));
 document.getElementById('toggleQueue').addEventListener('click',()=>setQueueOpen(document.getElementById('layout').classList.contains('queue-collapsed')));
 document.getElementById('hideQueue').addEventListener('click',()=>setQueueOpen(false));
-document.getElementById('reviewedDetails').addEventListener('toggle',ev=>{if(ev.target.open)loadReviewedList();else returnFromReviewed()});
+document.getElementById('reviewedDetails').addEventListener('toggle',ev=>{if(REVIEW_MODE&&!ev.target.open){ev.target.open=true;return}if(ev.target.open)loadReviewedList();else returnFromReviewed()});
+document.getElementById('reviewModeBtn').addEventListener('click',()=>{const url=new URL(location.href);if(REVIEW_MODE)url.searchParams.delete('review');else url.searchParams.set('review','1');if(AUTH_TOKEN)url.searchParams.set('token',AUTH_TOKEN);location.href=url.toString()});
 document.getElementById('overviewBtn').addEventListener('click',openOverview);
 document.getElementById('overviewClose').addEventListener('click',closeOverview);
 document.getElementById('contextBtn').addEventListener('click',openContext);
@@ -2907,8 +2977,8 @@ document.getElementById('addLabel').addEventListener('click',()=>{const input=do
 document.getElementById('saveLabels').addEventListener('click',async()=>{const status=document.getElementById('labelStatus');try{await savePendingLabelNames();for(const name of pendingLabelAdds)await changeLabel(MODE,'add','',name,true);pendingLabelAdds=[];renderLabelEditor();status.textContent='Saved to this version.';}catch(e){status.textContent=e.message||String(e);}});
 document.getElementById('authSubmit').addEventListener('click',submitAuth);
 document.getElementById('authInput').addEventListener('keydown',ev=>{if(ev.key==='Enter')submitAuth();});
-document.addEventListener('keydown',ev=>{const mod=ev.metaKey||ev.ctrlKey,target=ev.target,editing=target&&(target.matches?.('input,textarea,select')||target.isContentEditable),dialogOpen=document.querySelector('dialog[open]');if(MODE==='l1'&&!mod&&!editing&&!dialogOpen&&/^[1-9]$/.test(ev.key)){const index=Number(ev.key)-1;if(index<L1.length){ev.preventDefault();l1=L1[index];renderLabels()}return}if(MODE==='l1'&&!mod&&!editing&&!dialogOpen&&ev.code==='Space'){ev.preventDefault();if(!ev.repeat)save();return}if(!mod)return;if(ev.key.toLowerCase()==='z'){ev.preventDefault();if(ev.shiftKey)redoRoi();else undoRoi()}else if(ev.key.toLowerCase()==='y'){ev.preventDefault();redoRoi()}});
-let L1=%L1_JSON%; let L2=%L2_JSON%; let LABELS=%LABELS_JSON%; const ROI_MODE=%ROI_MODE_JSON%; const MODE=%MODE_JSON%; const MODES=%MODES_JSON%; const VERSION=%VERSION_JSON%; let VERSIONS=%VERSIONS_JSON%; localStorage.setItem(`hcc_sempath_annotation_version:${MODE}`,VERSION);const previousButton=document.querySelector('.actions button:last-child');previousButton.textContent='Previous tile';const forwardButton=document.createElement('button');forwardButton.type='button';forwardButton.textContent='Next tile';forwardButton.onclick=forwardTile;previousButton.after(forwardButton);renderModeNav(); renderVersions(); renderLabels(); if(isMobile())setQueueOpen(false); ensureAuth().then(()=>refreshPackage()).catch(e=>{if(e.message)document.getElementById('status').textContent=e.message||String(e);});
+document.addEventListener('keydown',ev=>{const mod=ev.metaKey||ev.ctrlKey,target=ev.target,editing=target&&(target.matches?.('input,textarea,select')||target.isContentEditable),dialogOpen=document.querySelector('dialog[open]');if(!mod&&!editing&&!dialogOpen&&ev.key.toLowerCase()==='c'){ev.preventDefault();if(document.getElementById('contextOverlay').classList.contains('hidden')){if(overviewIsOpen())closeOverview();openContext()}else closeContext();return}if(MODE==='l1'&&!mod&&!editing&&!dialogOpen&&ev.key==='Enter'){ev.preventDefault();if(!ev.repeat)nextRandom(true);return}if(MODE==='l1'&&!mod&&!editing&&!dialogOpen&&/^[1-9]$/.test(ev.key)){const index=Number(ev.key)-1;if(index<L1.length){ev.preventDefault();l1=L1[index];renderLabels()}return}if(MODE==='l1'&&!mod&&!editing&&!dialogOpen&&ev.code==='Space'){ev.preventDefault();if(!ev.repeat)save();return}if(!mod)return;if(ev.key.toLowerCase()==='z'){ev.preventDefault();if(ev.shiftKey)redoRoi();else undoRoi()}else if(ev.key.toLowerCase()==='y'){ev.preventDefault();redoRoi()}});
+let L1=%L1_JSON%; let L2=%L2_JSON%; let LABELS=%LABELS_JSON%; const ROI_MODE=%ROI_MODE_JSON%; const MODE=%MODE_JSON%; const MODES=%MODES_JSON%; const VERSION=%VERSION_JSON%; const REVIEW_MODE=%REVIEW_MODE_JSON%; let VERSIONS=%VERSIONS_JSON%; localStorage.setItem(`hcc_sempath_annotation_version:${MODE}`,VERSION);document.body.classList.toggle('review-mode',REVIEW_MODE);document.getElementById('reviewModeBtn').classList.toggle('active',REVIEW_MODE);document.getElementById('reviewModeBtn').textContent=REVIEW_MODE?'Reviewing':'Review';const previousButton=document.getElementById('previousTile');previousButton.textContent='Previous tile';const forwardButton=document.createElement('button');forwardButton.type='button';forwardButton.textContent='Next tile';forwardButton.onclick=forwardTile;previousButton.after(forwardButton);if(REVIEW_MODE){document.getElementById('reviewedDetails').open=true;document.getElementById('skipNext').textContent='Next tile';document.getElementById('toggleQueue').textContent='Reviewed tiles'}renderModeNav(); renderVersions(); renderLabels(); if(isMobile())setQueueOpen(false); ensureAuth().then(()=>refreshPackage()).catch(e=>{if(e.message)document.getElementById('status').textContent=e.message||String(e);});
 </script></body></html>
 """
 
@@ -2963,6 +3033,12 @@ def make_handler(
                     LOG.info("ui_open path=/")
                     mode = qs.get("mode", [default_mode])[0]
                     version = qs.get("version", [None])[0]
+                    review_mode = qs.get("review", ["0"])[0].strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    }
                     mode, version, selected_data = select_data(mode, version)
                     html = (
                         HTML.replace("%L1_JSON%", json.dumps(selected_data.state.l1_prototypes))
@@ -2972,6 +3048,7 @@ def make_handler(
                         .replace("%MODE_JSON%", json.dumps(mode))
                         .replace("%MODES_JSON%", json.dumps(list(archives)))
                         .replace("%VERSION_JSON%", json.dumps(version))
+                        .replace("%REVIEW_MODE_JSON%", json.dumps(review_mode))
                         .replace("%VERSIONS_JSON%", json.dumps(archives[mode].versions_json()["versions"]))
                     )
                     body = html.encode("utf-8")
@@ -3295,6 +3372,15 @@ def _annotation_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--include-packages",
+        default="",
+        help=(
+            "Optional comma-separated IAC paths or glob patterns relative to the input "
+            "directory. All Packages and package navigation are restricted "
+            "to this set."
+        ),
+    )
+    parser.add_argument(
         "--l2-review-manifest",
         default="",
         help=(
@@ -3321,6 +3407,14 @@ def _annotation_parser() -> argparse.ArgumentParser:
             "information report selects deficient ROI attributes dynamically."
         ),
     )
+    parser.add_argument(
+        "--review-existing",
+        action="store_true",
+        help=(
+            "Open the shared L1/L2 UI in review mode: show only saved "
+            "annotations and navigate them in deterministic order."
+        ),
+    )
     parser.add_argument("--no-open", action="store_true")
     return parser
 
@@ -3344,6 +3438,9 @@ def main() -> None:
     roi_priority_attributes = [
         value.strip() for value in args.roi_priority_attributes.split(",") if value.strip()
     ]
+    include_packages = [
+        value.strip() for value in args.include_packages.split(",") if value.strip()
+    ]
     roi_information_report = (
         DEFAULT_ROI_INFORMATION_REPORT
         if DEFAULT_ROI_INFORMATION_REPORT.is_file()
@@ -3354,6 +3451,7 @@ def main() -> None:
         args.l1_state,
         priority_queue=priority_queue,
         review_queue=l1_review_queue,
+        include_packages=include_packages,
         min_tissue_fraction=args.min_tissue_fraction,
     )
     l2_initial = AnnotationData(
@@ -3365,6 +3463,7 @@ def main() -> None:
         roi_mode=True,
         priority_queue=priority_queue,
         review_queue=l2_review_queue,
+        include_packages=include_packages,
         min_tissue_fraction=args.min_tissue_fraction,
     )
     datasets = {
@@ -3373,6 +3472,7 @@ def main() -> None:
             input_path=args.input,
             priority_queue=priority_queue,
             review_queue=l1_review_queue,
+            include_packages=include_packages,
             min_tissue_fraction=args.min_tissue_fraction,
         ),
         "l2": AnnotationArchive(
@@ -3384,6 +3484,7 @@ def main() -> None:
             roi_mode=True,
             priority_queue=priority_queue,
             review_queue=l2_review_queue,
+            include_packages=include_packages,
             min_tissue_fraction=args.min_tissue_fraction,
         ),
     }
@@ -3394,7 +3495,10 @@ def main() -> None:
         (args.host, port), make_handler(datasets, auth_token, roi_plan_generator)
     )
     base_url = f"http://{args.host}:{port}/"
-    url = f"{base_url}?token={auth_token}"
+    query = f"token={auth_token}"
+    if args.review_existing:
+        query += "&mode=l2&review=1"
+    url = f"{base_url}?{query}"
     states = ",".join(f"{mode}:{item.data().state.state_path}" for mode, item in datasets.items())
     LOG.info("server_start url=%s states=%s", base_url, states)
     print(f"annotation_ui url={url} states={states}", flush=True)
