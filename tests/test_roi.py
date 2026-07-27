@@ -196,7 +196,7 @@ def test_brush_is_positive_bag_and_not_point_or_solid_area_target(
     assert target.brush_bag_ids.max().item() == 1
     assert not target.explicit_negative.any()
     assert not target.implicit_negative[target.brush_mask].any()
-    assert target.implicit_negative.any()
+    assert not target.implicit_negative.any()
 
 
 def test_continuous_component_brush_is_area_only(tmp_path: Path) -> None:
@@ -227,6 +227,54 @@ def test_continuous_component_brush_is_area_only(tmp_path: Path) -> None:
     assert not target.point_centers.any()
     assert not target.brush_mask.any()
     assert target.area_positive.any()
+
+
+def test_continuous_component_accepts_mixed_point_circle_and_brush_as_area(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "spatial.json"
+    common = {
+        "tile_id": "mixed-necrosis",
+        "attribute": "necrosis-present",
+        "split": "train",
+        "state": "positive",
+    }
+    _write_records(
+        path,
+        [
+            {
+                **common,
+                "geometry": {"type": "point", "point": [35, 35]},
+            },
+            {
+                **common,
+                "geometry": {
+                    "type": "circle",
+                    "center": [100, 100],
+                    "radius": 18,
+                },
+            },
+            {
+                **common,
+                "geometry": {
+                    "type": "brush",
+                    "points": [[140, 140], [190, 180]],
+                    "width": 16,
+                },
+            },
+        ],
+    )
+    target = build_spatial_roi_targets(
+        path,
+        component_names=["necrosis-present"],
+        image_size=(224, 224),
+        grid_size=(32, 32),
+    )["mixed-necrosis"]
+
+    assert not target.point_centers.any()
+    assert not target.brush_mask.any()
+    assert target.area_positive.sum().item() > 2
+    assert not target.implicit_negative.any()
 
 
 def test_bile_pigment_all_geometries_supervise_burden_not_count(
@@ -457,7 +505,49 @@ def test_disconnected_structure_brush_strokes_remain_separate_instances(
     assert target.area_positive.any()
 
 
-def test_point_uses_local_tolerance_and_weak_unmarked_background(
+def test_pixel_separated_structure_brushes_do_not_merge_on_coarse_grid(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "spatial.json"
+    common = {
+        "tile_id": "nearby-vessels",
+        "attribute": "vascular-structure-present",
+        "split": "train",
+        "state": "positive",
+    }
+    _write_records(
+        path,
+        [
+            {
+                **common,
+                "geometry": {
+                    "type": "brush",
+                    "points": [[3, 3]],
+                    "width": 1,
+                },
+            },
+            {
+                **common,
+                "geometry": {
+                    "type": "brush",
+                    "points": [[10, 3]],
+                    "width": 1,
+                },
+            },
+        ],
+    )
+
+    target = build_spatial_roi_targets(
+        path,
+        component_names=["vascular-structure-present"],
+        image_size=(224, 224),
+        grid_size=(32, 32),
+    )["nearby-vessels"]
+
+    assert target.point_centers.sum().item() == 2
+
+
+def test_point_uses_local_tolerance_and_leaves_unmarked_cells_ignored(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "spatial.json"
@@ -486,7 +576,7 @@ def test_point_uses_local_tolerance_and_weak_unmarked_background(
     row, col = (target.point_centers[0] > 0).nonzero(as_tuple=False)[0]
     assert not target.implicit_negative[0, row, col]
     assert not target.implicit_negative[0, row - 1 : row + 2, col - 1 : col + 2].any()
-    assert target.implicit_negative.any()
+    assert not target.implicit_negative.any()
     assert not target.brush_mask.any()
     assert not target.explicit_negative.any()
 
@@ -524,9 +614,51 @@ def test_circle_is_one_large_instance_and_not_a_brush_bag(
     )["mixed"]
 
     assert target.point_centers.sum().item() == 2
+    assert target.instance_exclusion_support.any()
     assert not target.brush_mask.any()
     assert not target.area_positive.any()
     assert not target.explicit_negative.any()
+
+
+def test_cell_circle_radius_suppresses_duplicate_instance_peaks() -> None:
+    instance = torch.full((1, 1, 7, 7), -5.0)
+    instance[0, 0, 3, 3] = 5.0
+    instance[0, 0, 3, 5] = 5.0
+    point = torch.zeros_like(instance)
+    point[0, 0, 3, 3] = 1
+    circle = torch.zeros_like(instance, dtype=torch.bool)
+    circle[0, 0, 2:5, 2:6] = True
+    zeros_bool = torch.zeros_like(circle)
+    zeros_long = torch.zeros_like(instance, dtype=torch.long)
+    abundance = torch.zeros_like(instance)
+
+    without_radius, _ = spatial_morphometry_loss(
+        instance_logits=instance,
+        abundance_logits=abundance,
+        point_centers=point,
+        brush_bag_ids=zeros_long,
+        area_positive=zeros_bool,
+        explicit_negative=zeros_bool,
+        implicit_negative=zeros_bool,
+        component_names=["hemorrhage-present"],
+        point_tolerance_cells=0,
+        abundance_point_weight=0.0,
+    )
+    with_radius, _ = spatial_morphometry_loss(
+        instance_logits=instance,
+        abundance_logits=abundance,
+        point_centers=point,
+        instance_exclusion_support=circle,
+        brush_bag_ids=zeros_long,
+        area_positive=zeros_bool,
+        explicit_negative=zeros_bool,
+        implicit_negative=zeros_bool,
+        component_names=["hemorrhage-present"],
+        point_tolerance_cells=0,
+        abundance_point_weight=0.0,
+    )
+
+    assert with_radius > without_radius
 
 
 def test_explicit_negative_is_strong_and_absent_component_remains_ignore(

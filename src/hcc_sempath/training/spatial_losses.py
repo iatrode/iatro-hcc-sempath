@@ -18,11 +18,30 @@ def _mean_supervised_pair(
     supervised: torch.Tensor,
     zero_source: torch.Tensor,
 ) -> torch.Tensor:
+    """Average within each component, then equally across active components."""
+
     supervised = supervised.to(device=values.device, dtype=torch.bool)
     weight = supervised.to(dtype=values.dtype)
-    count = weight.sum()
-    mean = (values * weight).sum() / count.clamp_min(1)
-    return torch.where(count > 0, mean, zero_source.sum() * 0.0)
+    if values.ndim != 2 or supervised.shape != values.shape:
+        raise ValueError(
+            "component-balanced pair reduction expects [tile, component] "
+            f"values and mask, got values={tuple(values.shape)} "
+            f"supervised={tuple(supervised.shape)}"
+        )
+    component_count = weight.sum(dim=0)
+    component_mean = (
+        (values * weight).sum(dim=0) / component_count.clamp_min(1)
+    )
+    active = component_count > 0
+    active_weight = active.to(dtype=values.dtype)
+    mean = (
+        component_mean * active_weight
+    ).sum() / active_weight.sum().clamp_min(1)
+    return torch.where(
+        active.any(),
+        mean,
+        zero_source.sum() * 0.0,
+    )
 
 
 def _raise_if_true(condition: torch.Tensor, message: str) -> None:
@@ -386,8 +405,16 @@ def _point_peak_loss(
             extra_pair_indices,
             positive=False,
         )
+    pair_matrix = logits.new_zeros(
+        (logits.shape[0], component_count)
+    )
+    pair_matrix[pair_batch, pair_component] = pair_loss
     return (
-        pair_loss.mean(),
+        _mean_supervised_pair(
+            pair_matrix,
+            supervised,
+            logits,
+        ),
         supervised,
         point_count,
     )
@@ -583,7 +610,9 @@ def spatial_morphometry_loss(
     area_positive: torch.Tensor,
     explicit_negative: torch.Tensor,
     implicit_negative: torch.Tensor,
+    instance_exclusion_support: torch.Tensor | None = None,
     point_centers_host: torch.Tensor | None = None,
+    instance_exclusion_support_host: torch.Tensor | None = None,
     brush_bag_ids_host: torch.Tensor | None = None,
     area_positive_host: torch.Tensor | None = None,
     component_names: list[str] | tuple[str, ...] | None = None,
@@ -594,7 +623,7 @@ def spatial_morphometry_loss(
     explicit_negative_weight: float = 1.0,
     implicit_negative_weight: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Class-routed spatial supervision normalized per tile/component pair."""
+    """Class-routed supervision balanced across components per objective."""
 
     expected = instance_logits.shape
     if abundance_logits.shape != expected:
@@ -614,6 +643,15 @@ def spatial_morphometry_loss(
                 f"{name} shape mismatch: got={tuple(value.shape)} "
                 f"expected={tuple(expected)}"
             )
+    if (
+        instance_exclusion_support is not None
+        and instance_exclusion_support.shape != expected
+    ):
+        raise ValueError(
+            "instance_exclusion_support shape mismatch: "
+            f"got={tuple(instance_exclusion_support.shape)} "
+            f"expected={tuple(expected)}"
+        )
     for name, value in (
         ("abundance_point_weight", abundance_point_weight),
         ("brush_weight", brush_weight),
@@ -693,6 +731,19 @@ def spatial_morphometry_loss(
             dtype=torch.bool,
         )
     )
+    exclusion_bool = (
+        torch.zeros_like(area_positive, dtype=torch.bool)
+        if instance_exclusion_support is None
+        else instance_exclusion_support.to(dtype=torch.bool)
+    )
+    resolved_exclusion_host = (
+        None
+        if instance_exclusion_support_host is None
+        else instance_exclusion_support_host.detach().to(
+            device="cpu",
+            dtype=torch.bool,
+        )
+    )
 
     point_bool = point_centers > 0
     bag_bool = brush_bag_ids > 0
@@ -708,6 +759,15 @@ def spatial_morphometry_loss(
     _raise_if_true(
         area_bool & ~area,
         "non-area component received occupied-area support",
+    )
+    _raise_if_true(
+        exclusion_bool & ~countable,
+        "non-countable component received instance exclusion support",
+    )
+    _raise_if_true(
+        exclusion_bool.flatten(2).any(dim=2)
+        & ~point_bool.flatten(2).any(dim=2),
+        "instance exclusion support requires an instance centre",
     )
 
     positive_support = point_bool | bag_bool | area_bool
@@ -725,17 +785,29 @@ def spatial_morphometry_loss(
         explicit_bool & implicit_bool,
         "explicit and implicit negative targets overlap",
     )
+    _raise_if_true(
+        exclusion_bool & explicit_bool,
+        "instance exclusion support and explicit-negative targets overlap",
+    )
 
     instance_point, point_pairs, point_counts = _point_peak_loss(
         instance_logits,
         point_centers,
         tolerance_cells=point_tolerance_cells,
-        exclusion_support=area_bool & structure,
+        exclusion_support=(
+            exclusion_bool | (area_bool & structure)
+        ),
         point_centers_host=resolved_point_host,
         exclusion_support_host=(
             None
-            if resolved_area_host is None
-            else resolved_area_host & structure_host
+            if (
+                resolved_area_host is None
+                or resolved_exclusion_host is None
+            )
+            else (
+                resolved_exclusion_host
+                | (resolved_area_host & structure_host)
+            )
         ),
     )
     abundance_point, _, _ = _point_peak_loss(

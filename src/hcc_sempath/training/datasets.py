@@ -1005,6 +1005,12 @@ class PackageSampledDistillationDataset(Dataset):
             "prototype_mask": torch.tensor([bool(item["prototype_mask"]) for item in batch], dtype=torch.bool),
             "prototype_level1": torch.tensor([int(item["prototype_level1"]) for item in batch], dtype=torch.long),
             "l2_point_centers": torch.stack([item["l2_point_centers"] for item in batch]),
+            "l2_instance_exclusion_support": torch.stack(
+                [
+                    item["l2_instance_exclusion_support"]
+                    for item in batch
+                ]
+            ),
             "l2_brush_bag_ids": torch.stack([item["l2_brush_bag_ids"] for item in batch]),
             "l2_area_positive": torch.stack([item["l2_area_positive"] for item in batch]),
             "l2_explicit_negative": torch.stack([item["l2_explicit_negative"] for item in batch]),
@@ -1097,6 +1103,15 @@ def collate_distillation(batch: list[dict]) -> dict:
         "prototype_mask": torch.tensor([bool(item.get("prototype_mask", False)) for item in batch], dtype=torch.bool),
         "prototype_level1": torch.tensor([int(item.get("prototype_level1", -1)) for item in batch], dtype=torch.long),
         "l2_point_centers": torch.stack([item.get("l2_point_centers", torch.zeros((0, 0, 0))) for item in batch]),
+        "l2_instance_exclusion_support": torch.stack(
+            [
+                item.get(
+                    "l2_instance_exclusion_support",
+                    torch.zeros((0, 0, 0), dtype=torch.bool),
+                )
+                for item in batch
+            ]
+        ),
         "l2_brush_bag_ids": torch.stack([item.get("l2_brush_bag_ids", torch.zeros((0, 0, 0), dtype=torch.long)) for item in batch]),
         "l2_area_positive": torch.stack([item.get("l2_area_positive", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),
         "l2_explicit_negative": torch.stack([item.get("l2_explicit_negative", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),

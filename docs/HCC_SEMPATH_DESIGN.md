@@ -8,7 +8,7 @@ implementation, validation, and release contract.
 HCC-SemPath learns two complementary pathology representations from one fixed
 DINOv2-S/14 tile encoder:
 
-1. a four-class, mutually exclusive Level-1 tissue-state classification;
+1. a six-class, mutually exclusive Level-1 tissue-state classification;
 2. weakly supervised spatial Level-2 morphometry for eleven HCC components,
    supporting component location, instance count, local abundance, and
    calibrated area where the supervision permits it.
@@ -49,12 +49,14 @@ shared `z_hcc` toward scientifically interpretable global and local outputs.
 
 The global L1 classes, in fixed order, are:
 
-1. `HCC-tumor`
-2. `Background-liver`
-3. `Inflammatory-stromal`
-4. `Degenerative-material`
+1. `HCC-tumor-well-differentiated`
+2. `HCC-tumor-moderately-differentiated`
+3. `HCC-tumor-poorly-differentiated`
+4. `Background-liver`
+5. `Inflammatory-stromal`
+6. `Degenerative-material`
 
-The output is one four-way softmax.
+The output is one six-way softmax.
 
 ### Level 2
 
@@ -87,7 +89,7 @@ Tool meaning is resolved jointly with component biology:
 | --- | --- | --- | --- | --- |
 | Hepatocellular parenchyma, hemorrhage, inflammatory cells, fibroblasts | One instance | One larger instance | Dense-cell bag with unknown exact count | Instance count plus local density |
 | Steatosis/vacuolation, small vessel, large vessel, ductular/portal structure | One instance with unresolved extent | One large instance with approximate extent | One connected marked structure with approximate extent; overlapping strokes merge | Structure count plus area |
-| Necrosis, fibrous stroma | Invalid for positive annotation | Positive extent | Positive extent | Area/coverage only |
+| Necrosis, fibrous stroma | Positive area seed with unresolved extent | Positive extent | Positive extent | Area/coverage only |
 | Bile pigment | Small positive pigment seed, not an instance | Larger positive focus with approximate extent | Irregular/fused positive pigment extent | Pigment burden/area; derived focus density only |
 
 A circle supplies one countable centre for countable components and supplies
@@ -96,9 +98,8 @@ class-routed: dense-cell bag, connected large discrete structure, or
 continuous positive area. Brush input events are annotation mechanics:
 overlapping strokes on the same discrete structure form one instance.
 
-Explicit negatives are strong negative evidence. Ordinary unmarked space is
-usually background but can contain deliberately unresolved mixtures, so it
-must not receive the same confidence as an explicit negative.
+Explicit negatives are strong negative evidence. Ordinary unmarked space can
+contain deliberately unresolved mixtures and remains ignored.
 
 `roi_reviewed` records that a tile was visited and saved. A geometry-free `state=negative,
 review_complete=true` record supplies a strong tile-wide negative. Unmentioned
@@ -113,9 +114,9 @@ The student architecture and initialization remain fixed to pretrained
 DINOv2-S/14 at native 224-pixel input.
 All existing teacher feature caches remain usable. The four teachers shape the
 shared representation through feature and relation distillation. The stable
-L1 annotations define teacher-specific four-class prototypes and periodically
+L1 annotations define teacher-specific six-class prototypes and periodically
 recomputed student-space class centroids. Every student refresh re-encodes the
-complete fixed 3,000-tile bank with the current encoder; a compute mini-batch
+complete fixed 2,400-tile bank with the current encoder; a compute mini-batch
 is only a memory chunk and never defines the prototype pool. Their responses provide both HCC semantic
 supervision and per-tile PAMT-D teacher reliability, while direct L1
 cross-entropy supervises the human boundary.
@@ -129,7 +130,7 @@ targets.
 
 ### L1 head
 
-The normalized global embedding is read against four no-gradient,
+The normalized global embedding is read against six no-gradient,
 expert-updated student-space centroids:
 
 ```text
@@ -140,7 +141,7 @@ l1_logits[k] = cosine(z, centroid_l1[k]) / temperature
 Human L1 labels define the complete centroid bank and use cross entropy on the
 resulting response. Centroids are no-gradient coordinates recomputed from the
 current student between optimizer steps; gradients from the response update
-`z_hcc`. Semantic distillation and PAMT-D use the four primary teacher
+`z_hcc`. Semantic distillation and PAMT-D use the six primary teacher
 prototypes.
 
 ### Dense local branch
@@ -207,15 +208,15 @@ cardinality before response score, and non-matched cells within the union of
 click-tolerance regions are negative for the instance objective, so one click
 cannot train two decoded peaks. Dense-cell brushes use an aggregate
 positive-bag objective. Area-capable components use positive occupied-area
-support. Explicit negatives and ordinary unmarked background remain distinct
-confidence sources in both the direct loss and the local prototype readout.
+support. Explicit negatives supervise confirmed absence; all other unmarked
+cells remain outside the loss.
 
 The point tolerance represents click/grid uncertainty, not nucleus diameter.
 A point never supplies an inferred object area or an exact sub-grid centre.
-Positive support is removed from implicit-negative masks in every geometry
-route. Mixed point/brush cell annotations supervise resolved instances and
-unresolved abundance separately; they are not converted into contradictory
-dense instance truth.
+A circle additionally supplies instance-exclusion support so one large object
+cannot produce multiple centres, without becoming a cell-area target. Mixed
+point/brush cell annotations supervise resolved instances and unresolved
+abundance separately.
 
 PAMT-D combines teacher base weights and per-tile reliability as
 `w_m * alpha_mi`. Feature and L1-semantic losses are normalized jointly over
@@ -238,21 +239,16 @@ L = L_four_teacher(alpha_PAMTD)
       + L_brush_density_bag
       + L_positive_area
       + L_explicit_negative
-      + L_implicit_background
     )
 ```
 
-Each term is normalized per supervised tile/component pair before pairs are
-averaged. Cell brushes remain density bags; structure and continuous-component
+Each routed objective is averaged within component and then across its active
+components. The fixed objective weights combine count, density, and area
+endpoints. Cell brushes remain density bags; structure and continuous-component
 extent marks supervise the area head. Negative loss reaches the instance head
-only for countable components. Ordinary unmarked background cannot dominate
-sparse positive or explicit-negative supervision mechanically.
+only for countable components.
 
-Explicit negatives receive unit direct-loss weight and define the prototype
-boundary whenever available. Unmarked background receives a 0.05 direct-loss
-weight; its exact full-bank pair-averaged centroid supplies the fallback
-contrastive coordinate. Contrastive centroid subtraction uses the unscaled
-coordinate.
+Explicit negatives define the prototype boundary whenever available.
 
 ## 7. Optimization
 
@@ -290,12 +286,12 @@ using the current encoder state between optimizer steps. Replay mini-batches
 never perform EMA updates and never redefine the bank. Thus the semantic
 coordinate is independent of replay batch composition while still following
 the evolving student. Explicit-negative centroids define the local
-decision boundary when available; weak implicit-background centroids are used
-only as a fallback.
+decision boundary when available.
 
 ## 8. Data organization
 
-- L1 uses the stable 3,000-tile expert classification asset.
+- L1 uses the frozen 2,400-tile expert classification asset, with 400 tiles
+  per class.
 - L2 uses the current eleven-class spatial annotation manifest.
 - Both assets are intentionally small expert interventions on the
   population-scale four-teacher representation; neither is expected to label
@@ -356,8 +352,7 @@ likewise require `roi_measurement_complete`. These flags are validation-only
 claims and are never inferred from ordinary weak training marks. Dense-cell
 brushes are evaluated as top-fraction MIL bags, not exact positive pixels.
 Threshold scoring excludes incomplete tile/component pairs, retains explicit
-and weak implicit negatives only inside complete pairs, and includes
-complete-negative tiles when selecting bile minimum-focus size.
+and includes complete-negative tiles when selecting bile minimum-focus size.
 
 Validation tile IDs must resolve inside the requested manifest `val`/`exval`
 partition, which must be patient/slide-disjoint from the entire
@@ -393,7 +388,7 @@ separate research objects with independent evidence boundaries.
 HCC-SemPath contributes one HCC-specific representation with:
 
 - retained multi-teacher foundation features;
-- stable four-class global tissue state;
+- stable six-class global tissue state;
 - eleven-component, geometry-aware spatial output;
 - native support for class-routed point/circle/brush annotations;
 - cell-scale localization plus multi-grid structural context;
@@ -405,8 +400,8 @@ HCC-SemPath contributes one HCC-specific representation with:
 - `modeling/models.py`: dynamic L1/local L2 prototype readouts, dense fused
   spatial features, and decoder.
 - `spatial_schema.py`: fixed eleven-class measurement capabilities.
-- `training/roi.py`: instance centres, density bags, positive area, explicit
-  negatives, and weak implicit-background targets.
+- `training/roi.py`: instance centres, instance-exclusion support, density
+  bags, positive area, explicit negatives, and ignored unmarked regions.
 - `training/spatial_losses.py`: tolerant instance peaks, abundance point peaks,
   dense-cell brush bags, positive-area loss, and capability-routed negatives.
 - `training/pamtd.py`: per-tile four-teacher adjudication and shared semantic

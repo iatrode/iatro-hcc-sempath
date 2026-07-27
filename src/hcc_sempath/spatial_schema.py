@@ -60,6 +60,13 @@ DEFAULT_SPATIAL_COMPONENT_SPECS = (
         supports_area=False,
     ),
     SpatialComponentSpec(
+        "fibroblast",
+        CELL_INSTANCE_DENSITY,
+        supports_instance_count=True,
+        supports_density=True,
+        supports_area=False,
+    ),
+    SpatialComponentSpec(
         "fibrous-stroma-present",
         CONTINUOUS_AREA,
         supports_instance_count=False,
@@ -75,6 +82,13 @@ DEFAULT_SPATIAL_COMPONENT_SPECS = (
     ),
     SpatialComponentSpec(
         "vascular-structure-present",
+        STRUCTURE_INSTANCE_AREA,
+        supports_instance_count=True,
+        supports_density=False,
+        supports_area=True,
+    ),
+    SpatialComponentSpec(
+        "large-vessel",
         STRUCTURE_INSTANCE_AREA,
         supports_instance_count=True,
         supports_density=False,
@@ -105,7 +119,7 @@ def spatial_component_specs(
     """Resolve component contracts while preserving the supplied class order.
 
     ``unknown_mode`` exists only for small synthetic tests and downstream
-    experiments. Production nine-class manifests are validated against
+    experiments. Production eleven-component manifests are validated against
     ``DEFAULT_SPATIAL_COMPONENTS`` before reaching this function.
     """
 

@@ -4,7 +4,7 @@ HCC-SemPath learns an HCC-specific pathology representation from four cached
 pathology teachers and a small, fixed expert-supervision stream. The model
 combines:
 
-- four-class global L1 tissue-state classification;
+- six-class global L1 tissue-state classification;
 - eleven-component L2 spatial morphometry from class-routed point, circle, and
   brush annotations.
 
@@ -38,7 +38,7 @@ hcc-sempath --help
 ```text
 HCC image-tile IAC packages + four teacher-feature IAC streams
   -> shared DINOv2-S/14 HCC representation
-  -> L1 four-class global readout
+  -> L1 six-class global readout
   -> L2 eleven-component spatial instance/measurement maps
   -> independently calibrated count/density/area outputs
 ```

@@ -49,16 +49,41 @@ from .train import (
 from .utils import write_json
 
 
-def _load_prototype_map(cfg: dict, dims: dict[str, int]) -> dict[str, PrototypeRegistry] | None:
+def _load_prototype_map(
+    cfg: dict,
+    dims: dict[str, int],
+    expected_names: list[str] | tuple[str, ...] = DEFAULT_L1_CLASSES,
+) -> dict[str, PrototypeRegistry] | None:
     if float(cfg["loss"].get("semantic_weight", 0.0)) == 0:
         return None
     prototype_paths = cfg["data"].get("prototype_paths")
     if isinstance(prototype_paths, dict):
-        return {name: load_prototype_registry(prototype_paths[name], expected_dim=dim) for name, dim in dims.items()}
-    prototype_path = cfg["data"].get("prototype_path")
-    if prototype_path is None:
-        return None
-    return {name: load_prototype_registry(prototype_path, expected_dim=dim) for name, dim in dims.items()}
+        registries = {
+            name: load_prototype_registry(
+                prototype_paths[name],
+                expected_dim=dim,
+            )
+            for name, dim in dims.items()
+        }
+    else:
+        prototype_path = cfg["data"].get("prototype_path")
+        if prototype_path is None:
+            return None
+        registries = {
+            name: load_prototype_registry(
+                prototype_path,
+                expected_dim=dim,
+            )
+            for name, dim in dims.items()
+        }
+    expected = list(expected_names)
+    for teacher, registry in registries.items():
+        if registry.names != expected:
+            raise ValueError(
+                "teacher semantic prototype contract mismatch: "
+                f"teacher={teacher} expected={expected} got={registry.names}"
+            )
+    return registries
 
 
 def _prototype_source_splits(cfg: dict, split: str) -> set[str] | None:
@@ -371,7 +396,11 @@ def main() -> None:
         cfg=cfg,
         max_batches=cfg["train"].get("max_eval_batches", cfg["train"].get("max_val_batches")),
     )
-    prototypes = _load_prototype_map(cfg, dims)
+    prototypes = _load_prototype_map(
+        cfg,
+        dims,
+        expected_names=l1_class_names,
+    )
     eval_pairwise_max_samples = int(cfg["train"].get("eval_pairwise_max_samples", 4096))
     metrics = evaluate_teacher_outputs(
         student_by_teacher,

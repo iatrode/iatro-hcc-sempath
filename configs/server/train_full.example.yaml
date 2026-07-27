@@ -40,7 +40,9 @@ model:
     uni2_h: 1536
     virchow2: 2560
   l1_class_names:
-    [HCC-tumor, Background-liver, Inflammatory-stromal, Degenerative-material]
+    [HCC-tumor-well-differentiated, HCC-tumor-moderately-differentiated,
+     HCC-tumor-poorly-differentiated, Background-liver,
+     Inflammatory-stromal, Degenerative-material]
   spatial_dim: 256
   spatial_output_stride: 7
 

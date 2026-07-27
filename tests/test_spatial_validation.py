@@ -4,7 +4,10 @@ import copy
 
 import torch
 
-from hcc_sempath.spatial_schema import DEFAULT_SPATIAL_COMPONENTS
+from hcc_sempath.spatial_schema import (
+    DEFAULT_SPATIAL_COMPONENTS,
+    spatial_component_specs,
+)
 from hcc_sempath.training.spatial_validation import (
     calibrate_spatial_decoder,
 )
@@ -25,7 +28,9 @@ def _provenance() -> dict:
 
 
 def _complete_validation_case() -> dict:
-    shape = (2, 9, 7, 7)
+    component_count = len(DEFAULT_SPATIAL_COMPONENTS)
+    specs = spatial_component_specs(DEFAULT_SPATIAL_COMPONENTS)
+    shape = (2, component_count, 7, 7)
     instance = torch.zeros(shape)
     abundance = torch.zeros(shape)
     points = torch.zeros(shape)
@@ -33,11 +38,30 @@ def _complete_validation_case() -> dict:
     area = torch.zeros(shape, dtype=torch.bool)
     explicit = torch.zeros(shape, dtype=torch.bool)
     implicit = torch.ones(shape, dtype=torch.bool)
-    count_complete = torch.zeros((2, 9), dtype=torch.bool)
-    measurement_complete = torch.ones((2, 9), dtype=torch.bool)
-    geometry_modes = [[tuple() for _ in range(9)] for _ in range(2)]
-    countable = (0, 2, 4, 6, 7, 8)
-    area_capable = (1, 3, 5, 6, 7, 8)
+    count_complete = torch.zeros((2, component_count), dtype=torch.bool)
+    measurement_complete = torch.ones(
+        (2, component_count),
+        dtype=torch.bool,
+    )
+    geometry_modes = [
+        [tuple() for _ in range(component_count)]
+        for _ in range(2)
+    ]
+    countable = tuple(
+        index
+        for index, spec in enumerate(specs)
+        if spec.supports_instance_count
+    )
+    density_capable = tuple(
+        index
+        for index, spec in enumerate(specs)
+        if spec.supports_density
+    )
+    area_capable = tuple(
+        index
+        for index, spec in enumerate(specs)
+        if spec.supports_area
+    )
 
     for component in countable:
         count_complete[:, component] = True
@@ -45,7 +69,7 @@ def _complete_validation_case() -> dict:
         instance[0, component, 3, 3] = 0.9
         geometry_modes[0][component] = ("point",)
         geometry_modes[1][component] = ("negative",)
-    for component in (0, 2, 4):
+    for component in density_capable:
         abundance[0, component, 3, 3] = 0.9
     for component in area_capable:
         area[0, component, 2:5, 2:5] = True
@@ -80,7 +104,7 @@ def _complete_validation_case() -> dict:
     }
 
 
-def test_spatial_calibration_freezes_all_nine_component_readouts() -> None:
+def test_spatial_calibration_freezes_all_component_readouts() -> None:
     calibration, report = calibrate_spatial_decoder(
         **_complete_validation_case()
     )
@@ -88,19 +112,18 @@ def test_spatial_calibration_freezes_all_nine_component_readouts() -> None:
     assert calibration["spatial_component_names"] == list(
         DEFAULT_SPATIAL_COMPONENTS
     )
+    specs = spatial_component_specs(DEFAULT_SPATIAL_COMPONENTS)
     assert calibration["instance_threshold"] == [
-        0.5,
-        1.0,
-        0.5,
-        1.0,
-        0.5,
-        1.0,
-        0.5,
-        0.5,
-        0.5,
+        0.5 if spec.supports_instance_count else 1.0
+        for spec in specs
     ]
-    assert calibration["abundance_threshold"] == [0.5] * 9
-    assert calibration["nms_kernel"] == [3, 1, 3, 1, 3, 1, 3, 3, 3]
+    assert calibration["abundance_threshold"] == [
+        0.5
+    ] * len(DEFAULT_SPATIAL_COMPONENTS)
+    assert calibration["nms_kernel"] == [
+        3 if spec.supports_instance_count else 1
+        for spec in specs
+    ]
     assert calibration["provenance"] == _provenance()
     assert report["protocol"]["tile_count"] == 2
     assert report["protocol"]["independent_slide_count"] == 2
@@ -136,8 +159,11 @@ def test_spatial_calibration_freezes_all_nine_component_readouts() -> None:
 
 def test_unknown_structure_measurement_pair_cannot_shift_threshold() -> None:
     base = _complete_validation_case()
+    structure_index = DEFAULT_SPATIAL_COMPONENTS.index(
+        "steatosis-vacuolation-present"
+    )
     base["threshold_grid"] = [0.5, 0.8]
-    base["abundance_probability"][0, 6, 2:5, 2:5] = 0.7
+    base["abundance_probability"][0, structure_index, 2:5, 2:5] = 0.7
     calibration, _ = calibrate_spatial_decoder(**base)
 
     extended = copy.deepcopy(base)
@@ -162,17 +188,20 @@ def test_unknown_structure_measurement_pair_cannot_shift_threshold() -> None:
             ],
             dim=0,
         )
-    extended["point_centers"][2, 6, 3, 3] = 1
-    extended["abundance_probability"][2, 6].fill_(0.7)
-    extended["implicit_negative"][2, 6, 3, 3] = False
+    extended["point_centers"][2, structure_index, 3, 3] = 1
+    extended["abundance_probability"][2, structure_index].fill_(0.7)
+    extended["implicit_negative"][2, structure_index, 3, 3] = False
     extended["geometry_modes"].append(
-        [tuple() if index != 6 else ("point",) for index in range(9)]
+        [
+            tuple() if index != structure_index else ("point",)
+            for index in range(len(DEFAULT_SPATIAL_COMPONENTS))
+        ]
     )
     extended["slide_ids"].append("slide-unknown")
     extended_calibration, _ = calibrate_spatial_decoder(**extended)
 
-    assert calibration["abundance_threshold"][6] == 0.5
-    assert extended_calibration["abundance_threshold"][6] == 0.5
+    assert calibration["abundance_threshold"][structure_index] == 0.5
+    assert extended_calibration["abundance_threshold"][structure_index] == 0.5
 
 
 def test_completeness_only_measurement_negative_is_strong() -> None:
@@ -207,9 +236,18 @@ def test_dense_brush_is_one_mil_positive_not_dense_pixel_truth() -> None:
             padding.fill_(True)
         case[key] = torch.cat([case[key], padding], dim=0)
     case["count_complete"] = torch.cat(
-        [case["count_complete"], torch.zeros((1, 9), dtype=torch.bool)]
+        [
+            case["count_complete"],
+            torch.zeros(
+                (1, len(DEFAULT_SPATIAL_COMPONENTS)),
+                dtype=torch.bool,
+            ),
+        ]
     )
-    extra_measurement = torch.zeros((1, 9), dtype=torch.bool)
+    extra_measurement = torch.zeros(
+        (1, len(DEFAULT_SPATIAL_COMPONENTS)),
+        dtype=torch.bool,
+    )
     extra_measurement[0, 0] = True
     case["measurement_complete"] = torch.cat(
         [case["measurement_complete"], extra_measurement]
@@ -218,7 +256,10 @@ def test_dense_brush_is_one_mil_positive_not_dense_pixel_truth() -> None:
     case["abundance_probability"][2, 0, 1:2, 1:5] = 0.9
     case["implicit_negative"][2, 0, 1:5, 1:5] = False
     case["geometry_modes"].append(
-        [("brush",) if index == 0 else tuple() for index in range(9)]
+        [
+            ("brush",) if index == 0 else tuple()
+            for index in range(len(DEFAULT_SPATIAL_COMPONENTS))
+        ]
     )
     case["slide_ids"].append("slide-brush")
 

@@ -93,6 +93,17 @@ class BatchBuffer:
                 "l2_point_centers": torch.stack(
                     [item.point_centers for item in spatial]
                 ),
+                "l2_instance_exclusion_support": torch.stack(
+                    [
+                        item.instance_exclusion_support
+                        if item.instance_exclusion_support is not None
+                        else torch.zeros_like(
+                            item.area_positive,
+                            dtype=torch.bool,
+                        )
+                        for item in spatial
+                    ]
+                ),
                 "l2_brush_bag_ids": torch.stack(
                     [item.brush_bag_ids for item in spatial]
                 ),
@@ -112,6 +123,10 @@ class BatchBuffer:
         else:
             spatial_payload = {
                 "l2_point_centers": torch.zeros((count, 0, 0, 0)),
+                "l2_instance_exclusion_support": torch.zeros(
+                    (count, 0, 0, 0),
+                    dtype=torch.bool,
+                ),
                 "l2_brush_bag_ids": torch.zeros(
                     (count, 0, 0, 0),
                     dtype=torch.long,
@@ -594,6 +609,7 @@ class _MaterializedExpertBank:
             "prototype_mask",
             "prototype_level1",
             "l2_point_centers",
+            "l2_instance_exclusion_support",
             "l2_brush_bag_ids",
             "l2_area_positive",
             "l2_explicit_negative",
@@ -601,7 +617,20 @@ class _MaterializedExpertBank:
             "l2_spatial_supervised",
         )
         self.tensors = {
-            key: torch.cat([batch[key] for batch in batches], dim=0)
+            key: torch.cat(
+                [
+                    (
+                        batch[key]
+                        if key in batch
+                        else torch.zeros_like(
+                            batch["l2_area_positive"],
+                            dtype=torch.bool,
+                        )
+                    )
+                    for batch in batches
+                ],
+                dim=0,
+            )
             for key in tensor_keys
         }
         teacher_names = list(batches[0]["teacher_features"])
@@ -1137,7 +1166,12 @@ def _limit_records(records: list, limit: int, seed: int) -> list:
     return selected
 
 
-def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -> dict[str, PrototypeRegistry] | None:
+def _load_prototype_map(
+    cfg: dict,
+    dims: dict[str, int],
+    device: torch.device,
+    expected_names: list[str] | tuple[str, ...] = DEFAULT_L1_CLASSES,
+) -> dict[str, PrototypeRegistry] | None:
     loss_cfg = cfg["loss"]
     prototype_responses_enabled = (
         float(loss_cfg.get("semantic_weight", 0.0)) > 0
@@ -1148,13 +1182,42 @@ def _load_prototype_map(cfg: dict, dims: dict[str, int], device: torch.device) -
         return None
     prototype_paths = cfg["data"].get("prototype_paths")
     if isinstance(prototype_paths, dict):
-        return {name: load_prototype_registry(prototype_paths[name], expected_dim=dim).to(device) for name, dim in dims.items()}
-    prototype_path = cfg["data"].get("prototype_path")
-    if prototype_path is None:
-        raise ValueError(
-            "data.prototype_path or data.prototype_paths is required when semantic_weight > 0"
-        )
-    return {name: load_prototype_registry(prototype_path, expected_dim=dim).to(device) for name, dim in dims.items()}
+        registries = {
+            name: load_prototype_registry(
+                prototype_paths[name],
+                expected_dim=dim,
+            ).to(device)
+            for name, dim in dims.items()
+        }
+    else:
+        prototype_path = cfg["data"].get("prototype_path")
+        if prototype_path is None:
+            raise ValueError(
+                "data.prototype_path or data.prototype_paths is required "
+                "when prototype-response supervision is enabled"
+            )
+        registries = {
+            name: load_prototype_registry(
+                prototype_path,
+                expected_dim=dim,
+            ).to(device)
+            for name, dim in dims.items()
+        }
+    expected = list(expected_names)
+    for teacher, registry in registries.items():
+        if registry.names != expected:
+            raise ValueError(
+                "teacher semantic prototype contract mismatch: "
+                f"teacher={teacher} expected={expected} got={registry.names}"
+            )
+        if registry.levels != [1] * len(expected) or registry.exclusive != [
+            True
+        ] * len(expected):
+            raise ValueError(
+                "teacher semantic prototypes must contain exactly the "
+                f"exclusive L1 prototype bank: teacher={teacher}"
+            )
+    return registries
 
 
 def _prototype_source_splits(cfg: dict, key: str, default: list[str]) -> set[str] | None:
@@ -1313,7 +1376,6 @@ def main() -> None:
         )
     validate_training_config(cfg, names)
     dims = teacher_dims(cfg, names)
-    prototypes = _load_prototype_map(cfg, dims, device)
     l1_class_names = [
         str(name)
         for name in cfg["model"].get("l1_class_names", DEFAULT_L1_CLASSES)
@@ -1322,6 +1384,12 @@ def main() -> None:
         raise ValueError(
             f"fixed L1 class contract must be {list(DEFAULT_L1_CLASSES)}, got {l1_class_names}"
         )
+    prototypes = _load_prototype_map(
+        cfg,
+        dims,
+        device,
+        expected_names=l1_class_names,
+    )
     prototype_manifest_path = cfg["data"].get("prototype_supervision_manifest_path")
     train_prototype_labels = load_prototype_labels(
         prototype_manifest_path,

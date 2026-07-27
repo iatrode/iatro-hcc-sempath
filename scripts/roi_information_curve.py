@@ -29,7 +29,7 @@ from hcc_sempath.annotation_information import (  # noqa: E402
     meaningful_reference_checkpoints,
     prepare_fixed_probe_split,
     slide_round_robin_order,
-    tail_low_gain,
+    tail_plateau,
 )
 
 
@@ -38,16 +38,17 @@ DEFAULT_COUNTS = (
     "120,140,160,180,200,225,250,275,300,350,400,450,500"
 )
 DEFAULT_SEED = 13
-DEFAULT_RESAMPLES = 32
+DEFAULT_RESAMPLES = 16
 DEFAULT_TOPK = 5
 DEFAULT_ELBOW_RATIO = 0.35
+DEFAULT_DRIFT_THRESHOLD = 0.01
 DEFAULT_MIN_SLIDES = 5
 DEFAULT_MIN_INCREMENTS = 3
 DEFAULT_ELBOW_SUPPORT = 0.80
 DEFAULT_MAX_ZERO_GEOMETRY_FRACTION = 0.01
 DEFAULT_PROBE_SLIDE_FRACTION = 0.20
 DEFAULT_MIN_PROBE_SLIDES = 2
-DEFAULT_CONFIRMATION_INCREMENTS = 3
+DEFAULT_CONFIRMATION_INCREMENTS = 2
 ELBOW_SENSITIVITIES = (0.25, 0.35, 0.50)
 EXPECTED_TEACHERS = frozenset(
     {"gigapath", "h_optimus_1", "uni2_h", "virchow2"}
@@ -575,17 +576,19 @@ def _status(
     if tail_stable and coverage_issue:
         return (
             "coverage_limited",
-            "all teacher-space curves have low-gain tails, but slide or ROI "
+            "the pooled fixed-probe support passes, but slide or ROI "
             "geometry QC fails",
         )
     if tail_stable:
         return (
             "provisionally_stable",
-            "all four teacher spaces have confirmed low-gain fixed-probe tails",
+            "the pooled teacher-by-resample curves pass the L1 fixed-probe "
+            "tail criterion",
         )
     return (
         "still_growing",
-        "at least one teacher space lacks consecutive low-gain confirmation",
+        "the pooled teacher-by-resample curves do not yet reach the L1 "
+        "fixed-probe support threshold",
     )
 
 
@@ -602,6 +605,7 @@ def evaluate_information(
     min_slides: int,
     min_increments: int,
     support_threshold: float,
+    drift_threshold: float = DEFAULT_DRIFT_THRESHOLD,
     max_zero_geometry_fraction: float = DEFAULT_MAX_ZERO_GEOMETRY_FRACTION,
     probe_slide_fraction: float = DEFAULT_PROBE_SLIDE_FRACTION,
     min_probe_slides: int = DEFAULT_MIN_PROBE_SLIDES,
@@ -720,11 +724,13 @@ def evaluate_information(
             ratio_key = f"{ratio:.2f}"
             teacher_support: dict[str, float] = {}
             teacher_recommendation: dict[str, int | None] = {}
+            pooled_observed: list[int] = []
             for teacher, teacher_curves in curves_by_teacher.items():
                 decisions = [
-                    tail_low_gain(
+                    tail_plateau(
                         curve,
                         marginal_ratio_threshold=ratio,
+                        drift_threshold=drift_threshold,
                         confirmation_increments=confirmation_increments,
                     )
                     for curve in teacher_curves
@@ -735,24 +741,20 @@ def evaluate_information(
                     if stable and onset is not None
                 ]
                 teacher_support[teacher] = len(observed) / resamples
+                pooled_observed.extend(observed)
                 teacher_recommendation[teacher] = (
                     int(round(float(np.median(observed))))
                     if observed
                     else None
                 )
             supports_by_teacher_ratio[ratio_key] = teacher_support
-            supports_by_ratio[ratio_key] = min(teacher_support.values())
+            supports_by_ratio[ratio_key] = len(pooled_observed) / len(curves)
             recommendations_by_teacher_ratio[ratio_key] = (
                 teacher_recommendation
             )
-            observed_recommendations = [
-                value
-                for value in teacher_recommendation.values()
-                if value is not None
-            ]
             recommendations[ratio_key] = (
-                max(observed_recommendations)
-                if len(observed_recommendations) == len(teachers)
+                int(round(float(np.median(pooled_observed))))
+                if pooled_observed
                 else None
             )
         primary_key = f"{elbow_ratio:.2f}"
@@ -774,7 +776,7 @@ def evaluate_information(
             "status": status,
             "enough_now": status == "provisionally_stable",
             "reason": reason,
-            "teacher_low_gain_support_min": primary_support,
+            "tail_plateau_support": primary_support,
             "recommended_reference_tile_count_if_stable": recommended or "",
             "reference_capacity": reference_capacity,
             "last_remaining_novelty_mean": _finite(
@@ -796,7 +798,6 @@ def evaluate_information(
                     if isinstance(value, float)
                     else value
                     for key, value in row.items()
-                    if not key.startswith("center_drift")
                 },
             }
             for row in aggregate
@@ -812,8 +813,8 @@ def evaluate_information(
             "probe_slide_count_mean": aggregate[-1][
                 "probe_slide_count"
             ],
-            "teacher_low_gain_support_by_ratio": supports_by_ratio,
-            "teacher_low_gain_support_by_teacher_ratio": (
+            "tail_plateau_support_by_ratio": supports_by_ratio,
+            "tail_plateau_support_by_teacher_ratio": (
                 supports_by_teacher_ratio
             ),
             "recommended_reference_tile_count_by_ratio": recommendations,
@@ -827,7 +828,6 @@ def evaluate_information(
                         if isinstance(value, float)
                         else value
                         for key, value in row.items()
-                        if not key.startswith("center_drift")
                     }
                     for row in teacher_curve
                 ]
@@ -942,6 +942,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         min_slides=args.min_slides,
         min_increments=args.min_increments,
         support_threshold=args.elbow_support,
+        drift_threshold=DEFAULT_DRIFT_THRESHOLD,
         max_zero_geometry_fraction=args.max_zero_geometry_fraction,
         probe_slide_fraction=args.probe_slide_fraction,
         min_probe_slides=args.min_probe_slides,
@@ -965,10 +966,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "remaining novelty of one fixed slide-separated probe while "
                 "the nested reference set grows; monotone non-increasing by construction"
             ),
-            "teacher_gate": (
-                "coverage is computed separately for every teacher; the "
-                "component passes only when every teacher reaches the "
-                "required repeated low-gain support"
+            "support": (
+                "the decision pools teacher-by-resample curves exactly as "
+                "the L1 fixed-probe audit does; per-teacher support remains "
+                "diagnostic and does not independently veto a component"
             ),
             "geometry_role": (
                 "point, circle, brush, slide balance, rasterization, and "
@@ -985,8 +986,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "seed": args.seed,
             "topk": args.topk,
             "elbow_marginal_ratio": args.elbow_ratio,
+            "center_drift_threshold": DEFAULT_DRIFT_THRESHOLD,
             "elbow_ratio_sensitivity": list(ELBOW_SENSITIVITIES),
-            "required_teacher_low_gain_support": args.elbow_support,
+            "required_tail_plateau_support": args.elbow_support,
             "confirmation_increments": args.confirmation_increments,
             "minimum_slides": args.min_slides,
             "minimum_information_increments": args.min_increments,
@@ -994,9 +996,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "negative_evidence": "coverage QC only; no single negative center is assumed",
         },
         "status_meanings": {
-            "provisionally_stable": "every teacher space has a confirmed low-gain tail",
-            "still_growing": "at least one teacher space lacks consecutive low-gain confirmation",
-            "coverage_limited": "teacher curves pass but slide/geometry coverage fails QC",
+            "provisionally_stable": "pooled teacher-by-resample support reaches the L1 threshold",
+            "still_growing": "pooled teacher-by-resample support remains below the L1 threshold",
+            "coverage_limited": "tail support passes but slide/geometry coverage fails QC",
             "not_assessable": "too few tiles, increments, or independent slides to test stability",
         },
     }

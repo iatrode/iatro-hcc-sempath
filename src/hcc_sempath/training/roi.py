@@ -39,6 +39,9 @@ class SpatialRoiTarget:
     ``brush_bag_ids`` stores density-bag membership only for dense cell
     components. ``area_positive`` stores weak occupied-area support for
     continuous regions, pigment burden, and large discrete structures.
+    ``instance_exclusion_support`` retains the extent of a circle or connected
+    structure mark so the instance head cannot place duplicate centres inside
+    one annotated object. It is not an occupied-area label.
 
     Explicit and implicit negatives remain separate so ordinary unmarked
     background can receive a much smaller weight than an annotator-confirmed
@@ -50,6 +53,7 @@ class SpatialRoiTarget:
     area_positive: torch.Tensor  # [K, H, W], bool; weak area/extent support
     explicit_negative: torch.Tensor  # [K, H, W], bool; strong negative
     implicit_negative: torch.Tensor  # [K, H, W], bool; weak background
+    instance_exclusion_support: torch.Tensor | None = None
 
     @property
     def brush_mask(self) -> torch.Tensor:
@@ -61,6 +65,14 @@ class SpatialRoiTarget:
 
         return (
             (self.point_centers > 0).flatten(1).any(dim=1)
+            | (
+                self.instance_exclusion_support.flatten(1).any(dim=1)
+                if self.instance_exclusion_support is not None
+                else torch.zeros(
+                    self.point_centers.shape[0],
+                    dtype=torch.bool,
+                )
+            )
             | self.brush_mask.flatten(1).any(dim=1)
             | self.area_positive.flatten(1).any(dim=1)
             | self.explicit_negative.flatten(1).any(dim=1)
@@ -84,6 +96,10 @@ def empty_spatial_roi_target(
     h, w = grid_size
     return SpatialRoiTarget(
         point_centers=torch.zeros((component_count, h, w), dtype=torch.float32),
+        instance_exclusion_support=torch.zeros(
+            (component_count, h, w),
+            dtype=torch.bool,
+        ),
         brush_bag_ids=torch.zeros((component_count, h, w), dtype=torch.long),
         area_positive=torch.zeros((component_count, h, w), dtype=torch.bool),
         explicit_negative=torch.zeros((component_count, h, w), dtype=torch.bool),
@@ -336,7 +352,7 @@ def load_spatial_validation_metadata(
 
 
 def spatial_component_names(manifest_path: str | Path) -> list[str]:
-    """Read the active nine-component spatial contract."""
+    """Read the active eleven-component spatial contract."""
 
     payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     definitions = (
@@ -605,15 +621,22 @@ def _add_connected_geometry_centers(
     not independent biological instances.
     """
 
-    union = torch.zeros_like(point_centers, dtype=torch.bool)
+    # Split instances before output-grid reduction. Reducing the union first
+    # can make nearby but pixel-disjoint structures touch on the coarse grid
+    # and incorrectly collapse them into one object.
+    union = torch.zeros(image_size, dtype=torch.bool)
     for geometry in geometries:
-        union |= geometry_token_mask(
+        union |= _geometry_pixel_support(
             geometry,
             image_size=image_size,
-            grid_size=tuple(point_centers.shape),
         )
-    for support in _connected_supports(union):
-        _add_support_center(point_centers, support)
+    for pixel_support in _connected_supports(union):
+        grid_support = F.interpolate(
+            pixel_support.to(dtype=torch.float32)[None, None],
+            size=tuple(point_centers.shape),
+            mode="area",
+        )[0, 0] > 0
+        _add_support_center(point_centers, grid_support)
 
 
 def _add_area_support(
@@ -727,6 +750,9 @@ def build_spatial_roi_targets(
     for tile_id in sorted(tile_ids):
         target = empty_spatial_roi_target(len(component_names), grid_size)
         point_centers = target.point_centers.clone()
+        instance_exclusion_support = (
+            target.instance_exclusion_support.clone()
+        )
         brush_bag_ids = target.brush_bag_ids.clone()
         area_positive = target.area_positive.clone()
         explicit_negative = target.explicit_negative.clone()
@@ -785,6 +811,13 @@ def build_spatial_roi_targets(
                                 geometry,
                                 image_size=image_size,
                             )
+                            instance_exclusion_support[
+                                idx
+                            ] |= geometry_token_mask(
+                                geometry,
+                                image_size=image_size,
+                                grid_size=grid_size,
+                            )
                         else:
                             _add_brush_bag(
                                 brush_bag_ids[idx],
@@ -809,12 +842,26 @@ def build_spatial_roi_targets(
                                 geometry,
                                 image_size=image_size,
                             )
+                            instance_exclusion_support[
+                                idx
+                            ] |= geometry_token_mask(
+                                geometry,
+                                image_size=image_size,
+                                grid_size=grid_size,
+                            )
                         else:
                             structure_brush_geometries.append(geometry)
                             _add_area_support(
                                 area_positive[idx],
                                 geometry,
                                 image_size=image_size,
+                            )
+                            instance_exclusion_support[
+                                idx
+                            ] |= geometry_token_mask(
+                                geometry,
+                                image_size=image_size,
+                                grid_size=grid_size,
                             )
                     elif spec.mode == PIGMENT_BURDEN:
                         _add_area_support(
@@ -827,12 +874,6 @@ def build_spatial_roi_targets(
                             dilation_cells=0,
                         )
                     elif spec.mode == CONTINUOUS_AREA:
-                        if kind in POINT_GEOMETRIES:
-                            raise ValueError(
-                                "continuous-area components require circle/brush "
-                                f"extent, got point: tile={tile_id} "
-                                f"component={component}"
-                            )
                         _add_area_support(
                             area_positive[idx],
                             geometry,
@@ -867,7 +908,9 @@ def build_spatial_roi_targets(
                         f"tile={tile_id} component={component}"
                     )
                 explicit_negative[idx].fill_(True)
-            overlap = positive_support & explicit_negative[idx]
+            overlap = (
+                positive_support | instance_exclusion_support[idx]
+            ) & explicit_negative[idx]
             if bool(overlap.any()):
                 raise ValueError(
                     "positive and explicit-negative ROI geometry overlap: "
@@ -875,14 +918,13 @@ def build_spatial_roi_targets(
                     f"cells={int(overlap.sum())}"
                 )
 
-            has_positive = bool(positive_support.any())
-            if not complete_negative and (has_positive or complete_all):
-                implicit_negative[idx] = (
-                    ~positive_support & ~explicit_negative[idx]
-                )
+            # Unmarked cells remain ignore. A positive mark establishes only
+            # the supplied evidence; it cannot prove that every other cell is
+            # negative in a deliberately sparse or mixed ROI annotation.
 
         result[tile_id] = SpatialRoiTarget(
             point_centers=point_centers,
+            instance_exclusion_support=instance_exclusion_support,
             brush_bag_ids=brush_bag_ids,
             area_positive=area_positive,
             explicit_negative=explicit_negative,
@@ -903,6 +945,14 @@ def spatial_roi_payload(
         item = empty_spatial_roi_target(component_count, grid_size)
     return {
         "l2_point_centers": item.point_centers,
+        "l2_instance_exclusion_support": (
+            item.instance_exclusion_support
+            if item.instance_exclusion_support is not None
+            else torch.zeros_like(
+                item.area_positive,
+                dtype=torch.bool,
+            )
+        ),
         "l2_brush_bag_ids": item.brush_bag_ids,
         "l2_area_positive": item.area_positive,
         "l2_explicit_negative": item.explicit_negative,

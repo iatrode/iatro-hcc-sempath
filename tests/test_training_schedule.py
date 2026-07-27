@@ -7,6 +7,7 @@ import pytest
 from hcc_sempath.training.config import teacher_dims, teacher_names, validate_training_config
 from hcc_sempath.training.engine import (
     _normalize_uint8_images_fp16,
+    _l2_global_targets_from_spatial,
     _objective_gradient_diagnostics,
     _optimizer_step,
     _should_stop_for_alignment,
@@ -18,6 +19,8 @@ from hcc_sempath.training.engine import (
 )
 from hcc_sempath.training.losses import feature_distillation_loss_per_sample
 from hcc_sempath.training.prototype_labels import DEFAULT_L1_CLASSES
+from hcc_sempath.training.spatial_losses import _mean_supervised_pair
+from hcc_sempath.spatial_schema import DEFAULT_SPATIAL_COMPONENTS
 from hcc_sempath.training.train import (
     _build_optimizer,
     _configure_compiled_training_for_gradient_diagnostics,
@@ -274,30 +277,32 @@ def test_optimizer_helper_rejects_nonfinite_loss_without_step(
 
 
 def test_run_epoch_joint_l1_l2_route_keeps_full_bank_prototypes_fixed() -> None:
+    l1_count = len(DEFAULT_L1_CLASSES)
+    l2_count = len(DEFAULT_SPATIAL_COMPONENTS)
     model = HCCSemPathModel(
         backbone_name="vit_tiny_patch16_224",
         embedding_dim=8,
         teacher_dims={"teacher": 4},
         pretrained=False,
-        l1_num_classes=4,
-        spatial_num_components=9,
+        l1_num_classes=l1_count,
+        spatial_num_components=l2_count,
         spatial_dim=12,
         spatial_output_stride=7,
     )
     prototypes = {
         "teacher": PrototypeRegistry(
-            prototypes=torch.eye(4),
+            prototypes=torch.randn(l1_count, 4),
             names=list(DEFAULT_L1_CLASSES),
-            groups=["l1"] * 4,
-            levels=[1] * 4,
-            exclusive=[True] * 4,
+            groups=["l1"] * l1_count,
+            levels=[1] * l1_count,
+            exclusive=[True] * l1_count,
         )
     }
     grid = 31
-    point_centers = torch.zeros((1, 9, grid, grid))
+    point_centers = torch.zeros((1, l2_count, grid, grid))
     point_centers[0, 0, 10, 10] = 1
     implicit_negative = torch.zeros(
-        (1, 9, grid, grid),
+        (1, l2_count, grid, grid),
         dtype=torch.bool,
     )
     implicit_negative[0, 0, 0, 0] = True
@@ -310,27 +315,27 @@ def test_run_epoch_joint_l1_l2_route_keeps_full_bank_prototypes_fixed() -> None:
         "prototype_level1": torch.tensor([0]),
         "l2_point_centers": point_centers,
         "l2_brush_bag_ids": torch.zeros(
-            (1, 9, grid, grid),
+            (1, l2_count, grid, grid),
             dtype=torch.long,
         ),
         "l2_area_positive": zeros_bool,
         "l2_explicit_negative": zeros_bool,
         "l2_implicit_negative": implicit_negative,
         "l2_spatial_supervised": torch.tensor(
-            [[True] + [False] * 8]
+            [[True] + [False] * (l2_count - 1)]
         ),
     }
     model.replace_l1_prototypes(
-        torch.randn(4, 8),
-        torch.ones(4),
+        torch.randn(l1_count, 8),
+        torch.ones(l1_count),
     )
     model.replace_global_l2_prototypes(
-        torch.randn(9, 8),
-        torch.ones(9),
-        {"teacher": torch.randn(9, 4)},
+        torch.randn(l2_count, 8),
+        torch.ones(l2_count),
+        {"teacher": torch.randn(l2_count, 4)},
     )
     spatial_observations = {
-        name: (torch.randn(9, 12), torch.ones(9))
+        name: (torch.randn(l2_count, 12), torch.ones(l2_count))
         for name in (
             "instance",
             "measurement",
@@ -389,6 +394,56 @@ def test_run_epoch_joint_l1_l2_route_keeps_full_bank_prototypes_fixed() -> None:
         model.spatial_head.instance_prototypes,
         spatial_before,
     )
+
+
+def test_spatial_pair_reduction_balances_active_components() -> None:
+    values = torch.tensor(
+        [[1.0, 10.0], [3.0, 0.0], [5.0, 0.0]],
+        requires_grad=True,
+    )
+    supervised = torch.tensor(
+        [[True, True], [True, False], [True, False]]
+    )
+
+    loss = _mean_supervised_pair(values, supervised, values)
+
+    assert loss.item() == pytest.approx(6.5)
+    loss.backward()
+    assert values.grad is not None
+
+
+def test_spatial_pair_reduction_empty_mask_returns_connected_zero() -> None:
+    values = torch.randn(2, 3, requires_grad=True)
+
+    loss = _mean_supervised_pair(
+        values,
+        torch.zeros_like(values, dtype=torch.bool),
+        values,
+    )
+
+    assert loss.item() == 0.0
+    loss.backward()
+    assert values.grad is not None
+
+
+def test_local_negative_is_not_promoted_to_global_component_absence() -> None:
+    shape = (2, 1, 3, 3)
+    point = torch.zeros(shape)
+    point[0, 0, 1, 1] = 1
+    explicit = torch.zeros(shape, dtype=torch.bool)
+    explicit[0, 0, 0, 0] = True
+    explicit[1, 0].fill_(True)
+    batch = {
+        "l2_point_centers": point,
+        "l2_brush_bag_ids": torch.zeros(shape, dtype=torch.long),
+        "l2_area_positive": torch.zeros(shape, dtype=torch.bool),
+        "l2_explicit_negative": explicit,
+    }
+
+    positive, known = _l2_global_targets_from_spatial(batch)
+
+    assert positive[:, 0].tolist() == [True, False]
+    assert known[:, 0].tolist() == [True, True]
 
 
 def test_objective_gradient_diagnostics_measure_shared_signal() -> None:

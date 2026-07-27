@@ -8,7 +8,9 @@ from ..modeling.prototypes import PrototypeRegistry
 
 
 DEFAULT_L1_CLASSES = (
-    "HCC-tumor",
+    "HCC-tumor-well-differentiated",
+    "HCC-tumor-moderately-differentiated",
+    "HCC-tumor-poorly-differentiated",
     "Background-liver",
     "Inflammatory-stromal",
     "Degenerative-material",

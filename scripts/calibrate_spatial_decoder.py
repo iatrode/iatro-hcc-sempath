@@ -164,7 +164,7 @@ def _optimizer_visible_packages(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Calibrate the nine-component decoder on an independent ROI split."
+        description="Calibrate the eleven-component decoder on an independent ROI split."
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--annotation", required=True)

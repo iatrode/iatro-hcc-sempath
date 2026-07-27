@@ -167,7 +167,7 @@ class PrototypeRefreshState:
     global_loader: object | None
     spatial_loader: object | None
     last_global_step: int | None = None
-    last_spatial_step: int | None = None
+    last_spatial_global_step: int | None = None
 
 
 def _objective_gradient_diagnostics(
@@ -396,6 +396,18 @@ def _l2_positive_from_batch(batch: dict) -> torch.Tensor:
     ).flatten(2).any(dim=2)
 
 
+def _l2_global_targets_from_spatial(
+    batch: dict,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Summarize local ROI evidence without promoting local negatives."""
+
+    positive = _l2_positive_from_batch(batch)
+    complete_negative = batch["l2_explicit_negative"].to(
+        dtype=torch.bool
+    ).flatten(2).all(dim=2)
+    return positive, positive | complete_negative
+
+
 @torch.inference_mode()
 def _refresh_global_prototypes(
     model,
@@ -597,7 +609,6 @@ def _maybe_refresh_prototypes(
     device: torch.device,
     state: PrototypeRefreshState | None,
     global_step: int,
-    l2_supervised_step: int,
 ) -> None:
     if state is None:
         return
@@ -636,10 +647,10 @@ def _maybe_refresh_prototypes(
         )
     )
     refresh_spatial = (
-        state.last_spatial_step is None
+        state.last_spatial_global_step is None
         or (
             spatial_interval > 0
-            and l2_supervised_step - state.last_spatial_step
+            and global_step - state.last_spatial_global_step
             >= spatial_interval
         )
     )
@@ -650,10 +661,10 @@ def _maybe_refresh_prototypes(
             cfg,
             device,
         )
-        state.last_spatial_step = int(l2_supervised_step)
+        state.last_spatial_global_step = int(global_step)
         _log(
             "dynamic_spatial_prototypes_refreshed "
-            f"l2_supervised_step={l2_supervised_step} "
+            f"global_step={global_step} "
             f"tiles={metrics['tiles']} "
             f"positive_observations={metrics['positive_observations']} "
             f"seconds={metrics['seconds']:.2f}"
@@ -694,7 +705,25 @@ def _move_spatial_batch(batch: dict, device: torch.device) -> dict[str, torch.Te
         "l2_explicit_negative",
         "l2_implicit_negative",
     )
-    return {key: batch[key].to(device, non_blocking=device.type == "cuda") for key in keys}
+    result = {
+        key: batch[key].to(
+            device,
+            non_blocking=device.type == "cuda",
+        )
+        for key in keys
+    }
+    exclusion = batch.get(
+        "l2_instance_exclusion_support",
+        torch.zeros_like(
+            batch["l2_area_positive"],
+            dtype=torch.bool,
+        ),
+    )
+    result["l2_instance_exclusion_support"] = exclusion.to(
+        device,
+        non_blocking=device.type == "cuda",
+    )
+    return result
 
 
 def _amp_enabled(device: torch.device, cfg: dict, train: bool) -> bool:
@@ -1109,6 +1138,13 @@ def run_epoch(
                     "l2_implicit_negative",
                 )
             }
+            spatial_host["l2_instance_exclusion_support"] = batch.get(
+                "l2_instance_exclusion_support",
+                torch.zeros_like(
+                    batch["l2_area_positive"],
+                    dtype=torch.bool,
+                ),
+            )
             active_spatial_host = (
                 {
                     key: value[spatial_sample_mask]
@@ -1140,7 +1176,6 @@ def run_epoch(
                         device=device,
                         state=prototype_refresh_state,
                         global_step=global_step,
-                        l2_supervised_step=l2_supervised_step,
                     )
                 with torch.autocast(
                     device_type=device.type,
@@ -1170,16 +1205,12 @@ def run_epoch(
                             raise RuntimeError(
                                 "active spatial targets were not prepared"
                             )
-                        active_l2_positive = (
-                            (active_spatial_host["l2_point_centers"] > 0)
-                            | (active_spatial_host["l2_brush_bag_ids"] > 0)
-                            | active_spatial_host["l2_area_positive"].to(
-                                dtype=torch.bool
-                            )
-                        ).flatten(2).any(dim=2)
-                        active_l2_explicit_negative = active_spatial_host[
-                            "l2_explicit_negative"
-                        ].to(dtype=torch.bool).flatten(2).any(dim=2)
+                        (
+                            active_l2_positive,
+                            active_l2_known,
+                        ) = _l2_global_targets_from_spatial(
+                            active_spatial_host
+                        )
                         summary_shape = (
                             spatial_sample_mask.shape[0],
                             active_l2_positive.shape[1],
@@ -1188,24 +1219,23 @@ def run_epoch(
                             summary_shape,
                             dtype=torch.bool,
                         )
-                        l2_explicit_negative_host = torch.zeros_like(
+                        l2_known_host = torch.zeros_like(
                             l2_positive_host
                         )
                         l2_positive_host[spatial_sample_mask] = (
                             active_l2_positive
                         )
-                        l2_explicit_negative_host[spatial_sample_mask] = (
-                            active_l2_explicit_negative
+                        l2_known_host[spatial_sample_mask] = (
+                            active_l2_known
                         )
                         l2_positive = l2_positive_host.to(
                             device,
                             non_blocking=device.type == "cuda",
                         )
-                        l2_explicit_negative = l2_explicit_negative_host.to(
+                        l2_known = l2_known_host.to(
                             device,
                             non_blocking=device.type == "cuda",
                         )
-                        l2_known = l2_positive | l2_explicit_negative
                         l2_target = l2_positive.to(dtype=torch.float32)
                     student_by_teacher = outputs["teacher_outputs"]
                     teacher_l2_prototypes = {
@@ -1346,6 +1376,9 @@ def run_epoch(
                             area_positive=active_spatial["l2_area_positive"],
                             explicit_negative=active_spatial["l2_explicit_negative"],
                             implicit_negative=active_spatial["l2_implicit_negative"],
+                            instance_exclusion_support=active_spatial[
+                                "l2_instance_exclusion_support"
+                            ],
                             point_centers_host=active_spatial_host[
                                 "l2_point_centers"
                             ],
@@ -1355,6 +1388,11 @@ def run_epoch(
                             area_positive_host=active_spatial_host[
                                 "l2_area_positive"
                             ],
+                            instance_exclusion_support_host=(
+                                active_spatial_host[
+                                    "l2_instance_exclusion_support"
+                                ]
+                            ),
                             component_names=cfg["data"].get(
                                 "spatial_component_names"
                             ),
@@ -1739,8 +1777,8 @@ def fit(
             last_global_step=(resume_state or {}).get(
                 "dynamic_prototype_step"
             ),
-            last_spatial_step=(resume_state or {}).get(
-                "dynamic_spatial_prototype_step"
+            last_spatial_global_step=(resume_state or {}).get(
+                "dynamic_spatial_prototype_global_step"
             ),
         )
         if (
@@ -1919,8 +1957,8 @@ def fit(
                     if prototype_refresh_state is not None
                     else None
                 ),
-                "dynamic_spatial_prototype_step": (
-                    prototype_refresh_state.last_spatial_step
+                "dynamic_spatial_prototype_global_step": (
+                    prototype_refresh_state.last_spatial_global_step
                     if prototype_refresh_state is not None
                     else None
                 ),
@@ -1974,6 +2012,16 @@ def fit(
                 "epoch": epoch,
                 "global_step": global_step,
                 "l2_supervised_step": l2_supervised_step,
+                "dynamic_prototype_step": (
+                    prototype_refresh_state.last_global_step
+                    if prototype_refresh_state is not None
+                    else None
+                ),
+                "dynamic_spatial_prototype_global_step": (
+                    prototype_refresh_state.last_spatial_global_step
+                    if prototype_refresh_state is not None
+                    else None
+                ),
                 "best_loss": best_loss,
                 "best_teacher_alignment": best_teacher_alignment,
                 "best_l1_accuracy": best_l1_accuracy,

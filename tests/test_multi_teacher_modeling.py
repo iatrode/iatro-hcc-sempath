@@ -18,7 +18,10 @@ from hcc_sempath.modeling.models import (
     model_state_sha256,
     validate_spatial_decoder_calibration,
 )
-from hcc_sempath.spatial_schema import DEFAULT_SPATIAL_COMPONENTS
+from hcc_sempath.spatial_schema import (
+    DEFAULT_SPATIAL_COMPONENTS,
+    spatial_component_specs,
+)
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 from hcc_sempath.training.losses import multi_teacher_distillation_loss
 from hcc_sempath.training.engine import _objective_gradient_diagnostics
@@ -195,28 +198,22 @@ def test_spatial_objective_reaches_shared_encoder_by_default() -> None:
     )
 
 
-def test_fixed_nine_class_head_suppresses_non_countable_instance_channels() -> None:
+def test_fixed_spatial_head_suppresses_non_countable_instance_channels() -> None:
+    component_count = len(DEFAULT_SPATIAL_COMPONENTS)
     model = HCCSemPathModel(
         backbone_name="vit_tiny_patch16_224",
         embedding_dim=11,
         teacher_dims={},
         pretrained=False,
-        spatial_num_components=9,
+        spatial_num_components=component_count,
         spatial_dim=13,
     ).eval()
     with torch.no_grad():
         outputs = model(torch.randn(1, 3, 224, 224))
 
     assert outputs["l2_instance_valid"].tolist() == [
-        True,
-        False,
-        True,
-        False,
-        True,
-        False,
-        True,
-        True,
-        True,
+        spec.supports_instance_count
+        for spec in spatial_component_specs(DEFAULT_SPATIAL_COMPONENTS)
     ]
     invalid = ~outputs["l2_instance_valid"]
     assert torch.all(outputs["l2_instance_probabilities"][:, invalid] < 1e-8)
@@ -364,31 +361,34 @@ def test_spatial_prototype_replacement_uses_exact_bank_statistics() -> None:
     torch.testing.assert_close(head.instance_prototype_counts, counts)
 
 
-def test_structure_point_does_not_update_unknown_measurement_negative_prototype() -> None:
+def test_structure_point_updates_instance_but_not_unknown_measurement_prototype() -> None:
+    component_count = len(DEFAULT_SPATIAL_COMPONENTS)
+    structure_index = DEFAULT_SPATIAL_COMPONENTS.index(
+        "vascular-structure-present"
+    )
     head = SpatialMorphometryHead(
         student_dim=2,
-        component_count=9,
+        component_count=component_count,
         spatial_dim=2,
     )
     features = torch.randn(1, 2, 5, 5)
-    point = torch.zeros((1, 9, 5, 5))
-    point[0, 6, 2, 2] = 1
-    implicit = torch.zeros((1, 9, 5, 5), dtype=torch.bool)
-    implicit[0, 6] = True
-    implicit[0, 6, 1:4, 1:4] = False
+    shape = (1, component_count, 5, 5)
+    point = torch.zeros(shape)
+    point[0, structure_index, 2, 2] = 1
+    zeros_bool = torch.zeros(shape, dtype=torch.bool)
 
     _replace_spatial_prototypes(
         head,
         features,
         point_centers=point,
-        brush_bag_ids=torch.zeros((1, 9, 5, 5), dtype=torch.long),
-        area_positive=torch.zeros((1, 9, 5, 5), dtype=torch.bool),
-        explicit_negative=torch.zeros((1, 9, 5, 5), dtype=torch.bool),
-        implicit_negative=implicit,
+        brush_bag_ids=torch.zeros(shape, dtype=torch.long),
+        area_positive=zeros_bool,
+        explicit_negative=zeros_bool,
+        implicit_negative=zeros_bool,
     )
 
-    assert head.instance_implicit_negative_prototype_counts[6].item() == 1
-    assert head.measurement_implicit_negative_prototype_counts[6].item() == 0
+    assert head.instance_prototype_counts[structure_index].item() == 1
+    assert head.measurement_prototype_counts[structure_index].item() == 0
 
 
 def test_hcc_sempath_model_decodes_instances_and_uncalibrated_abundance() -> None:
@@ -421,13 +421,17 @@ def test_hcc_sempath_model_decodes_instances_and_uncalibrated_abundance() -> Non
 
 
 def test_spatial_decoder_masks_invalid_counts_and_derives_bile_focus_density() -> None:
-    instance = torch.zeros((1, 9, 5, 5))
-    measurement = torch.zeros((1, 9, 5, 5))
+    component_count = len(DEFAULT_SPATIAL_COMPONENTS)
+    bile_index = DEFAULT_SPATIAL_COMPONENTS.index(
+        "bile-pigment-present"
+    )
+    instance = torch.zeros((1, component_count, 5, 5))
+    measurement = torch.zeros((1, component_count, 5, 5))
     instance[0, 0, 2, 2] = 0.9
     instance[0, 1, 2, 2] = 0.9
-    instance[0, 3, 2, 2] = 0.9
-    measurement[0, 3, 1, 1] = 0.9
-    measurement[0, 3, 3, 3] = 0.9
+    instance[0, bile_index, 2, 2] = 0.9
+    measurement[0, bile_index, 1, 1] = 0.9
+    measurement[0, bile_index, 3, 3] = 0.9
     decoded = decode_spatial_morphometry(
         {
             "l2_instance_probabilities": instance,
@@ -442,30 +446,16 @@ def test_spatial_decoder_masks_invalid_counts_and_derives_bile_focus_density() -
 
     assert decoded["instance_counts"][0, 0].item() == 1
     assert torch.isnan(decoded["instance_counts"][0, 1])
-    assert torch.isnan(decoded["instance_counts"][0, 3])
+    assert torch.isnan(decoded["instance_counts"][0, bile_index])
     assert decoded["instance_count_valid"].tolist() == [
-        True,
-        False,
-        True,
-        False,
-        True,
-        False,
-        True,
-        True,
-        True,
+        spec.supports_instance_count
+        for spec in spatial_component_specs(DEFAULT_SPATIAL_COMPONENTS)
     ]
     assert decoded["area_valid"].tolist() == [
-        False,
-        True,
-        False,
-        True,
-        False,
-        True,
-        True,
-        True,
-        True,
+        spec.supports_area
+        for spec in spatial_component_specs(DEFAULT_SPATIAL_COMPONENTS)
     ]
-    assert decoded["focus_counts"][0, 3].item() == 2
+    assert decoded["focus_counts"][0, bile_index].item() == 2
     assert torch.isnan(decoded["focus_counts"][0, 0])
 
 
@@ -531,11 +521,15 @@ def test_sparse_components_preserve_diagonal_eight_connectivity() -> None:
 
 
 def test_spatial_decoder_focus_minimum_uses_eight_connected_extent() -> None:
-    instance = torch.zeros((1, 9, 5, 5))
+    component_count = len(DEFAULT_SPATIAL_COMPONENTS)
+    bile_index = DEFAULT_SPATIAL_COMPONENTS.index(
+        "bile-pigment-present"
+    )
+    instance = torch.zeros((1, component_count, 5, 5))
     measurement = torch.zeros_like(instance)
-    measurement[0, 3, 1, 1] = 0.9
-    measurement[0, 3, 2, 2] = 0.9
-    measurement[0, 3, 4, 4] = 0.9
+    measurement[0, bile_index, 1, 1] = 0.9
+    measurement[0, bile_index, 2, 2] = 0.9
+    measurement[0, bile_index, 4, 4] = 0.9
 
     decoded = decode_spatial_morphometry(
         {
@@ -549,7 +543,7 @@ def test_spatial_decoder_focus_minimum_uses_eight_connected_extent() -> None:
         minimum_focus_cells=2,
     )
 
-    assert decoded["focus_counts"][0, 3].item() == 1
+    assert decoded["focus_counts"][0, bile_index].item() == 1
 
 
 def test_spatial_decoder_requires_frozen_analysis_values() -> None:

@@ -255,7 +255,7 @@ class SpatialContextBlock(nn.Module):
 
 
 class SpatialMorphometryHead(nn.Module):
-    """Nine-component class-routed spatial morphometry.
+    """Eleven-component class-routed spatial morphometry.
 
     The local branch reuses the pretrained 14x14 DINO patch projection with a
     seven-pixel stride. This preserves the intended cell-scale observation

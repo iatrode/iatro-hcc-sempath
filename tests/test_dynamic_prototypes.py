@@ -5,6 +5,8 @@ import torch.nn.functional as F
 
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.training.engine import (
+    PrototypeRefreshState,
+    _maybe_refresh_prototypes,
     _refresh_global_prototypes,
 )
 
@@ -138,3 +140,45 @@ def test_prototype_response_updates_zhcc_but_not_detached_centroids() -> None:
     assert float(projector_grad.abs().sum()) > 0
     assert model.l1_prototypes.grad is None
     torch.testing.assert_close(model.l1_prototypes, before)
+
+
+def test_spatial_prototypes_refresh_on_global_step_clock(
+    monkeypatch,
+) -> None:
+    refresh_steps: list[int] = []
+    state = PrototypeRefreshState(
+        global_loader=None,
+        spatial_loader=object(),
+    )
+
+    def fake_refresh(model, loader, cfg, device):
+        del model, loader, cfg, device
+        refresh_steps.append(current_step[0])
+        return {
+            "tiles": 1,
+            "positive_observations": 1,
+            "seconds": 0.0,
+        }
+
+    monkeypatch.setattr(
+        "hcc_sempath.training.engine._refresh_spatial_prototypes",
+        fake_refresh,
+    )
+    cfg = {
+        "train": {
+            "dynamic_spatial_prototype_refresh_steps": 500,
+        }
+    }
+    current_step = [0]
+    for step in (0, 499, 500, 999, 1000, 2500, 2999, 3000):
+        current_step[0] = step
+        _maybe_refresh_prototypes(
+            model=object(),
+            cfg=cfg,
+            device=torch.device("cpu"),
+            state=state,
+            global_step=step,
+        )
+
+    assert refresh_steps == [0, 500, 1000, 2500, 3000]
+    assert state.last_spatial_global_step == 3000

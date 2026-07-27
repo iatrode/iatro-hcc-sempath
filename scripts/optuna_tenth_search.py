@@ -26,7 +26,7 @@ TEACHERS = ("gigapath", "h_optimus_1", "uni2_h", "virchow2")
 BASELINE_PARAMS = {"lr": 1e-4, "weight_decay": 1e-2}
 SEARCH_SPACE = {
     "lr": {"low": 3e-5, "high": 2e-4, "log": True},
-    "weight_decay": {"low": 1e-3, "high": 3e-2, "log": True},
+    "weight_decay": {"low": 1e-3, "high": 5e-2, "log": True},
 }
 RESULT_METRICS = (
     "train_loss",

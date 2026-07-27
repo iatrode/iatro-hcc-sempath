@@ -154,11 +154,11 @@ def test_curve_is_nested_and_reports_finite_metrics_after_first_increment() -> N
 def test_parser_defaults_to_pretraining_audit_configuration() -> None:
     module = _load_module()
     args = module.build_parser().parse_args([])
-    assert args.resamples == 32
+    assert args.resamples == 16
     assert args.elbow_ratio == 0.35
     assert args.teacher_feature_packages == ""
     assert args.probe_slide_fraction == 0.20
-    assert args.confirmation_increments == 3
+    assert args.confirmation_increments == 2
 
 
 def test_coverage_keeps_point_circle_and_brush_modalities_separate() -> None:
@@ -236,7 +236,7 @@ def test_curve_counts_unique_tiles_not_teacher_observations() -> None:
     assert len(set(order)) == 3
 
 
-def test_l2_requires_low_gain_support_from_every_teacher(
+def test_l2_uses_the_same_pooled_tail_support_as_l1(
     monkeypatch,
 ) -> None:
     module = _load_module()
@@ -274,13 +274,13 @@ def test_l2_requires_low_gain_support_from_every_teacher(
     ]
     call_count = 0
 
-    def fake_tail_low_gain(*args, **kwargs):
+    def fake_tail_plateau(*args, **kwargs):
         nonlocal call_count
         teacher_index = (call_count // 4) % 2
         call_count += 1
         return (teacher_index == 0, 12 if teacher_index == 0 else None)
 
-    monkeypatch.setattr(module, "tail_low_gain", fake_tail_low_gain)
+    monkeypatch.setattr(module, "tail_plateau", fake_tail_plateau)
     summary, _, report = module.evaluate_information(
         samples,
         coverage,
@@ -296,10 +296,8 @@ def test_l2_requires_low_gain_support_from_every_teacher(
     )
 
     assert summary[0]["status"] == "still_growing"
-    assert report["a"]["teacher_low_gain_support_by_teacher_ratio"][
+    assert report["a"]["tail_plateau_support_by_teacher_ratio"][
         "0.35"
     ] == {"t1": 1.0, "t2": 0.0}
-    assert report["a"]["teacher_low_gain_support_by_ratio"]["0.35"] == 0.0
-    assert all(
-        "center_drift" not in row for row in report["a"]["curve"]
-    )
+    assert report["a"]["tail_plateau_support_by_ratio"]["0.35"] == 0.5
+    assert all("center_drift" in row for row in report["a"]["curve"])

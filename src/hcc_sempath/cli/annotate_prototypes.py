@@ -42,7 +42,9 @@ CONTEXT_WORKERS = 8
 MAX_OPEN_IAC_VIEWERS = 8
 
 L1_PROTOTYPES = [
-    "HCC-tumor",
+    "HCC-tumor-well-differentiated",
+    "HCC-tumor-moderately-differentiated",
+    "HCC-tumor-poorly-differentiated",
     "Background-liver",
     "Inflammatory-stromal",
     "Degenerative-material",
@@ -54,15 +56,16 @@ L2_PROTOTYPES = [
     "hemorrhage-present",
     "bile-pigment-present",
     "inflammatory-cell-present",
+    "fibroblast",
     "fibrous-stroma-present",
     "steatosis-vacuolation-present",
-    "hyaline-change-present",
     "vascular-structure-present",
+    "large-vessel",
     "ductular-portal-present",
 ]
 
 # Spatial ROI taxonomy.
-ROI_L2_PROTOTYPES = [name for name in L2_PROTOTYPES if name != "hyaline-change-present"]
+ROI_L2_PROTOTYPES = list(L2_PROTOTYPES)
 DEFAULT_ROI_INFORMATION_REPORT = (
     Path(__file__).resolve().parents[3]
     / "artifacts"

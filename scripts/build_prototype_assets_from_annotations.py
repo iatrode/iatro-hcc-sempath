@@ -221,8 +221,8 @@ def main() -> None:
     l1_names = [str(name) for name in payload.get("l1_prototypes", [])]
     if not l1_names:
         raise ValueError("annotation JSON missing l1_prototypes")
-    # Teacher prototypes define the four-way L1 semantic axis; the geometry
-    # manifest supplies spatial L2 supervision.
+    # Teacher prototypes define the frozen exclusive L1 semantic axis; the
+    # geometry manifest supplies the independent spatial L2 supervision.
     l2_names: list[str] = []
     names = list(l1_names)
     levels = [1] * len(l1_names)
