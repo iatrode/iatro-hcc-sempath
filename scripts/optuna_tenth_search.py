@@ -86,6 +86,12 @@ def write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
 
+def atomic_write_yaml(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    write_yaml(temporary, payload)
+    temporary.replace(path)
+
+
 def config_digest(cfg: dict[str, Any]) -> str:
     payload = yaml.safe_dump(cfg, sort_keys=True, allow_unicode=True).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -293,7 +299,9 @@ def export_study_artifacts(
         rows.append(row)
 
     summary_path = output_root / "study_summary.csv"
-    temporary_summary = summary_path.with_suffix(".csv.tmp")
+    temporary_summary = summary_path.with_name(
+        f".{summary_path.name}.{os.getpid()}.tmp"
+    )
     fieldnames = list(rows[0]) if rows else [
         "number",
         "state",
@@ -308,12 +316,17 @@ def export_study_artifacts(
     temporary_summary.replace(summary_path)
 
     manifest_path = output_root / "study_manifest.yaml"
-    write_yaml(manifest_path, manifest)
+    atomic_write_yaml(manifest_path, manifest)
     if study.best_trials:
         best = study.best_trial
         best_config = Path(str(best.user_attrs.get("output_dir", ""))) / "config.yaml"
         if best_config.is_file():
-            shutil.copy2(best_config, output_root / "best_config.yaml")
+            best_config_path = output_root / "best_config.yaml"
+            temporary_best_config = best_config_path.with_name(
+                f".{best_config_path.name}.{os.getpid()}.tmp"
+            )
+            shutil.copy2(best_config, temporary_best_config)
+            temporary_best_config.replace(best_config_path)
 
 
 def read_metric_rows(metrics_path: Path) -> list[dict[str, str]]:
@@ -430,6 +443,12 @@ def main() -> None:
     parser.add_argument("--prototype-asset-dir", default="artifacts/prototypes/hcc_annotation_final_classification")
     parser.add_argument("--python", default="python")
     parser.add_argument("--n-trials", type=int, default=24)
+    parser.add_argument(
+        "--study-trials",
+        type=int,
+        default=0,
+        help="Total trials planned across all concurrent workers (manifest only).",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--timeout-hours", type=float, default=0.0)
     parser.add_argument("--poll-sec", type=float, default=20.0)
@@ -505,7 +524,11 @@ def main() -> None:
         "epochs_per_trial": int(args.epochs),
         "population_fraction": 0.10,
         "complete_classification_spatial_expert_banks": True,
-        "n_trials_requested": int(args.n_trials),
+        "n_trials_requested": (
+            int(args.study_trials)
+            if int(args.study_trials) > 0
+            else int(args.n_trials)
+        ),
         "timeout_hours": float(args.timeout_hours),
         "runtime_seed": int(base_cfg["runtime"]["seed"]),
         "sampler": "TPESampler",

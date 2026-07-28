@@ -62,3 +62,15 @@ def test_train_loss_objective_is_strict_and_directionally_correct() -> None:
     assert module.score_row({"train_loss": "1.25"}, "train_loss") == -1.25
     with pytest.raises(ValueError, match="non-finite objective metric"):
         module.score_row({}, "train_loss")
+
+
+def test_atomic_yaml_write_leaves_no_worker_temporary_file(
+    tmp_path: Path,
+) -> None:
+    module = _search_module()
+    output = tmp_path / "study_manifest.yaml"
+
+    module.atomic_write_yaml(output, {"n_trials_requested": 5})
+
+    assert module.load_yaml(output) == {"n_trials_requested": 5}
+    assert list(tmp_path.glob(".*.tmp")) == []
