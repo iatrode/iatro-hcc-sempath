@@ -9,6 +9,7 @@ train:
   epochs: 3
   max_val_batches: 1
   max_eval_batches: 1
+  checkpoint_interval_steps: 1000
   development_probe_interval_steps: 1000
   development_probe_batches: 64
   development_early_stop: true
