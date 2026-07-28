@@ -1091,7 +1091,7 @@ def run_epoch(
     prefetched_iterator=None,
     prototype_refresh_state: PrototypeRefreshState | None = None,
     step_metrics_writer: StepMetricsWriter | None = None,
-    development_probe: Callable[[int, int, int], None] | None = None,
+    development_probe: Callable[[int, int, int], bool] | None = None,
     step_checkpoint: Callable[[int, int, int, int, dict], None] | None = None,
     resume_epoch_accumulator: dict | None = None,
 ) -> dict[str, float] | tuple[dict[str, float], tuple]:
@@ -1658,6 +1658,23 @@ def run_epoch(
                     )
 
             n_batches += 1
+            stop_requested = False
+            if train and optimizer_stepped and development_probe is not None:
+                probe_start = time.perf_counter()
+                stop_requested = bool(
+                    development_probe(
+                        global_step,
+                        spatial_supervised_step,
+                        epoch,
+                    )
+                )
+                _probe.timeline_event(
+                    "batch.development_probe",
+                    seconds=time.perf_counter() - probe_start,
+                    epoch=epoch,
+                    batch=n_batches,
+                    global_step=global_step,
+                )
             if train and optimizer_stepped and step_checkpoint is not None:
                 checkpoint_totals = {
                     key: (
@@ -1683,16 +1700,6 @@ def run_epoch(
                             prior_elapsed + time.perf_counter() - start
                         ),
                     },
-                )
-            if train and optimizer_stepped and development_probe is not None:
-                probe_start = time.perf_counter()
-                development_probe(global_step, spatial_supervised_step, epoch)
-                _probe.timeline_event(
-                    "batch.development_probe",
-                    seconds=time.perf_counter() - probe_start,
-                    epoch=epoch,
-                    batch=n_batches,
-                    global_step=global_step,
                 )
             _probe.timeline_event(
                 "batch.total",
@@ -1747,6 +1754,8 @@ def run_epoch(
                 )
                 interval_start = now
                 interval_tiles = 0
+            if stop_requested:
+                break
     finally:
         if step_metrics_writer is not None:
             step_metrics_writer.flush()
@@ -1779,6 +1788,23 @@ def run_epoch(
     result["seconds"] = elapsed
     result["global_step_end"] = float(global_step)
     result["spatial_supervised_step_end"] = float(spatial_supervised_step)
+    result["batch_in_epoch_end"] = float(n_batches)
+    result["epoch_accumulator_end"] = {
+        "totals": {
+            key: (
+                float(value.detach().cpu())
+                if isinstance(value, torch.Tensor)
+                else float(value)
+            )
+            for key, value in totals.items()
+        },
+        "gradient_totals": dict(gradient_totals),
+        "gradient_count": gradient_count,
+        "last_gradient_step": last_gradient_step,
+        "batches": n_batches,
+        "tiles": n_tiles,
+        "seconds": elapsed,
+    }
     result["scheduled_classification_weight"] = float(last_loss_cfg["classification_weight"])
     result["scheduled_spatial_weight"] = float(last_loss_cfg["spatial_weight"])
 
@@ -1890,6 +1916,97 @@ def _classification_eval_metrics(supervised: dict[str, torch.Tensor]) -> dict[st
     }
 
 
+def _truncate_csv_after_step(path: Path, maximum_step: int) -> None:
+    """Atomically discard metric rows newer than an exact resume checkpoint."""
+
+    if not path.exists():
+        return
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        rows = [
+            row
+            for row in reader
+            if not row.get("global_step")
+            or int(float(row["global_step"])) <= maximum_step
+        ]
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    tmp_path.replace(path)
+
+
+def _development_early_stop_state_from_csv(
+    path: Path,
+    *,
+    maximum_step: int,
+    minimum_step: int,
+    relative_delta: float,
+) -> dict[str, float | int | bool | None]:
+    state: dict[str, float | int | bool | None] = {
+        "previous_loss": None,
+        "consecutive_low_gain": 0,
+        "last_probe_step": 0,
+        "triggered": False,
+    }
+    if not path.exists():
+        return state
+    with path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            step = int(float(row["global_step"]))
+            if step > maximum_step:
+                continue
+            loss = float(row["loss"])
+            previous = state["previous_loss"]
+            if previous is not None and step >= minimum_step:
+                gain = (float(previous) - loss) / max(
+                    abs(float(previous)),
+                    1e-12,
+                )
+                state["consecutive_low_gain"] = (
+                    int(state["consecutive_low_gain"]) + 1
+                    if gain < relative_delta
+                    else 0
+                )
+            state["previous_loss"] = loss
+            state["last_probe_step"] = step
+    return state
+
+
+def _update_development_early_stop_state(
+    state: dict[str, float | int | bool | None],
+    *,
+    step: int,
+    loss: float,
+    enabled: bool,
+    minimum_step: int,
+    relative_delta: float,
+    patience: int,
+) -> tuple[float, bool]:
+    relative_improvement = float("nan")
+    previous_loss = state.get("previous_loss")
+    if enabled and previous_loss is not None and step >= minimum_step:
+        relative_improvement = (
+            float(previous_loss) - loss
+        ) / max(abs(float(previous_loss)), 1e-12)
+        state["consecutive_low_gain"] = (
+            int(state.get("consecutive_low_gain", 0)) + 1
+            if relative_improvement < relative_delta
+            else 0
+        )
+    state["previous_loss"] = float(loss)
+    state["last_probe_step"] = int(step)
+    triggered = bool(
+        enabled
+        and step >= minimum_step
+        and int(state.get("consecutive_low_gain", 0)) >= patience
+    )
+    state["triggered"] = triggered
+    return relative_improvement, triggered
+
+
 def fit(
     model,
     train_loader,
@@ -1900,13 +2017,24 @@ def fit(
     cfg,
     *,
     scheduler=None,
+    scheduler_contract: dict | None = None,
     resume_state: dict | None = None,
-    target_epochs: int | None = None,
     prototype_refresh_loader=None,
     spatial_prototype_refresh_loader=None,
 ) -> dict:
     output_dir = ensure_dir(cfg["runtime"]["output_dir"])
     checkpoints = ensure_dir(output_dir / "checkpoints")
+    resume_global_step = int((resume_state or {}).get("global_step", 0))
+    if resume_state is not None:
+        for metric_name in (
+            "step_metrics.csv",
+            "development_metrics.csv",
+            "metrics.csv",
+        ):
+            _truncate_csv_after_step(
+                output_dir / metric_name,
+                resume_global_step,
+            )
     write_json(output_dir / "resolved_config.json", cfg)
     best_loss = float((resume_state or {}).get("best_loss", float("inf")))
     best_teacher_alignment = float(
@@ -1938,15 +2066,11 @@ def fit(
             cfg["train"]["epochs"],
         )
     )
-    expected_epochs = int(
-        target_epochs
-        if target_epochs is not None
-        else previous_expected_epochs
-    )
+    expected_epochs = int(cfg["train"]["epochs"])
     if expected_epochs < start_epoch - 1:
         raise ValueError(
-            "target epochs precede the checkpoint epoch: "
-            f"target={expected_epochs} checkpoint={start_epoch - 1}"
+            "configured train.epochs precedes the checkpoint epoch: "
+            f"configured={expected_epochs} checkpoint={start_epoch - 1}"
         )
     global_step = int((resume_state or {}).get("global_step", 0))
     continuation_history = list(
@@ -1958,7 +2082,7 @@ def fit(
                 "checkpoint_epoch": start_epoch - 1,
                 "checkpoint_global_step": global_step,
                 "previous_expected_epochs": previous_expected_epochs,
-                "target_epochs": expected_epochs,
+                "configured_epochs": expected_epochs,
                 "lr_terminal_behavior": (
                     "clamp_at_min_lr"
                     if str(cfg["train"].get("scheduler", "none")).lower()
@@ -2006,6 +2130,55 @@ def fit(
     checkpoint_interval_steps = int(
         cfg["train"].get("checkpoint_interval_steps", 1000)
     )
+    development_early_stop_enabled = bool(
+        cfg["train"].get("development_early_stop", False)
+    )
+    development_early_stop_min_step = int(
+        cfg["train"].get("development_early_stop_min_step", 4000)
+    )
+    development_early_stop_relative_delta = float(
+        cfg["train"].get("development_early_stop_relative_delta", 0.005)
+    )
+    development_early_stop_patience = int(
+        cfg["train"].get("development_early_stop_patience", 2)
+    )
+    development_early_stop_contract = {
+        "enabled": development_early_stop_enabled,
+        "minimum_step": development_early_stop_min_step,
+        "relative_delta": development_early_stop_relative_delta,
+        "patience": development_early_stop_patience,
+        "probe_interval_steps": int(
+            cfg["train"].get("development_probe_interval_steps", 0) or 0
+        ),
+        "probe_batches": int(
+            cfg["train"].get("development_probe_batches", 64)
+        ),
+    }
+    saved_early_stop_state = (resume_state or {}).get(
+        "development_early_stop_state"
+    )
+    saved_early_stop_contract = (resume_state or {}).get(
+        "development_early_stop_contract"
+    )
+    early_stop_state = (
+        dict(saved_early_stop_state)
+        if (
+            isinstance(saved_early_stop_state, dict)
+            and saved_early_stop_contract
+            == development_early_stop_contract
+        )
+        else _development_early_stop_state_from_csv(
+            output_dir / "development_metrics.csv",
+            maximum_step=resume_global_step,
+            minimum_step=development_early_stop_min_step,
+            relative_delta=development_early_stop_relative_delta,
+        )
+    )
+    development_stop_requested = bool(
+        development_early_stop_enabled
+        and early_stop_state.get("triggered", False)
+    )
+    development_stop_summary: dict[str, float | int | bool] = {}
 
     def checkpoint_payload(
         *,
@@ -2027,9 +2200,8 @@ def fit(
                 else None
             ),
             "scheduler_contract": _scheduler_contract(
-                cfg,
-                len(train_loader),
-            ),
+                cfg, len(train_loader)
+            ) if scheduler_contract is None else dict(scheduler_contract),
             "scaler": scaler.state_dict(),
             "epoch": int(epoch),
             "batch_in_epoch": int(batch_in_epoch),
@@ -2059,6 +2231,10 @@ def fit(
             "training_complete": bool(training_complete),
             "expected_epochs": expected_epochs,
             "continuation_history": continuation_history,
+            "development_early_stop_state": dict(early_stop_state),
+            "development_early_stop_contract": dict(
+                development_early_stop_contract
+            ),
         }
 
     def save_step_checkpoint(
@@ -2116,12 +2292,13 @@ def fit(
         step: int,
         spatial_step: int,
         current_epoch: int,
-    ) -> None:
+    ) -> bool:
+        nonlocal development_stop_requested, development_stop_summary
         if (
             development_probe_interval <= 0
             or step % development_probe_interval != 0
         ):
-            return
+            return False
         was_training = bool(model.training)
         try:
             probe_metrics = run_epoch(
@@ -2144,6 +2321,28 @@ def fit(
             epoch=current_epoch,
             global_step=step,
         )
+        probe_loss = float(probe_metrics["loss"])
+        relative_improvement, development_stop_requested = (
+            _update_development_early_stop_state(
+                early_stop_state,
+                step=step,
+                loss=probe_loss,
+                enabled=development_early_stop_enabled,
+                minimum_step=development_early_stop_min_step,
+                relative_delta=development_early_stop_relative_delta,
+                patience=development_early_stop_patience,
+            )
+        )
+        development_stop_summary = {
+            "epoch": int(current_epoch),
+            "global_step": int(step),
+            "spatial_supervised_step": int(spatial_step),
+            "early_stopped": development_stop_requested,
+            **{
+                key: float(value)
+                for key, value in probe_metrics.items()
+            },
+        }
         append_csv(
             output_dir / "development_metrics.csv",
             {
@@ -2160,9 +2359,22 @@ def fit(
                 "scheduled_spatial_weight": float(
                     probe_loss_cfg["spatial_weight"]
                 ),
+                "relative_loss_improvement": relative_improvement,
+                "early_stop_consecutive_low_gain": int(
+                    early_stop_state.get("consecutive_low_gain", 0)
+                ),
+                "early_stop_triggered": development_stop_requested,
                 **probe_metrics,
             },
         )
+        if development_stop_requested:
+            _log(
+                "development_early_stop "
+                f"global_step={step} "
+                f"relative_delta={development_early_stop_relative_delta} "
+                f"patience={development_early_stop_patience}"
+            )
+        return development_stop_requested
 
     try:
         for epoch in range(start_epoch, expected_epochs + 1):
@@ -2206,6 +2418,22 @@ def fit(
             spatial_supervised_step = int(
                 train_metrics["spatial_supervised_step_end"]
             )
+            if development_stop_requested:
+                last_metrics = dict(development_stop_summary)
+                _atomic_torch_save(
+                    checkpoint_payload(
+                        epoch=epoch,
+                        batch_in_epoch=int(
+                            train_metrics["batch_in_epoch_end"]
+                        ),
+                        epoch_accumulator=dict(
+                            train_metrics["epoch_accumulator_end"]
+                        ),
+                        training_complete=True,
+                    ),
+                    checkpoints / "last.pt",
+                )
+                break
             val_iterator = iter(val_loader)
             try:
                 val_metrics, val_embeddings = run_epoch(

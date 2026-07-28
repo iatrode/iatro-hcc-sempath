@@ -546,6 +546,66 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
         )
     if int(cfg.get("train", {}).get("development_probe_batches", 64)) <= 0:
         raise ValueError("train.development_probe_batches must be positive")
+    development_early_stop = bool(
+        cfg.get("train", {}).get("development_early_stop", False)
+    )
+    if development_early_stop and int(
+        cfg.get("train", {}).get("development_probe_interval_steps", 0)
+    ) <= 0:
+        raise ValueError(
+            "train.development_early_stop requires a positive "
+            "development_probe_interval_steps"
+        )
+    development_early_stop_min_step = int(
+        cfg.get("train", {}).get(
+            "development_early_stop_min_step",
+            4000,
+        )
+    )
+    if development_early_stop_min_step < 0:
+        raise ValueError(
+            "train.development_early_stop_min_step must be non-negative"
+        )
+    if development_early_stop:
+        ramp_end_steps = [
+            int(loss_cfg.get("expert_supervision_start_step", 0))
+            + int(loss_cfg.get("expert_supervision_ramp_steps", 0)),
+        ]
+        if float(loss_cfg.get("prototype_filter_weight", 0.0)) > 0:
+            ramp_end_steps.append(
+                int(loss_cfg.get("prototype_filter_start_step", 0))
+                + int(loss_cfg.get("prototype_filter_ramp_steps", 0))
+            )
+        if float(loss_cfg.get("zhcc_response_weight", 0.0)) > 0:
+            ramp_end_steps.append(
+                int(loss_cfg.get("zhcc_response_start_step", 0))
+                + int(loss_cfg.get("zhcc_response_ramp_steps", 0))
+            )
+        stable_loss_step = max(ramp_end_steps)
+        if development_early_stop_min_step < stable_loss_step:
+            raise ValueError(
+                "train.development_early_stop_min_step must not precede "
+                f"the final active loss ramp at step {stable_loss_step}"
+            )
+    relative_delta = float(
+        cfg.get("train", {}).get(
+            "development_early_stop_relative_delta",
+            0.005,
+        )
+    )
+    if not 0.0 < relative_delta < 1.0:
+        raise ValueError(
+            "train.development_early_stop_relative_delta must be in (0, 1)"
+        )
+    if int(
+        cfg.get("train", {}).get(
+            "development_early_stop_patience",
+            2,
+        )
+    ) <= 0:
+        raise ValueError(
+            "train.development_early_stop_patience must be positive"
+        )
     if int(cfg.get("train", {}).get("lr_warmup_steps", 0)) < 0:
         raise ValueError("train.lr_warmup_steps must be non-negative")
     if (

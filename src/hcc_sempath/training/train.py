@@ -44,7 +44,7 @@ from .datasets import (
     read_packaged_tile_records,
     validate_teacher_cache,
 )
-from .engine import build_lr_scheduler, fit
+from .engine import _scheduler_contract, build_lr_scheduler, fit
 from .manifest import load_training_manifest
 from .prototype_labels import DEFAULT_CLASSIFICATION_CLASSES, load_prototype_labels
 from .roi import (
@@ -1154,6 +1154,15 @@ def _resume_contract(cfg: dict) -> dict:
         "tensorboard",
         "tensorboard_batch_interval",
         "tensorboard_log_dir",
+        "epochs",
+        "step_metrics_flush_steps",
+        "checkpoint_interval_steps",
+        "development_probe_interval_steps",
+        "development_probe_batches",
+        "development_early_stop",
+        "development_early_stop_min_step",
+        "development_early_stop_relative_delta",
+        "development_early_stop_patience",
     ):
         contract.get("train", {}).pop(key, None)
     return contract
@@ -1203,26 +1212,18 @@ def _validate_resume_contract(cfg: dict, resume_state: dict) -> None:
         )
 
 
-def _resolve_target_epochs(
+def _resolve_configured_epochs(
     cfg: dict,
     resume_state: dict | None,
-    requested: int,
 ) -> int:
     configured = int(cfg["train"]["epochs"])
     checkpoint_epoch = int((resume_state or {}).get("epoch", 0))
-    checkpoint_target = int(
-        (resume_state or {}).get("expected_epochs", configured)
-    )
-    target = int(requested) if int(requested) > 0 else checkpoint_target
-    if target < configured:
+    if configured < checkpoint_epoch:
         raise ValueError(
-            f"target epochs must be at least configured epochs ({configured})"
+            "train.epochs "
+            f"({configured}) precedes checkpoint epoch ({checkpoint_epoch})"
         )
-    if target < checkpoint_epoch:
-        raise ValueError(
-            f"target epochs ({target}) precede checkpoint epoch ({checkpoint_epoch})"
-        )
-    return target
+    return configured
 
 
 def _limit_records(records: list, limit: int, seed: int) -> list:
@@ -1406,15 +1407,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train HCC-SemPath distillation model.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", default="")
-    parser.add_argument(
-        "--target-epochs",
-        type=int,
-        default=0,
-        help=(
-            "Absolute terminal epoch for a resumed run. The original LR schedule "
-            "is preserved and remains clamped at min_lr after its planned end."
-        ),
-    )
     args = parser.parse_args()
     _probe.timeline_event("startup.begin", force=True)
     cfg = load_config(args.config)
@@ -2008,8 +2000,6 @@ def main() -> None:
             for key, value in resume_state["model"].items()
         }
         model.load_state_dict(state)
-    elif int(args.target_epochs) > 0:
-        raise ValueError("--target-epochs requires --resume")
     if bool(cfg["train"].get("compile", False)):
         _configure_compiled_training_for_gradient_diagnostics()
         model = torch.compile(model)
@@ -2018,14 +2008,15 @@ def main() -> None:
     _probe.timeline_event("startup.optimizer_built", force=True)
     if resume_state and "optimizer" in resume_state:
         optimizer.load_state_dict(resume_state["optimizer"])
-    scheduler = build_lr_scheduler(optimizer, cfg, len(train_loader))
+    scheduler_cfg = (
+        resume_state.get("config", cfg)
+        if resume_state is not None
+        else cfg
+    )
+    scheduler = build_lr_scheduler(optimizer, scheduler_cfg, len(train_loader))
     if resume_state and scheduler is not None and resume_state.get("scheduler") is not None:
         scheduler.load_state_dict(resume_state["scheduler"])
-    target_epochs = _resolve_target_epochs(
-        cfg,
-        resume_state,
-        int(args.target_epochs),
-    )
+    _resolve_configured_epochs(cfg, resume_state)
     metrics = fit(
         model,
         train_loader,
@@ -2035,8 +2026,11 @@ def main() -> None:
         device,
         cfg,
         scheduler=scheduler,
+        scheduler_contract=_scheduler_contract(
+            scheduler_cfg,
+            len(train_loader),
+        ),
         resume_state=resume_state,
-        target_epochs=target_epochs,
         prototype_refresh_loader=prototype_refresh_loader,
         spatial_prototype_refresh_loader=(
             spatial_prototype_refresh_loader

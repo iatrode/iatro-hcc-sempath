@@ -63,18 +63,19 @@ hcc-sempath train \
   --config configs/server/train_full.example.yaml \
   --resume outputs/hcc_sempath_v2/checkpoints/last.pt
 
-# Extend a completed run without restarting or re-expanding its LR schedule.
+# To extend a completed run, increase train.epochs in a tracked config and
+# resume from its checkpoint.
 hcc-sempath train \
   --config configs/server/train_full.example.yaml \
-  --resume outputs/hcc_sempath_v2/checkpoints/last.pt \
-  --target-epochs 6
+  --resume outputs/hcc_sempath_v2/checkpoints/last.pt
 ```
 
 Checkpoints retain the resolved configuration, optimizer and scheduler states,
 restart-relevant optimizer hyperparameters, the explicit scheduler contract,
 RNG state, dynamic-prototype refresh positions, and the absolute terminal
-epoch. Resuming without `--target-epochs` continues toward the terminal epoch
-stored in the checkpoint; a larger absolute target safely extends the run.
+epoch. A resumed run takes its terminal epoch only from `train.epochs` in the
+supplied configuration; increasing that value records a continuation while
+preserving the optimizer and scheduler state.
 
 Evaluate retained teacher alignment and classification:
 

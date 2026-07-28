@@ -9,3 +9,9 @@ train:
   epochs: 3
   max_val_batches: 1
   max_eval_batches: 1
+  development_probe_interval_steps: 1000
+  development_probe_batches: 64
+  development_early_stop: true
+  development_early_stop_min_step: 4000
+  development_early_stop_relative_delta: 0.005
+  development_early_stop_patience: 2

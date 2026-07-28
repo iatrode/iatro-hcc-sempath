@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 
 import pytest
@@ -12,6 +13,9 @@ from hcc_sempath.training.engine import (
     _objective_gradient_diagnostics,
     _optimizer_step,
     _should_stop_for_alignment,
+    _development_early_stop_state_from_csv,
+    _truncate_csv_after_step,
+    _update_development_early_stop_state,
     build_lr_scheduler,
     fit,
     run_epoch,
@@ -26,7 +30,7 @@ from hcc_sempath.training.train import (
     _build_optimizer,
     _configure_compiled_training_for_gradient_diagnostics,
     _resume_contract,
-    _resolve_target_epochs,
+    _resolve_configured_epochs,
 )
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
@@ -384,21 +388,33 @@ def test_run_epoch_joint_classification_spatial_route_keeps_full_bank_prototypes
     }
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
     checkpoints = []
+    callback_order = []
+
+    def development_probe(*args):
+        callback_order.append("probe")
+        return True
+
+    def step_checkpoint(*args):
+        callback_order.append("checkpoint")
+        checkpoints.append(args)
 
     result = run_epoch(
         model,
-        [batch],
+        [batch, batch],
         prototypes,
         optimizer,
         torch.device("cpu"),
         cfg,
         train=True,
-        step_checkpoint=lambda *args: checkpoints.append(args),
+        development_probe=development_probe,
+        step_checkpoint=step_checkpoint,
     )
 
     assert result["global_step_end"] == 1
     assert result["spatial_supervised_step_end"] == 1
+    assert result["batch_in_epoch_end"] == 1
     assert len(checkpoints) == 1
+    assert callback_order == ["probe", "checkpoint"]
     assert checkpoints[0][:4] == (1, 1, 1, 1)
     assert checkpoints[0][4]["batches"] == 1
     assert checkpoints[0][4]["tiles"] == 1
@@ -693,7 +709,7 @@ def test_teacher_dims_require_configured_teacher_entries() -> None:
         teacher_dims(cfg, ["gigapath", "uni2_h", "virchow2"])
 
 
-def test_resume_contract_freezes_data_seed_preprocessing_and_epochs() -> None:
+def test_resume_contract_freezes_data_seed_and_preprocessing() -> None:
     cfg = {
         "runtime": {
             "device": "cuda",
@@ -728,6 +744,7 @@ def test_resume_contract_freezes_data_seed_preprocessing_and_epochs() -> None:
         "data": {**cfg["data"], "num_workers": 2, "prefetch_factor": 1},
         "train": {
             **cfg["train"],
+            "epochs": 120,
             "log_interval": 0,
             "tensorboard": False,
         },
@@ -738,7 +755,6 @@ def test_resume_contract_freezes_data_seed_preprocessing_and_epochs() -> None:
         ("runtime", "seed", 14),
         ("data", "mean", [0.2, 0.2, 0.3]),
         ("data", "prototype_paths", {"teacher": "other.pt"}),
-        ("train", "epochs", 101),
         ("train", "max_grad_norm", 2.0),
     ):
         changed = {
@@ -808,6 +824,28 @@ def test_training_config_rejects_spatial_teacher_alignment_early_stop() -> None:
     }
 
     with pytest.raises(ValueError, match="terminal epoch"):
+        validate_training_config(cfg, ["teacher"])
+
+
+def test_development_early_stop_cannot_precede_active_loss_ramps() -> None:
+    cfg = {
+        "data": {"teachers": ["teacher"]},
+        "model": {"teacher_dims": {"teacher": 8}},
+        "loss": {
+            "teacher_weights": {"teacher": 1.0},
+            "expert_supervision_start_step": 1000,
+            "expert_supervision_ramp_steps": 1000,
+            "prototype_filter_weight": 0.0,
+            "zhcc_response_weight": 0.0,
+        },
+        "train": {
+            "development_probe_interval_steps": 1000,
+            "development_early_stop": True,
+            "development_early_stop_min_step": 1500,
+        },
+    }
+
+    with pytest.raises(ValueError, match="final active loss ramp"):
         validate_training_config(cfg, ["teacher"])
 
 
@@ -914,18 +952,115 @@ def test_spatial_fit_reports_terminal_epoch_and_sets_epoch_before_iter(
     assert events.index(("train_set", 1)) < events.index(("train_iter", 1))
 
 
-def test_resume_target_epochs_are_absolute_and_restartable() -> None:
-    cfg = {"train": {"epochs": 3}}
+def test_resume_terminal_epoch_comes_only_from_config() -> None:
+    cfg = {"train": {"epochs": 6}}
     completed = {"epoch": 3, "expected_epochs": 3}
     extended = {"epoch": 4, "expected_epochs": 6}
 
-    assert _resolve_target_epochs(cfg, completed, 6) == 6
-    assert _resolve_target_epochs(cfg, extended, 0) == 6
+    assert _resolve_configured_epochs(cfg, completed) == 6
+    assert _resolve_configured_epochs(cfg, extended) == 6
 
-    with pytest.raises(ValueError, match="configured epochs"):
-        _resolve_target_epochs(cfg, completed, 2)
     with pytest.raises(ValueError, match="checkpoint epoch"):
-        _resolve_target_epochs(cfg, extended, 3)
+        _resolve_configured_epochs({"train": {"epochs": 3}}, extended)
+
+
+def test_resume_truncates_metric_rows_after_checkpoint_step(tmp_path) -> None:
+    path = tmp_path / "step_metrics.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["global_step", "loss"],
+        )
+        writer.writeheader()
+        writer.writerows(
+            [
+                {"global_step": 3999, "loss": 0.3},
+                {"global_step": 4000, "loss": 0.29},
+                {"global_step": 4001, "loss": 0.28},
+            ]
+        )
+
+    _truncate_csv_after_step(path, 4000)
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [int(row["global_step"]) for row in rows] == [3999, 4000]
+
+
+def test_early_stop_state_can_be_recovered_from_existing_probe_csv(
+    tmp_path,
+) -> None:
+    path = tmp_path / "development_metrics.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["global_step", "loss"],
+        )
+        writer.writeheader()
+        writer.writerows(
+            [
+                {"global_step": 3000, "loss": 0.3000},
+                {"global_step": 4000, "loss": 0.2900},
+                {"global_step": 5000, "loss": 0.2890},
+                {"global_step": 6000, "loss": 0.2880},
+            ]
+        )
+
+    state = _development_early_stop_state_from_csv(
+        path,
+        maximum_step=6000,
+        minimum_step=4000,
+        relative_delta=0.005,
+    )
+
+    assert state["last_probe_step"] == 6000
+    assert state["previous_loss"] == pytest.approx(0.288)
+    assert state["consecutive_low_gain"] == 2
+
+
+def test_development_early_stop_requires_two_consecutive_small_gains() -> None:
+    state = {
+        "previous_loss": 0.300,
+        "consecutive_low_gain": 0,
+        "last_probe_step": 3000,
+        "triggered": False,
+    }
+
+    _, stopped = _update_development_early_stop_state(
+        state,
+        step=4000,
+        loss=0.290,
+        enabled=True,
+        minimum_step=4000,
+        relative_delta=0.005,
+        patience=2,
+    )
+    assert not stopped
+    assert state["consecutive_low_gain"] == 0
+
+    gain, stopped = _update_development_early_stop_state(
+        state,
+        step=5000,
+        loss=0.289,
+        enabled=True,
+        minimum_step=4000,
+        relative_delta=0.005,
+        patience=2,
+    )
+    assert gain == pytest.approx((0.290 - 0.289) / 0.290)
+    assert not stopped
+
+    _, stopped = _update_development_early_stop_state(
+        state,
+        step=6000,
+        loss=0.288,
+        enabled=True,
+        minimum_step=4000,
+        relative_delta=0.005,
+        patience=2,
+    )
+    assert stopped
+    assert state["triggered"] is True
 
 
 def test_fit_resumes_the_same_epoch_from_saved_batch_cursor(

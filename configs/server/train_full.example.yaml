@@ -114,6 +114,10 @@ train:
   checkpoint_interval_steps: 1000
   development_probe_interval_steps: 1000
   development_probe_batches: 64
+  development_early_stop: true
+  development_early_stop_min_step: 5000
+  development_early_stop_relative_delta: 0.005
+  development_early_stop_patience: 2
   # Re-encode the complete fixed expert banks in the evolving student.
   # Batch sizes are compute chunks only; every refresh uses every bank tile.
   dynamic_prototype_refresh_steps: 500
