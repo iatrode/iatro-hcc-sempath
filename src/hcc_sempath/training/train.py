@@ -2005,7 +2005,14 @@ def main() -> None:
         model.load_state_dict(state)
     if bool(cfg["train"].get("compile", False)):
         _configure_compiled_training_for_gradient_diagnostics()
-        model = torch.compile(model)
+        # Population and expert-replay batches intentionally have different
+        # shapes. Inductor CUDA Graph private pools otherwise churn between
+        # those shapes, releasing most VRAM and stalling every spatial replay.
+        # Keep Inductor fusion while using the regular CUDA allocator.
+        model = torch.compile(
+            model,
+            options={"triton.cudagraphs": False},
+        )
     _probe.timeline_event("startup.model_compile_wrapped", force=True)
     optimizer = _build_optimizer(model, cfg, device)
     _probe.timeline_event("startup.optimizer_built", force=True)
