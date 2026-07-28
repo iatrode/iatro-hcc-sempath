@@ -7,9 +7,19 @@ data:
   train_tile_fraction: 0.10
   val_tile_fraction: 0.10
 
-# Only training duration is reduced. The full population stream, complete
-# fixed classification/spatial expert union, LR warm-up, and expert-intervention schedule remain
-# identical to the terminal configuration.
+loss:
+  # Preserve the intervention phase reached by the terminal run despite the
+  # shorter one-tenth population epoch.
+  expert_supervision_start_step: 1000
+  expert_supervision_ramp_steps: 1000
+  prototype_filter_start_step: 1500
+  prototype_filter_ramp_steps: 1000
+  zhcc_response_start_step: 1500
+  zhcc_response_ramp_steps: 1000
+
+# Only the population view and training duration are reduced. The complete
+# fixed classification/spatial expert banks and all objective definitions are
+# unchanged.
 train:
   epochs: 20
   max_val_batches: 256
