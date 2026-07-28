@@ -8,7 +8,7 @@ data:
   val_tile_fraction: 0.10
 
 # Only training duration is reduced. The full population stream, complete
-# fixed L1/L2 expert union, LR warm-up, and expert-intervention schedule remain
+# fixed classification/spatial expert union, LR warm-up, and expert-intervention schedule remain
 # identical to the terminal configuration.
 train:
   epochs: 20

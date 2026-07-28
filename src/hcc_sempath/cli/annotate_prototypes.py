@@ -41,7 +41,7 @@ CONTEXT_MAX_RADIUS = 8
 CONTEXT_WORKERS = 8
 MAX_OPEN_IAC_VIEWERS = 8
 
-L1_PROTOTYPES = [
+CLASSIFICATION_PROTOTYPES = [
     "HCC-tumor-well-differentiated",
     "HCC-tumor-moderately-differentiated",
     "HCC-tumor-poorly-differentiated",
@@ -50,22 +50,22 @@ L1_PROTOTYPES = [
     "Degenerative-material",
 ]
 
-L2_PROTOTYPES = [
-    "hepatocellular-parenchyma-present",
-    "necrosis-present",
-    "hemorrhage-present",
-    "bile-pigment-present",
-    "inflammatory-cell-present",
+SPATIAL_PROTOTYPES = [
+    "hepatocellular-parenchyma",
+    "necrosis",
+    "hemorrhage",
+    "bile-pigment",
+    "inflammatory-cell",
     "fibroblast",
-    "fibrous-stroma-present",
-    "steatosis-vacuolation-present",
-    "vascular-structure-present",
+    "fibrous-stroma",
+    "steatosis-vacuolation",
+    "small-vessel",
     "large-vessel",
-    "ductular-portal-present",
+    "ductular-portal",
 ]
 
 # Spatial ROI taxonomy.
-ROI_L2_PROTOTYPES = list(L2_PROTOTYPES)
+ROI_SPATIAL_PROTOTYPES = list(SPATIAL_PROTOTYPES)
 ROI_INFORMATION_SUPPORT_THRESHOLD = 0.80
 
 
@@ -124,9 +124,9 @@ class RoiCandidateQueue:
         candidates = payload.get("candidates")
         if not isinstance(candidates, list) or not candidates:
             raise ValueError("ROI candidate pool requires a non-empty candidates list")
-        self.attributes = list(payload.get("l2_prototypes") or ROI_L2_PROTOTYPES)
-        if self.attributes != ROI_L2_PROTOTYPES:
-            raise ValueError(f"ROI candidate pool taxonomy must be {ROI_L2_PROTOTYPES}")
+        self.attributes = list(payload.get("spatial_prototypes") or ROI_SPATIAL_PROTOTYPES)
+        if self.attributes != ROI_SPATIAL_PROTOTYPES:
+            raise ValueError(f"ROI candidate pool taxonomy must be {ROI_SPATIAL_PROTOTYPES}")
         self.candidates: list[dict] = []
         self.by_tile_id: dict[str, dict] = {}
         for rank, item in enumerate(candidates):
@@ -136,15 +136,15 @@ class RoiCandidateQueue:
             record = dict(item)
             record["tile_id"] = tile_id
             record["rank"] = int(item.get("rank", rank))
-            record["source_l2"] = [
-                name for name in item.get("source_l2", []) if name in self.attributes
+            record["source_spatial"] = [
+                name for name in item.get("source_spatial", []) if name in self.attributes
             ]
             record["priority_attributes"] = [
-                name for name in item.get("priority_attributes", record["source_l2"])
+                name for name in item.get("priority_attributes", record["source_spatial"])
                 if name in self.attributes
             ]
             if not record["priority_attributes"]:
-                record["priority_attributes"] = list(record["source_l2"])
+                record["priority_attributes"] = list(record["source_spatial"])
             self.candidates.append(record)
             self.by_tile_id[tile_id] = record
         self.information_report_path = (
@@ -203,20 +203,7 @@ class RoiCandidateQueue:
                 if isinstance(pooled_support, (int, float)):
                     information_support = float(pooled_support)
                 else:
-                    # Compatibility with reports generated before the
-                    # pooled classification/spatial stopping rule.
-                    legacy_supports = value.get(
-                        "teacher_low_gain_support_by_teacher_ratio",
-                        {},
-                    ).get("0.35", {})
-                    finite_supports = [
-                        float(support)
-                        for support in legacy_supports.values()
-                        if isinstance(support, (int, float))
-                    ]
-                    information_support = (
-                        min(finite_supports) if finite_supports else 0.0
-                    )
+                    information_support = 0.0
                 if status == "provisionally_stable":
                     urgency = 0.0
                 elif status == "coverage_limited":
@@ -261,7 +248,7 @@ class RoiCandidateQueue:
             candidate = self.by_tile_id.get(tile_id)
             if candidate is None:
                 continue
-            for source in candidate["source_l2"]:
+            for source in candidate["source_spatial"]:
                 reviewed[source] += 1
                 positive[source].update(
                     target for target in targets if target in self.attributes
@@ -309,7 +296,7 @@ class RoiCandidateQueue:
             direct = [
                 item
                 for item in relevant
-                if name in item["source_l2"]
+                if name in item["source_spatial"]
             ]
             reviewed = sum(
                 item["tile_id"] in processed_tile_ids
@@ -369,7 +356,7 @@ class RoiCandidateQueue:
             if item["tile_id"] not in processed_tile_ids
             and item["tile_id"] != exclude_tile_id
             and (allowed_tile_ids is None or item["tile_id"] in allowed_tile_ids)
-            and item["source_l2"]
+            and item["source_spatial"]
         ]
         probabilities = self._source_target_probabilities(
             roi_positive_by_tile or {},
@@ -381,7 +368,7 @@ class RoiCandidateQueue:
                 target: max(
                     (
                         probabilities[source][target]
-                        for source in item["source_l2"]
+                        for source in item["source_spatial"]
                         if source in probabilities
                     ),
                     default=0.0,
@@ -428,7 +415,7 @@ class RoiCandidateQueue:
                 for target in ranked_targets
                 if (
                     target in deficient
-                    and target in item["source_l2"]
+                    and target in item["source_spatial"]
                 )
             ]
             weighted.append(
@@ -449,7 +436,7 @@ class RoiCandidateQueue:
         )
         remaining_direct = {
             name: sum(
-                name in item["source_l2"]
+                name in item["source_spatial"]
                 for item in candidates
             )
             for name in active
@@ -776,7 +763,7 @@ def _is_counted_annotation(item: dict) -> bool:
     review_decision = str(item.get("review_decision") or "").strip().lower()
     if decision in skip_values or review_decision in skip_values:
         return False
-    return bool(str(item.get("l1") or item.get("level1_label") or "").strip())
+    return bool(str(item.get("classification") or item.get("classification_label") or "").strip())
 
 
 def _ordered_unique(values) -> list[str]:
@@ -802,14 +789,14 @@ def _state_prototypes(payload: dict, key: str, fallback: list[str], annotation_f
     return _ordered_unique(values)
 
 
-def _default_label_definitions(level: str, values: list[str]) -> list[dict]:
+def _default_label_definitions(task: str, values: list[str]) -> list[dict]:
     return [
-        {"id": value, "name": value, "level": level, "active": True, "order": index}
+        {"id": value, "name": value, "task": task, "active": True, "order": index}
         for index, value in enumerate(values)
     ]
 
 
-def _normalized_label_definitions(level: str, values: list[str], raw: object) -> list[dict]:
+def _normalized_label_definitions(task: str, values: list[str], raw: object) -> list[dict]:
     definitions: list[dict] = []
     seen: set[str] = set()
     if isinstance(raw, list):
@@ -822,7 +809,7 @@ def _normalized_label_definitions(level: str, values: list[str], raw: object) ->
             definitions.append({
                 "id": label_id,
                 "name": str(item.get("name") or label_id).strip() or label_id,
-                "level": level,
+                "task": task,
                 "active": bool(item.get("active", True)),
                 "order": int(item.get("order", index)),
             })
@@ -830,7 +817,7 @@ def _normalized_label_definitions(level: str, values: list[str], raw: object) ->
     for value in values:
         if value not in seen:
             definitions.append({
-                "id": value, "name": value, "level": level,
+                "id": value, "name": value, "task": task,
                 "active": True, "order": len(definitions),
             })
             seen.add(value)
@@ -843,7 +830,7 @@ class AnnotationState:
         state_path: str | Path,
         input_path: str | Path,
         *,
-        l2_prototypes: list[str] | None = None,
+        spatial_prototypes: list[str] | None = None,
         require_complete_roi: bool = False,
     ) -> None:
         self.state_path = Path(state_path)
@@ -853,12 +840,12 @@ class AnnotationState:
         self.extra_payload: dict = {}
         self.last_iac = ""
         self.last_row: int | None = None
-        self.l1_prototypes = list(L1_PROTOTYPES)
-        self.l2_prototypes = list(l2_prototypes or L2_PROTOTYPES)
+        self.classification_prototypes = list(CLASSIFICATION_PROTOTYPES)
+        self.spatial_prototypes = list(spatial_prototypes or SPATIAL_PROTOTYPES)
         self.require_complete_roi = bool(require_complete_roi)
         self.label_definitions = {
-            "l1": _default_label_definitions("l1", self.l1_prototypes),
-            "l2": _default_label_definitions("l2", self.l2_prototypes),
+            "classification": _default_label_definitions("classification", self.classification_prototypes),
+            "spatial": _default_label_definitions("spatial", self.spatial_prototypes),
         }
         self.revision = 0
         if self.state_path.exists():
@@ -869,40 +856,40 @@ class AnnotationState:
             self.last_iac = str(payload.get("last_iac") or "")
             raw_last_row = payload.get("last_row")
             self.last_row = int(raw_last_row) if raw_last_row is not None else None
-            self.l1_prototypes = _state_prototypes(payload, "l1_prototypes", L1_PROTOTYPES, "l1")
-            if l2_prototypes is None:
-                self.l2_prototypes = _state_prototypes(payload, "l2_prototypes", L2_PROTOTYPES, "l2")
+            self.classification_prototypes = _state_prototypes(payload, "classification_prototypes", CLASSIFICATION_PROTOTYPES, "classification")
+            if spatial_prototypes is None:
+                self.spatial_prototypes = _state_prototypes(payload, "spatial_prototypes", SPATIAL_PROTOTYPES, "spatial")
             else:
-                self.l2_prototypes = list(l2_prototypes)
+                self.spatial_prototypes = list(spatial_prototypes)
             raw_definitions = payload.get("label_definitions") or {}
             self.label_definitions = {
-                "l1": _normalized_label_definitions("l1", self.l1_prototypes, raw_definitions.get("l1")),
-                "l2": _normalized_label_definitions("l2", self.l2_prototypes, raw_definitions.get("l2")),
+                "classification": _normalized_label_definitions("classification", self.classification_prototypes, raw_definitions.get("classification")),
+                "spatial": _normalized_label_definitions("spatial", self.spatial_prototypes, raw_definitions.get("spatial")),
             }
             self._sync_active_prototypes()
             known_keys = {
-                "version", "input_path", "l1_prototypes", "l2_prototypes",
+                "version", "input_path", "classification_prototypes", "spatial_prototypes",
                 "annotations", "skipped", "last_iac", "last_row", "roi_mode", "label_definitions",
             }
             self.extra_payload = {key: value for key, value in payload.items() if key not in known_keys}
             LOG.info(
-                "state_load path=%s annotations=%d skipped=%d l1=%d l2=%d input=%s",
+                "state_load path=%s annotations=%d skipped=%d classification=%d spatial=%d input=%s",
                 self.state_path,
                 len(self.annotations),
                 len(self.skipped),
-                len(self.l1_prototypes),
-                len(self.l2_prototypes),
+                len(self.classification_prototypes),
+                len(self.spatial_prototypes),
                 self.input_path,
             )
         else:
             LOG.info("state_new path=%s input=%s", self.state_path, self.input_path)
 
     def _sync_active_prototypes(self) -> None:
-        self.l1_prototypes = [item["id"] for item in self.label_definitions["l1"] if item["active"]]
-        self.l2_prototypes = [item["id"] for item in self.label_definitions["l2"] if item["active"]]
+        self.classification_prototypes = [item["id"] for item in self.label_definitions["classification"] if item["active"]]
+        self.spatial_prototypes = [item["id"] for item in self.label_definitions["spatial"] if item["active"]]
 
     def labels_json(self) -> dict:
-        return {"revision": self.revision, "levels": self.label_definitions}
+        return {"revision": self.revision, "label_sets": self.label_definitions}
 
     def review_completion(self, review_id: str) -> tuple[set[str], set[str]]:
         passes = self.extra_payload.get("review_passes")
@@ -938,51 +925,51 @@ class AnnotationState:
             "skipped": sorted(skipped_ids),
         }
 
-    def _label_references(self, level: str, label_id: str) -> int:
-        if level == "l1":
-            return sum(1 for item in self.annotations.values() if item.get("l1") == label_id)
-        return sum(1 for item in self.annotations.values() if label_id in item.get("l2", []))
+    def _label_references(self, task: str, label_id: str) -> int:
+        if task == "classification":
+            return sum(1 for item in self.annotations.values() if item.get("classification") == label_id)
+        return sum(1 for item in self.annotations.values() if label_id in item.get("spatial", []))
 
-    def change_label(self, level: str, operation: str, *, label_id: str = "", name: str = "") -> dict:
-        level = level.lower()
-        if level not in {"l1", "l2"}:
-            raise ValueError("label level must be l1 or l2")
-        definitions = self.label_definitions[level]
+    def change_label(self, task: str, operation: str, *, label_id: str = "", name: str = "") -> dict:
+        task = task.lower()
+        if task not in {"classification", "spatial"}:
+            raise ValueError("label task must be classification or spatial")
+        definitions = self.label_definitions[task]
         current = next((item for item in definitions if item["id"] == label_id), None)
         clean_name = name.strip()
         if operation == "add":
             if not clean_name:
                 raise ValueError("label name is required")
             if any(item["name"].casefold() == clean_name.casefold() for item in definitions):
-                raise ValueError(f"duplicate {level.upper()} label name: {clean_name}")
+                raise ValueError(f"duplicate {task.upper()} label name: {clean_name}")
             slug = re.sub(r"[^a-z0-9]+", "-", clean_name.lower()).strip("-") or "label"
-            base = f"{level}_{slug}"
+            base = f"{task}_{slug}"
             label_id = base
             suffix = 2
             known = {item["id"] for item in definitions}
             while label_id in known:
                 label_id = f"{base}-{suffix}"
                 suffix += 1
-            definitions.append({"id": label_id, "name": clean_name, "level": level, "active": True, "order": len(definitions)})
+            definitions.append({"id": label_id, "name": clean_name, "task": task, "active": True, "order": len(definitions)})
         elif current is None:
-            raise ValueError(f"unknown {level.upper()} label: {label_id}")
+            raise ValueError(f"unknown {task.upper()} label: {label_id}")
         elif operation == "rename":
             if not clean_name:
                 raise ValueError("label name is required")
             if any(item["id"] != label_id and item["name"].casefold() == clean_name.casefold() for item in definitions):
-                raise ValueError(f"duplicate {level.upper()} label name: {clean_name}")
+                raise ValueError(f"duplicate {task.upper()} label name: {clean_name}")
             current["name"] = clean_name
         elif operation == "archive":
-            if level == "l1" and sum(bool(item["active"]) for item in definitions) <= 1 and current["active"]:
+            if task == "classification" and sum(bool(item["active"]) for item in definitions) <= 1 and current["active"]:
                 raise ValueError("classification requires at least one active label")
             current["active"] = False
         elif operation == "restore":
             current["active"] = True
         elif operation == "delete":
-            references = self._label_references(level, label_id)
+            references = self._label_references(task, label_id)
             if references:
                 raise ValueError(f"label has {references} annotation reference(s); archive it instead")
-            if level == "l1" and current["active"] and sum(bool(item["active"]) for item in definitions) <= 1:
+            if task == "classification" and current["active"] and sum(bool(item["active"]) for item in definitions) <= 1:
                 raise ValueError("classification requires at least one active label")
             definitions.remove(current)
         else:
@@ -1005,8 +992,8 @@ class AnnotationState:
         return dict(value) if value is not None else None
 
     def roi_positive_counts(self) -> dict[str, int]:
-        counts = {name: 0 for name in self.l2_prototypes}
-        expected = set(self.l2_prototypes)
+        counts = {name: 0 for name in self.spatial_prototypes}
+        expected = set(self.spatial_prototypes)
         for item in self.annotations.values():
             roi = list(item.get("roi") or [])
             positive = {
@@ -1048,22 +1035,22 @@ class AnnotationState:
         self,
         package: AnnotationPackage,
         record: IacRecord,
-        l1: str,
-        l2: list[str],
+        classification: str,
+        spatial: list[str],
         roi: list[dict] | None = None,
         *,
         review_id: str | None = None,
     ) -> None:
-        known_l1 = {item["id"] for item in self.label_definitions["l1"]}
-        known_l2 = {item["id"] for item in self.label_definitions["l2"]}
-        if l1 not in known_l1:
-            raise ValueError(f"unknown classification prototype: {l1}")
-        unknown_l2 = sorted(set(l2) - known_l2)
-        if unknown_l2:
-            raise ValueError(f"unknown spatial prototype(s): {unknown_l2}")
+        known_classification = {item["id"] for item in self.label_definitions["classification"]}
+        known_spatial = {item["id"] for item in self.label_definitions["spatial"]}
+        if classification not in known_classification:
+            raise ValueError(f"unknown classification prototype: {classification}")
+        unknown_spatial = sorted(set(spatial) - known_spatial)
+        if unknown_spatial:
+            raise ValueError(f"unknown spatial prototype(s): {unknown_spatial}")
         roi = list(roi or [])
         for item in roi:
-            if item.get("attribute") not in known_l2:
+            if item.get("attribute") not in known_spatial:
                 raise ValueError(f"unknown spatial attribute: {item.get('attribute')}")
             if item.get("state", "positive") not in {"positive", "negative"}:
                 raise ValueError(f"unknown ROI state: {item.get('state')}")
@@ -1090,10 +1077,10 @@ class AnnotationState:
             conflict = sorted(positive_roi & negative_reviewed)
             if conflict:
                 raise ValueError(f"ROI class cannot be both positive and negative: {conflict}")
-            if set(l2) != positive_roi:
+            if set(spatial) != positive_roi:
                 raise ValueError(
                     f"spatial selections must equal positive ROI attributes: "
-                    f"selected={sorted(l2)} roi={sorted(positive_roi)}"
+                    f"selected={sorted(spatial)} roi={sorted(positive_roi)}"
                 )
         payload = {
             "dataset": package.dataset,
@@ -1105,8 +1092,8 @@ class AnnotationState:
             "split": record.split,
             "x": record.display_x,
             "y": record.display_y,
-            "l1": l1,
-            "l2": list(l2),
+            "classification": classification,
+            "spatial": list(spatial),
             "roi": roi,
             "roi_complete_all": False,
             "roi_reviewed": self.require_complete_roi,
@@ -1124,14 +1111,14 @@ class AnnotationState:
         self.revision += 1
         self.flush()
         LOG.info(
-            "annotation_save iac=%s row=%d tile_id=%s x=%d y=%d l1=%s l2=%s total_annotations=%d",
+            "annotation_save iac=%s row=%d tile_id=%s x=%d y=%d classification=%s spatial=%s total_annotations=%d",
             package.rel_path,
             record.row,
             record.tile_id,
             record.display_x,
             record.display_y,
-            l1,
-            ",".join(l2) if l2 else "-",
+            classification,
+            ",".join(spatial) if spatial else "-",
             len(self.annotations),
         )
 
@@ -1184,8 +1171,8 @@ class AnnotationState:
         payload.update({
             "version": 2,
             "input_path": self.input_path,
-            "l1_prototypes": self.l1_prototypes,
-            "l2_prototypes": self.l2_prototypes,
+            "classification_prototypes": self.classification_prototypes,
+            "spatial_prototypes": self.spatial_prototypes,
             "last_iac": self.last_iac,
             "last_row": self.last_row,
             "annotations": self.annotations,
@@ -1201,7 +1188,7 @@ class AnnotationState:
         LOG.info("state_flush json=%s csv=%s annotations=%d", self.state_path, self.csv_path, len(self.annotations))
 
     def _write_csv(self) -> None:
-        base_fields = ["dataset", "iac", "iac_path", "tile_id", "row", "slide", "split", "x", "y", "l1", "l1_name", "l2", "l2_names"]
+        base_fields = ["dataset", "iac", "iac_path", "tile_id", "row", "slide", "split", "x", "y", "classification", "classification_name", "spatial", "spatial_names"]
         extra_fields = sorted(
             {
                 key
@@ -1216,11 +1203,11 @@ class AnnotationState:
             writer.writeheader()
             for item in sorted(self.annotations.values(), key=lambda value: (value["iac"], value["row"])):
                 row = dict(item)
-                l1_names = {entry["id"]: entry["name"] for entry in self.label_definitions["l1"]}
-                l2_names = {entry["id"]: entry["name"] for entry in self.label_definitions["l2"]}
-                row["l1_name"] = l1_names.get(row.get("l1", ""), row.get("l1", ""))
-                row["l2_names"] = ";".join(l2_names.get(value, value) for value in row.get("l2", []))
-                row["l2"] = ";".join(row.get("l2", []))
+                classification_names = {entry["id"]: entry["name"] for entry in self.label_definitions["classification"]}
+                spatial_names = {entry["id"]: entry["name"] for entry in self.label_definitions["spatial"]}
+                row["classification_name"] = classification_names.get(row.get("classification", ""), row.get("classification", ""))
+                row["spatial_names"] = ";".join(spatial_names.get(value, value) for value in row.get("spatial", []))
+                row["spatial"] = ";".join(row.get("spatial", []))
                 writer.writerow(row)
 
 
@@ -1260,7 +1247,7 @@ class AnnotationData:
         requested_priority = tuple(dict.fromkeys(
             str(name).strip() for name in (roi_priority_attributes or ()) if str(name).strip()
         ))
-        unknown_priority = set(requested_priority) - set(ROI_L2_PROTOTYPES)
+        unknown_priority = set(requested_priority) - set(ROI_SPATIAL_PROTOTYPES)
         if unknown_priority:
             raise ValueError(f"unknown ROI navigation priority attributes: {sorted(unknown_priority)}")
         self.roi_priority_attributes = requested_priority
@@ -1275,7 +1262,7 @@ class AnnotationData:
         self.state = AnnotationState(
             state_path,
             input_path,
-            l2_prototypes=ROI_L2_PROTOTYPES if self.roi_mode else None,
+            spatial_prototypes=ROI_SPATIAL_PROTOTYPES if self.roi_mode else None,
             require_complete_roi=self.roi_mode,
         )
         if self.priority_queue is not None:
@@ -1455,7 +1442,7 @@ class AnnotationData:
             processed_tile_ids=processed_tile_ids,
             roi_positive_counts=self.state.roi_positive_counts(),
             roi_positive_by_tile={
-                str(item["tile_id"]): set(item.get("l2", []))
+                str(item["tile_id"]): set(item.get("spatial", []))
                 for item in self.state.annotations.values()
                 if item.get("tile_id")
             },
@@ -1522,20 +1509,20 @@ class AnnotationData:
             "skipped": sum(item["skipped"] for item in lightweight_by_package.values()),
         }
         overall["remaining"] = max(0, overall["total"] - overall["annotated"] - overall["skipped"])
-        l1_counts = {name: 0 for name in self.state.l1_prototypes}
-        l2_counts = {name: 0 for name in self.state.l2_prototypes}
+        classification_counts = {name: 0 for name in self.state.classification_prototypes}
+        spatial_counts = {name: 0 for name in self.state.spatial_prototypes}
         for key, item in self.state.annotations.items():
             if key in self.state.skipped or not _is_counted_annotation(item):
                 continue
-            l1_counts[item["l1"]] = l1_counts.get(item["l1"], 0) + 1
-            for label in item["l2"]:
-                l2_counts[label] = l2_counts.get(label, 0) + 1
-        package_l1_counts = {name: 0 for name in self.state.l1_prototypes}
-        package_l2_counts = {name: 0 for name in self.state.l2_prototypes}
+            classification_counts[item["classification"]] = classification_counts.get(item["classification"], 0) + 1
+            for label in item["spatial"]:
+                spatial_counts[label] = spatial_counts.get(label, 0) + 1
+        package_classification_counts = {name: 0 for name in self.state.classification_prototypes}
+        package_spatial_counts = {name: 0 for name in self.state.spatial_prototypes}
         for item in self.state.counted_annotations_for_package(package):
-            package_l1_counts[item["l1"]] = package_l1_counts.get(item["l1"], 0) + 1
-            for label in item["l2"]:
-                package_l2_counts[label] = package_l2_counts.get(label, 0) + 1
+            package_classification_counts[item["classification"]] = package_classification_counts.get(item["classification"], 0) + 1
+            for label in item["spatial"]:
+                package_spatial_counts[label] = package_spatial_counts.get(label, 0) + 1
         LOG.info(
             "progress_read iac=%s annotated=%d total=%d remaining=%d overall_annotated=%d overall_total=%d",
             package.rel_path,
@@ -1586,10 +1573,10 @@ class AnnotationData:
         return {
             "package": counts,
             "overall": overall,
-            "l1": l1_counts,
-            "l2": l2_counts,
-            "package_l1": package_l1_counts,
-            "package_l2": package_l2_counts,
+            "classification": classification_counts,
+            "spatial": spatial_counts,
+            "package_classification": package_classification_counts,
+            "package_spatial": package_spatial_counts,
             "roi_counts": roi_counts,
             "roi_priority_attributes": roi_priority_attributes,
             "roi_information_policy": roi_information_policy,
@@ -1757,11 +1744,11 @@ class AnnotationData:
                 record = remaining_by_tile[candidate["tile_id"]]
                 if self._is_random_candidate(pkg_idx, record):
                     LOG.info(
-                        "random_tile_roi_hint iac=%s row=%d tile_id=%s source_l2=%s targets=%s",
+                        "random_tile_roi_hint iac=%s row=%d tile_id=%s source_spatial=%s targets=%s",
                         target_package.rel_path,
                         record.row,
                         record.tile_id,
-                        ",".join(candidate["source_l2"]),
+                        ",".join(candidate["source_spatial"]),
                         ",".join(
                             candidate.get(
                                 "dynamic_priority_attributes",
@@ -1826,11 +1813,11 @@ class AnnotationData:
                         )
                     if record is not None and self._is_random_candidate(p_idx, record):
                         LOG.info(
-                            "random_tile_global_roi_hint iac=%s row=%d tile_id=%s source_l2=%s targets=%s",
+                            "random_tile_global_roi_hint iac=%s row=%d tile_id=%s source_spatial=%s targets=%s",
                             pkg.rel_path,
                             record.row,
                             record.tile_id,
-                            ",".join(chosen_candidate["source_l2"]),
+                            ",".join(chosen_candidate["source_spatial"]),
                             ",".join(
                                 chosen_candidate.get(
                                     "dynamic_priority_attributes",
@@ -1944,8 +1931,8 @@ class AnnotationData:
                         "x": int(annotation.get("x") or 0),
                         "y": int(annotation.get("y") or 0),
                     },
-                    "l1": str(annotation.get("l1") or ""),
-                    "l2": list(annotation.get("l2") or []),
+                    "classification": str(annotation.get("classification") or ""),
+                    "spatial": list(annotation.get("spatial") or []),
                     "roi_count": sum(1 for entry in roi if entry.get("geometry") is not None),
                 }
             )
@@ -2408,14 +2395,14 @@ class AnnotationArchive:
 
     def change_label(
         self,
-        level: str,
+        task: str,
         operation: str,
         *,
         version_id: str | None = None,
         label_id: str = "",
         name: str = "",
     ) -> dict:
-        return self.data(version_id).state.change_label(level, operation, label_id=label_id, name=name)
+        return self.data(version_id).state.change_label(task, operation, label_id=label_id, name=name)
 
     def create_version(self, name: str, source_version: str = "main") -> dict:
         clean_name = name.strip()
@@ -2433,8 +2420,8 @@ class AnnotationArchive:
         payload = {
             "version": 2,
             "input_path": self.input_path,
-            "l1_prototypes": list(source.state.l1_prototypes),
-            "l2_prototypes": list(source.state.l2_prototypes),
+            "classification_prototypes": list(source.state.classification_prototypes),
+            "spatial_prototypes": list(source.state.spatial_prototypes),
             "label_definitions": source.state.label_definitions,
             "annotations": {},
             "skipped": [],
@@ -2534,14 +2521,14 @@ pre{white-space:pre-wrap;font-size:12px;background:#f1f3f4;padding:8px}
 <body><div id="authGate" class="authGate"><div class="authBox"><h3>Annotation token</h3><input id="authInput" autocomplete="off"><button id="authSubmit" class="primary" type="button">Open</button><div id="authStatus" class="status"></div></div></div>
 <div id="layout" class="layout"><aside><div id="packageHeader" class="panelHead"><div><div class="panelTitle">IAC packages</div><div id="packageSummary" class="muted"></div></div><button id="hideQueue" class="ghost" type="button">Hide</button></div><div id="packages" class="panelBody packageBody"></div><details id="reviewedDetails" class="reviewedPanel"><summary>Marked tiles (<span id="reviewedCount">0</span>)</summary><div id="reviewedList" class="reviewedList"><div class="muted">Expand to load saved annotations.</div></div></details></aside>
 <main><div class="topbar"><button id="toggleQueue" type="button">Tiles</button><div id="modeNav" class="modeNav"></div><div id="title" class="topbarTitle">Prototype annotation</div><div class="topTools"><button id="reviewModeBtn" type="button">Review</button><button id="overviewBtn" type="button">Overview</button><button id="contextBtn" type="button">Context</button><button id="manageLabels" class="labelManage" type="button">Labels</button></div></div><div class="subbar"><div class="versionGroup"><span class="versionLabel">Version</span><select id="versionSelect" class="versionSelect" title="Annotation version"></select><button id="newVersion" class="compactButton" type="button">New</button></div><div id="progress" class="topProgress"></div></div><section class="workspace"><div class="primaryWorkspace"><div class="imageControlRow tileControlRow"><div class="muted" id="recordMeta"></div><label class="rangeControl">Tile zoom <input id="tileZoom" type="range" min="1" max="6" step="0.1" value="2"><span id="tileZoomValue" class="rangeValue">2.0×</span></label></div>
-<div id="tileViewport" class="tileViewport"><div id="tileStage" class="tileStage"><img id="tile" class="tile" draggable="false"><canvas id="roiCanvas" class="roiCanvas" width="224" height="224"></canvas></div></div><div class="annotationControls"><div id="prototypeLabels"><div id="l1Section"><div id="l1" class="chips"></div></div><div id="l2Section"><div id="l2" class="chips"></div></div></div><div id="roiClassBar" class="roiClassBar"></div><div id="roiStatus" class="muted">Select an ROI class, then draw on the tile.</div><div id="roiPlan" class="roiPlan"><button type="button" id="roiPlanGenerate">Find similar marks</button><label id="roiSimilarityControl" class="rangeControl hidden">Similarity <input id="roiSimilarity" type="range" min="0.20" max="0.99" step="0.01" value="0.70"><span id="roiSimilarityValue" class="rangeValue">70%</span></label><label id="roiExclusionControl" class="rangeControl hidden">Exclusion <input id="roiExclusion" type="range" min="3" max="40" step="1" value="7"><span id="roiExclusionValue" class="rangeValue">7 px</span></label><div id="roiPlanStatus" class="roiPlanStatus muted">Select one class and add 1–3 reliable point or circle seeds.</div><div id="roiPlanDecision" class="roiPlanDecision hidden"><button type="button" id="roiPlanAccept" class="primary">Accept visible matches</button><button type="button" id="roiPlanRestart">Start from scratch</button></div></div><div id="roiNavigationNotice" class="roiNavigationNotice hidden"></div><details id="roiCountDetails" class="muted"><summary>ROI positive tile counts</summary><div id="roiCountProgress"></div></details><div id="roiTools" class="roiTools"><button type="button" data-roi-tool="point">Point</button><button type="button" data-roi-tool="brush">Brush</button><button type="button" data-roi-tool="eraser">Eraser</button><button type="button" data-roi-tool="circle">Circle</button><label class="rangeControl">Brush / eraser width <input id="brushWidth" type="range" min="0.012" max="0.500" step="0.002" value="0.035"><span id="brushWidthValue" class="rangeValue">3.5%</span></label><button type="button" id="roiUndo">Undo</button><button type="button" id="roiRedo">Redo</button><button type="button" id="roiClear">Clear selected class</button><button type="button" id="tileGridToggle">Grid</button></div><div class="actions"><button id="saveNext" onclick="save()" class="primary">Save + next</button><button id="skipNext" onclick="nextRandom(true)">Skip + next</button><button id="previousTile" onclick="reviewed()">Browse saved tiles</button></div><div id="status" class="statusLine"></div></div></div></section></main>
+<div id="tileViewport" class="tileViewport"><div id="tileStage" class="tileStage"><img id="tile" class="tile" draggable="false"><canvas id="roiCanvas" class="roiCanvas" width="224" height="224"></canvas></div></div><div class="annotationControls"><div id="prototypeLabels"><div id="classificationSection"><div id="classification" class="chips"></div></div><div id="spatialSection"><div id="spatial" class="chips"></div></div></div><div id="roiClassBar" class="roiClassBar"></div><div id="roiStatus" class="muted">Select an ROI class, then draw on the tile.</div><div id="roiPlan" class="roiPlan"><button type="button" id="roiPlanGenerate">Find similar marks</button><label id="roiSimilarityControl" class="rangeControl hidden">Similarity <input id="roiSimilarity" type="range" min="0.20" max="0.99" step="0.01" value="0.70"><span id="roiSimilarityValue" class="rangeValue">70%</span></label><label id="roiExclusionControl" class="rangeControl hidden">Exclusion <input id="roiExclusion" type="range" min="3" max="40" step="1" value="7"><span id="roiExclusionValue" class="rangeValue">7 px</span></label><div id="roiPlanStatus" class="roiPlanStatus muted">Select one class and add 1–3 reliable point or circle seeds.</div><div id="roiPlanDecision" class="roiPlanDecision hidden"><button type="button" id="roiPlanAccept" class="primary">Accept visible matches</button><button type="button" id="roiPlanRestart">Start from scratch</button></div></div><div id="roiNavigationNotice" class="roiNavigationNotice hidden"></div><details id="roiCountDetails" class="muted"><summary>ROI positive tile counts</summary><div id="roiCountProgress"></div></details><div id="roiTools" class="roiTools"><button type="button" data-roi-tool="point">Point</button><button type="button" data-roi-tool="brush">Brush</button><button type="button" data-roi-tool="eraser">Eraser</button><button type="button" data-roi-tool="circle">Circle</button><label class="rangeControl">Brush / eraser width <input id="brushWidth" type="range" min="0.012" max="0.500" step="0.002" value="0.035"><span id="brushWidthValue" class="rangeValue">3.5%</span></label><button type="button" id="roiUndo">Undo</button><button type="button" id="roiRedo">Redo</button><button type="button" id="roiClear">Clear selected class</button><button type="button" id="tileGridToggle">Grid</button></div><div class="actions"><button id="saveNext" onclick="save()" class="primary">Save + next</button><button id="skipNext" onclick="nextRandom(true)">Skip + next</button><button id="previousTile" onclick="reviewed()">Browse saved tiles</button></div><div id="status" class="statusLine"></div></div></div></section></main>
 </div>
 <div id="overviewOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>Location overview</b><div class="contextHint">Drag or horizontal-scroll to explore · click a location to open its tile</div></div><div class="overviewBarTools"><label class="rangeControl">Zoom <input id="overviewZoom" type="range" min="0.25" max="12" step="0.25" value="1"><span id="overviewZoomValue" class="rangeValue">1.0×</span></label><button id="overviewClose" type="button">Close</button></div></div><div class="overviewStage"><div id="thumbWrap" class="thumbWrap"><div id="thumbLoading" class="loading">Loading overview...</div><img id="thumb" class="thumb panzoom" draggable="false"></div></div></div>
 <div id="contextOverlay" class="contextOverlay hidden"><div class="contextBar"><div><b>5×5 context</b><div id="contextMeta" class="muted"></div><div class="contextHint">Drag or horizontal-scroll to explore · click a tile to annotate it · C to close</div></div><button id="contextClose" type="button">Close</button></div><div id="contextStage" class="contextStage"><div id="contextViewport" class="contextViewport"><img id="contextImg" class="contextImg" draggable="false"><div id="contextLoading" class="contextLoading hidden">Loading nearby tiles…</div></div></div></div>
 <dialog id="labelDialog" class="labelDialog"><div class="dialogHead"><b id="labelDialogTitle">Label management</b><button id="closeLabels" type="button">Close</button></div><div class="dialogBody"><div id="labelEditor"></div><div class="addLabelRow"><input id="newLabelName" placeholder="New label name"><button id="addLabel" class="primary" type="button">Add</button><button id="saveLabels" type="button">Save label configuration</button></div><div id="labelStatus" class="muted"></div></div></dialog>
 <dialog id="versionDialog" class="labelDialog"><div class="dialogHead"><b>Create annotation version</b><button id="closeVersion" type="button">Close</button></div><div class="dialogBody"><div class="addLabelRow"><input id="newVersionName" placeholder="Version name"><button id="createVersion" class="primary" type="button">Create</button></div><div id="versionStatus" class="muted">The new version starts with no annotations and keeps the current label configuration.</div></div></dialog>
 <script>
-let packages=[], pkg=0, current=null, l1="", l2=new Set(), l1Counts={}, l2Counts={}, restoredLastIac=false, showGrid=false, navigationMode='global', tileHistory=[], tileForward=[], resumeAfterRow=null;
+let packages=[], pkg=0, current=null, classification="", spatial=new Set(), classificationCounts={}, spatialCounts={}, restoredLastIac=false, showGrid=false, navigationMode='global', tileHistory=[], tileForward=[], resumeAfterRow=null;
 let roi=[],roiTool='point',roiToolByClass={},roiAttribute='__all__',roiDrawing=null,roiPreview=null,roiCursor=null,roiAllComplete=true,roiPlan=null,roiPlanLoading=false;
 let roiClassState={},roiExclusionOverrides={};
 let reviewedReturn=null,reviewedItems=[],reviewedIndex=-1;
@@ -2554,8 +2541,8 @@ let contextDrag=null,contextFrame=0,contextRequest=0,contextPendingWindow=null,c
 let undoStack=[],redoStack=[];
 let tileScale=2;
 const ROI_ALL='__all__';
-const NUCLEUS_MATCH_CLASSES=new Set(['hepatocellular-parenchyma-present','inflammatory-cell-present']);
-const AREA_ONLY_CLASSES=new Set(['necrosis-present','fibrous-stroma-present']);
+const NUCLEUS_MATCH_CLASSES=new Set(['hepatocellular-parenchyma','inflammatory-cell']);
+const AREA_ONLY_CLASSES=new Set(['necrosis','fibrous-stroma']);
 const ROI_COLORS=['#e11d48','#f97316','#eab308','#22c55e','#14b8a6','#06b6d4','#3b82f6','#8b5cf6','#d946ef','#84cc16','#64748b'];
 const TOKEN_KEYS=['token','auth_token','access_token'];
 let AUTH_TOKEN='';
@@ -2566,7 +2553,7 @@ function scoped(path){return path+(path.includes('?')?'&':'?')+'mode='+encodeURI
 async function api(path, opts){const r=await fetch(authed(scoped(path)), opts); if(!r.ok) throw new Error(await r.text()); return r.headers.get('content-type')?.includes('json')?r.json():r.blob();}
 function setQueueOpen(open){document.getElementById('layout').classList.toggle('queue-collapsed',!open);}
 function isMobile(){return window.matchMedia('(max-width:760px)').matches;}
-function applyModeLayout(){const l1Mode=MODE==='l1';document.getElementById('roiClassBar').style.display=l1Mode?'none':'flex';document.getElementById('roiStatus').style.display=l1Mode?'none':'block';document.getElementById('roiPlan').style.display=l1Mode?'none':'flex';document.getElementById('roiCountDetails').style.display=l1Mode?'none':'block';document.getElementById('roiTools').style.display=l1Mode?'none':'flex';document.getElementById('roiCanvas').style.display=l1Mode?'none':'block';document.getElementById('prototypeLabels').style.display=l1Mode?'block':'none';document.getElementById('l1Section').style.display=l1Mode?'block':'none';document.getElementById('l2Section').style.display='none';document.getElementById('tileViewport').style.cursor=l1Mode?'default':'crosshair';}
+function applyModeLayout(){const classificationMode=MODE==='classification';document.getElementById('roiClassBar').style.display=classificationMode?'none':'flex';document.getElementById('roiStatus').style.display=classificationMode?'none':'block';document.getElementById('roiPlan').style.display=classificationMode?'none':'flex';document.getElementById('roiCountDetails').style.display=classificationMode?'none':'block';document.getElementById('roiTools').style.display=classificationMode?'none':'flex';document.getElementById('roiCanvas').style.display=classificationMode?'none':'block';document.getElementById('prototypeLabels').style.display=classificationMode?'block':'none';document.getElementById('classificationSection').style.display=classificationMode?'block':'none';document.getElementById('spatialSection').style.display='none';document.getElementById('tileViewport').style.cursor=classificationMode?'default':'crosshair';}
 async function ensureAuth(){setAuthToken(tokenFromUrl()||localStorage.getItem('hcc_sempath_annotation_token')||''); if(!AUTH_TOKEN){document.getElementById('authGate').style.display='flex'; throw new Error('');}}
 async function submitAuth(){setAuthToken(document.getElementById('authInput').value.trim()); try{await api('/api/scan-status'); document.getElementById('authGate').style.display='none'; refreshPackage().catch(e=>document.getElementById('status').textContent=e.message||String(e));}catch(e){document.getElementById('authStatus').textContent='Invalid token.';}}
 function setupPanZoom(el,onClick,options={}){
@@ -2589,9 +2576,9 @@ function setupPanZoom(el,onClick,options={}){
     el.setPanZoomScale=setScale;el.resetPanZoom=()=>{tx=0;ty=0;setScale(1)};
     window.addEventListener('resize',()=>{measure();apply()});
 }
-function labelName(level,id){const item=(LABELS.levels[level]||[]).find(x=>x.id===id);return item?item.name:id}
-function prototypeButton(level,id,selected,count,maxCount,onClick,shortcut=''){const b=document.createElement('button'); const pct=maxCount?Math.round(count/maxCount*100):0; b.className='chip'+(selected?' selected':''); b.style.setProperty('--pct',pct+'%');const key=shortcut?`<kbd class=chipShortcut>${shortcut}</kbd>`:'';b.innerHTML=`<span class=chipRow><span>${key}${labelName(level,id)}</span><span class=chipCount>${count}</span></span>`; b.onclick=onClick; return b;}
-function roiColor(attribute){const i=L2.indexOf(attribute);return ROI_COLORS[(i<0?0:i)%ROI_COLORS.length]}
+function labelName(task,id){const item=(LABELS.label_sets[task]||[]).find(x=>x.id===id);return item?item.name:id}
+function prototypeButton(task,id,selected,count,maxCount,onClick,shortcut=''){const b=document.createElement('button'); const pct=maxCount?Math.round(count/maxCount*100):0; b.className='chip'+(selected?' selected':''); b.style.setProperty('--pct',pct+'%');const key=shortcut?`<kbd class=chipShortcut>${shortcut}</kbd>`:'';b.innerHTML=`<span class=chipRow><span>${key}${labelName(task,id)}</span><span class=chipCount>${count}</span></span>`; b.onclick=onClick; return b;}
+function roiColor(attribute){const i=SPATIAL.indexOf(attribute);return ROI_COLORS[(i<0?0:i)%ROI_COLORS.length]}
 function snapshotRoi(){return JSON.stringify({roi,roiClassState})}
 function restoreRoi(snapshot){const state=JSON.parse(snapshot);roi=state.roi||[];roiClassState=state.roiClassState||{};syncPositiveLabels();renderRoi()}
 function pushUndo(){undoStack.push(snapshotRoi()); if(undoStack.length>100)undoStack.shift(); redoStack=[]}
@@ -2602,8 +2589,8 @@ function selectRoiTool(tool,remember=true){let next=['point','brush','eraser','c
 function toggleRoiClass(name){pushUndo();roiPlan=null;if(roiAttribute===name){roiClassState[name]=roiClassState[name]==='negative'?'open':'negative'}else{roiAttribute=name;if(!roiClassState[name])roiClassState[name]='open';selectRoiTool(roiToolByClass[name]||(AREA_ONLY_CLASSES.has(name)?'brush':'point'),false)}renderLabels();renderRoi()}
 function hasPositiveRoi(attribute){return roi.some(item=>item.attribute===attribute&&item.geometry&&item.state!=='negative')}
 function roiClassIcon(attribute,state){return state==='negative'?'−':hasPositiveRoi(attribute)?'●':'○'}
-function renderRoiClassBar(){const bar=document.getElementById('roiClassBar'); if(!bar)return; bar.style.display=ROI_MODE?'flex':'none'; bar.innerHTML=''; if(!ROI_MODE)return; const all=document.createElement('button'); all.type='button'; all.className='roiClassButton'+(roiAttribute===ROI_ALL?' selected':''); all.style.borderLeftColor='#111827'; all.textContent='All'; all.onclick=()=>{roiPlan=null;roiAttribute=ROI_ALL;renderLabels();renderRoi()}; bar.appendChild(all); L2.forEach(x=>{const state=roiClassState[x]||'open';const positive=hasPositiveRoi(x);const b=document.createElement('button'); b.type='button'; b.className='roiClassButton'+(roiAttribute===x?' selected':''); b.style.borderLeftColor=state==='negative'?'#111827':roiColor(x); b.textContent=`${roiClassIcon(x,state)} ${labelName('l2',x)}`; b.title=state==='negative'?'Explicit negative; click again to return to positive/uncertain.':positive?'Positive ROI present; clear its ROI before marking this class negative.':'Positive or uncertain by default; no positive ROI yet. Click selected class again to mark explicit negative.'; b.onclick=()=>toggleRoiClass(x); bar.appendChild(b)})}
-function renderLabels(){renderRoiClassBar();const a=document.getElementById('l1');a.innerHTML='';document.getElementById('l2').innerHTML='';if(MODE==='l1'){const l1Max=Math.max(1,...Object.values(l1Counts));L1.forEach((x,index)=>a.appendChild(prototypeButton('l1',x,l1===x,l1Counts[x]||0,l1Max,()=>{l1=x;renderLabels()},index<9?String(index+1):'')))}document.getElementById('roiStatus').textContent=ROI_MODE?(roiAttribute===ROI_ALL?'All spatial classes visible. Select one class before drawing. Unmarked classes stay unknown/ignored unless explicitly toggled negative.':`Drawing ROI for: ${labelName('l2',roiAttribute)}. Unmarked classes stay unknown/ignored unless explicitly toggled negative.`):'';applyModeLayout();}
+function renderRoiClassBar(){const bar=document.getElementById('roiClassBar'); if(!bar)return; bar.style.display=ROI_MODE?'flex':'none'; bar.innerHTML=''; if(!ROI_MODE)return; const all=document.createElement('button'); all.type='button'; all.className='roiClassButton'+(roiAttribute===ROI_ALL?' selected':''); all.style.borderLeftColor='#111827'; all.textContent='All'; all.onclick=()=>{roiPlan=null;roiAttribute=ROI_ALL;renderLabels();renderRoi()}; bar.appendChild(all); SPATIAL.forEach(x=>{const state=roiClassState[x]||'open';const positive=hasPositiveRoi(x);const b=document.createElement('button'); b.type='button'; b.className='roiClassButton'+(roiAttribute===x?' selected':''); b.style.borderLeftColor=state==='negative'?'#111827':roiColor(x); b.textContent=`${roiClassIcon(x,state)} ${labelName('spatial',x)}`; b.title=state==='negative'?'Explicit negative; click again to return to positive/uncertain.':positive?'Positive ROI present; clear its ROI before marking this class negative.':'Positive or uncertain by default; no positive ROI yet. Click selected class again to mark explicit negative.'; b.onclick=()=>toggleRoiClass(x); bar.appendChild(b)})}
+function renderLabels(){renderRoiClassBar();const a=document.getElementById('classification');a.innerHTML='';document.getElementById('spatial').innerHTML='';if(MODE==='classification'){const classificationMax=Math.max(1,...Object.values(classificationCounts));CLASSIFICATION.forEach((x,index)=>a.appendChild(prototypeButton('classification',x,classification===x,classificationCounts[x]||0,classificationMax,()=>{classification=x;renderLabels()},index<9?String(index+1):'')))}document.getElementById('roiStatus').textContent=ROI_MODE?(roiAttribute===ROI_ALL?'All spatial classes visible. Select one class before drawing. Unmarked classes stay unknown/ignored unless explicitly toggled negative.':`Drawing ROI for: ${labelName('spatial',roiAttribute)}. Unmarked classes stay unknown/ignored unless explicitly toggled negative.`):'';applyModeLayout();}
 function roiPoint(ev,clamp=false){const r=document.getElementById('roiCanvas').getBoundingClientRect();let x=(ev.clientX-r.left)/r.width,y=(ev.clientY-r.top)/r.height;if(clamp){x=Math.max(0,Math.min(1,x));y=Math.max(0,Math.min(1,y))}return{x,y}}
 function applyTileZoom(){const stage=document.getElementById('tileStage'); if(!stage)return; stage.style.transform=`scale(${tileScale})`; stage.style.marginRight=(224*(tileScale-1))+'px'; stage.style.marginBottom=(224*(tileScale-1))+'px'}
 function setTileZoom(scale){tileScale=Math.min(6,Math.max(1,scale));applyTileZoom();const input=document.getElementById('tileZoom'),value=document.getElementById('tileZoomValue');if(input)input.value=tileScale;if(value)value.textContent=`${tileScale.toFixed(1)}×`}
@@ -2618,7 +2605,7 @@ function roiExclusionDistance(){return parseFloat(document.getElementById('roiEx
 function setRoiExclusionDistance(distance){const input=document.getElementById('roiExclusion');const next=Math.min(parseFloat(input.max),Math.max(parseFloat(input.min),distance));input.value=String(Math.round(next));document.getElementById('roiExclusionValue').textContent=`${Math.round(next)} px`}
 function plannedCenter(item){const g=item.geometry;if(g?.type==='point')return g.point;if(g?.type==='circle')return g.center;return null}
 function visiblePlannedSuggestions(){const suggestions=roiPlan?.suggestions||[],threshold=similarityThreshold(),minimumSq=(roiExclusionDistance()/224)**2,occupied=occupiedRoiCenters(),target=roiPlan?.summary?.preview_target??suggestions.length,selected=[],selectedCenters=[];for(const item of suggestions){if((item.confidence??0)<threshold)continue;const center=plannedCenter(item);if(!center)continue;if(occupied.some(point=>(center[0]-point[0])**2+(center[1]-point[1])**2<minimumSq))continue;if(selectedCenters.some(point=>(center[0]-point[0])**2+(center[1]-point[1])**2<minimumSq))continue;selected.push(item);selectedCenters.push(center);if(selected.length>=target)break}return selected}
-function renderRoiPlan(){const status=document.getElementById('roiPlanStatus'),decision=document.getElementById('roiPlanDecision'),button=document.getElementById('roiPlanGenerate'),controls=[document.getElementById('roiSimilarityControl'),document.getElementById('roiExclusionControl')],supported=NUCLEUS_MATCH_CLASSES.has(roiAttribute);if(!status)return;button.disabled=roiPlanLoading||!current||(!supported&&roiAttribute!==ROI_ALL);if(!supported&&roiAttribute!==ROI_ALL){button.textContent='Find similar marks';status.textContent='Image-only nucleus matching is currently validated for hepatocellular parenchyma and inflammatory cells only.';decision.classList.add('hidden');controls.forEach(control=>control.classList.add('hidden'));return}if(roiPlanLoading){button.textContent='Finding matches…';status.textContent='Matching each selected seed as an independent local image template.';decision.classList.add('hidden');controls.forEach(control=>control.classList.add('hidden'));return}button.textContent=roiPlan?'Rebuild similar marks':'Find similar marks';if(!roiPlan){const seeds=seedCentersForSelectedClass();status.textContent=roiAttribute===ROI_ALL?'Select one ROI class, then add 1–3 reliable point or circle seeds.':`${labelName('l2',roiAttribute)} · ${seeds.length} seed${seeds.length===1?'':'s'}. Add reliable marks, then find similar centers.`;decision.classList.add('hidden');controls.forEach(control=>control.classList.add('hidden'));return}const visible=visiblePlannedSuggestions(),automatic=roiPlan.summary?.minimum_spacing_pixels,exclusion=roiExclusionDistance(),detected=roiPlan.summary?.candidate_count??roiPlan.suggestions.length,maxScore=roiPlan.summary?.maximum_similarity,target=roiPlan.summary?.preview_target;document.getElementById('roiSimilarityValue').textContent=`${Math.round(similarityThreshold()*100)}%`;document.getElementById('roiExclusionValue').textContent=`${Math.round(exclusion)} px`;status.textContent=`Nucleus-image preview · ${roiPlan.summary?.seed_count||0} seeds${target?` → target ${target}`:''} · detected ${detected} centers${maxScore!=null?` · best ${Math.round(maxScore*100)}%`:''} · ${Math.round(exclusion)} px exclusion${automatic?` (auto ${automatic.toFixed(1)})`:''} · showing ${visible.length}/${roiPlan.suggestions.length} matches. Preview marks are not saved yet.`;decision.classList.remove('hidden');controls.forEach(control=>control.classList.remove('hidden'))}
+function renderRoiPlan(){const status=document.getElementById('roiPlanStatus'),decision=document.getElementById('roiPlanDecision'),button=document.getElementById('roiPlanGenerate'),controls=[document.getElementById('roiSimilarityControl'),document.getElementById('roiExclusionControl')],supported=NUCLEUS_MATCH_CLASSES.has(roiAttribute);if(!status)return;button.disabled=roiPlanLoading||!current||(!supported&&roiAttribute!==ROI_ALL);if(!supported&&roiAttribute!==ROI_ALL){button.textContent='Find similar marks';status.textContent='Image-only nucleus matching is currently validated for hepatocellular parenchyma and inflammatory cells only.';decision.classList.add('hidden');controls.forEach(control=>control.classList.add('hidden'));return}if(roiPlanLoading){button.textContent='Finding matches…';status.textContent='Matching each selected seed as an independent local image template.';decision.classList.add('hidden');controls.forEach(control=>control.classList.add('hidden'));return}button.textContent=roiPlan?'Rebuild similar marks':'Find similar marks';if(!roiPlan){const seeds=seedCentersForSelectedClass();status.textContent=roiAttribute===ROI_ALL?'Select one ROI class, then add 1–3 reliable point or circle seeds.':`${labelName('spatial',roiAttribute)} · ${seeds.length} seed${seeds.length===1?'':'s'}. Add reliable marks, then find similar centers.`;decision.classList.add('hidden');controls.forEach(control=>control.classList.add('hidden'));return}const visible=visiblePlannedSuggestions(),automatic=roiPlan.summary?.minimum_spacing_pixels,exclusion=roiExclusionDistance(),detected=roiPlan.summary?.candidate_count??roiPlan.suggestions.length,maxScore=roiPlan.summary?.maximum_similarity,target=roiPlan.summary?.preview_target;document.getElementById('roiSimilarityValue').textContent=`${Math.round(similarityThreshold()*100)}%`;document.getElementById('roiExclusionValue').textContent=`${Math.round(exclusion)} px`;status.textContent=`Nucleus-image preview · ${roiPlan.summary?.seed_count||0} seeds${target?` → target ${target}`:''} · detected ${detected} centers${maxScore!=null?` · best ${Math.round(maxScore*100)}%`:''} · ${Math.round(exclusion)} px exclusion${automatic?` (auto ${automatic.toFixed(1)})`:''} · showing ${visible.length}/${roiPlan.suggestions.length} matches. Preview marks are not saved yet.`;decision.classList.remove('hidden');controls.forEach(control=>control.classList.remove('hidden'))}
 function drawPointMark(x,point,color,alpha=1){const px=point[0]*224,py=point[1]*224;x.save();x.globalAlpha=alpha;for(const [radius,fill] of [[3.4,'#000'],[2.3,'#fff'],[1.2,color]]){x.fillStyle=fill;x.beginPath();x.arc(px,py,radius,0,Math.PI*2);x.fill()}x.restore()}
 function drawPlannedPoint(x,g,color){const px=g.point[0]*224,py=g.point[1]*224;x.save();x.globalAlpha=.5;x.lineCap='round';for(const [width,stroke] of [[2.5,'rgba(15,23,42,.9)'],[1.5,'#fff'],[.7,color]]){x.lineWidth=width;x.strokeStyle=stroke;x.beginPath();x.moveTo(px-3.5,py);x.lineTo(px+3.5,py);x.moveTo(px,py-3.5);x.lineTo(px,py+3.5);x.stroke()}x.restore()}
 function drawPlannedCircle(x,g,color){const px=g.center[0]*224,py=g.center[1]*224,radius=g.radius*224;x.save();x.globalAlpha=1;x.setLineDash([]);x.fillStyle=color+'55';x.beginPath();x.arc(px,py,radius,0,Math.PI*2);x.fill();for(const [width,stroke] of [[7,'rgba(15,23,42,.9)'],[5,'#fff'],[2.5,color]]){x.lineWidth=width;x.strokeStyle=stroke;x.beginPath();x.arc(px,py,radius,0,Math.PI*2);x.stroke()}x.restore()}
@@ -2627,13 +2614,13 @@ function plannedGeometryDuplicate(item){const g=item.geometry;return roi.some(ol
 async function generateRoiPlan(){if(!ROI_MODE||!current||roiPlanLoading)return;if(roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one ROI class before finding similar marks.';return}if(!NUCLEUS_MATCH_CLASSES.has(roiAttribute)){document.getElementById('status').textContent='Image-only nucleus matching is not validated for this ROI class.';return}const seeds=seedCentersForSelectedClass();if(!seeds.length){document.getElementById('status').textContent='Add at least one reliable point or circle seed for the selected class first.';return}const tileKey=`${pkg}:${current.row}:${current.tile_id}`;roiPlan=null;roiPlanLoading=true;renderRoi();try{const result=await api('/api/roi-similar',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({package:pkg,row:current.row,attribute:roiAttribute,seeds,occupied:occupiedRoiCenters()})});if(!current||tileKey!==`${pkg}:${current.row}:${current.tile_id}`)return;setRoiSimilarityThreshold(result.summary?.recommended_similarity??0.70);setRoiExclusionDistance(roiExclusionOverrides[roiAttribute]??result.summary?.minimum_spacing_pixels??7);roiPlan=result;document.getElementById('status').textContent='Similar local image centers are ready. Adjust similarity and exclusion distance, then accept visible matches or start from scratch.';}catch(e){document.getElementById('status').textContent='Similarity search failed: '+(e.message||String(e))}finally{roiPlanLoading=false;renderRoi()}}
 function acceptRoiPlan(){if(!roiPlan)return;pushUndo();let added=0;for(const proposed of visiblePlannedSuggestions()){const item={attribute:proposed.attribute,state:'positive',review_complete:false,geometry:proposed.geometry};if(plannedGeometryDuplicate(item))continue;roi.push(item);delete roiClassState[item.attribute];added++}roiPlan=null;syncPositiveLabels();renderRoi();document.getElementById('status').textContent=`Accepted ${added} similar mark${added===1?'':'s'}. All marks remain editable.`}
 function restartRoiFromScratch(){pushUndo();roi=[];roiClassState={};roiExclusionOverrides={};roiDrawing=null;roiPreview=null;roiCursor=null;roiPlan=null;syncPositiveLabels();renderRoi();document.getElementById('status').textContent='Started this tile from scratch.'}
-function syncPositiveLabels(){l2=new Set(roi.filter(item=>item.geometry&&item.state!=='negative').map(item=>item.attribute));renderLabels()}
+function syncPositiveLabels(){spatial=new Set(roi.filter(item=>item.geometry&&item.state!=='negative').map(item=>item.attribute));renderLabels()}
 function pointDistanceSq(a,b){return(a[0]-b[0])**2+(a[1]-b[1])**2}
 function densifyPath(points,maxStep){if(!points.length)return[];const dense=[points[0]];for(let i=1;i<points.length;i++){const a=points[i-1],b=points[i],distance=Math.sqrt(pointDistanceSq(a,b)),steps=Math.max(1,Math.ceil(distance/maxStep));for(let step=1;step<=steps;step++){const t=step/steps;dense.push([a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t])}}return dense}
 function eraseBrushGeometry(item,center,eraserRadius){const geometry=item.geometry,threshold=eraserRadius+(geometry.width||.035)/2,points=densifyPath(geometry.points||[],Math.max(.002,Math.min(.008,eraserRadius/2))),runs=[];let run=[];for(const point of points){if(pointDistanceSq(point,center)>threshold**2)run.push(point);else{if(run.length>1)runs.push(run);run=[]}}if(run.length>1)runs.push(run);return runs.map(points=>({...item,geometry:{...geometry,points}}))}
 function eraseCurrentClassAt(center,eraserRadius){const next=[];for(const item of roi){const geometry=item.geometry;if(item.attribute!==roiAttribute||!geometry){next.push(item);continue}if(geometry.type==='point'){if(pointDistanceSq(geometry.point,center)>eraserRadius**2)next.push(item)}else if(geometry.type==='circle'){if(pointDistanceSq(geometry.center,center)>(geometry.radius+eraserRadius)**2)next.push(item)}else if(geometry.type==='brush')next.push(...eraseBrushGeometry(item,center,eraserRadius));else next.push(item)}roi=next}
 function eraseCurrentClassAlong(start,end,eraserRadius){for(const point of densifyPath([start,end],Math.max(.002,eraserRadius/2)))eraseCurrentClassAt(point,eraserRadius)}
-function finishEraserStroke(ev=null){if(roiDrawing?.tool!=='eraser')return false;if(ev&&roiDrawing.pointerId!==ev.pointerId)return false;const c=document.getElementById('roiCanvas'),pointerId=roiDrawing.pointerId;roiDrawing=null;roiPreview=null;if(c.hasPointerCapture(pointerId))c.releasePointerCapture(pointerId);syncPositiveLabels();renderRoi();document.getElementById('status').textContent=`Erased ${labelName('l2',roiAttribute)} within the selected range.`;return true}
+function finishEraserStroke(ev=null){if(roiDrawing?.tool!=='eraser')return false;if(ev&&roiDrawing.pointerId!==ev.pointerId)return false;const c=document.getElementById('roiCanvas'),pointerId=roiDrawing.pointerId;roiDrawing=null;roiPreview=null;if(c.hasPointerCapture(pointerId))c.releasePointerCapture(pointerId);syncPositiveLabels();renderRoi();document.getElementById('status').textContent=`Erased ${labelName('spatial',roiAttribute)} within the selected range.`;return true}
 function setupEraser(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerdown',ev=>{if(ev.button!==0||roiTool!=='eraser')return;ev.preventDefault();ev.stopImmediatePropagation();if(roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one spatial class before erasing.';return}if(roiClassState[roiAttribute]==='negative'){document.getElementById('status').textContent='This ROI class is marked negative. Toggle it back before erasing.';return}const p=roiPoint(ev);pushUndo();roiPlan=null;roiDrawing={tool:'eraser',pointerId:ev.pointerId,points:[[p.x,p.y]],width:brushWidth()};eraseCurrentClassAt([p.x,p.y],roiDrawing.width/2);c.setPointerCapture(ev.pointerId);renderRoi()},{capture:true});c.addEventListener('pointermove',ev=>{if(roiDrawing?.tool!=='eraser'||roiDrawing.pointerId!==ev.pointerId)return;ev.preventDefault();ev.stopImmediatePropagation();const p=roiPoint(ev),next=[p.x,p.y],previous=roiDrawing.points[roiDrawing.points.length-1];roiCursor=p;roiDrawing.points.push(next);eraseCurrentClassAlong(previous,next,roiDrawing.width/2);renderRoi()},{capture:true});window.addEventListener('pointerup',ev=>finishEraserStroke(ev),true);window.addEventListener('pointercancel',ev=>finishEraserStroke(ev),true);window.addEventListener('mouseup',()=>finishEraserStroke(),true);window.addEventListener('blur',()=>finishEraserStroke());c.addEventListener('lostpointercapture',()=>finishEraserStroke())}
 function updateRoiCursor(ev){const p=roiPoint(ev);roiCursor=((roiTool==='brush'||roiTool==='eraser')&&roiAttribute!==ROI_ALL&&roiClassState[roiAttribute]!=='negative')?p:null;renderRoi()}
 function setupTileUndo(){document.getElementById('tileStage').addEventListener('contextmenu',ev=>{if(!ROI_MODE)return;ev.preventDefault();ev.stopPropagation();undoRoi()})}
@@ -2715,8 +2702,8 @@ async function refreshPackage(){
         console.error(e);
     }
 }
-async function progress(){const p=await api('/api/progress?package='+pkg);l1Counts=p.l1;l2Counts=p.roi_counts&&Object.keys(p.roi_counts).length?p.roi_counts:p.l2;renderLabels();const filtered=p.auto_filtered?` · ${p.auto_filtered} blank filtered`:'';const priority=p.priority;const review=p.review;const activeProgress=review||priority;const handled=activeProgress?activeProgress.reviewed+activeProgress.skipped:0;const progressPct=activeProgress&&activeProgress.total?Math.round(handled/activeProgress.total*100):0;const progressLine=review?`<b>Review list ${review.reviewed}/${review.total}</b> completed · ${review.remaining} remaining · ${review.skipped} skipped<div class=bar><div style="width:${progressPct}%"></div></div>`:priority?`<b>Priority list ${priority.reviewed}/${priority.total}</b> reviewed · ${priority.remaining} remaining · ${priority.skipped} skipped<div class=bar><div style="width:${progressPct}%"></div></div>`:'';document.getElementById('progress').innerHTML=`${progressLine}<div>All tiles: ${p.overall.annotated}/${p.overall.total} reviewed · ${p.overall.remaining} remaining · ${p.overall.skipped} skipped${filtered}</div>`;document.getElementById('reviewedCount').textContent=p.overall.annotated;const active=new Set(p.roi_priority_attributes||[]);document.getElementById('roiCountProgress').innerHTML=Object.keys(p.roi_counts||{}).map(x=>`${active.has(x)?'●':'○'} ${labelName('l2',x)}: ${p.roi_counts[x]||0}`).join('<br>');const exhausted=[...active].filter(x=>p.roi_navigation_status&&p.roi_navigation_status[x]&&p.roi_navigation_status[x].exhausted);const notice=document.getElementById('roiNavigationNotice');notice.textContent=exhausted.map(x=>`${labelName('l2',x)}: all ${p.roi_navigation_status[x].total} candidates reviewed; the information curve needs more coverage.`).join('\n');notice.classList.toggle('hidden',!exhausted.length);}
-async function showRecord(rec){current=rec; l1=""; l2=new Set();roi=[];roiClassState={};roiExclusionOverrides={};undoStack=[];redoStack=[];roiPreview=null;roiCursor=null;roiPlan=null;roiPlanLoading=false;roiAttribute=ROI_MODE?ROI_ALL:'';roiAllComplete=true;renderLabels();renderRoi(); if(!rec){document.getElementById('recordMeta').textContent='No unreviewed tile to show.'; document.getElementById('tile').removeAttribute('src'); return;}const saved=await api(`/api/annotation-state?package=${pkg}&row=${rec.row}`);if(saved.annotation){l1=saved.annotation.l1||'';l2=new Set(saved.annotation.l2||[]);roi=(saved.annotation.roi||[]).filter(item=>item.geometry);(saved.annotation.roi||[]).filter(item=>item.review_complete&&item.state==='negative'&&!item.geometry).forEach(item=>{roiClassState[item.attribute]='negative'});const complete=new Set((saved.annotation.roi||[]).filter(item=>item.review_complete).map(item=>item.attribute));roiAllComplete=L2.every(name=>complete.has(name))}renderLabels();renderRoi();document.getElementById('recordMeta').textContent=`Package ${pkg+1} · tile ${rec.row+1} · x=${rec.x} y=${rec.y}`; const tile=document.getElementById('tile'); tile.src=authed(scoped(`/api/tile?package=${pkg}&row=${rec.row}`)); applyTileZoom(); setThumbnailSrc();}
+async function progress(){const p=await api('/api/progress?package='+pkg);classificationCounts=p.classification;spatialCounts=p.roi_counts&&Object.keys(p.roi_counts).length?p.roi_counts:p.spatial;renderLabels();const filtered=p.auto_filtered?` · ${p.auto_filtered} blank filtered`:'';const priority=p.priority;const review=p.review;const activeProgress=review||priority;const handled=activeProgress?activeProgress.reviewed+activeProgress.skipped:0;const progressPct=activeProgress&&activeProgress.total?Math.round(handled/activeProgress.total*100):0;const progressLine=review?`<b>Review list ${review.reviewed}/${review.total}</b> completed · ${review.remaining} remaining · ${review.skipped} skipped<div class=bar><div style="width:${progressPct}%"></div></div>`:priority?`<b>Priority list ${priority.reviewed}/${priority.total}</b> reviewed · ${priority.remaining} remaining · ${priority.skipped} skipped<div class=bar><div style="width:${progressPct}%"></div></div>`:'';document.getElementById('progress').innerHTML=`${progressLine}<div>All tiles: ${p.overall.annotated}/${p.overall.total} reviewed · ${p.overall.remaining} remaining · ${p.overall.skipped} skipped${filtered}</div>`;document.getElementById('reviewedCount').textContent=p.overall.annotated;const active=new Set(p.roi_priority_attributes||[]);document.getElementById('roiCountProgress').innerHTML=Object.keys(p.roi_counts||{}).map(x=>`${active.has(x)?'●':'○'} ${labelName('spatial',x)}: ${p.roi_counts[x]||0}`).join('<br>');const exhausted=[...active].filter(x=>p.roi_navigation_status&&p.roi_navigation_status[x]&&p.roi_navigation_status[x].exhausted);const notice=document.getElementById('roiNavigationNotice');notice.textContent=exhausted.map(x=>`${labelName('spatial',x)}: all ${p.roi_navigation_status[x].total} candidates reviewed; the information curve needs more coverage.`).join('\n');notice.classList.toggle('hidden',!exhausted.length);}
+async function showRecord(rec){current=rec; classification=""; spatial=new Set();roi=[];roiClassState={};roiExclusionOverrides={};undoStack=[];redoStack=[];roiPreview=null;roiCursor=null;roiPlan=null;roiPlanLoading=false;roiAttribute=ROI_MODE?ROI_ALL:'';roiAllComplete=true;renderLabels();renderRoi(); if(!rec){document.getElementById('recordMeta').textContent='No unreviewed tile to show.'; document.getElementById('tile').removeAttribute('src'); return;}const saved=await api(`/api/annotation-state?package=${pkg}&row=${rec.row}`);if(saved.annotation){classification=saved.annotation.classification||'';spatial=new Set(saved.annotation.spatial||[]);roi=(saved.annotation.roi||[]).filter(item=>item.geometry);(saved.annotation.roi||[]).filter(item=>item.review_complete&&item.state==='negative'&&!item.geometry).forEach(item=>{roiClassState[item.attribute]='negative'});const complete=new Set((saved.annotation.roi||[]).filter(item=>item.review_complete).map(item=>item.attribute));roiAllComplete=SPATIAL.every(name=>complete.has(name))}renderLabels();renderRoi();document.getElementById('recordMeta').textContent=`Package ${pkg+1} · tile ${rec.row+1} · x=${rec.x} y=${rec.y}`; const tile=document.getElementById('tile'); tile.src=authed(scoped(`/api/tile?package=${pkg}&row=${rec.row}`)); applyTileZoom(); setThumbnailSrc();}
 async function nextRandom(isSkip=false){
     try {
         if(REVIEW_MODE){await reviewStep(1);return}
@@ -2759,23 +2746,23 @@ async function nextRandom(isSkip=false){
 async function reviewed(){if(REVIEW_MODE){await reviewStep(-1);return}const previous=tileHistory.pop();if(!previous){document.getElementById('status').textContent='No previous tile in this session.';return}if(current)tileForward.push({package:pkg,record:current});pkg=previous.package;navigationMode='local';await progress();await showRecord(previous.record)}
 async function openReviewed(item){if(!REVIEW_MODE&&!reviewedReturn&&current)reviewedReturn={package:pkg,record:current,navigationMode};tileForward=[];reviewedIndex=reviewedItems.findIndex(candidate=>candidate.package_index===item.package_index&&candidate.record.row===item.record.row);pkg=item.package_index;navigationMode='local';if(!REVIEW_MODE)await loadPackages();await progress();await showRecord(item.record);renderReviewedList();if(isMobile())setQueueOpen(false)}
 async function returnFromReviewed(){const target=reviewedReturn;reviewedReturn=null;if(!target)return;pkg=target.package;navigationMode=target.navigationMode;await loadPackages();await progress();await showRecord(target.record)}
-function renderReviewedList(){const root=document.getElementById('reviewedList');root.innerHTML='';if(!reviewedItems.length){root.innerHTML='<div class="muted">No saved annotations in this mode and version.</div>';return}reviewedItems.forEach((item,index)=>{const button=document.createElement('button');button.type='button';button.className='reviewedItem'+(current&&pkg===item.package_index&&current.row===item.record.row?' active':'');const title=document.createElement('span');title.textContent=REVIEW_MODE?`${index+1} / ${reviewedItems.length}`:`Package ${item.package_index+1} · tile ${item.record.row+1}`;const meta=document.createElement('span');meta.className='reviewedItemMeta';meta.textContent=MODE==='l1'?labelName('l1',item.l1):`${item.l2.map(x=>labelName('l2',x)).join(', ')||'No positive ROI'} · ${item.roi_count} mark${item.roi_count===1?'':'s'}`;button.append(title,meta);button.onclick=()=>openReviewed(item);root.appendChild(button);if(button.classList.contains('active'))button.scrollIntoView({block:'nearest'})})}
+function renderReviewedList(){const root=document.getElementById('reviewedList');root.innerHTML='';if(!reviewedItems.length){root.innerHTML='<div class="muted">No saved annotations in this mode and version.</div>';return}reviewedItems.forEach((item,index)=>{const button=document.createElement('button');button.type='button';button.className='reviewedItem'+(current&&pkg===item.package_index&&current.row===item.record.row?' active':'');const title=document.createElement('span');title.textContent=REVIEW_MODE?`${index+1} / ${reviewedItems.length}`:`Package ${item.package_index+1} · tile ${item.record.row+1}`;const meta=document.createElement('span');meta.className='reviewedItemMeta';meta.textContent=MODE==='classification'?labelName('classification',item.classification):`${item.spatial.map(x=>labelName('spatial',x)).join(', ')||'No positive ROI'} · ${item.roi_count} mark${item.roi_count===1?'':'s'}`;button.append(title,meta);button.onclick=()=>openReviewed(item);root.appendChild(button);if(button.classList.contains('active'))button.scrollIntoView({block:'nearest'})})}
 async function loadReviewedList(){const root=document.getElementById('reviewedList');root.innerHTML='<div class="muted">Loading...</div>';try{const result=await api('/api/reviewed-list?package=all');reviewedItems=result.items||[];document.getElementById('reviewedCount').textContent=result.total;renderReviewedList();return result}catch(e){reviewedItems=[];root.innerHTML='';const error=document.createElement('div');error.className='muted';error.textContent=e.message||String(e);root.appendChild(error);throw e}}
 async function reviewStep(delta){if(!reviewedItems.length){await showRecord(null);document.getElementById('status').textContent='No saved annotations in this mode and version.';return}if(reviewedIndex<0)reviewedIndex=0;else reviewedIndex=Math.min(reviewedItems.length-1,Math.max(0,reviewedIndex+delta));await openReviewed(reviewedItems[reviewedIndex]);document.getElementById('status').textContent=`Review ${reviewedIndex+1}/${reviewedItems.length}.`}
 async function forwardTile(){if(REVIEW_MODE){await reviewStep(1);return}const next=tileForward.pop();if(!next){document.getElementById('status').textContent='No next tile in this session.';return}if(current)tileHistory.push({package:pkg,record:current});pkg=next.package;navigationMode='local';await progress();await showRecord(next.record)}
 async function save(){
     try {
         if(!current){await nextRandom(); return;}
-        if(!ROI_MODE&&!l1){document.getElementById('status').textContent='Select one classification prototype first.'; return;}
+        if(!ROI_MODE&&!classification){document.getElementById('status').textContent='Select one classification prototype first.'; return;}
         if(ROI_MODE&&roiPlan){document.getElementById('status').textContent='Choose Accept visible matches or Start from scratch before saving.';return;}
         const positives=new Set(roi.filter(item=>item.geometry&&item.state!=='negative').map(item=>item.attribute));
-        const negativeAttrs=L2.filter(attribute=>roiClassState[attribute]==='negative');
+        const negativeAttrs=SPATIAL.filter(attribute=>roiClassState[attribute]==='negative');
         const conflicts=negativeAttrs.filter(attribute=>positives.has(attribute));
         if(conflicts.length){window.alert(`ROI conflict: marked negative but has ROI annotation: ${conflicts.join(', ')}`);document.getElementById('status').textContent='Resolve negative/positive ROI conflict before saving.';return}
         const negativePayload=negativeAttrs.map(attribute=>({attribute,state:'negative',review_complete:true}));
         const roiPayload=ROI_MODE?[...roi,...negativePayload]:roi;
-        const saveL1=ROI_MODE?L1[0]:l1;
-        await api('/api/annotation',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({package:pkg,row:current.row,l1:saveL1,l2:[...l2],roi:roiPayload})});
+        const saveClassification=ROI_MODE?CLASSIFICATION[0]:classification;
+        await api('/api/annotation',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({package:pkg,row:current.row,classification:saveClassification,spatial:[...spatial],roi:roiPayload})});
         document.getElementById('status').textContent='Saved.';
         setThumbnailSrc();
         await progress();
@@ -2946,14 +2933,14 @@ function setupContextNavigator(){
     });
     viewport.addEventListener('pointercancel',()=>{contextDrag=null;contextRequest++;contextPendingWindow=null;viewport.classList.remove('dragging')});
 }
-function renderModeNav(){const nav=document.getElementById('modeNav');nav.innerHTML='';MODES.forEach(mode=>{const b=document.createElement('button');b.type='button';b.textContent=mode==='l1'?'Classification':'Spatial';b.classList.toggle('active',mode===MODE);b.disabled=mode===MODE;b.onclick=()=>{const url=new URL(location.href);url.searchParams.set('mode',mode);url.searchParams.delete('version');if(AUTH_TOKEN)url.searchParams.set('token',AUTH_TOKEN);location.href=url.toString()};nav.appendChild(b)});document.getElementById('title').textContent=MODE==='l1'?'Classification prototype supervision':'Spatial prototype supervision';}
+function renderModeNav(){const nav=document.getElementById('modeNav');nav.innerHTML='';MODES.forEach(mode=>{const b=document.createElement('button');b.type='button';b.textContent=mode==='classification'?'Classification':'Spatial';b.classList.toggle('active',mode===MODE);b.disabled=mode===MODE;b.onclick=()=>{const url=new URL(location.href);url.searchParams.set('mode',mode);url.searchParams.delete('version');if(AUTH_TOKEN)url.searchParams.set('token',AUTH_TOKEN);location.href=url.toString()};nav.appendChild(b)});document.getElementById('title').textContent=MODE==='classification'?'Classification prototype supervision':'Spatial prototype supervision';}
 function versionStorageKey(){return `hcc_sempath_annotation_version:${MODE}`}
 function renderVersions(){const select=document.getElementById('versionSelect');select.innerHTML='';VERSIONS.forEach(item=>{const option=document.createElement('option');option.value=item.id;option.textContent=`${item.name} (${item.annotations})`;option.selected=item.id===VERSION;select.appendChild(option)});}
 async function createVersion(){const name=document.getElementById('newVersionName').value.trim();const status=document.getElementById('versionStatus');if(!name){status.textContent='Enter a version name.';return}try{const result=await api('/api/versions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:MODE,name,source_version:VERSION})});const url=new URL(location.href);url.searchParams.set('version',result.created);localStorage.setItem(versionStorageKey(),result.created);if(AUTH_TOKEN)url.searchParams.set('token',AUTH_TOKEN);location.href=url.toString()}catch(e){status.textContent=e.message||String(e)}}
 function labelDrafts(){return Object.fromEntries([...document.querySelectorAll('#labelEditor input[data-label-id]')].map(input=>[input.dataset.labelId,input.value]));}
-function renderLabelEditor(drafts={}){const level=MODE;document.getElementById('labelDialogTitle').textContent=`${level.toUpperCase()} label management · ${VERSION}`;const root=document.getElementById('labelEditor');root.innerHTML='';(LABELS.levels[level]||[]).forEach(item=>{const row=document.createElement('div');row.className='labelEditorRow';const badge=document.createElement('span');badge.className='muted';badge.textContent=item.active?'Active':'Archived';const input=document.createElement('input');input.value=drafts[item.id]??item.name;input.dataset.labelId=item.id;input.disabled=!item.active;const rename=document.createElement('button');rename.type='button';rename.textContent='Rename';rename.disabled=!item.active;rename.onclick=()=>changeLabel(level,'rename',item.id,input.value);const state=document.createElement('button');state.type='button';state.textContent=item.active?'Archive':'Restore';state.onclick=()=>changeLabel(level,item.active?'archive':'restore',item.id,'');const remove=document.createElement('button');remove.type='button';remove.textContent='Delete';remove.onclick=()=>{if(window.confirm(`Delete label "${item.name}"?`))changeLabel(level,'delete',item.id,'')};row.append(badge,input,rename,state,remove);root.appendChild(row)});pendingLabelAdds.forEach(name=>{const row=document.createElement('div');row.className='labelEditorRow';row.innerHTML=`<span class=muted>Pending new</span><span>${name}</span>`;root.appendChild(row)});}
-async function changeLabel(level,operation,labelId,name,preserveDrafts=false){const status=document.getElementById('labelStatus');const drafts=preserveDrafts?labelDrafts():{};try{LABELS=await api('/api/labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:MODE,level,operation,label_id:labelId,name})});L1=LABELS.levels.l1.filter(x=>x.active).map(x=>x.id);L2=LABELS.levels.l2.filter(x=>x.active).map(x=>x.id);renderLabelEditor(drafts);renderLabels();status.textContent='Saved.'}catch(e){status.textContent=e.message||String(e)}}
-function clearSelectedRoiClass(){if(roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one spatial class before clearing.';return}const cleared=roiAttribute;pushUndo();roi=roi.filter(x=>x.attribute!==cleared);delete roiClassState[cleared];delete roiExclusionOverrides[cleared];roiDrawing=null;roiPreview=null;roiCursor=null;roiPlan=null;syncPositiveLabels();renderRoi();document.getElementById('status').textContent=`Cleared ROI state for: ${labelName('l2',cleared)}.`}
+function renderLabelEditor(drafts={}){const task=MODE;document.getElementById('labelDialogTitle').textContent=`${task.toUpperCase()} label management · ${VERSION}`;const root=document.getElementById('labelEditor');root.innerHTML='';(LABELS.label_sets[task]||[]).forEach(item=>{const row=document.createElement('div');row.className='labelEditorRow';const badge=document.createElement('span');badge.className='muted';badge.textContent=item.active?'Active':'Archived';const input=document.createElement('input');input.value=drafts[item.id]??item.name;input.dataset.labelId=item.id;input.disabled=!item.active;const rename=document.createElement('button');rename.type='button';rename.textContent='Rename';rename.disabled=!item.active;rename.onclick=()=>changeLabel(task,'rename',item.id,input.value);const state=document.createElement('button');state.type='button';state.textContent=item.active?'Archive':'Restore';state.onclick=()=>changeLabel(task,item.active?'archive':'restore',item.id,'');const remove=document.createElement('button');remove.type='button';remove.textContent='Delete';remove.onclick=()=>{if(window.confirm(`Delete label "${item.name}"?`))changeLabel(task,'delete',item.id,'')};row.append(badge,input,rename,state,remove);root.appendChild(row)});pendingLabelAdds.forEach(name=>{const row=document.createElement('div');row.className='labelEditorRow';row.innerHTML=`<span class=muted>Pending new</span><span>${name}</span>`;root.appendChild(row)});}
+async function changeLabel(task,operation,labelId,name,preserveDrafts=false){const status=document.getElementById('labelStatus');const drafts=preserveDrafts?labelDrafts():{};try{LABELS=await api('/api/labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:MODE,task,operation,label_id:labelId,name})});CLASSIFICATION=LABELS.label_sets.classification.filter(x=>x.active).map(x=>x.id);SPATIAL=LABELS.label_sets.spatial.filter(x=>x.active).map(x=>x.id);renderLabelEditor(drafts);renderLabels();status.textContent='Saved.'}catch(e){status.textContent=e.message||String(e)}}
+function clearSelectedRoiClass(){if(roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one spatial class before clearing.';return}const cleared=roiAttribute;pushUndo();roi=roi.filter(x=>x.attribute!==cleared);delete roiClassState[cleared];delete roiExclusionOverrides[cleared];roiDrawing=null;roiPreview=null;roiCursor=null;roiPlan=null;syncPositiveLabels();renderRoi();document.getElementById('status').textContent=`Cleared ROI state for: ${labelName('spatial',cleared)}.`}
 setupEraser();setupRoi();setupTileUndo();document.querySelectorAll('[data-roi-tool]').forEach(button=>button.addEventListener('click',()=>selectRoiTool(button.dataset.roiTool)));document.getElementById('roiUndo').onclick=undoRoi;document.getElementById('roiRedo').onclick=redoRoi;document.getElementById('roiClear').onclick=clearSelectedRoiClass;selectRoiTool('point',false);
 document.getElementById('roiPlanGenerate').onclick=generateRoiPlan;document.getElementById('roiPlanAccept').onclick=acceptRoiPlan;document.getElementById('roiPlanRestart').onclick=restartRoiFromScratch;
 document.getElementById('roiSimilarity').addEventListener('input',renderRoi);
@@ -2977,13 +2964,13 @@ document.getElementById('closeVersion').addEventListener('click',()=>document.ge
 document.getElementById('createVersion').addEventListener('click',createVersion);
 document.getElementById('manageLabels').addEventListener('click',()=>{pendingLabelAdds=[];renderLabelEditor();document.getElementById('labelDialog').showModal()});
 document.getElementById('closeLabels').addEventListener('click',()=>{pendingLabelAdds=[];document.getElementById('labelDialog').close()});
-async function savePendingLabelNames(){const level=MODE;const pending=[...document.querySelectorAll('#labelEditor input[data-label-id]')].map(input=>({id:input.dataset.labelId,name:input.value.trim()})).filter(item=>{const current=(LABELS.levels[level]||[]).find(label=>label.id===item.id);return current&&current.active&&item.name&&item.name!==current.name});for(const item of pending)await changeLabel(level,'rename',item.id,item.name,true);}
+async function savePendingLabelNames(){const task=MODE;const pending=[...document.querySelectorAll('#labelEditor input[data-label-id]')].map(input=>({id:input.dataset.labelId,name:input.value.trim()})).filter(item=>{const current=(LABELS.label_sets[task]||[]).find(label=>label.id===item.id);return current&&current.active&&item.name&&item.name!==current.name});for(const item of pending)await changeLabel(task,'rename',item.id,item.name,true);}
 document.getElementById('addLabel').addEventListener('click',()=>{const input=document.getElementById('newLabelName');const status=document.getElementById('labelStatus');const name=input.value.trim();const finalNames=[...document.querySelectorAll('#labelEditor input[data-label-id]')].map(item=>item.value.trim().toLocaleLowerCase()).concat(pendingLabelAdds.map(item=>item.toLocaleLowerCase()));if(!name){status.textContent='Enter a label name.';return}if(finalNames.includes(name.toLocaleLowerCase())){status.textContent='A current label or draft already uses this name.';return}pendingLabelAdds.push(name);input.value='';renderLabelEditor(labelDrafts());status.textContent='Added as a draft. Save label configuration to commit.';});
 document.getElementById('saveLabels').addEventListener('click',async()=>{const status=document.getElementById('labelStatus');try{await savePendingLabelNames();for(const name of pendingLabelAdds)await changeLabel(MODE,'add','',name,true);pendingLabelAdds=[];renderLabelEditor();status.textContent='Saved to this version.';}catch(e){status.textContent=e.message||String(e);}});
 document.getElementById('authSubmit').addEventListener('click',submitAuth);
 document.getElementById('authInput').addEventListener('keydown',ev=>{if(ev.key==='Enter')submitAuth();});
-document.addEventListener('keydown',ev=>{const mod=ev.metaKey||ev.ctrlKey,target=ev.target,editing=target&&(target.matches?.('input,textarea,select')||target.isContentEditable),dialogOpen=document.querySelector('dialog[open]');if(!mod&&!editing&&!dialogOpen&&ev.key.toLowerCase()==='c'){ev.preventDefault();if(document.getElementById('contextOverlay').classList.contains('hidden')){if(overviewIsOpen())closeOverview();openContext()}else closeContext();return}if(MODE==='l1'&&!mod&&!editing&&!dialogOpen&&ev.key==='Enter'){ev.preventDefault();if(!ev.repeat)nextRandom(true);return}if(MODE==='l1'&&!mod&&!editing&&!dialogOpen&&/^[1-9]$/.test(ev.key)){const index=Number(ev.key)-1;if(index<L1.length){ev.preventDefault();l1=L1[index];renderLabels()}return}if(MODE==='l1'&&!mod&&!editing&&!dialogOpen&&ev.code==='Space'){ev.preventDefault();if(!ev.repeat)save();return}if(!mod)return;if(ev.key.toLowerCase()==='z'){ev.preventDefault();if(ev.shiftKey)redoRoi();else undoRoi()}else if(ev.key.toLowerCase()==='y'){ev.preventDefault();redoRoi()}});
-let L1=%L1_JSON%; let L2=%L2_JSON%; let LABELS=%LABELS_JSON%; const ROI_MODE=%ROI_MODE_JSON%; const MODE=%MODE_JSON%; const MODES=%MODES_JSON%; const VERSION=%VERSION_JSON%; const REVIEW_MODE=%REVIEW_MODE_JSON%; let VERSIONS=%VERSIONS_JSON%; localStorage.setItem(`hcc_sempath_annotation_version:${MODE}`,VERSION);document.body.classList.toggle('review-mode',REVIEW_MODE);document.getElementById('reviewModeBtn').classList.toggle('active',REVIEW_MODE);document.getElementById('reviewModeBtn').textContent=REVIEW_MODE?'Reviewing':'Review';const previousButton=document.getElementById('previousTile');previousButton.textContent='Previous tile';const forwardButton=document.createElement('button');forwardButton.type='button';forwardButton.textContent='Next tile';forwardButton.onclick=forwardTile;previousButton.after(forwardButton);if(REVIEW_MODE){document.getElementById('reviewedDetails').open=true;document.getElementById('skipNext').textContent='Next tile';document.getElementById('toggleQueue').textContent='Reviewed tiles'}renderModeNav(); renderVersions(); renderLabels(); if(isMobile())setQueueOpen(false); ensureAuth().then(()=>refreshPackage()).catch(e=>{if(e.message)document.getElementById('status').textContent=e.message||String(e);});
+document.addEventListener('keydown',ev=>{const mod=ev.metaKey||ev.ctrlKey,target=ev.target,editing=target&&(target.matches?.('input,textarea,select')||target.isContentEditable),dialogOpen=document.querySelector('dialog[open]');if(!mod&&!editing&&!dialogOpen&&ev.key.toLowerCase()==='c'){ev.preventDefault();if(document.getElementById('contextOverlay').classList.contains('hidden')){if(overviewIsOpen())closeOverview();openContext()}else closeContext();return}if(MODE==='classification'&&!mod&&!editing&&!dialogOpen&&ev.key==='Enter'){ev.preventDefault();if(!ev.repeat)nextRandom(true);return}if(MODE==='classification'&&!mod&&!editing&&!dialogOpen&&/^[1-9]$/.test(ev.key)){const index=Number(ev.key)-1;if(index<CLASSIFICATION.length){ev.preventDefault();classification=CLASSIFICATION[index];renderLabels()}return}if(MODE==='classification'&&!mod&&!editing&&!dialogOpen&&ev.code==='Space'){ev.preventDefault();if(!ev.repeat)save();return}if(!mod)return;if(ev.key.toLowerCase()==='z'){ev.preventDefault();if(ev.shiftKey)redoRoi();else undoRoi()}else if(ev.key.toLowerCase()==='y'){ev.preventDefault();redoRoi()}});
+let CLASSIFICATION=%CLASSIFICATION_JSON%; let SPATIAL=%SPATIAL_JSON%; let LABELS=%LABELS_JSON%; const ROI_MODE=%ROI_MODE_JSON%; const MODE=%MODE_JSON%; const MODES=%MODES_JSON%; const VERSION=%VERSION_JSON%; const REVIEW_MODE=%REVIEW_MODE_JSON%; let VERSIONS=%VERSIONS_JSON%; localStorage.setItem(`hcc_sempath_annotation_version:${MODE}`,VERSION);document.body.classList.toggle('review-mode',REVIEW_MODE);document.getElementById('reviewModeBtn').classList.toggle('active',REVIEW_MODE);document.getElementById('reviewModeBtn').textContent=REVIEW_MODE?'Reviewing':'Review';const previousButton=document.getElementById('previousTile');previousButton.textContent='Previous tile';const forwardButton=document.createElement('button');forwardButton.type='button';forwardButton.textContent='Next tile';forwardButton.onclick=forwardTile;previousButton.after(forwardButton);if(REVIEW_MODE){document.getElementById('reviewedDetails').open=true;document.getElementById('skipNext').textContent='Next tile';document.getElementById('toggleQueue').textContent='Reviewed tiles'}renderModeNav(); renderVersions(); renderLabels(); if(isMobile())setQueueOpen(false); ensureAuth().then(()=>refreshPackage()).catch(e=>{if(e.message)document.getElementById('status').textContent=e.message||String(e);});
 </script></body></html>
 """
 
@@ -3002,7 +2989,7 @@ def make_handler(
     auth_token: str,
     roi_plan_generator=None,
 ):
-    raw_datasets = data if isinstance(data, dict) else ({"l2" if isinstance(data, AnnotationData) and data.roi_mode else "l1": data})
+    raw_datasets = data if isinstance(data, dict) else ({"spatial" if isinstance(data, AnnotationData) and data.roi_mode else "classification": data})
     archives = {
         mode: item if isinstance(item, AnnotationArchive) else AnnotationArchive(
             item,
@@ -3046,8 +3033,8 @@ def make_handler(
                     }
                     mode, version, selected_data = select_data(mode, version)
                     html = (
-                        HTML.replace("%L1_JSON%", json.dumps(selected_data.state.l1_prototypes))
-                        .replace("%L2_JSON%", json.dumps(selected_data.state.l2_prototypes))
+                        HTML.replace("%CLASSIFICATION_JSON%", json.dumps(selected_data.state.classification_prototypes))
+                        .replace("%SPATIAL_JSON%", json.dumps(selected_data.state.spatial_prototypes))
                         .replace("%LABELS_JSON%", json.dumps(selected_data.state.labels_json()))
                         .replace("%ROI_MODE_JSON%", json.dumps(selected_data.roi_mode))
                         .replace("%MODE_JSON%", json.dumps(mode))
@@ -3212,7 +3199,7 @@ def make_handler(
                     index = int(payload["package"])
                     row = int(payload["row"])
                     attribute = str(payload["attribute"])
-                    if attribute not in selected_data.state.l2_prototypes:
+                    if attribute not in selected_data.state.spatial_prototypes:
                         raise ValueError(f"unknown spatial attribute: {attribute}")
                     tile_png = selected_data.viewer(index).read_tile_png(row)
                     LOG.info(
@@ -3257,7 +3244,7 @@ def make_handler(
                     viewer = selected_data.viewer(index)
                     record = viewer._by_row[row]
                     package = selected_data.package(index)
-                    LOG.info("annotation_request iac=%s row=%d l1=%s l2=%s", package.rel_path, row, payload.get("l1"), payload.get("l2", []))
+                    LOG.info("annotation_request iac=%s row=%d classification=%s spatial=%s", package.rel_path, row, payload.get("classification"), payload.get("spatial", []))
                     if (
                         selected_data.priority_queue is not None
                         and selected_data.review_queue is None
@@ -3266,8 +3253,8 @@ def make_handler(
                     selected_data.state.save_annotation(
                         package,
                         record,
-                        str(payload["l1"]),
-                        list(payload.get("l2", [])),
+                        str(payload["classification"]),
+                        list(payload.get("spatial", [])),
                         list(payload.get("roi", [])),
                         review_id=(
                             selected_data.review_queue.review_id
@@ -3320,7 +3307,7 @@ def make_handler(
                         str(payload.get("version") or qs.get("version", [None])[0]) if (payload.get("version") or qs.get("version")) else None,
                     )
                     result = selected_data.state.change_label(
-                        str(payload["level"]), str(payload["operation"]),
+                        str(payload["task"]), str(payload["operation"]),
                         label_id=str(payload.get("label_id") or ""),
                         name=str(payload.get("name") or ""),
                     )
@@ -3354,8 +3341,8 @@ def _annotation_parser() -> argparse.ArgumentParser:
         description="Open the classification/spatial prototype annotation UI."
     )
     parser.add_argument("--input", required=True, help="IAC file or directory containing image-tile IAC packages.")
-    parser.add_argument("--l1-state", required=True, help="Classification JSON state file.")
-    parser.add_argument("--l2-state", required=True, help="Spatial annotation JSON state file.")
+    parser.add_argument("--classification-state", required=True, help="Classification JSON state file.")
+    parser.add_argument("--spatial-state", required=True, help="Spatial annotation JSON state file.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765, help="Use 0 to pick a free port.")
     parser.add_argument("--token", default="", help="Annotation UI auth token; overrides the persisted state .auth-token when set.")
@@ -3371,7 +3358,7 @@ def _annotation_parser() -> argparse.ArgumentParser:
         help="Shared mutable tile-priority manifest used by both expert tasks.",
     )
     parser.add_argument(
-        "--l1-review-manifest",
+        "--classification-review-manifest",
         default="",
         help=(
             "Optional read-only strict tile list for a classification review pass. "
@@ -3388,7 +3375,7 @@ def _annotation_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--l2-review-manifest",
+        "--spatial-review-manifest",
         default="",
         help=(
             "Optional read-only strict tile list for a spatial review pass. "
@@ -3435,19 +3422,19 @@ def _annotation_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(task=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _annotation_parser().parse_args()
     from hcc_sempath.modeling.roi_plan import RoiPlanGenerator
 
     priority_queue = SharedPriorityQueue(args.priority_manifest)
-    l1_review_queue = (
-        StrictReviewQueue(args.l1_review_manifest)
-        if args.l1_review_manifest
+    classification_review_queue = (
+        StrictReviewQueue(args.classification_review_manifest)
+        if args.classification_review_manifest
         else None
     )
-    l2_review_queue = (
-        StrictReviewQueue(args.l2_review_manifest)
-        if args.l2_review_manifest
+    spatial_review_queue = (
+        StrictReviewQueue(args.spatial_review_manifest)
+        if args.spatial_review_manifest
         else None
     )
     roi_priority_attributes = [
@@ -3461,49 +3448,49 @@ def main() -> None:
         if args.roi_information_report
         else None
     )
-    l1_initial = AnnotationData(
+    classification_initial = AnnotationData(
         args.input,
-        args.l1_state,
+        args.classification_state,
         priority_queue=priority_queue,
-        review_queue=l1_review_queue,
+        review_queue=classification_review_queue,
         include_packages=include_packages,
         min_tissue_fraction=args.min_tissue_fraction,
     )
-    l2_initial = AnnotationData(
+    spatial_initial = AnnotationData(
         args.input,
-        args.l2_state,
+        args.spatial_state,
         roi_candidate_manifest=args.roi_candidate_manifest or None,
         roi_information_report=roi_information_report,
         roi_priority_attributes=roi_priority_attributes,
         roi_mode=True,
         priority_queue=priority_queue,
-        review_queue=l2_review_queue,
+        review_queue=spatial_review_queue,
         include_packages=include_packages,
         min_tissue_fraction=args.min_tissue_fraction,
     )
     datasets = {
-        "l1": AnnotationArchive(
-            l1_initial,
+        "classification": AnnotationArchive(
+            classification_initial,
             input_path=args.input,
             priority_queue=priority_queue,
-            review_queue=l1_review_queue,
+            review_queue=classification_review_queue,
             include_packages=include_packages,
             min_tissue_fraction=args.min_tissue_fraction,
         ),
-        "l2": AnnotationArchive(
-            l2_initial,
+        "spatial": AnnotationArchive(
+            spatial_initial,
             input_path=args.input,
             roi_candidate_manifest=args.roi_candidate_manifest or None,
             roi_information_report=roi_information_report,
             roi_priority_attributes=roi_priority_attributes,
             roi_mode=True,
             priority_queue=priority_queue,
-            review_queue=l2_review_queue,
+            review_queue=spatial_review_queue,
             include_packages=include_packages,
             min_tissue_fraction=args.min_tissue_fraction,
         ),
     }
-    auth_token = _load_or_create_auth_token(args.l1_state, args.token)
+    auth_token = _load_or_create_auth_token(args.classification_state, args.token)
     roi_plan_generator = RoiPlanGenerator()
     port = _find_free_port(args.host, args.port)
     server = ThreadingHTTPServer(
@@ -3512,7 +3499,7 @@ def main() -> None:
     base_url = f"http://{args.host}:{port}/"
     query = f"token={auth_token}"
     if args.review_existing:
-        query += "&mode=l2&review=1"
+        query += "&mode=spatial&review=1"
     url = f"{base_url}?{query}"
     states = ",".join(f"{mode}:{item.data().state.state_path}" for mode, item in datasets.items())
     LOG.info("server_start url=%s states=%s", base_url, states)

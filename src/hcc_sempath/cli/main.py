@@ -7,8 +7,14 @@ from collections.abc import Sequence
 
 COMMANDS: dict[str, tuple[str, str]] = {
     "build-tile-cache": ("hcc_sempath.cli.tile_cache", "Build image-tile IAC packages from a WSI file or directory."),
-    "annotate-prototypes": ("hcc_sempath.cli.annotate_prototypes", "Open browser UI for L1/L2 prototype tile annotation."),
-    "build-priority-list": ("hcc_sempath.cli.build_priority_list", "Build a shared mutable L1/L2 tile-priority manifest."),
+    "annotate-prototypes": (
+        "hcc_sempath.cli.annotate_prototypes",
+        "Open the classification/spatial prototype annotation UI.",
+    ),
+    "build-priority-list": (
+        "hcc_sempath.cli.build_priority_list",
+        "Build a shared mutable classification/spatial tile-priority manifest.",
+    ),
     "build-roi-queue": ("hcc_sempath.cli.build_roi_queue", "Build a component-presence navigation pool for ROI annotation."),
     "build-teacher-cache": ("hcc_sempath.teacher.cache", "Run a teacher model and write <teacher-name>.features.iac directly."),
     "build-train-manifest": ("hcc_sempath.training.manifest", "Build a training manifest from per-WSI IAC packages."),

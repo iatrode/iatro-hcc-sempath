@@ -113,7 +113,7 @@ def test_generator_uses_independent_image_templates_and_real_similarity() -> Non
 
     result = RoiPlanGenerator().generate_similar(
         Image.fromarray(image),
-        attribute="inflammatory-cell-present",
+        attribute="inflammatory-cell",
         seeds=[(24 / 96, 30 / 96)],
         occupied=[(24 / 96, 30 / 96)],
     )
@@ -141,6 +141,6 @@ def test_generator_rejects_non_nuclear_attributes() -> None:
     with np.testing.assert_raises_regex(ValueError, "nucleus matching currently supports"):
         RoiPlanGenerator().generate_similar(
             Image.new("RGB", (96, 96), (220, 190, 210)),
-            attribute="bile-pigment-present",
+            attribute="bile-pigment",
             seeds=[(0.5, 0.5)],
         )

@@ -5,10 +5,10 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from hcc_sempath.cli.annotate_prototypes import ROI_L2_PROTOTYPES
+from hcc_sempath.cli.annotate_prototypes import ROI_SPATIAL_PROTOTYPES
 
 
-# This only bounds the size of the historical-label navigation pool. It is not
+# This only bounds the size of the component-positive navigation pool. It is not
 # an annotation target or a stopping rule; per-component information curves
 # decide whether additional expert annotation is needed.
 DEFAULT_PLANNING_COVERAGE = 100
@@ -34,20 +34,20 @@ def build_roi_candidate_queue(
 ) -> dict:
     if planning_coverage <= 0:
         raise ValueError("planning_coverage must be positive")
-    attributes = list(ROI_L2_PROTOTYPES)
+    attributes = list(ROI_SPATIAL_PROTOTYPES)
     by_tile: dict[str, dict] = {}
     for path in annotation_paths:
         for item in _records(path):
             tile_id = str(item.get("tile_id") or "").strip()
-            source_l2 = sorted(set(item.get("source_l2") or item.get("l2") or []) & set(attributes))
-            if not tile_id or not source_l2:
+            source_spatial = sorted(set(item.get("source_spatial") or item.get("spatial") or []) & set(attributes))
+            if not tile_id or not source_spatial:
                 continue
             candidate = {
                 "tile_id": tile_id,
                 "iac": str(item.get("iac") or item.get("iac_path") or ""),
                 "row": int(item.get("row", -1)),
                 "slide": str(item.get("slide") or item.get("slide_id") or ""),
-                "source_l2": source_l2,
+                "source_spatial": source_spatial,
             }
             previous = by_tile.get(tile_id)
             if previous is not None and previous != candidate:
@@ -56,7 +56,7 @@ def build_roi_candidate_queue(
 
     available = Counter()
     for item in by_tile.values():
-        available.update(item["source_l2"])
+        available.update(item["source_spatial"])
     goals = {
         name: min(planning_coverage, available[name])
         for name in attributes
@@ -72,26 +72,26 @@ def build_roi_candidate_queue(
         best = min(
             remaining.values(),
             key=lambda item: (
-                -sum(1 / max(1, available[name]) for name in item["source_l2"] if useful[name]),
-                -sum(useful[name] for name in item["source_l2"]),
+                -sum(1 / max(1, available[name]) for name in item["source_spatial"] if useful[name]),
+                -sum(useful[name] for name in item["source_spatial"]),
                 item["slide"],
                 item["tile_id"],
             ),
             default=None,
         )
-        if best is None or not any(useful[name] for name in best["source_l2"]):
+        if best is None or not any(useful[name] for name in best["source_spatial"]):
             break
         remaining.pop(best["tile_id"])
-        priority = [name for name in best["source_l2"] if useful[name]]
+        priority = [name for name in best["source_spatial"] if useful[name]]
         selected.append({**best, "priority_attributes": priority, "rank": len(selected)})
-        counts.update(best["source_l2"])
+        counts.update(best["source_spatial"])
     unfilled = {
         name: max(0, planning_coverage - available[name])
         for name in attributes
     }
     return {
         "version": 2,
-        "l2_prototypes": attributes,
+        "spatial_prototypes": attributes,
         "planning_coverage_per_attribute": {
             name: planning_coverage for name in attributes
         },
@@ -107,14 +107,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Build a component-presence navigation pool for ROI annotation."
     )
-    parser.add_argument("--annotations", action="append", required=True, help="Tile-level annotation JSON or supplemental candidate JSON; repeatable. Existing L2 labels are optional and only affect priority.")
+    parser.add_argument(
+        "--annotations",
+        action="append",
+        required=True,
+        help=(
+            "Tile-level annotation JSON or supplemental candidate JSON; "
+            "repeatable. Existing spatial labels are optional and only affect "
+            "priority."
+        ),
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--planning-coverage",
         type=int,
         default=DEFAULT_PLANNING_COVERAGE,
         help=(
-            "Maximum historical positive-tile coverage retained per component "
+            "Maximum positive-tile coverage retained per component "
             "for navigation planning; this is not an annotation target."
         ),
     )

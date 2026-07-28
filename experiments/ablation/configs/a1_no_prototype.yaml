@@ -1,18 +1,18 @@
 inherits: matched_tenth.yaml
 
 # Ablation A1 — multi-teacher distillation without the global HCC prototype
-# coordinate or L1 supervision. The matched L2 spatial task remains active.
+# coordinate or classification supervision. The matched spatial task remains active.
 # Design doc §7 item 4.
 #
-# Mechanism removal vs A0: L1 targets and prototype-response objectives are
-# turned off. The same L1 expert tile images remain in the fixed replay union,
-# but their L1 labels are masked so image distribution and replay frequency
-# remain matched. This removes L1 target loss, prototype-coordinate semantic
+# Mechanism removal vs A0: classification targets and prototype-response objectives are
+# turned off. The same classification expert tile images remain in the fixed replay union,
+# but their classification labels are masked so image distribution and replay frequency
+# remain matched. This removes classification target loss, prototype-coordinate semantic
 # distillation, PAMT-D reliability adjudication, and student response matching
-# together; four-teacher feature/relation distillation and spatial L2
+# together; four-teacher feature/relation distillation and spatial
 # supervision, including its local prototype readout, remain active.
 #
-# Active prototype paths and the L1 target manifest are explicitly nulled. The
+# Active prototype paths and the classification target manifest are explicitly nulled. The
 # resolver retains the separate replay-selection manifest solely for matched
 # tile sampling.
 

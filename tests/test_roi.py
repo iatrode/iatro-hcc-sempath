@@ -15,7 +15,7 @@ from hcc_sempath.training.spatial_losses import (
     _brush_bag_loss,
     _maximum_cardinality_score_matching,
     _point_peak_loss,
-    l1_classification_loss,
+    classification_objective_loss,
     spatial_morphometry_loss,
 )
 
@@ -66,28 +66,28 @@ def _write_records(path: Path, records: list[dict]) -> None:
     path.write_text(json.dumps(records), encoding="utf-8")
 
 
-def test_masked_l1_loss_matches_selected_cross_entropy_and_handles_empty() -> None:
+def test_masked_classification_loss_matches_selected_cross_entropy_and_handles_empty() -> None:
     logits = torch.tensor(
         [[2.0, -1.0], [-0.5, 1.5], [1.0, 0.0]],
         requires_grad=True,
     )
     mask = torch.tensor([True, False, True])
     targets = torch.tensor([0, -1, 1])
-    loss, parts = l1_classification_loss(logits, mask, targets)
+    loss, parts = classification_objective_loss(logits, mask, targets)
     expected = torch.nn.functional.cross_entropy(
         logits[mask],
         targets[mask],
     )
     torch.testing.assert_close(loss, expected)
-    assert parts["l1_supervised_tiles"].item() == 2
+    assert parts["classification_supervised_tiles"].item() == 2
 
-    empty, empty_parts = l1_classification_loss(
+    empty, empty_parts = classification_objective_loss(
         logits,
         torch.zeros(3, dtype=torch.bool),
         torch.full((3,), -1, dtype=torch.long),
     )
     assert empty.item() == 0.0
-    assert empty_parts["l1_accuracy"].item() == 0.0
+    assert empty_parts["classification_accuracy"].item() == 0.0
 
 
 def test_validation_completeness_is_explicit_and_geometry_preserved(
@@ -95,8 +95,8 @@ def test_validation_completeness_is_explicit_and_geometry_preserved(
 ) -> None:
     path = tmp_path / "validation.json"
     names = [
-        "hepatocellular-parenchyma-present",
-        "necrosis-present",
+        "hepatocellular-parenchyma",
+        "necrosis",
     ]
     path.write_text(
         json.dumps(
@@ -206,7 +206,7 @@ def test_continuous_component_brush_is_area_only(tmp_path: Path) -> None:
         [
             {
                 "tile_id": "necrosis",
-                "attribute": "necrosis-present",
+                "attribute": "necrosis",
                 "split": "train",
                 "state": "positive",
                 "geometry": {
@@ -219,7 +219,7 @@ def test_continuous_component_brush_is_area_only(tmp_path: Path) -> None:
     )
     target = build_spatial_roi_targets(
         path,
-        component_names=["necrosis-present"],
+        component_names=["necrosis"],
         image_size=(224, 224),
         grid_size=(32, 32),
     )["necrosis"]
@@ -235,7 +235,7 @@ def test_continuous_component_accepts_mixed_point_circle_and_brush_as_area(
     path = tmp_path / "spatial.json"
     common = {
         "tile_id": "mixed-necrosis",
-        "attribute": "necrosis-present",
+        "attribute": "necrosis",
         "split": "train",
         "state": "positive",
     }
@@ -266,7 +266,7 @@ def test_continuous_component_accepts_mixed_point_circle_and_brush_as_area(
     )
     target = build_spatial_roi_targets(
         path,
-        component_names=["necrosis-present"],
+        component_names=["necrosis"],
         image_size=(224, 224),
         grid_size=(32, 32),
     )["mixed-necrosis"]
@@ -283,7 +283,7 @@ def test_bile_pigment_all_geometries_supervise_burden_not_count(
     path = tmp_path / "spatial.json"
     common = {
         "tile_id": "pigment",
-        "attribute": "bile-pigment-present",
+        "attribute": "bile-pigment",
         "split": "train",
         "state": "positive",
     }
@@ -311,7 +311,7 @@ def test_bile_pigment_all_geometries_supervise_burden_not_count(
     )
     target = build_spatial_roi_targets(
         path,
-        component_names=["bile-pigment-present"],
+        component_names=["bile-pigment"],
         image_size=(224, 224),
         grid_size=(32, 32),
     )["pigment"]
@@ -327,7 +327,7 @@ def test_large_structure_circle_and_brush_each_add_one_instance_with_area(
     path = tmp_path / "spatial.json"
     common = {
         "tile_id": "duct",
-        "attribute": "ductular-portal-present",
+        "attribute": "ductular-portal",
         "split": "train",
         "state": "positive",
     }
@@ -354,7 +354,7 @@ def test_large_structure_circle_and_brush_each_add_one_instance_with_area(
     )
     target = build_spatial_roi_targets(
         path,
-        component_names=["ductular-portal-present"],
+        component_names=["ductular-portal"],
         image_size=(224, 224),
         grid_size=(32, 32),
     )["duct"]
@@ -373,7 +373,7 @@ def test_large_structure_point_has_center_without_invented_extent(
         [
             {
                 "tile_id": "vacuole",
-                "attribute": "steatosis-vacuolation-present",
+                "attribute": "steatosis-vacuolation",
                 "split": "train",
                 "state": "positive",
                 "geometry": {"type": "point", "point": [112, 112]},
@@ -382,7 +382,7 @@ def test_large_structure_point_has_center_without_invented_extent(
     )
     target = build_spatial_roi_targets(
         path,
-        component_names=["steatosis-vacuolation-present"],
+        component_names=["steatosis-vacuolation"],
         image_size=(224, 224),
         grid_size=(32, 32),
         point_tolerance_cells=1,
@@ -401,7 +401,7 @@ def test_bile_point_is_one_burden_seed_not_a_tolerance_sized_extent(
         [
             {
                 "tile_id": "pigment",
-                "attribute": "bile-pigment-present",
+                "attribute": "bile-pigment",
                 "split": "train",
                 "state": "positive",
                 "geometry": {"type": "point", "point": [112, 112]},
@@ -410,7 +410,7 @@ def test_bile_point_is_one_burden_seed_not_a_tolerance_sized_extent(
     )
     target = build_spatial_roi_targets(
         path,
-        component_names=["bile-pigment-present"],
+        component_names=["bile-pigment"],
         image_size=(224, 224),
         grid_size=(32, 32),
         point_tolerance_cells=1,
@@ -426,7 +426,7 @@ def test_connected_structure_brush_strokes_form_one_instance(
     path = tmp_path / "spatial.json"
     common = {
         "tile_id": "vessel",
-        "attribute": "vascular-structure-present",
+        "attribute": "small-vessel",
         "split": "train",
         "state": "positive",
     }
@@ -453,7 +453,7 @@ def test_connected_structure_brush_strokes_form_one_instance(
     )
     target = build_spatial_roi_targets(
         path,
-        component_names=["vascular-structure-present"],
+        component_names=["small-vessel"],
         image_size=(224, 224),
         grid_size=(32, 32),
     )["vessel"]
@@ -469,7 +469,7 @@ def test_disconnected_structure_brush_strokes_remain_separate_instances(
     path = tmp_path / "spatial.json"
     common = {
         "tile_id": "vessels",
-        "attribute": "vascular-structure-present",
+        "attribute": "small-vessel",
         "split": "train",
         "state": "positive",
     }
@@ -496,7 +496,7 @@ def test_disconnected_structure_brush_strokes_remain_separate_instances(
     )
     target = build_spatial_roi_targets(
         path,
-        component_names=["vascular-structure-present"],
+        component_names=["small-vessel"],
         image_size=(224, 224),
         grid_size=(32, 32),
     )["vessels"]
@@ -511,7 +511,7 @@ def test_pixel_separated_structure_brushes_do_not_merge_on_coarse_grid(
     path = tmp_path / "spatial.json"
     common = {
         "tile_id": "nearby-vessels",
-        "attribute": "vascular-structure-present",
+        "attribute": "small-vessel",
         "split": "train",
         "state": "positive",
     }
@@ -539,7 +539,7 @@ def test_pixel_separated_structure_brushes_do_not_merge_on_coarse_grid(
 
     target = build_spatial_roi_targets(
         path,
-        component_names=["vascular-structure-present"],
+        component_names=["small-vessel"],
         image_size=(224, 224),
         grid_size=(32, 32),
     )["nearby-vessels"]
@@ -640,7 +640,7 @@ def test_cell_circle_radius_suppresses_duplicate_instance_peaks() -> None:
         area_positive=zeros_bool,
         explicit_negative=zeros_bool,
         implicit_negative=zeros_bool,
-        component_names=["hemorrhage-present"],
+        component_names=["hemorrhage"],
         point_tolerance_cells=0,
         abundance_point_weight=0.0,
     )
@@ -653,7 +653,7 @@ def test_cell_circle_radius_suppresses_duplicate_instance_peaks() -> None:
         area_positive=zeros_bool,
         explicit_negative=zeros_bool,
         implicit_negative=zeros_bool,
-        component_names=["hemorrhage-present"],
+        component_names=["hemorrhage"],
         point_tolerance_cells=0,
         abundance_point_weight=0.0,
     )
@@ -795,10 +795,10 @@ def test_spatial_loss_routes_point_brush_and_negative_gradients() -> None:
     assert instance_logits.grad.abs().sum() > 0
     assert abundance_logits.grad is not None
     assert abundance_logits.grad.abs().sum() > 0
-    assert parts["l2_point_count"].item() == 1
-    assert parts["l2_brush_bag_count"].item() == 1
-    assert parts["l2_explicit_negative_pairs"].item() == 1
-    assert parts["l2_implicit_negative_pairs"].item() == 1
+    assert parts["spatial_point_count"].item() == 1
+    assert parts["spatial_brush_bag_count"].item() == 1
+    assert parts["spatial_explicit_negative_pairs"].item() == 1
+    assert parts["spatial_implicit_negative_pairs"].item() == 1
 
 
 @pytest.mark.parametrize("top_fraction", [0.25, 0.5, 1.0])
@@ -930,7 +930,7 @@ def test_area_only_loss_does_not_train_instance_channel() -> None:
         area_positive=area_positive,
         explicit_negative=zeros_bool,
         implicit_negative=zeros_bool,
-        component_names=["necrosis-present"],
+        component_names=["necrosis"],
     )
     loss.backward()
 
@@ -938,7 +938,7 @@ def test_area_only_loss_does_not_train_instance_channel() -> None:
     assert instance_logits.grad.abs().sum().item() == 0
     assert measurement_logits.grad is not None
     assert measurement_logits.grad.abs().sum().item() > 0
-    assert parts["l2_area_supervised_pairs"].item() == 1
+    assert parts["spatial_area_supervised_pairs"].item() == 1
 
 
 def test_structure_point_does_not_train_unknown_measurement_extent() -> None:
@@ -959,7 +959,7 @@ def test_structure_point_does_not_train_unknown_measurement_extent() -> None:
         area_positive=zeros_bool,
         explicit_negative=zeros_bool,
         implicit_negative=implicit,
-        component_names=["vascular-structure-present"],
+        component_names=["small-vessel"],
         point_tolerance_cells=1,
     )
     loss.backward()
@@ -991,7 +991,7 @@ def test_structure_extent_penalizes_a_second_instance_peak() -> None:
         area_positive=area,
         explicit_negative=zeros_bool,
         implicit_negative=zeros_bool,
-        component_names=["vascular-structure-present"],
+        component_names=["small-vessel"],
         point_tolerance_cells=0,
     )
     two_loss, _ = spatial_morphometry_loss(
@@ -1002,7 +1002,7 @@ def test_structure_extent_penalizes_a_second_instance_peak() -> None:
         area_positive=area,
         explicit_negative=zeros_bool,
         implicit_negative=zeros_bool,
-        component_names=["vascular-structure-present"],
+        component_names=["small-vessel"],
         point_tolerance_cells=0,
     )
 

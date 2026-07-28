@@ -18,8 +18,8 @@ _RGB_FROM_HED = np.asarray(
 )
 _HED_FROM_RGB = np.linalg.inv(_RGB_FROM_HED).astype(np.float32)
 _NUCLEUS_MATCH_SIGMA = {
-    "hepatocellular-parenchyma-present": 2.0,
-    "inflammatory-cell-present": 0.0,
+    "hepatocellular-parenchyma": 2.0,
+    "inflammatory-cell": 0.0,
 }
 
 
@@ -302,7 +302,7 @@ class RoiPlanGenerator:
         if attribute not in _NUCLEUS_MATCH_SIGMA:
             raise ValueError(
                 "image-only nucleus matching currently supports only "
-                "hepatocellular-parenchyma-present and inflammatory-cell-present"
+                "hepatocellular-parenchyma and inflammatory-cell"
             )
 
         with self._lock:

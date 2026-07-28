@@ -231,7 +231,7 @@ def test_dataset_adds_dynamic_prototype_supervision_fields(tmp_path: Path) -> No
     labels = {
         "slide_a_0000000": PrototypeLabel(
             tile_id="slide_a_0000000",
-            level1=1,
+            classification=1,
             source_split="train",
         )
     }
@@ -246,7 +246,7 @@ def test_dataset_adds_dynamic_prototype_supervision_fields(tmp_path: Path) -> No
     batch = collate_distillation([dataset[0], dataset[1]])
 
     assert batch["prototype_mask"].tolist() == [True, False]
-    assert batch["prototype_level1"].tolist() == [1, -1]
+    assert batch["prototype_classification"].tolist() == [1, -1]
 
 
 def test_expert_row_resolution_reads_only_requested_tile_ids(
@@ -346,9 +346,9 @@ def test_dataset_collates_spatial_targets_and_preserves_ignore_mask(tmp_path: Pa
     )
     batch = collate_distillation([dataset[0], dataset[1]])
 
-    assert batch["l2_point_centers"].shape == (2, 2, 2, 2)
-    assert batch["l2_implicit_negative"][0].sum().item() == 1
-    assert batch["l2_implicit_negative"][1].sum().item() == 0
+    assert batch["spatial_point_centers"].shape == (2, 2, 2, 2)
+    assert batch["spatial_implicit_negative"][0].sum().item() == 1
+    assert batch["spatial_implicit_negative"][1].sum().item() == 0
 
 
 def test_package_scatter_loader_copies_spatial_tensors(tmp_path: Path) -> None:
@@ -383,9 +383,9 @@ def test_package_scatter_loader_copies_spatial_tensors(tmp_path: Path) -> None:
     )
 
     batch = buffer.view(2)
-    assert batch["l2_point_centers"][0, 0, 1, 1].item() == 1
-    assert batch["l2_implicit_negative"][0].sum().item() == 1
-    assert batch["l2_implicit_negative"][1].sum().item() == 0
+    assert batch["spatial_point_centers"][0, 0, 1, 1].item() == 1
+    assert batch["spatial_implicit_negative"][0].sum().item() == 1
+    assert batch["spatial_implicit_negative"][1].sum().item() == 0
 
 
 def test_build_training_manifest_splits_public_heldout_by_count(tmp_path: Path) -> None:

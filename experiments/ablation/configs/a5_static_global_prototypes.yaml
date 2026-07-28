@@ -1,6 +1,6 @@
 inherits: matched_tenth.yaml
 
-# A5: A0 with global L1/L2 reliability prototypes computed once before
+# A5: A0 with global classification/spatial reliability prototypes computed once before
 # optimization and then fixed. Spatial prototypes continue to track the
 # evolving local representation.
 

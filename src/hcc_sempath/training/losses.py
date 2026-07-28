@@ -86,16 +86,16 @@ def semantic_distillation_loss(
     student: torch.Tensor,
     teacher: torch.Tensor,
     prototypes: PrototypeRegistry,
-    primary_temperature: float = 1.0,
+    classification_temperature: float = 1.0,
     sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Preserve the fixed L1 semantic axis."""
+    """Preserve the fixed classification semantic axis."""
 
-    per_sample = primary_prototype_kl_loss_per_sample(
+    per_sample = classification_prototype_kl_loss_per_sample(
         student,
         teacher,
         prototypes,
-        temperature=primary_temperature,
+        temperature=classification_temperature,
     )
     return _weighted_sample_mean(
         per_sample,
@@ -104,14 +104,14 @@ def semantic_distillation_loss(
     )
 
 
-def primary_prototype_kl_loss(
+def classification_prototype_kl_loss(
     student: torch.Tensor,
     teacher: torch.Tensor,
     prototypes: PrototypeRegistry,
     temperature: float = 1.0,
     sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    per_sample = primary_prototype_kl_loss_per_sample(
+    per_sample = classification_prototype_kl_loss_per_sample(
         student,
         teacher,
         prototypes,
@@ -124,7 +124,7 @@ def primary_prototype_kl_loss(
     )
 
 
-def primary_prototype_kl_loss_per_sample(
+def classification_prototype_kl_loss_per_sample(
     student: torch.Tensor,
     teacher: torch.Tensor,
     prototypes: PrototypeRegistry,
@@ -134,9 +134,15 @@ def primary_prototype_kl_loss_per_sample(
         raise ValueError(
             f"semantic temperature must be positive, got {temperature}"
         )
-    primary = prototypes.primary_prototypes
-    student_logits = bounded_logits(normalized_prototype_logits(student, primary) / temperature)
-    teacher_logits = bounded_logits(normalized_prototype_logits(teacher, primary) / temperature)
+    classification_prototypes = prototypes.prototypes
+    student_logits = bounded_logits(
+        normalized_prototype_logits(student, classification_prototypes)
+        / temperature
+    )
+    teacher_logits = bounded_logits(
+        normalized_prototype_logits(teacher, classification_prototypes)
+        / temperature
+    )
     teacher_target = clamp_probability(
         F.softmax(teacher_logits, dim=-1),
         normalize=True,
@@ -207,7 +213,7 @@ def total_distillation_loss(
     semantic_weight: float,
     semantic_temperature: float,
     feature_loss_type: str = "cosine",
-    primary_temperature: float | None = None,
+    classification_temperature: float | None = None,
     sample_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     feature_per_sample = feature_distillation_loss_per_sample(
@@ -232,7 +238,7 @@ def total_distillation_loss(
             student=student,
             teacher=teacher,
             prototypes=prototypes,
-            primary_temperature=semantic_temperature if primary_temperature is None else primary_temperature,
+            classification_temperature=semantic_temperature if classification_temperature is None else classification_temperature,
             sample_weight=sample_weight,
         )
     total = feature + relation_weight * relation + semantic_weight * semantic
@@ -252,7 +258,7 @@ def multi_teacher_distillation_loss(
     semantic_temperature: float,
     teacher_weights: dict[str, float] | None = None,
     feature_loss_type: str = "cosine",
-    primary_temperature: float | None = None,
+    classification_temperature: float | None = None,
     teacher_sample_weights: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if not student_by_teacher:
@@ -368,14 +374,14 @@ def multi_teacher_distillation_loss(
 
         prototypes = prototypes_by_teacher.get(name) if prototypes_by_teacher else None
         if prototypes is not None and semantic_weight != 0:
-            semantic_values = primary_prototype_kl_loss_per_sample(
+            semantic_values = classification_prototype_kl_loss_per_sample(
                 student,
                 teacher,
                 prototypes,
                 temperature=(
                     semantic_temperature
-                    if primary_temperature is None
-                    else primary_temperature
+                    if classification_temperature is None
+                    else classification_temperature
                 ),
             )
             semantic_numerator = semantic_numerator + (

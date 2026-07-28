@@ -7,7 +7,7 @@ from pathlib import Path
 from ..modeling.prototypes import PrototypeRegistry
 
 
-DEFAULT_L1_CLASSES = (
+DEFAULT_CLASSIFICATION_CLASSES = (
     "HCC-tumor-well-differentiated",
     "HCC-tumor-moderately-differentiated",
     "HCC-tumor-poorly-differentiated",
@@ -20,7 +20,7 @@ DEFAULT_L1_CLASSES = (
 @dataclass(frozen=True)
 class PrototypeLabel:
     tile_id: str
-    level1: int
+    classification: int
     source_split: str
 
 
@@ -38,16 +38,16 @@ def load_prototype_labels(
     if manifest_path is None or prototypes is None:
         return {}
     if isinstance(prototypes, PrototypeRegistry):
-        primary_names = [prototypes.names[idx] for idx in prototypes.primary_indices]
+        classification_names = list(prototypes.names)
     else:
-        primary_names = [str(name) for name in prototypes]
-    primary_index = {name: idx for idx, name in enumerate(primary_names)}
+        classification_names = [str(name) for name in prototypes]
+    classification_index = {name: idx for idx, name in enumerate(classification_names)}
     labels: dict[str, PrototypeLabel] = {}
     with Path(manifest_path).open("r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         required = {
             "tile_id",
-            "level1_label",
+            "classification_label",
             "source_split",
             "adjudicated",
         }
@@ -60,15 +60,15 @@ def load_prototype_labels(
                 continue
             if require_adjudicated and not _truthy(row.get("adjudicated")):
                 continue
-            level1_name = str(row["level1_label"]).strip()
-            if level1_name not in primary_index:
-                raise ValueError(f"unknown level1 prototype label: {level1_name}")
+            classification_name = str(row["classification_label"]).strip()
+            if classification_name not in classification_index:
+                raise ValueError(f"unknown classification prototype label: {classification_name}")
             tile_id = str(row["tile_id"]).strip()
             if tile_id in labels:
                 raise ValueError(f"duplicate prototype supervision tile_id: {tile_id}")
             labels[tile_id] = PrototypeLabel(
                 tile_id=tile_id,
-                level1=int(primary_index[level1_name]),
+                classification=int(classification_index[classification_name]),
                 source_split=source_split,
             )
     return labels

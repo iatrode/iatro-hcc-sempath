@@ -32,7 +32,7 @@ def _local_base(tmp_path: Path) -> Path:
                         "uni2_h": "/local/uni2.pt",
                         "virchow2": "/local/virchow2.pt",
                     },
-                    "prototype_supervision_manifest_path": "/local/l1.csv",
+                    "prototype_supervision_manifest_path": "/local/classification.csv",
                 },
                 "model": {
                     "teacher_dims": {
@@ -116,13 +116,13 @@ def test_all_conditions_reuse_the_selected_a0_budget_and_schedule(
         assert Path(resolved["runtime"]["output_dir"]).parent == tmp_path / "runs"
 
 
-def test_no_prototype_masks_l1_labels_but_preserves_replay_population(
+def test_no_prototype_masks_classification_labels_but_preserves_replay_population(
     tmp_path: Path,
 ) -> None:
     resolved = _resolve(tmp_path, "a1")
 
     assert resolved["data"]["prototype_supervision_manifest_path"] is None
-    assert resolved["data"]["expert_replay_prototype_manifest_path"] == "/local/l1.csv"
+    assert resolved["data"]["expert_replay_prototype_manifest_path"] == "/local/classification.csv"
     assert resolved["data"]["prototype_paths"] is None
     assert resolved["loss"]["semantic_weight"] == 0.0
     assert resolved["loss"]["zhcc_response_weight"] == 0.0
@@ -157,7 +157,7 @@ def test_global_and_spatial_prototype_refresh_are_independent(
     assert spatial_static["train"]["dynamic_spatial_prototype_refresh_steps"] == 0
 
 
-def test_l2_architecture_and_target_conditions_change_one_named_control(
+def test_spatial_architecture_and_target_conditions_change_one_named_control(
     tmp_path: Path,
 ) -> None:
     semantic_only = _resolve(tmp_path, "a9")

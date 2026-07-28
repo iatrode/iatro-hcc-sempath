@@ -34,7 +34,7 @@ def test_trial_config_uses_matched_tenth_population_and_fixed_losses(
     )
     losses = {
         "prototype_filter_weight": 0.5,
-        "l1_weight": 1.0,
+        "classification_weight": 1.0,
         "spatial_weight": 0.1,
     }
     cfg = module.trial_config(

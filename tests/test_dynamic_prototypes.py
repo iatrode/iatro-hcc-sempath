@@ -33,13 +33,13 @@ def _prototype_batch(
             )
         },
         "prototype_mask": torch.ones(size, dtype=torch.bool),
-        "prototype_level1": labels,
-        "l2_point_centers": point,
-        "l2_brush_bag_ids": torch.zeros_like(point, dtype=torch.long),
-        "l2_area_positive": zeros_bool,
-        "l2_explicit_negative": zeros_bool,
-        "l2_implicit_negative": zeros_bool,
-        "l2_spatial_supervised": positives.bool(),
+        "prototype_classification": labels,
+        "spatial_point_centers": point,
+        "spatial_brush_bag_ids": torch.zeros_like(point, dtype=torch.long),
+        "spatial_area_positive": zeros_bool,
+        "spatial_explicit_negative": zeros_bool,
+        "spatial_implicit_negative": zeros_bool,
+        "spatial_supervised": positives.bool(),
     }
 
 
@@ -50,7 +50,7 @@ def test_full_bank_prototype_refresh_is_chunk_invariant_and_tracks_student() -> 
         embedding_dim=8,
         teacher_dims={"teacher": 2},
         pretrained=False,
-        l1_num_classes=4,
+        classification_num_classes=4,
         spatial_num_components=2,
         spatial_dim=8,
     )
@@ -83,14 +83,14 @@ def test_full_bank_prototype_refresh_is_chunk_invariant_and_tracks_student() -> 
     )
     with torch.no_grad():
         expected = F.normalize(model.encode(images), dim=-1)
-    first = model.l1_prototypes.clone()
+    first = model.classification_prototypes.clone()
 
     assert metrics["tiles"] == 4
-    assert metrics["l1_observations"] == 4
-    assert metrics["l2_positive_observations"] == 2
-    torch.testing.assert_close(model.l1_prototype_counts, torch.ones(4))
+    assert metrics["classification_observations"] == 4
+    assert metrics["spatial_positive_observations"] == 2
+    torch.testing.assert_close(model.classification_prototype_counts, torch.ones(4))
     torch.testing.assert_close(
-        model.global_l2_prototype_counts,
+        model.global_spatial_prototype_counts,
         torch.ones(2),
     )
     torch.testing.assert_close(first, expected)
@@ -106,8 +106,8 @@ def test_full_bank_prototype_refresh_is_chunk_invariant_and_tracks_student() -> 
         torch.device("cpu"),
     )
 
-    assert not torch.allclose(model.l1_prototypes, first)
-    torch.testing.assert_close(model.l1_prototype_counts, torch.ones(4))
+    assert not torch.allclose(model.classification_prototypes, first)
+    torch.testing.assert_close(model.classification_prototype_counts, torch.ones(4))
 
 
 def test_prototype_response_updates_zhcc_but_not_detached_centroids() -> None:
@@ -117,19 +117,19 @@ def test_prototype_response_updates_zhcc_but_not_detached_centroids() -> None:
         embedding_dim=8,
         teacher_dims={},
         pretrained=False,
-        l1_num_classes=4,
+        classification_num_classes=4,
     )
-    model.replace_l1_prototypes(
+    model.replace_classification_prototypes(
         torch.randn(4, 8),
         torch.ones(4),
     )
-    before = model.l1_prototypes.clone()
+    before = model.classification_prototypes.clone()
     outputs = model(
         torch.randn(3, 3, 224, 224),
         run_spatial=False,
     )
     loss = F.cross_entropy(
-        outputs["l1_logits"],
+        outputs["classification_logits"],
         torch.tensor([0, 1, 2]),
     )
 
@@ -138,8 +138,8 @@ def test_prototype_response_updates_zhcc_but_not_detached_centroids() -> None:
     projector_grad = model.encoder.projector[1].weight.grad
     assert projector_grad is not None
     assert float(projector_grad.abs().sum()) > 0
-    assert model.l1_prototypes.grad is None
-    torch.testing.assert_close(model.l1_prototypes, before)
+    assert model.classification_prototypes.grad is None
+    torch.testing.assert_close(model.classification_prototypes, before)
 
 
 def test_spatial_prototypes_refresh_on_global_step_clock(

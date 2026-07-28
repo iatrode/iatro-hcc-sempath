@@ -325,59 +325,43 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
         or float(loss_cfg.get("prototype_filter_weight", 0.0)) > 0
         or float(loss_cfg.get("zhcc_response_weight", 0.0)) > 0
     )
-    unsupported_loss_keys = sorted(
-        key
-        for key in (
-            "scale_relation_by_alpha",
-            "consensus_weight",
-            "prototype_l1_agreement_weight",
-            "prototype_l2_agreement_weight",
-            "zhcc_proto_weight",
-            "zhcc_level2_weight",
-            "zhcc_primary_temperature",
-            "zhcc_attribute_temperature",
-            "attribute_temperature",
-            "l2_attribute_adjudication",
-            "roi_weight",
-            "roi_consistency_weight",
-            "roi_start_step",
-            "roi_ramp_steps",
-            "roi_backbone_start_step",
-            "roi_consistency_start_step",
-            "spatial_offset_weight",
-            "spatial_region_dice_weight",
-            "min_teacher_warmup_steps",
-            "max_teacher_warmup_steps",
-            "teacher_prior_plateau_window_steps",
-            "prototype_ramp_steps",
-            "filter_ramp_steps",
-            "proto_to_filter_delay_steps",
-            "semantic_warmup_epochs",
-            "l1_start_step",
-            "l1_ramp_steps",
-            "spatial_start_step",
-            "spatial_ramp_steps",
-            "spatial_backbone_start_step",
-        )
-        if key in loss_cfg
-    )
-    if unsupported_loss_keys:
+    supported_loss_keys = {
+        "teacher_weights",
+        "feature_loss_type",
+        "relation_weight",
+        "semantic_weight",
+        "semantic_temperature",
+        "classification_temperature",
+        "pamtd_classification_temperature",
+        "prototype_filter_weight",
+        "prototype_filter_alpha_min",
+        "prototype_filter_start_step",
+        "prototype_filter_ramp_steps",
+        "prototype_consensus_weight",
+        "prototype_label_weight",
+        "prototype_student_weight",
+        "classification_agreement_weight",
+        "spatial_agreement_weight",
+        "zhcc_response_weight",
+        "zhcc_response_start_step",
+        "zhcc_response_ramp_steps",
+        "spatial_global_temperature",
+        "classification_weight",
+        "spatial_weight",
+        "spatial_point_tolerance_cells",
+        "spatial_abundance_point_weight",
+        "spatial_brush_weight",
+        "spatial_brush_top_fraction",
+        "spatial_explicit_negative_weight",
+        "spatial_implicit_negative_weight",
+        "expert_supervision_start_step",
+        "expert_supervision_ramp_steps",
+        "spatial_detach_shared_encoder",
+    }
+    unknown_loss_keys = sorted(set(loss_cfg) - supported_loss_keys)
+    if unknown_loss_keys:
         raise ValueError(
-            "unsupported loss keys; use spatial_* objectives: "
-            f"{unsupported_loss_keys}"
-        )
-    unsupported_online_prototype_keys = sorted(
-        key
-        for key in (
-            "prototype_momentum",
-            "prototype_update_until_step",
-        )
-        if key in loss_cfg
-    )
-    if unsupported_online_prototype_keys:
-        raise ValueError(
-            "prototype refresh uses the exact full bank; remove loss keys: "
-            f"{unsupported_online_prototype_keys}"
+            f"unknown loss configuration keys: {unknown_loss_keys}"
         )
     unsupported_data_keys = sorted(
         key
@@ -427,7 +411,7 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
     for key in (
         "relation_weight",
         "semantic_weight",
-        "l1_weight",
+        "classification_weight",
         "spatial_weight",
         "spatial_abundance_point_weight",
         "spatial_brush_weight",
@@ -462,9 +446,9 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
         )
     for key in (
         "semantic_temperature",
-        "primary_temperature",
-        "pamtd_primary_temperature",
-        "l2_global_temperature",
+        "classification_temperature",
+        "pamtd_classification_temperature",
+        "spatial_global_temperature",
     ):
         if key in loss_cfg and (
             not math.isfinite(float(loss_cfg[key]))

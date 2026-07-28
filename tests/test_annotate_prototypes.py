@@ -18,9 +18,9 @@ from hcc_sempath.cli.annotate_prototypes import (
     AnnotationArchive,
     AnnotationState,
     HTML,
-    L1_PROTOTYPES,
-    L2_PROTOTYPES,
-    ROI_L2_PROTOTYPES,
+    CLASSIFICATION_PROTOTYPES,
+    SPATIAL_PROTOTYPES,
+    ROI_SPATIAL_PROTOTYPES,
     RoiCandidateQueue,
     SharedPriorityQueue,
     StrictReviewQueue,
@@ -161,37 +161,37 @@ def test_auth_token_requires_exact_nonempty_match() -> None:
     assert not _auth_ok("other", "secret")
 
 
-def test_annotation_cli_always_requires_l1_and_l2_roi_workspaces() -> None:
+def test_annotation_cli_always_requires_classification_and_spatial_roi_workspaces() -> None:
     parser = _annotation_parser()
     args = parser.parse_args([
         "--input", "tiles",
-        "--l1-state", "l1.json",
-        "--l2-state", "l2.json",
+        "--classification-state", "classification.json",
+        "--spatial-state", "spatial.json",
         "--priority-manifest", "priority.json",
-        "--l1-review-manifest", "l1-review.json",
-        "--l2-review-manifest", "l2-review.json",
+        "--classification-review-manifest", "classification-review.json",
+        "--spatial-review-manifest", "spatial-review.json",
         "--include-packages", "301/a.iac,301/b.iac",
         "--roi-candidate-manifest", "roi-candidates.json",
         "--roi-information-report", "roi-information.json",
-        "--roi-priority-attributes", "vascular-structure-present,ductular-portal-present",
+        "--roi-priority-attributes", "small-vessel,ductular-portal",
         "--review-existing",
     ])
-    assert (args.l1_state, args.l2_state, args.priority_manifest) == (
-        "l1.json", "l2.json", "priority.json",
+    assert (args.classification_state, args.spatial_state, args.priority_manifest) == (
+        "classification.json", "spatial.json", "priority.json",
     )
     assert not any("--state" in action.option_strings for action in parser._actions)
     assert args.roi_candidate_manifest == "roi-candidates.json"
     assert args.roi_information_report == "roi-information.json"
-    assert args.l1_review_manifest == "l1-review.json"
-    assert args.l2_review_manifest == "l2-review.json"
+    assert args.classification_review_manifest == "classification-review.json"
+    assert args.spatial_review_manifest == "spatial-review.json"
     assert args.include_packages == "301/a.iac,301/b.iac"
-    assert args.roi_priority_attributes == "vascular-structure-present,ductular-portal-present"
+    assert args.roi_priority_attributes == "small-vessel,ductular-portal"
     assert args.review_existing is True
     assert not any("--roi-plan-config" in action.option_strings for action in parser._actions)
     assert not any("--roi-plan-checkpoint" in action.option_strings for action in parser._actions)
     assert not any("--roi-plan-device" in action.option_strings for action in parser._actions)
     with pytest.raises(SystemExit):
-        parser.parse_args(["--input", "tiles", "--l1-state", "l1.json"])
+        parser.parse_args(["--input", "tiles", "--classification-state", "classification.json"])
 
 
 def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> None:
@@ -201,13 +201,13 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "%ROI_MODE_JSON%" in HTML
     assert 'id="roiClassBar"' in HTML
     assert "function applyModeLayout()" in HTML
-    assert "document.getElementById('roiCanvas').style.display=l1Mode?'none':'block'" in HTML
-    assert "document.getElementById('roiTools').style.display=l1Mode?'none':'flex'" in HTML
-    assert "document.getElementById('prototypeLabels').style.display=l1Mode?'block':'none'" in HTML
-    assert "document.getElementById('l1Section').style.display=l1Mode?'block':'none'" in HTML
-    assert "document.getElementById('l2Section').style.display='none'" in HTML
+    assert "document.getElementById('roiCanvas').style.display=classificationMode?'none':'block'" in HTML
+    assert "document.getElementById('roiTools').style.display=classificationMode?'none':'flex'" in HTML
+    assert "document.getElementById('prototypeLabels').style.display=classificationMode?'block':'none'" in HTML
+    assert "document.getElementById('classificationSection').style.display=classificationMode?'block':'none'" in HTML
+    assert "document.getElementById('spatialSection').style.display='none'" in HTML
     assert (
-        "MODE==='l1'?'Classification prototype supervision':"
+        "MODE==='classification'?'Classification prototype supervision':"
         "'Spatial prototype supervision'"
     ) in HTML
     assert "index<9?String(index+1):''" in HTML
@@ -220,9 +220,9 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "horizontalWheelUntil" not in HTML
     assert "ev.key.toLowerCase()==='c'" in HTML
     assert "dialogOpen=document.querySelector('dialog[open]')" in HTML
-    assert "MODE==='l1'&&!mod&&!editing&&!dialogOpen" in HTML
+    assert "MODE==='classification'&&!mod&&!editing&&!dialogOpen" in HTML
     assert "/^[1-9]$/.test(ev.key)" in HTML
-    assert "l1=L1[index];renderLabels()" in HTML
+    assert "classification=CLASSIFICATION[index];renderLabels()" in HTML
     assert "ev.code==='Space'" in HTML
     assert "if(!ev.repeat)save()" in HTML
     assert "All spatial classes visible. Select one class before drawing." in HTML
@@ -276,7 +276,7 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert 'data-roi-tool="eraser">Eraser' in HTML
     assert "['point','brush','eraser','circle']" in HTML
     assert "roiToolByClass[roiAttribute]=roiTool" in HTML
-    assert "const AREA_ONLY_CLASSES=new Set(['necrosis-present','fibrous-stroma-present'])" in HTML
+    assert "const AREA_ONLY_CLASSES=new Set(['necrosis','fibrous-stroma'])" in HTML
     assert "function roiToolAllowed(tool,attribute=roiAttribute)" in HTML
     assert "AREA_ONLY_CLASSES.has(name)?'brush':'point'" in HTML
     assert 'id="roiNavigationNotice"' in HTML
@@ -383,12 +383,12 @@ def _write_roi_queue(path: Path, tile_ids: list[str]) -> None:
         json.dumps(
             {
                 "version": 2,
-                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "spatial_prototypes": ROI_SPATIAL_PROTOTYPES,
                 "candidates": [
                     {
                         "tile_id": tile_id,
                         "rank": rank,
-                        "source_l2": [ROI_L2_PROTOTYPES[rank % len(ROI_L2_PROTOTYPES)]],
+                        "source_spatial": [ROI_SPATIAL_PROTOTYPES[rank % len(ROI_SPATIAL_PROTOTYPES)]],
                     }
                     for rank, tile_id in enumerate(tile_ids)
                 ],
@@ -407,29 +407,29 @@ def test_shared_priority_list_drives_roi_then_expands_to_fallback_tile(tmp_path:
     priority = SharedPriorityQueue(priority_path)
     data = AnnotationData(iac_path, state_path, roi_mode=True, priority_queue=priority)
     try:
-        assert data.state.l2_prototypes == ROI_L2_PROTOTYPES
+        assert data.state.spatial_prototypes == ROI_SPATIAL_PROTOTYPES
         assert len(data.annotation_records(0)) == 4
         package = data.package(0)
         record = data.random_record(0)["record"]
         assert record["tile_id"] == "s1_0000000"
         iac_record = data.viewer(0)._by_row[record["row"]]
         geometry = {
-            "attribute": ROI_L2_PROTOTYPES[0],
+            "attribute": ROI_SPATIAL_PROTOTYPES[0],
             "state": "positive",
             "geometry": {"type": "point", "coordinate_space": "normalized", "point": [0.5, 0.5]},
         }
         data.state.save_annotation(
             package,
             iac_record,
-            L1_PROTOTYPES[0],
-            [ROI_L2_PROTOTYPES[0]],
+            CLASSIFICATION_PROTOTYPES[0],
+            [ROI_SPATIAL_PROTOTYPES[0]],
             [geometry],
         )
         fallback = data.random_record(0)["record"]
         assert fallback is not None
         assert fallback["tile_id"] != "s1_0000000"
         assert priority.contains(fallback["tile_id"])
-        assert data.progress(0)["roi_counts"][ROI_L2_PROTOTYPES[0]] == 1
+        assert data.progress(0)["roi_counts"][ROI_SPATIAL_PROTOTYPES[0]] == 1
         assert data.progress(0)["priority"] == {"reviewed": 1, "skipped": 0, "total": 2, "remaining": 1}
         saved = data.annotation_json(0, iac_record.row)["annotation"]
         assert saved["roi_reviewed"] is True
@@ -439,9 +439,9 @@ def test_shared_priority_list_drives_roi_then_expands_to_fallback_tile(tmp_path:
             data.state.save_annotation(
                 package,
                 iac_record,
-                L1_PROTOTYPES[0],
-                [ROI_L2_PROTOTYPES[0]],
-                [geometry, {"attribute": ROI_L2_PROTOTYPES[0], "state": "negative", "review_complete": True}],
+                CLASSIFICATION_PROTOTYPES[0],
+                [ROI_SPATIAL_PROTOTYPES[0]],
+                [geometry, {"attribute": ROI_SPATIAL_PROTOTYPES[0], "state": "negative", "review_complete": True}],
             )
     finally:
         data.close()
@@ -451,7 +451,7 @@ def test_strict_review_list_revisits_existing_tiles_and_stops_without_fallback(
     tmp_path: Path,
 ) -> None:
     iac_path = tmp_path / "tiles.iac"
-    state_path = tmp_path / "l1.json"
+    state_path = tmp_path / "classification.json"
     priority_path = tmp_path / "priority.json"
     review_path = tmp_path / "review.json"
     _write_iac(iac_path)
@@ -487,7 +487,7 @@ def test_strict_review_list_revisits_existing_tiles_and_stops_without_fallback(
     seed.state.save_annotation(
         package,
         first_record,
-        L1_PROTOTYPES[0],
+        CLASSIFICATION_PROTOTYPES[0],
         [],
     )
     seed.close()
@@ -510,7 +510,7 @@ def test_strict_review_list_revisits_existing_tiles_and_stops_without_fallback(
         assert data.state.annotation_for(
             data.package(0),
             data.viewer(0)._by_row[0],
-        )["l1"] == L1_PROTOTYPES[0]
+        )["classification"] == CLASSIFICATION_PROTOTYPES[0]
 
         second = data.random_record("all")
         assert second["record"]["tile_id"] == "s1_0000001"
@@ -518,7 +518,7 @@ def test_strict_review_list_revisits_existing_tiles_and_stops_without_fallback(
         data.state.save_annotation(
             data.package(0),
             second_record,
-            L1_PROTOTYPES[1],
+            CLASSIFICATION_PROTOTYPES[1],
             [],
             review_id=review.review_id,
         )
@@ -587,7 +587,7 @@ def test_brush_validation_keeps_edge_overlap_and_rejects_invalid_geometry() -> N
         )
 
 
-def test_old_l2_candidates_bias_random_navigation_without_prefilling_labels(tmp_path: Path) -> None:
+def test_old_spatial_candidates_bias_random_navigation_without_prefilling_labels(tmp_path: Path) -> None:
     iac_path = tmp_path / "tiles.iac"
     state_path = tmp_path / "roi.json"
     queue_path = tmp_path / "roi_candidates.json"
@@ -596,15 +596,15 @@ def test_old_l2_candidates_bias_random_navigation_without_prefilling_labels(tmp_
         json.dumps(
             {
                 "version": 1,
-                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "spatial_prototypes": ROI_SPATIAL_PROTOTYPES,
                 "candidates": [
                     {
                         "tile_id": "s1_0000000",
-                        "source_l2": ["fibrous-stroma-present"],
+                        "source_spatial": ["fibrous-stroma"],
                     },
                     {
                         "tile_id": "s1_0000001",
-                        "source_l2": ["vascular-structure-present"],
+                        "source_spatial": ["small-vessel"],
                     },
                 ],
             }
@@ -615,14 +615,14 @@ def test_old_l2_candidates_bias_random_navigation_without_prefilling_labels(tmp_
         iac_path,
         state_path,
         roi_candidate_manifest=queue_path,
-        roi_priority_attributes=["vascular-structure-present"],
+        roi_priority_attributes=["small-vessel"],
         min_tissue_fraction=0,
     )
     try:
         result = data.random_record(0)
         assert result["record"]["tile_id"] == "s1_0000001"
         assert result["selection"] == "component_presence_navigation_hint"
-        assert "source_l2" not in result
+        assert "source_spatial" not in result
         assert data.state.annotations == {}
     finally:
         data.close()
@@ -637,10 +637,10 @@ def test_roi_navigation_priority_attribute_order_changes_sampling_weight(
         json.dumps(
             {
                 "version": 1,
-                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "spatial_prototypes": ROI_SPATIAL_PROTOTYPES,
                 "candidates": [
-                    {"tile_id": "vascular", "source_l2": ["vascular-structure-present"]},
-                    {"tile_id": "bile", "source_l2": ["bile-pigment-present"]},
+                    {"tile_id": "vascular", "source_spatial": ["small-vessel"]},
+                    {"tile_id": "bile", "source_spatial": ["bile-pigment"]},
                 ],
             }
         ),
@@ -648,17 +648,17 @@ def test_roi_navigation_priority_attribute_order_changes_sampling_weight(
     )
     queue = RoiCandidateQueue(queue_path)
     monkeypatch.setattr(random, "random", lambda: 0.5)
-    counts = {name: 0 for name in ROI_L2_PROTOTYPES}
+    counts = {name: 0 for name in ROI_SPATIAL_PROTOTYPES}
 
     vascular_first = queue.weighted_remaining(
         processed_tile_ids=set(),
         roi_positive_counts=counts,
-        priority_attributes=["vascular-structure-present", "bile-pigment-present"],
+        priority_attributes=["small-vessel", "bile-pigment"],
     )
     bile_first = queue.weighted_remaining(
         processed_tile_ids=set(),
         roi_positive_counts=counts,
-        priority_attributes=["bile-pigment-present", "vascular-structure-present"],
+        priority_attributes=["bile-pigment", "small-vessel"],
     )
 
     assert vascular_first[0]["tile_id"] == "vascular"
@@ -670,14 +670,14 @@ def test_roi_navigation_has_no_fixed_positive_tile_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     queue_path = tmp_path / "roi_candidates.json"
-    attribute = "vascular-structure-present"
+    attribute = "small-vessel"
     queue_path.write_text(
         json.dumps(
             {
                 "version": 2,
-                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "spatial_prototypes": ROI_SPATIAL_PROTOTYPES,
                 "candidates": [
-                    {"tile_id": "vascular", "source_l2": [attribute]},
+                    {"tile_id": "vascular", "source_spatial": [attribute]},
                 ],
             }
         ),
@@ -701,7 +701,7 @@ def _write_roi_information_report(
     deficient: dict[str, str],
 ) -> None:
     attributes = {}
-    for name in ROI_L2_PROTOTYPES:
+    for name in ROI_SPATIAL_PROTOTYPES:
         status = deficient.get(name, "provisionally_stable")
         support = 0.0 if status == "not_assessable" else 0.5
         attributes[name] = {
@@ -709,22 +709,11 @@ def _write_roi_information_report(
             "tail_plateau_support_by_ratio": {
                 "0.35": support,
             },
-            "teacher_low_gain_support_by_teacher_ratio": {
-                "0.35": {
-                    teacher: support
-                    for teacher in (
-                        "gigapath",
-                        "h_optimus_1",
-                        "uni2_h",
-                        "virchow2",
-                    )
-                }
-            },
         }
     path.write_text(json.dumps({"attributes": attributes}), encoding="utf-8")
 
 
-def test_roi_navigation_uses_information_deficit_inside_old_l2_pool(
+def test_roi_navigation_uses_information_deficit_inside_old_spatial_pool(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -733,15 +722,15 @@ def test_roi_navigation_uses_information_deficit_inside_old_l2_pool(
     queue_path.write_text(
         json.dumps(
             {
-                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "spatial_prototypes": ROI_SPATIAL_PROTOTYPES,
                 "candidates": [
                     {
                         "tile_id": "necrosis",
-                        "source_l2": ["necrosis-present"],
+                        "source_spatial": ["necrosis"],
                     },
                     {
                         "tile_id": "fibrous",
-                        "source_l2": ["fibrous-stroma-present"],
+                        "source_spatial": ["fibrous-stroma"],
                     },
                 ],
             }
@@ -750,7 +739,7 @@ def test_roi_navigation_uses_information_deficit_inside_old_l2_pool(
     )
     _write_roi_information_report(
         report_path,
-        deficient={"necrosis-present": "still_growing"},
+        deficient={"necrosis": "still_growing"},
     )
     queue = RoiCandidateQueue(
         queue_path,
@@ -760,7 +749,7 @@ def test_roi_navigation_uses_information_deficit_inside_old_l2_pool(
 
     remaining = queue.weighted_remaining(
         processed_tile_ids=set(),
-        roi_positive_counts={name: 0 for name in ROI_L2_PROTOTYPES},
+        roi_positive_counts={name: 0 for name in ROI_SPATIAL_PROTOTYPES},
     )
 
     assert [item["tile_id"] for item in remaining] == [
@@ -768,7 +757,7 @@ def test_roi_navigation_uses_information_deficit_inside_old_l2_pool(
         "fibrous",
     ]
     assert remaining[0]["dynamic_priority_attributes"][0] == (
-        "necrosis-present"
+        "necrosis"
     )
 
 
@@ -781,14 +770,14 @@ def test_roi_navigation_learns_cross_label_yield_when_direct_hints_are_used(
     candidates = [
         {
             "tile_id": f"reviewed-fibrous-{index}",
-            "source_l2": ["fibrous-stroma-present"],
+            "source_spatial": ["fibrous-stroma"],
         }
         for index in range(4)
     ]
     candidates.extend(
         {
             "tile_id": f"reviewed-ductular-{index}",
-            "source_l2": ["ductular-portal-present"],
+            "source_spatial": ["ductular-portal"],
         }
         for index in range(4)
     )
@@ -796,18 +785,18 @@ def test_roi_navigation_learns_cross_label_yield_when_direct_hints_are_used(
         [
             {
                 "tile_id": "remaining-fibrous",
-                "source_l2": ["fibrous-stroma-present"],
+                "source_spatial": ["fibrous-stroma"],
             },
             {
                 "tile_id": "remaining-ductular",
-                "source_l2": ["ductular-portal-present"],
+                "source_spatial": ["ductular-portal"],
             },
         ]
     )
     queue_path.write_text(
         json.dumps(
             {
-                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "spatial_prototypes": ROI_SPATIAL_PROTOTYPES,
                 "candidates": candidates,
             }
         ),
@@ -815,7 +804,7 @@ def test_roi_navigation_learns_cross_label_yield_when_direct_hints_are_used(
     )
     _write_roi_information_report(
         report_path,
-        deficient={"vascular-structure-present": "not_assessable"},
+        deficient={"small-vessel": "not_assessable"},
     )
     queue = RoiCandidateQueue(
         queue_path,
@@ -829,7 +818,7 @@ def test_roi_navigation_learns_cross_label_yield_when_direct_hints_are_used(
     }
     positive_by_tile = {
         tile_id: (
-            {"vascular-structure-present"}
+            {"small-vessel"}
             if tile_id.startswith("reviewed-fibrous-")
             else set()
         )
@@ -838,16 +827,16 @@ def test_roi_navigation_learns_cross_label_yield_when_direct_hints_are_used(
 
     remaining = queue.weighted_remaining(
         processed_tile_ids=processed,
-        roi_positive_counts={name: 0 for name in ROI_L2_PROTOTYPES},
+        roi_positive_counts={name: 0 for name in ROI_SPATIAL_PROTOTYPES},
         roi_positive_by_tile=positive_by_tile,
-        priority_attributes=["vascular-structure-present"],
+        priority_attributes=["small-vessel"],
     )
 
     assert [item["tile_id"] for item in remaining] == [
         "remaining-fibrous",
         "remaining-ductular",
     ]
-    policy = queue.sampling_policy()["vascular-structure-present"]
+    policy = queue.sampling_policy()["small-vessel"]
     assert policy["remaining_direct_hint_count"] == 0
     assert policy["predicted_remaining_yield"] > 0
 
@@ -860,11 +849,11 @@ def test_roi_progress_exposes_explicit_navigation_target(tmp_path: Path) -> None
     queue_path.write_text(
         json.dumps(
             {
-                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "spatial_prototypes": ROI_SPATIAL_PROTOTYPES,
                 "candidates": [
                     {
                         "tile_id": "s1_0000000",
-                        "source_l2": ["steatosis-vacuolation-present"],
+                        "source_spatial": ["steatosis-vacuolation"],
                     },
                 ],
             }
@@ -874,8 +863,8 @@ def test_roi_progress_exposes_explicit_navigation_target(tmp_path: Path) -> None
     _write_roi_information_report(
         report_path,
         deficient={
-            "steatosis-vacuolation-present": "still_growing",
-            "vascular-structure-present": "not_assessable",
+            "steatosis-vacuolation": "still_growing",
+            "small-vessel": "not_assessable",
         },
     )
     data = AnnotationData(
@@ -883,13 +872,13 @@ def test_roi_progress_exposes_explicit_navigation_target(tmp_path: Path) -> None
         tmp_path / "roi.json",
         roi_candidate_manifest=queue_path,
         roi_information_report=report_path,
-        roi_priority_attributes=["steatosis-vacuolation-present"],
+        roi_priority_attributes=["steatosis-vacuolation"],
         roi_mode=True,
         min_tissue_fraction=0,
     )
     try:
         assert data.progress(0)["roi_priority_attributes"] == [
-            "steatosis-vacuolation-present"
+            "steatosis-vacuolation"
         ]
     finally:
         data.close()
@@ -904,15 +893,15 @@ def test_roi_navigation_lists_direct_deficient_hints_before_inferred_hints(
     queue_path.write_text(
         json.dumps(
             {
-                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "spatial_prototypes": ROI_SPATIAL_PROTOTYPES,
                 "candidates": [
                     {
                         "tile_id": "direct",
-                        "source_l2": ["vascular-structure-present"],
+                        "source_spatial": ["small-vessel"],
                     },
                     {
                         "tile_id": "inferred",
-                        "source_l2": ["fibrous-stroma-present"],
+                        "source_spatial": ["fibrous-stroma"],
                     },
                 ],
             }
@@ -921,7 +910,7 @@ def test_roi_navigation_lists_direct_deficient_hints_before_inferred_hints(
     )
     _write_roi_information_report(
         report_path,
-        deficient={"vascular-structure-present": "not_assessable"},
+        deficient={"small-vessel": "not_assessable"},
     )
     queue = RoiCandidateQueue(
         queue_path,
@@ -932,7 +921,7 @@ def test_roi_navigation_lists_direct_deficient_hints_before_inferred_hints(
 
     remaining = queue.weighted_remaining(
         processed_tile_ids=set(),
-        roi_positive_counts={name: 0 for name in ROI_L2_PROTOTYPES},
+        roi_positive_counts={name: 0 for name in ROI_SPATIAL_PROTOTYPES},
     )
 
     assert [item["tile_id"] for item in remaining] == [
@@ -940,26 +929,26 @@ def test_roi_navigation_lists_direct_deficient_hints_before_inferred_hints(
         "inferred",
     ]
     assert remaining[0]["direct_priority_attributes"] == [
-        "vascular-structure-present"
+        "small-vessel"
     ]
 
 
-def test_roi_navigation_reports_exhausted_old_l2_class(
+def test_roi_navigation_reports_exhausted_old_spatial_class(
     tmp_path: Path,
 ) -> None:
     queue_path = tmp_path / "roi_candidates.json"
     queue_path.write_text(
         json.dumps(
             {
-                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "spatial_prototypes": ROI_SPATIAL_PROTOTYPES,
                 "candidates": [
                     {
                         "tile_id": "vascular",
-                        "source_l2": ["vascular-structure-present"],
+                        "source_spatial": ["small-vessel"],
                     },
                     {
                         "tile_id": "necrosis",
-                        "source_l2": ["necrosis-present"],
+                        "source_spatial": ["necrosis"],
                     },
                 ],
             }
@@ -970,14 +959,14 @@ def test_roi_navigation_reports_exhausted_old_l2_class(
 
     status = queue.direct_hint_status({"vascular"})
 
-    assert status["vascular-structure-present"] == {
+    assert status["small-vessel"] == {
         "total": 1,
         "reviewed": 1,
         "remaining": 0,
         "exhausted": True,
     }
-    assert status["necrosis-present"]["exhausted"] is False
-    assert status["necrosis-present"]["remaining"] == 1
+    assert status["necrosis"]["exhausted"] is False
+    assert status["necrosis"]["remaining"] == 1
 
 
 def test_roi_navigation_hints_stay_inside_shared_priority_boundary(tmp_path: Path) -> None:
@@ -989,10 +978,10 @@ def test_roi_navigation_hints_stay_inside_shared_priority_boundary(tmp_path: Pat
         json.dumps(
             {
                 "version": 1,
-                "l2_prototypes": ROI_L2_PROTOTYPES,
+                "spatial_prototypes": ROI_SPATIAL_PROTOTYPES,
                 "candidates": [
-                    {"tile_id": "s1_0000001", "source_l2": ["vascular-structure-present"]},
-                    {"tile_id": "s1_0000002", "source_l2": ["vascular-structure-present"]},
+                    {"tile_id": "s1_0000001", "source_spatial": ["small-vessel"]},
+                    {"tile_id": "s1_0000002", "source_spatial": ["small-vessel"]},
                 ],
             }
         ),
@@ -1013,7 +1002,7 @@ def test_roi_navigation_hints_stay_inside_shared_priority_boundary(tmp_path: Pat
         iac_path,
         tmp_path / "roi.json",
         roi_candidate_manifest=queue_path,
-        roi_priority_attributes=["vascular-structure-present"],
+        roi_priority_attributes=["small-vessel"],
         priority_queue=SharedPriorityQueue(priority_path),
         min_tissue_fraction=0,
     )
@@ -1025,27 +1014,27 @@ def test_roi_navigation_hints_stay_inside_shared_priority_boundary(tmp_path: Pat
         data.close()
 
 
-def test_build_roi_queue_excludes_hyaline_and_reports_planning_coverage(tmp_path: Path) -> None:
+def test_build_roi_queue_excludes_unknown_labels_and_reports_planning_coverage(tmp_path: Path) -> None:
     source = tmp_path / "annotations.json"
     source.write_text(
         json.dumps(
             {
                 "annotations": {
-                    "a": {"tile_id": "t1", "iac": "a.iac", "row": 1, "slide": "s1", "l2": [ROI_L2_PROTOTYPES[0], ROI_L2_PROTOTYPES[1]]},
-                    "b": {"tile_id": "t2", "iac": "a.iac", "row": 2, "slide": "s1", "l2": [ROI_L2_PROTOTYPES[1], "hyaline-change-present"]},
+                    "a": {"tile_id": "t1", "iac": "a.iac", "row": 1, "slide": "s1", "spatial": [ROI_SPATIAL_PROTOTYPES[0], ROI_SPATIAL_PROTOTYPES[1]]},
+                    "b": {"tile_id": "t2", "iac": "a.iac", "row": 2, "slide": "s1", "spatial": [ROI_SPATIAL_PROTOTYPES[1], "unknown-component"]},
                 }
             }
         ),
         encoding="utf-8",
     )
     payload = build_roi_candidate_queue([source], planning_coverage=2)
-    assert "hyaline-change-present" not in payload["l2_prototypes"]
+    assert "unknown-component" not in payload["spatial_prototypes"]
     assert payload["candidate_count"] == 2
     assert payload["version"] == 2
-    assert payload["planning_coverage_per_attribute"][ROI_L2_PROTOTYPES[0]] == 2
-    assert payload["source_positive_inventory"][ROI_L2_PROTOTYPES[0]] == 1
-    assert payload["unfilled_planning_coverage"][ROI_L2_PROTOTYPES[0]] == 1
-    assert payload["selected_source_coverage"][ROI_L2_PROTOTYPES[1]] == 2
+    assert payload["planning_coverage_per_attribute"][ROI_SPATIAL_PROTOTYPES[0]] == 2
+    assert payload["source_positive_inventory"][ROI_SPATIAL_PROTOTYPES[0]] == 1
+    assert payload["unfilled_planning_coverage"][ROI_SPATIAL_PROTOTYPES[0]] == 1
+    assert payload["selected_source_coverage"][ROI_SPATIAL_PROTOTYPES[1]] == 2
     queue_path = tmp_path / "queue.json"
     queue_path.write_text(json.dumps(payload), encoding="utf-8")
     assert RoiCandidateQueue(queue_path).contains("t1")
@@ -1055,7 +1044,7 @@ def test_build_priority_manifest_keeps_only_tile_identity_and_deduplicates(tmp_p
     first = tmp_path / "first.json"
     second = tmp_path / "second.json"
     first.write_text(
-        json.dumps({"annotations": {"a": {"tile_id": "t1", "iac": "a.iac", "row": 1, "slide": "s1", "l1": "x", "l2": ["auxiliary-label"]}}}),
+        json.dumps({"annotations": {"a": {"tile_id": "t1", "iac": "a.iac", "row": 1, "slide": "s1", "classification": "x", "spatial": ["auxiliary-label"]}}}),
         encoding="utf-8",
     )
     second.write_text(
@@ -1067,7 +1056,7 @@ def test_build_priority_manifest_keeps_only_tile_identity_and_deduplicates(tmp_p
 
     assert payload["candidate_count"] == 2
     assert [item["tile_id"] for item in payload["candidates"]] == ["t1", "t2"]
-    assert all("l1" not in item and "l2" not in item for item in payload["candidates"])
+    assert all("classification" not in item and "spatial" not in item for item in payload["candidates"])
 
 
 def test_package_list_and_progress_do_not_open_iac_viewers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1141,7 +1130,7 @@ def test_annotation_http_requires_auth_token(tmp_path: Path) -> None:
         data.close()
 
 
-def test_l2_roi_similarity_endpoint_uses_seeds_without_saving(tmp_path: Path) -> None:
+def test_spatial_roi_similarity_endpoint_uses_seeds_without_saving(tmp_path: Path) -> None:
     iac_path = tmp_path / "tiles.iac"
     state_path = tmp_path / "annotations.json"
     _write_iac(iac_path)
@@ -1160,13 +1149,13 @@ def test_l2_roi_similarity_endpoint_uses_seeds_without_saving(tmp_path: Path) ->
             occupied: list,
         ) -> dict:
             self.tile_bytes = tile_bytes
-            assert attribute == ROI_L2_PROTOTYPES[0]
+            assert attribute == ROI_SPATIAL_PROTOTYPES[0]
             assert seeds == [[0.4, 0.6]]
             assert occupied == [[0.4, 0.6], [0.2, 0.3]]
             return {
                 "version": 1,
                 "suggestions": [{
-                    "attribute": ROI_L2_PROTOTYPES[0],
+                    "attribute": ROI_SPATIAL_PROTOTYPES[0],
                     "state": "positive",
                     "geometry": {
                         "type": "point",
@@ -1189,14 +1178,14 @@ def test_l2_roi_similarity_endpoint_uses_seeds_without_saving(tmp_path: Path) ->
     thread.start()
     url = (
         f"http://127.0.0.1:{server.server_address[1]}"
-        "/api/roi-similar?token=secret&mode=l2"
+        "/api/roi-similar?token=secret&mode=spatial"
     )
     request = Request(
         url,
         data=json.dumps({
             "package": 0,
             "row": 0,
-            "attribute": ROI_L2_PROTOTYPES[0],
+            "attribute": ROI_SPATIAL_PROTOTYPES[0],
             "seeds": [[0.4, 0.6]],
             "occupied": [[0.4, 0.6], [0.2, 0.3]],
         }).encode("utf-8"),
@@ -1245,11 +1234,11 @@ def test_annotation_state_writes_resume_json_and_csv(tmp_path: Path) -> None:
         data.state.save_annotation(
             package,
             record,
-            L1_PROTOTYPES[0],
-            [L2_PROTOTYPES[0], L2_PROTOTYPES[3]],
+            CLASSIFICATION_PROTOTYPES[0],
+            [SPATIAL_PROTOTYPES[0], SPATIAL_PROTOTYPES[3]],
             [
                 {
-                    "attribute": L2_PROTOTYPES[0],
+                    "attribute": SPATIAL_PROTOTYPES[0],
                     "state": "positive",
                     "geometry": {
                         "type": "point",
@@ -1268,7 +1257,7 @@ def test_annotation_state_writes_resume_json_and_csv(tmp_path: Path) -> None:
     assert next(iter(reloaded.annotations.values()))["roi"][0]["geometry"]["type"] == "point"
     csv_text = state_path.with_suffix(".csv").read_text(encoding="utf-8")
     assert "HCC-tumor" in csv_text
-    assert "hepatocellular-parenchyma-present;bile-pigment-present" in csv_text
+    assert "hepatocellular-parenchyma;bile-pigment" in csv_text
 
 
 def test_annotation_state_uses_taxonomy_from_json_and_observed_labels(tmp_path: Path) -> None:
@@ -1284,8 +1273,8 @@ def test_annotation_state_uses_taxonomy_from_json_and_observed_labels(tmp_path: 
                 {
                     "version": 1,
                     "input_path": str(iac_path),
-                    "l1_prototypes": ["HCC-tumor", "Background-liver"],
-                    "l2_prototypes": ["hepatocellular-parenchyma-present"],
+                    "classification_prototypes": ["HCC-tumor", "Background-liver"],
+                    "spatial_prototypes": ["hepatocellular-parenchyma"],
                     "annotations": {
                         _annotation_key(package, record): {
                             "dataset": package.dataset,
@@ -1296,8 +1285,8 @@ def test_annotation_state_uses_taxonomy_from_json_and_observed_labels(tmp_path: 
                             "slide": record.slide_label,
                             "x": record.display_x,
                             "y": record.display_y,
-                            "l1": "Inflammatory-stromal",
-                            "l2": ["ductular-portal-present"],
+                            "classification": "Inflammatory-stromal",
+                            "spatial": ["ductular-portal"],
                         }
                     },
                 },
@@ -1310,13 +1299,13 @@ def test_annotation_state_uses_taxonomy_from_json_and_observed_labels(tmp_path: 
 
     data = AnnotationData(iac_path, state_path)
     try:
-        assert data.state.l1_prototypes == ["HCC-tumor", "Background-liver", "Inflammatory-stromal"]
-        assert data.state.l2_prototypes == ["hepatocellular-parenchyma-present", "ductular-portal-present"]
+        assert data.state.classification_prototypes == ["HCC-tumor", "Background-liver", "Inflammatory-stromal"]
+        assert data.state.spatial_prototypes == ["hepatocellular-parenchyma", "ductular-portal"]
         second = data.viewer(0).records[1]
-        data.state.save_annotation(package, second, "Inflammatory-stromal", ["ductular-portal-present"])
+        data.state.save_annotation(package, second, "Inflammatory-stromal", ["ductular-portal"])
         payload = json.loads(state_path.read_text(encoding="utf-8"))
-        assert payload["l1_prototypes"] == data.state.l1_prototypes
-        assert payload["l2_prototypes"] == data.state.l2_prototypes
+        assert payload["classification_prototypes"] == data.state.classification_prototypes
+        assert payload["spatial_prototypes"] == data.state.spatial_prototypes
     finally:
         data.close()
 
@@ -1330,11 +1319,11 @@ def test_csv_export_preserves_review_fields_without_crashing(tmp_path: Path) -> 
     try:
         package = data.packages[0]
         record = data.viewer(0).records[0]
-        data.state.save_annotation(package, record, L1_PROTOTYPES[0], [])
+        data.state.save_annotation(package, record, CLASSIFICATION_PROTOTYPES[0], [])
         key = _annotation_key(package, record)
         data.state.annotations[key]["reviewed"] = True
         data.state.annotations[key]["review_decision"] = "adjust"
-        data.state.annotations[key]["review_suggested_l1"] = L1_PROTOTYPES[1]
+        data.state.annotations[key]["review_suggested_classification"] = CLASSIFICATION_PROTOTYPES[1]
         data.state.flush()
     finally:
         data.close()
@@ -1379,7 +1368,7 @@ def test_progress_reports_overall_annotation_counts(tmp_path: Path) -> None:
     try:
         package = data.packages[0]
         record = data.viewer(0).records[0]
-        data.state.save_annotation(package, record, L1_PROTOTYPES[0], [])
+        data.state.save_annotation(package, record, CLASSIFICATION_PROTOTYPES[0], [])
 
         progress = data.progress(0)
         assert progress["package"] == {"annotated": 1, "total": 4, "remaining": 3, "skipped": 0}
@@ -1401,7 +1390,7 @@ def test_progress_excludes_skipped_annotations(tmp_path: Path) -> None:
         second_package = data.packages[1]
         first_records = data.viewer(0).records
         second_record = data.viewer(1).records[0]
-        data.state.save_annotation(first_package, first_records[0], L1_PROTOTYPES[0], [])
+        data.state.save_annotation(first_package, first_records[0], CLASSIFICATION_PROTOTYPES[0], [])
 
         data.state.skipped.add(_annotation_key(first_package, first_records[1]))
         data.state.skipped.add(_annotation_key(second_package, second_record))
@@ -1409,7 +1398,7 @@ def test_progress_excludes_skipped_annotations(tmp_path: Path) -> None:
         progress = data.progress(0)
         assert progress["package"] == {"annotated": 1, "total": 4, "remaining": 2, "skipped": 1}
         assert progress["overall"] == {"annotated": 1, "total": 8, "remaining": 5, "skipped": 2}
-        assert progress["l1"][L1_PROTOTYPES[0]] == 1
+        assert progress["classification"][CLASSIFICATION_PROTOTYPES[0]] == 1
     finally:
         data.close()
 
@@ -1427,15 +1416,15 @@ def test_progress_label_counts_cover_all_packages(tmp_path: Path) -> None:
         second_package = data.packages[1]
         first_record = data.viewer(0).records[0]
         second_record = data.viewer(1).records[0]
-        data.state.save_annotation(first_package, first_record, L1_PROTOTYPES[0], [L2_PROTOTYPES[0]])
-        data.state.save_annotation(second_package, second_record, L1_PROTOTYPES[1], [L2_PROTOTYPES[1]])
+        data.state.save_annotation(first_package, first_record, CLASSIFICATION_PROTOTYPES[0], [SPATIAL_PROTOTYPES[0]])
+        data.state.save_annotation(second_package, second_record, CLASSIFICATION_PROTOTYPES[1], [SPATIAL_PROTOTYPES[1]])
 
         progress = data.progress(0)
-        assert progress["l1"][L1_PROTOTYPES[0]] == 1
-        assert progress["l1"][L1_PROTOTYPES[1]] == 1
-        assert progress["l2"][L2_PROTOTYPES[0]] == 1
-        assert progress["l2"][L2_PROTOTYPES[1]] == 1
-        assert progress["package_l1"][L1_PROTOTYPES[1]] == 0
+        assert progress["classification"][CLASSIFICATION_PROTOTYPES[0]] == 1
+        assert progress["classification"][CLASSIFICATION_PROTOTYPES[1]] == 1
+        assert progress["spatial"][SPATIAL_PROTOTYPES[0]] == 1
+        assert progress["spatial"][SPATIAL_PROTOTYPES[1]] == 1
+        assert progress["package_classification"][CLASSIFICATION_PROTOTYPES[1]] == 0
     finally:
         data.close()
 
@@ -1459,8 +1448,8 @@ def test_top_level_skipped_records_are_preserved_and_not_sampled(tmp_path: Path)
                 "version": 1,
                 "input_path": str(iac_path.resolve()),
                 "last_iac": package.rel_path,
-                "l1_prototypes": L1_PROTOTYPES,
-                "l2_prototypes": L2_PROTOTYPES,
+                "classification_prototypes": CLASSIFICATION_PROTOTYPES,
+                "spatial_prototypes": SPATIAL_PROTOTYPES,
                 "annotations": {},
                 "skipped": [skipped_key],
             }
@@ -1480,7 +1469,7 @@ def test_top_level_skipped_records_are_preserved_and_not_sampled(tmp_path: Path)
         seen_rows = {data.random_record(0)["record"]["row"] for _ in range(30)}
         assert skipped_record.row not in seen_rows
 
-        data.state.save_annotation(package, skipped_record, L1_PROTOTYPES[0], [])
+        data.state.save_annotation(package, skipped_record, CLASSIFICATION_PROTOTYPES[0], [])
         payload = json.loads(state_path.read_text(encoding="utf-8"))
         assert payload["last_iac"] == package.rel_path
         assert skipped_key not in payload["skipped"]
@@ -1497,7 +1486,7 @@ def test_random_record_skips_annotated_tiles_and_overview_is_jpg(tmp_path: Path)
     try:
         package = data.packages[0]
         first = data.viewer(0).records[0]
-        data.state.save_annotation(package, first, L1_PROTOTYPES[1], [])
+        data.state.save_annotation(package, first, CLASSIFICATION_PROTOTYPES[1], [])
 
         seen_rows = {data.random_record(0)["record"]["row"] for _ in range(30)}
         assert first.row not in seen_rows
@@ -1518,17 +1507,17 @@ def test_reviewed_records_lists_saved_annotations_but_not_skips(tmp_path: Path) 
     try:
         package = data.packages[0]
         records = data.viewer(0).records
-        data.state.save_annotation(package, records[0], L1_PROTOTYPES[0], [])
+        data.state.save_annotation(package, records[0], CLASSIFICATION_PROTOTYPES[0], [])
         data.state.save_skip(package, records[1])
         data.state.save_annotation(
-            package, records[2], L1_PROTOTYPES[1], [L2_PROTOTYPES[0]]
+            package, records[2], CLASSIFICATION_PROTOTYPES[1], [SPATIAL_PROTOTYPES[0]]
         )
 
         result = data.reviewed_records("all")
 
         assert result["total"] == 2
         assert [item["record"]["row"] for item in result["items"]] == [0, 2]
-        assert result["items"][1]["l2"] == [L2_PROTOTYPES[0]]
+        assert result["items"][1]["spatial"] == [SPATIAL_PROTOTYPES[0]]
     finally:
         data.close()
 
@@ -1608,7 +1597,7 @@ def test_save_skip_persists_state(tmp_path: Path) -> None:
         record1 = data.viewer(0).records[1]
 
         # 1. Save annotation on record0
-        data.state.save_annotation(package, record0, L1_PROTOTYPES[0], [])
+        data.state.save_annotation(package, record0, CLASSIFICATION_PROTOTYPES[0], [])
         assert _annotation_key(package, record0) in data.state.annotations
 
         # 2. Skip record0 (should be a no-op because it's annotated)
@@ -1714,25 +1703,25 @@ def test_label_lifecycle_preserves_stable_ids_and_referenced_labels(tmp_path: Pa
     try:
         package = data.package(0)
         record = data.viewer(0).records[0]
-        label_id = L1_PROTOTYPES[0]
+        label_id = CLASSIFICATION_PROTOTYPES[0]
         data.state.save_annotation(package, record, label_id, [])
-        data.state.change_label("l1", "rename", label_id=label_id, name="HCC tumor custom")
-        recycled = data.state.change_label("l1", "add", name=L1_PROTOTYPES[0])
-        assert any(item["name"] == L1_PROTOTYPES[0] for item in recycled["levels"]["l1"])
-        assert data.state.annotations[_annotation_key(package, record)]["l1"] == label_id
+        data.state.change_label("classification", "rename", label_id=label_id, name="HCC tumor custom")
+        recycled = data.state.change_label("classification", "add", name=CLASSIFICATION_PROTOTYPES[0])
+        assert any(item["name"] == CLASSIFICATION_PROTOTYPES[0] for item in recycled["label_sets"]["classification"])
+        assert data.state.annotations[_annotation_key(package, record)]["classification"] == label_id
         with pytest.raises(ValueError, match="archive it instead"):
-            data.state.change_label("l1", "delete", label_id=label_id)
-        data.state.change_label("l1", "archive", label_id=label_id)
+            data.state.change_label("classification", "delete", label_id=label_id)
+        data.state.change_label("classification", "archive", label_id=label_id)
         data.state.save_annotation(package, record, label_id, [])
-        result = data.state.change_label("l1", "add", name="New morphology")
-        added = next(item for item in result["levels"]["l1"] if item["name"] == "New morphology")
-        data.state.change_label("l1", "delete", label_id=added["id"])
+        result = data.state.change_label("classification", "add", name="New morphology")
+        added = next(item for item in result["label_sets"]["classification"] if item["name"] == "New morphology")
+        data.state.change_label("classification", "delete", label_id=added["id"])
     finally:
         data.close()
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     assert payload["version"] == 2
     assert "label_definitions" in payload
-    assert "l1_name" in state_path.with_suffix(".csv").read_text(encoding="utf-8").splitlines()[0]
+    assert "classification_name" in state_path.with_suffix(".csv").read_text(encoding="utf-8").splitlines()[0]
 
 
 def test_label_definitions_are_independent_between_versions_after_reload(tmp_path: Path) -> None:
@@ -1743,7 +1732,7 @@ def test_label_definitions_are_independent_between_versions_after_reload(tmp_pat
     archive = AnnotationArchive(main, input_path=iac_path)
     try:
         version_id = archive.create_version("marking")["created"]
-        archive.data(version_id).state.change_label("l1", "rename", label_id=L1_PROTOTYPES[0], name="G1")
+        archive.data(version_id).state.change_label("classification", "rename", label_id=CLASSIFICATION_PROTOTYPES[0], name="G1")
     finally:
         archive.close()
 
@@ -1751,8 +1740,8 @@ def test_label_definitions_are_independent_between_versions_after_reload(tmp_pat
     reloaded_archive = AnnotationArchive(reopened, input_path=iac_path)
     try:
         assert reloaded_archive.default_version == version_id
-        assert reloaded_archive.data("main").state.label_definitions["l1"][0]["name"] == L1_PROTOTYPES[0]
-        assert reloaded_archive.data(version_id).state.label_definitions["l1"][0]["name"] == "G1"
+        assert reloaded_archive.data("main").state.label_definitions["classification"][0]["name"] == CLASSIFICATION_PROTOTYPES[0]
+        assert reloaded_archive.data(version_id).state.label_definitions["classification"][0]["name"] == "G1"
     finally:
         reloaded_archive.close()
 
@@ -1793,7 +1782,7 @@ def test_marked_tile_list_is_collapsed_and_loaded_on_demand() -> None:
     assert "touch-action:pan-y" in HTML
 
 
-def test_review_mode_is_shared_by_l1_and_l2_and_uses_saved_tile_order() -> None:
+def test_review_mode_is_shared_by_classification_and_spatial_and_uses_saved_tile_order() -> None:
     assert "%REVIEW_MODE_JSON%" in HTML
     assert 'id="reviewModeBtn"' in HTML
     assert ".review-mode #packageHeader,.review-mode #packages{display:none}" in HTML
@@ -1825,49 +1814,49 @@ def test_unified_handler_exposes_navigation_and_versions(tmp_path: Path) -> None
     queue_path = tmp_path / "queue.json"
     _write_iac(iac_path)
     _write_roi_queue(queue_path, ["s1_0000000"])
-    l1_data = AnnotationData(iac_path, tmp_path / "l1.json")
-    l2_data = AnnotationData(iac_path, tmp_path / "l2.json", roi_candidate_manifest=queue_path)
+    classification_data = AnnotationData(iac_path, tmp_path / "classification.json")
+    spatial_data = AnnotationData(iac_path, tmp_path / "spatial.json", roi_candidate_manifest=queue_path)
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler({"l1": l1_data, "l2": l2_data}, "secret"))
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler({"classification": classification_data, "spatial": spatial_data}, "secret"))
     except PermissionError:
-        l1_data.close()
-        l2_data.close()
+        classification_data.close()
+        spatial_data.close()
         pytest.skip("local socket bind is blocked in this sandbox")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     root_url = f"http://127.0.0.1:{server.server_address[1]}/"
     try:
-        with urlopen(f"{root_url}?mode=l2&version=main", timeout=5) as response:
+        with urlopen(f"{root_url}?mode=spatial&version=main", timeout=5) as response:
             html = response.read().decode("utf-8")
-        assert 'const MODE="l2"' in html
-        assert 'const MODES=["l1", "l2"]' in html
+        assert 'const MODE="spatial"' in html
+        assert 'const MODES=["classification", "spatial"]' in html
         assert 'const VERSION="main"' in html
         assert "%VERSIONS_JSON%" not in html
-        with urlopen(f"{root_url}api/versions?token=secret&mode=l1&version=main", timeout=5) as response:
+        with urlopen(f"{root_url}api/versions?token=secret&mode=classification&version=main", timeout=5) as response:
             versions = json.loads(response.read().decode("utf-8"))
         assert versions["versions"][0]["id"] == "main"
     finally:
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
-        l1_data.close()
-        l2_data.close()
+        classification_data.close()
+        spatial_data.close()
 
 
 def test_annotation_versions_are_independent_and_reloadable(tmp_path: Path) -> None:
     iac_path = tmp_path / "tiles.iac"
-    main_path = tmp_path / "l1.json"
+    main_path = tmp_path / "classification.json"
     _write_iac(iac_path)
     initial = AnnotationData(iac_path, main_path, min_tissue_fraction=0)
     archive = AnnotationArchive(initial, input_path=iac_path, min_tissue_fraction=0)
     package = initial.package(0)
-    initial.state.save_annotation(package, initial.viewer(0).records[0], L1_PROTOTYPES[0], [])
+    initial.state.save_annotation(package, initial.viewer(0).records[0], CLASSIFICATION_PROTOTYPES[0], [])
     created = archive.create_version("Second review")
     version_id = created["created"]
     second = archive.data(version_id)
     assert second.state.annotations == {}
     assert second.state.label_definitions == initial.state.label_definitions
-    second.state.save_annotation(second.package(0), second.viewer(0).records[1], L1_PROTOTYPES[1], [])
+    second.state.save_annotation(second.package(0), second.viewer(0).records[1], CLASSIFICATION_PROTOTYPES[1], [])
     assert len(initial.state.annotations) == len(second.state.annotations) == 1
     assert set(initial.state.annotations) != set(second.state.annotations)
     archive.close()

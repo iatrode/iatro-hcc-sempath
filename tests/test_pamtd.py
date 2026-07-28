@@ -11,24 +11,21 @@ from hcc_sempath.training.pamtd import (
     prototype_adjudicated_teacher_target,
     prototype_response_distillation_loss,
 )
-from hcc_sempath.training.prototype_labels import DEFAULT_L1_CLASSES
+from hcc_sempath.training.prototype_labels import DEFAULT_CLASSIFICATION_CLASSES
 
 
-L1_COUNT = len(DEFAULT_L1_CLASSES)
-L2_COUNT = len(DEFAULT_SPATIAL_COMPONENTS)
+CLASSIFICATION_COUNT = len(DEFAULT_CLASSIFICATION_CLASSES)
+SPATIAL_COUNT = len(DEFAULT_SPATIAL_COMPONENTS)
 
 
 def _registry() -> PrototypeRegistry:
     return PrototypeRegistry(
-        prototypes=torch.eye(L1_COUNT),
-        names=list(DEFAULT_L1_CLASSES),
-        groups=["l1"] * L1_COUNT,
-        levels=[1] * L1_COUNT,
-        exclusive=[True] * L1_COUNT,
+        prototypes=torch.eye(CLASSIFICATION_COUNT),
+        names=list(DEFAULT_CLASSIFICATION_CLASSES),
     )
 
 
-def test_pamtd_returns_per_tile_teacher_weights_and_l1_target() -> None:
+def test_pamtd_returns_per_tile_teacher_weights_and_classification_target() -> None:
     teacher_by_name = {
         "a": torch.tensor(
             [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -42,27 +39,27 @@ def test_pamtd_returns_per_tile_teacher_weights_and_l1_target() -> None:
     result = prototype_adjudicated_teacher_target(
         teacher_by_name=teacher_by_name,
         prototypes_by_teacher={"a": _registry(), "b": _registry()},
-        student_primary_response=torch.full(
-            (2, L1_COUNT),
-            1.0 / L1_COUNT,
+        student_classification_response=torch.full(
+            (2, CLASSIFICATION_COUNT),
+            1.0 / CLASSIFICATION_COUNT,
         ),
-        class_names=DEFAULT_L1_CLASSES,
-        l1_mask=torch.tensor([True, False]),
-        l1_target=torch.tensor([0, -1]),
+        class_names=DEFAULT_CLASSIFICATION_CLASSES,
+        classification_mask=torch.tensor([True, False]),
+        classification_target=torch.tensor([0, -1]),
         filter_strength=1.0,
         alpha_min=0.25,
-        primary_temperature=0.1,
+        classification_temperature=0.1,
     )
 
     assert set(result.teacher_sample_weights) == {"a", "b"}
     for weight in result.teacher_sample_weights.values():
         assert weight.shape == (2,)
         assert torch.all((weight >= 0.25) & (weight <= 1.0))
-    assert result.primary_target.shape == (2, L1_COUNT)
+    assert result.classification_target.shape == (2, CLASSIFICATION_COUNT)
     assert result.response_sample_weight.shape == (2,)
-    assert result.primary_target[0].argmax().item() == 0
+    assert result.classification_target[0].argmax().item() == 0
     torch.testing.assert_close(
-        result.primary_target.sum(dim=1),
+        result.classification_target.sum(dim=1),
         torch.ones(2),
     )
 
@@ -72,57 +69,57 @@ def test_spatial_component_response_only_adjudicates_teacher_reliability() -> No
         [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
          [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]]
     )
-    l2_prototypes = torch.stack(
+    spatial_prototypes = torch.stack(
         [
             torch.roll(
-                torch.eye(L1_COUNT)[0],
-                shifts=index % L1_COUNT,
+                torch.eye(CLASSIFICATION_COUNT)[0],
+                shifts=index % CLASSIFICATION_COUNT,
             )
-            for index in range(L2_COUNT)
+            for index in range(SPATIAL_COUNT)
         ]
     )
     result = prototype_adjudicated_teacher_target(
         teacher_by_name={"a": teacher},
         prototypes_by_teacher={"a": _registry()},
-        student_primary_response=torch.full(
-            (2, L1_COUNT),
-            1.0 / L1_COUNT,
+        student_classification_response=torch.full(
+            (2, CLASSIFICATION_COUNT),
+            1.0 / CLASSIFICATION_COUNT,
         ),
-        class_names=DEFAULT_L1_CLASSES,
-        teacher_l2_prototypes={
-            "a": (l2_prototypes, torch.ones(L2_COUNT))
+        class_names=DEFAULT_CLASSIFICATION_CLASSES,
+        teacher_spatial_prototypes={
+            "a": (spatial_prototypes, torch.ones(SPATIAL_COUNT))
         },
-        student_l2_response=torch.full((2, L2_COUNT), 0.5),
-        l2_target=torch.zeros((2, L2_COUNT)),
-        l2_known=torch.ones((2, L2_COUNT), dtype=torch.bool),
-        primary_temperature=0.1,
-        l2_temperature=0.1,
+        student_spatial_response=torch.full((2, SPATIAL_COUNT), 0.5),
+        spatial_target=torch.zeros((2, SPATIAL_COUNT)),
+        spatial_known=torch.ones((2, SPATIAL_COUNT), dtype=torch.bool),
+        classification_temperature=0.1,
+        spatial_temperature=0.1,
     )
 
-    # The deployable target remains the fixed L1 response. L2 contributes
+    # The deployable target remains the fixed classification response. spatial contributes
     # only to the teacher reliability used by PAMT-D.
-    assert result.primary_target.shape == (2, L1_COUNT)
+    assert result.classification_target.shape == (2, CLASSIFICATION_COUNT)
     assert result.teacher_sample_weights["a"].shape == (2,)
 
     population_result = prototype_adjudicated_teacher_target(
         teacher_by_name={"a": teacher},
         prototypes_by_teacher={"a": _registry()},
-        student_primary_response=torch.full(
-            (2, L1_COUNT),
-            1.0 / L1_COUNT,
+        student_classification_response=torch.full(
+            (2, CLASSIFICATION_COUNT),
+            1.0 / CLASSIFICATION_COUNT,
         ),
-        class_names=DEFAULT_L1_CLASSES,
-        teacher_l2_prototypes={
-            "a": (l2_prototypes, torch.ones(L2_COUNT))
+        class_names=DEFAULT_CLASSIFICATION_CLASSES,
+        teacher_spatial_prototypes={
+            "a": (spatial_prototypes, torch.ones(SPATIAL_COUNT))
         },
-        student_l2_response=torch.full((2, L2_COUNT), 0.5),
-        primary_temperature=0.1,
-        l2_temperature=0.1,
+        student_spatial_response=torch.full((2, SPATIAL_COUNT), 0.5),
+        classification_temperature=0.1,
+        spatial_temperature=0.1,
     )
-    assert population_result.primary_target.shape == (2, L1_COUNT)
+    assert population_result.classification_target.shape == (2, CLASSIFICATION_COUNT)
 
 
-def test_uninitialized_l2_prototypes_are_exactly_l1_only() -> None:
+def test_uninitialized_spatial_prototypes_are_exactly_classification_only() -> None:
     teacher = torch.tensor(
         [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
          [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]]
@@ -130,36 +127,36 @@ def test_uninitialized_l2_prototypes_are_exactly_l1_only() -> None:
     common = {
         "teacher_by_name": {"a": teacher},
         "prototypes_by_teacher": {"a": _registry()},
-        "student_primary_response": torch.full(
-            (2, L1_COUNT),
-            1.0 / L1_COUNT,
+        "student_classification_response": torch.full(
+            (2, CLASSIFICATION_COUNT),
+            1.0 / CLASSIFICATION_COUNT,
         ),
-        "class_names": DEFAULT_L1_CLASSES,
-        "primary_temperature": 0.1,
-        "l2_temperature": 0.1,
+        "class_names": DEFAULT_CLASSIFICATION_CLASSES,
+        "classification_temperature": 0.1,
+        "spatial_temperature": 0.1,
     }
     baseline = prototype_adjudicated_teacher_target(**common)
-    with_empty_l2 = prototype_adjudicated_teacher_target(
+    with_empty_spatial = prototype_adjudicated_teacher_target(
         **common,
-        teacher_l2_prototypes={
+        teacher_spatial_prototypes={
             "a": (
-                torch.randn(L2_COUNT, L1_COUNT),
-                torch.zeros(L2_COUNT),
+                torch.randn(SPATIAL_COUNT, CLASSIFICATION_COUNT),
+                torch.zeros(SPATIAL_COUNT),
             )
         },
-        student_l2_response=torch.rand(2, L2_COUNT),
+        student_spatial_response=torch.rand(2, SPATIAL_COUNT),
     )
 
     torch.testing.assert_close(
-        with_empty_l2.primary_target,
-        baseline.primary_target,
+        with_empty_spatial.classification_target,
+        baseline.classification_target,
     )
     torch.testing.assert_close(
-        with_empty_l2.response_sample_weight,
+        with_empty_spatial.response_sample_weight,
         baseline.response_sample_weight,
     )
     torch.testing.assert_close(
-        with_empty_l2.teacher_sample_weights["a"],
+        with_empty_spatial.teacher_sample_weights["a"],
         baseline.teacher_sample_weights["a"],
     )
 
@@ -348,36 +345,36 @@ def test_response_distillation_uses_adjudicated_tile_mass() -> None:
 def test_zero_weight_teacher_cannot_change_consensus_or_target() -> None:
     common = {
         "prototypes_by_teacher": {"a": _registry()},
-        "student_primary_response": torch.full(
-            (1, L1_COUNT),
-            1.0 / L1_COUNT,
+        "student_classification_response": torch.full(
+            (1, CLASSIFICATION_COUNT),
+            1.0 / CLASSIFICATION_COUNT,
         ),
-        "class_names": DEFAULT_L1_CLASSES,
+        "class_names": DEFAULT_CLASSIFICATION_CLASSES,
         "teacher_weights": {"a": 1.0},
-        "primary_temperature": 0.1,
+        "classification_temperature": 0.1,
     }
     baseline = prototype_adjudicated_teacher_target(
-        teacher_by_name={"a": torch.eye(L1_COUNT)[:1]},
+        teacher_by_name={"a": torch.eye(CLASSIFICATION_COUNT)[:1]},
         **common,
     )
     with_zero = prototype_adjudicated_teacher_target(
         teacher_by_name={
-            "a": torch.eye(L1_COUNT)[:1],
-            "ignored": torch.eye(L1_COUNT)[-1:],
+            "a": torch.eye(CLASSIFICATION_COUNT)[:1],
+            "ignored": torch.eye(CLASSIFICATION_COUNT)[-1:],
         },
         prototypes_by_teacher={
             "a": _registry(),
             "ignored": _registry(),
         },
-        student_primary_response=common["student_primary_response"],
-        class_names=DEFAULT_L1_CLASSES,
+        student_classification_response=common["student_classification_response"],
+        class_names=DEFAULT_CLASSIFICATION_CLASSES,
         teacher_weights={"a": 1.0, "ignored": 0.0},
-        primary_temperature=0.1,
+        classification_temperature=0.1,
     )
 
     torch.testing.assert_close(
-        with_zero.primary_target,
-        baseline.primary_target,
+        with_zero.classification_target,
+        baseline.classification_target,
     )
     torch.testing.assert_close(
         with_zero.teacher_sample_weights["a"],
@@ -391,25 +388,25 @@ def test_zero_weight_teacher_cannot_change_consensus_or_target() -> None:
 def test_zero_reliability_mass_has_valid_fallback_but_no_response_weight() -> None:
     result = prototype_adjudicated_teacher_target(
         teacher_by_name={
-            "a": torch.eye(L1_COUNT)[:1],
-            "b": torch.eye(L1_COUNT)[1:2],
+            "a": torch.eye(CLASSIFICATION_COUNT)[:1],
+            "b": torch.eye(CLASSIFICATION_COUNT)[1:2],
         },
         prototypes_by_teacher={"a": _registry(), "b": _registry()},
-        student_primary_response=torch.full(
-            (1, L1_COUNT),
-            1.0 / L1_COUNT,
+        student_classification_response=torch.full(
+            (1, CLASSIFICATION_COUNT),
+            1.0 / CLASSIFICATION_COUNT,
         ),
-        class_names=DEFAULT_L1_CLASSES,
+        class_names=DEFAULT_CLASSIFICATION_CLASSES,
         filter_strength=1.0,
         alpha_min=0.0,
         consensus_weight=0.0,
         prototype_label_weight=0.0,
         student_agreement_weight=0.0,
-        primary_temperature=0.1,
+        classification_temperature=0.1,
     )
 
     torch.testing.assert_close(
-        result.primary_target.sum(dim=1),
+        result.classification_target.sum(dim=1),
         torch.ones(1),
     )
     assert result.response_sample_weight.item() == 0.0
@@ -515,14 +512,14 @@ def test_batch_size_one_relation_is_finite_zero() -> None:
 
 
 def test_distillation_is_finite_under_cpu_autocast() -> None:
-    student_a = torch.randn(3, L1_COUNT, requires_grad=True)
-    student_b = torch.randn(3, L1_COUNT, requires_grad=True)
+    student_a = torch.randn(3, CLASSIFICATION_COUNT, requires_grad=True)
+    student_b = torch.randn(3, CLASSIFICATION_COUNT, requires_grad=True)
     with torch.autocast("cpu", dtype=torch.bfloat16):
         total, parts = multi_teacher_distillation_loss(
             student_by_teacher={"a": student_a, "b": student_b},
             teacher_by_name={
-                "a": torch.randn(3, L1_COUNT),
-                "b": torch.randn(3, L1_COUNT),
+                "a": torch.randn(3, CLASSIFICATION_COUNT),
+                "b": torch.randn(3, CLASSIFICATION_COUNT),
             },
             prototypes_by_teacher={"a": _registry(), "b": _registry()},
             relation_weight=0.05,

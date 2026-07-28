@@ -35,7 +35,7 @@ from .datasets import (
 from .engine import collect_embeddings
 from .manifest import load_training_manifest
 from .metrics import evaluate_teacher_outputs
-from .prototype_labels import DEFAULT_L1_CLASSES, load_prototype_labels
+from .prototype_labels import DEFAULT_CLASSIFICATION_CLASSES, load_prototype_labels
 from .roi import spatial_component_names
 from .train import (
     _PackageShuffleBatchLoader,
@@ -52,7 +52,7 @@ from .utils import write_json
 def _load_prototype_map(
     cfg: dict,
     dims: dict[str, int],
-    expected_names: list[str] | tuple[str, ...] = DEFAULT_L1_CLASSES,
+    expected_names: list[str] | tuple[str, ...] = DEFAULT_CLASSIFICATION_CLASSES,
 ) -> dict[str, PrototypeRegistry] | None:
     if float(cfg["loss"].get("semantic_weight", 0.0)) == 0:
         return None
@@ -277,9 +277,9 @@ def main() -> None:
         candidate_size = (int(metadata["tile_height"]), int(metadata["tile_width"]))
         if candidate_size != image_size:
             raise ValueError(f"tile package size mismatch: {package_path} has {candidate_size}, expected {image_size}")
-    l1_class_names = [
+    classification_class_names = [
         str(name)
-        for name in cfg["model"].get("l1_class_names", DEFAULT_L1_CLASSES)
+        for name in cfg["model"].get("classification_class_names", DEFAULT_CLASSIFICATION_CLASSES)
     ]
     frozen_spatial_names = cfg["data"].get("spatial_component_names")
     spatial_names = (
@@ -305,7 +305,7 @@ def main() -> None:
         ]
     prototype_labels = load_prototype_labels(
         cfg["data"].get("prototype_supervision_manifest_path"),
-        l1_class_names,
+        classification_class_names,
         allowed_source_splits=_prototype_source_splits(cfg, args.split),
     )
     if manifest_path:
@@ -376,7 +376,7 @@ def main() -> None:
         projector_type=cfg["model"].get("projector_type", "linear"),
         projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
         teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),
-        l1_num_classes=len(l1_class_names),
+        classification_num_classes=len(classification_class_names),
         spatial_num_components=(
             len(spatial_names)
         ),
@@ -409,7 +409,7 @@ def main() -> None:
     prototypes = _load_prototype_map(
         cfg,
         dims,
-        expected_names=l1_class_names,
+        expected_names=classification_class_names,
     )
     eval_pairwise_max_samples = int(cfg["train"].get("eval_pairwise_max_samples", 4096))
     metrics = evaluate_teacher_outputs(
@@ -420,13 +420,13 @@ def main() -> None:
         max_pairwise_samples=eval_pairwise_max_samples,
     )
     mask = supervised["prototype_mask"].bool()
-    logits = supervised["l1_logits"]
-    metrics["l1_evaluated_tiles"] = float(mask.sum())
-    metrics["l1_accuracy"] = (
+    logits = supervised["classification_logits"]
+    metrics["classification_evaluated_tiles"] = float(mask.sum())
+    metrics["classification_accuracy"] = (
         float(
             (
                 logits[mask].argmax(dim=1)
-                == supervised["prototype_level1"][mask]
+                == supervised["prototype_classification"][mask]
             )
             .float()
             .mean()

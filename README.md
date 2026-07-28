@@ -80,7 +80,7 @@ declare `roi_count_complete` and `roi_measurement_complete`:
 ```bash
 python scripts/calibrate_spatial_decoder.py \
   --checkpoint outputs/hcc_sempath_v2/checkpoints/last.pt \
-  --annotation /path/to/hcc_l2_spatial_validation.json \
+  --annotation /path/to/hcc_spatial_validation.json \
   --validation-split val \
   --output-calibration outputs/hcc_sempath_v2/spatial_calibration.json \
   --output-report outputs/hcc_sempath_v2/spatial_validation_report.json
@@ -115,8 +115,8 @@ Start the combined annotation service:
 ```bash
 hcc-sempath annotate-prototypes \
   --input /path/to/image_tile_iac_root \
-  --l1-state /private/study/classification_state.json \
-  --l2-state /private/study/spatial_state.json \
+  --classification-state /private/study/classification_state.json \
+  --spatial-state /private/study/spatial_state.json \
   --priority-manifest /private/study/shared_priority_tiles.json \
   --roi-candidate-manifest /private/study/spatial_candidates.json \
   --roi-information-report /private/study/spatial_information_report.json
@@ -133,12 +133,12 @@ tile boundary:
 ```bash
 hcc-sempath annotate-prototypes \
   --input /path/to/image_tile_iac_root \
-  --l1-state /private/study/classification_review.json \
-  --l2-state /private/study/spatial_state.json \
+  --classification-state /private/study/classification_review.json \
+  --spatial-state /private/study/spatial_state.json \
   --priority-manifest /private/study/shared_priority_tiles.json \
   --roi-candidate-manifest /private/study/spatial_candidates.json \
-  --l1-review-manifest /private/study/classification_review_manifest.json \
-  --l2-review-manifest /private/study/spatial_review_manifest.json
+  --classification-review-manifest /private/study/classification_review_manifest.json \
+  --spatial-review-manifest /private/study/spatial_review_manifest.json
 ```
 
 Each review manifest contains a stable `review_id` and the ordered

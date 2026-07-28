@@ -48,7 +48,7 @@ from .datasets import (
 )
 from .engine import build_lr_scheduler, fit
 from .manifest import load_training_manifest
-from .prototype_labels import DEFAULT_L1_CLASSES, load_prototype_labels
+from .prototype_labels import DEFAULT_CLASSIFICATION_CLASSES, load_prototype_labels
 from .roi import (
     SpatialRoiTarget,
     build_spatial_roi_targets,
@@ -74,7 +74,7 @@ class BatchBuffer:
     images: torch.Tensor                       # (B, H, W, 3) uint8, pinned
     teacher_features: dict                       # name -> (B, dim) float32, pinned
     prototype_mask: torch.Tensor                 # (B,) bool
-    prototype_level1: torch.Tensor               # (B,) long
+    prototype_classification: torch.Tensor               # (B,) long
     spatial_targets: list[SpatialRoiTarget | None]
     spatial_shape: tuple[int, int, int]
     tile_id: list = field(default_factory=list)  # (B,) str
@@ -90,10 +90,10 @@ class BatchBuffer:
             )
             spatial = [item if item is not None else empty for item in selected]
             spatial_payload = {
-                "l2_point_centers": torch.stack(
+                "spatial_point_centers": torch.stack(
                     [item.point_centers for item in spatial]
                 ),
-                "l2_instance_exclusion_support": torch.stack(
+                "spatial_instance_exclusion_support": torch.stack(
                     [
                         item.instance_exclusion_support
                         if item.instance_exclusion_support is not None
@@ -104,46 +104,46 @@ class BatchBuffer:
                         for item in spatial
                     ]
                 ),
-                "l2_brush_bag_ids": torch.stack(
+                "spatial_brush_bag_ids": torch.stack(
                     [item.brush_bag_ids for item in spatial]
                 ),
-                "l2_area_positive": torch.stack(
+                "spatial_area_positive": torch.stack(
                     [item.area_positive for item in spatial]
                 ),
-                "l2_explicit_negative": torch.stack(
+                "spatial_explicit_negative": torch.stack(
                     [item.explicit_negative for item in spatial]
                 ),
-                "l2_implicit_negative": torch.stack(
+                "spatial_implicit_negative": torch.stack(
                     [item.implicit_negative for item in spatial]
                 ),
-                "l2_spatial_supervised": torch.stack(
+                "spatial_supervised": torch.stack(
                     [item.supervised for item in spatial]
                 ),
             }
         else:
             spatial_payload = {
-                "l2_point_centers": torch.zeros((count, 0, 0, 0)),
-                "l2_instance_exclusion_support": torch.zeros(
+                "spatial_point_centers": torch.zeros((count, 0, 0, 0)),
+                "spatial_instance_exclusion_support": torch.zeros(
                     (count, 0, 0, 0),
                     dtype=torch.bool,
                 ),
-                "l2_brush_bag_ids": torch.zeros(
+                "spatial_brush_bag_ids": torch.zeros(
                     (count, 0, 0, 0),
                     dtype=torch.long,
                 ),
-                "l2_area_positive": torch.zeros(
+                "spatial_area_positive": torch.zeros(
                     (count, 0, 0, 0),
                     dtype=torch.bool,
                 ),
-                "l2_explicit_negative": torch.zeros(
+                "spatial_explicit_negative": torch.zeros(
                     (count, 0, 0, 0),
                     dtype=torch.bool,
                 ),
-                "l2_implicit_negative": torch.zeros(
+                "spatial_implicit_negative": torch.zeros(
                     (count, 0, 0, 0),
                     dtype=torch.bool,
                 ),
-                "l2_spatial_supervised": torch.zeros(
+                "spatial_supervised": torch.zeros(
                     (count, 0),
                     dtype=torch.bool,
                 ),
@@ -155,7 +155,7 @@ class BatchBuffer:
             "images_hwc": True,
             "teacher_features": {name: feat[:count] for name, feat in self.teacher_features.items()},
             "prototype_mask": self.prototype_mask[:count],
-            "prototype_level1": self.prototype_level1[:count],
+            "prototype_classification": self.prototype_classification[:count],
             **spatial_payload,
         }
 
@@ -171,7 +171,7 @@ def _alloc_batch_buffer(batch_size: int, spec: dict, pin: bool) -> BatchBuffer:
             for name, dim in spec["teacher_dims"].items()
         },
         prototype_mask=torch.zeros((batch_size,), dtype=torch.bool),
-        prototype_level1=torch.full((batch_size,), -1, dtype=torch.long),
+        prototype_classification=torch.full((batch_size,), -1, dtype=torch.long),
         spatial_targets=[None] * batch_size,
         spatial_shape=(spatial_k, spatial_h, spatial_w),
         tile_id=[""] * batch_size,
@@ -589,7 +589,7 @@ class _PackageShuffleBatchLoader:
 
 
 class _MaterializedExpertBank:
-    """One in-memory copy of the small fixed L1/L2 expert union."""
+    """One in-memory copy of the small fixed classification/spatial expert union."""
 
     def __init__(self, batches: list[dict]) -> None:
         if not batches:
@@ -607,14 +607,14 @@ class _MaterializedExpertBank:
         self.images_hwc = bool(batches[0].get("images_hwc", False))
         tensor_keys = (
             "prototype_mask",
-            "prototype_level1",
-            "l2_point_centers",
-            "l2_instance_exclusion_support",
-            "l2_brush_bag_ids",
-            "l2_area_positive",
-            "l2_explicit_negative",
-            "l2_implicit_negative",
-            "l2_spatial_supervised",
+            "prototype_classification",
+            "spatial_point_centers",
+            "spatial_instance_exclusion_support",
+            "spatial_brush_bag_ids",
+            "spatial_area_positive",
+            "spatial_explicit_negative",
+            "spatial_implicit_negative",
+            "spatial_supervised",
         )
         self.tensors = {
             key: torch.cat(
@@ -623,7 +623,7 @@ class _MaterializedExpertBank:
                         batch[key]
                         if key in batch
                         else torch.zeros_like(
-                            batch["l2_area_positive"],
+                            batch["spatial_area_positive"],
                             dtype=torch.bool,
                         )
                     )
@@ -1170,7 +1170,7 @@ def _load_prototype_map(
     cfg: dict,
     dims: dict[str, int],
     device: torch.device,
-    expected_names: list[str] | tuple[str, ...] = DEFAULT_L1_CLASSES,
+    expected_names: list[str] | tuple[str, ...] = DEFAULT_CLASSIFICATION_CLASSES,
 ) -> dict[str, PrototypeRegistry] | None:
     loss_cfg = cfg["loss"]
     prototype_responses_enabled = (
@@ -1209,13 +1209,6 @@ def _load_prototype_map(
             raise ValueError(
                 "teacher semantic prototype contract mismatch: "
                 f"teacher={teacher} expected={expected} got={registry.names}"
-            )
-        if registry.levels != [1] * len(expected) or registry.exclusive != [
-            True
-        ] * len(expected):
-            raise ValueError(
-                "teacher semantic prototypes must contain exactly the "
-                f"exclusive L1 prototype bank: teacher={teacher}"
             )
     return registries
 
@@ -1376,29 +1369,29 @@ def main() -> None:
         )
     validate_training_config(cfg, names)
     dims = teacher_dims(cfg, names)
-    l1_class_names = [
+    classification_class_names = [
         str(name)
-        for name in cfg["model"].get("l1_class_names", DEFAULT_L1_CLASSES)
+        for name in cfg["model"].get("classification_class_names", DEFAULT_CLASSIFICATION_CLASSES)
     ]
-    if tuple(l1_class_names) != DEFAULT_L1_CLASSES:
+    if tuple(classification_class_names) != DEFAULT_CLASSIFICATION_CLASSES:
         raise ValueError(
-            f"fixed L1 class contract must be {list(DEFAULT_L1_CLASSES)}, got {l1_class_names}"
+            f"fixed classification class contract must be {list(DEFAULT_CLASSIFICATION_CLASSES)}, got {classification_class_names}"
         )
     prototypes = _load_prototype_map(
         cfg,
         dims,
         device,
-        expected_names=l1_class_names,
+        expected_names=classification_class_names,
     )
     prototype_manifest_path = cfg["data"].get("prototype_supervision_manifest_path")
     train_prototype_labels = load_prototype_labels(
         prototype_manifest_path,
-        l1_class_names,
+        classification_class_names,
         allowed_source_splits=_prototype_source_splits(cfg, "prototype_supervision_train_splits", ["train"]),
     )
     val_prototype_labels = load_prototype_labels(
         prototype_manifest_path,
-        l1_class_names,
+        classification_class_names,
         allowed_source_splits=_prototype_source_splits(cfg, "prototype_supervision_val_splits", ["val"]),
     )
     replay_prototype_manifest_path = cfg["data"].get(
@@ -1410,7 +1403,7 @@ def main() -> None:
         if replay_prototype_manifest_path == prototype_manifest_path
         else load_prototype_labels(
             replay_prototype_manifest_path,
-            l1_class_names,
+            classification_class_names,
             allowed_source_splits=_prototype_source_splits(
                 cfg,
                 "prototype_supervision_train_splits",
@@ -1815,7 +1808,7 @@ def main() -> None:
         projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
         teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),
         grad_checkpointing=bool(cfg["model"].get("grad_checkpointing", False)),
-        l1_num_classes=len(l1_class_names),
+        classification_num_classes=len(classification_class_names),
         spatial_num_components=len(component_names) if spatial_manifest_path else 0,
         spatial_dim=int(cfg["model"].get("spatial_dim", 256)),
         spatial_output_stride=spatial_stride,

@@ -59,9 +59,9 @@ def test_annotation_loader_uses_active_current_roi_taxonomy(tmp_path: Path) -> N
     path.write_text(
         json.dumps(
             {
-                "l2_prototypes": ["fallback"],
+                "spatial_prototypes": ["fallback"],
                 "label_definitions": {
-                    "l2": [
+                    "spatial": [
                         {"id": "current-a", "active": True},
                         {"id": "retired", "active": False},
                     ]
@@ -239,7 +239,7 @@ def test_curve_counts_unique_tiles_not_teacher_observations() -> None:
     assert len(set(order)) == 3
 
 
-def test_l2_uses_the_same_pooled_tail_support_as_l1(
+def test_spatial_uses_the_same_pooled_tail_support_as_classification(
     monkeypatch,
 ) -> None:
     module = _load_module()

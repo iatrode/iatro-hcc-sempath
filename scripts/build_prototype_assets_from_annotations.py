@@ -58,7 +58,7 @@ def _load_annotations(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
     annotations = payload.get("annotations")
     if not isinstance(annotations, dict):
         raise ValueError(f"annotation JSON missing annotations object: {path}")
-    rows = [item for item in annotations.values() if item.get("tile_id") and item.get("l1")]
+    rows = [item for item in annotations.values() if item.get("tile_id") and item.get("classification")]
     if not rows:
         raise ValueError(f"annotation JSON has no usable annotations: {path}")
     return payload, rows
@@ -102,21 +102,15 @@ def _write_registry(
     *,
     prototypes: list[np.ndarray],
     names: list[str],
-    levels: list[int],
-    exclusive: list[bool],
     counts: list[int],
     source: dict[str, Any],
 ) -> None:
-    groups = ["primary_state" if level == 1 else "attribute_presence" for level in levels]
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "version": 1,
             "prototypes": torch.from_numpy(np.stack(prototypes, axis=0).astype(np.float32)),
             "names": names,
-            "groups": groups,
-            "levels": levels,
-            "exclusive": exclusive,
             "counts": counts,
             "source": source,
         },
@@ -134,7 +128,7 @@ def _write_supervision_csv(path: Path, rows: list[dict[str, Any]], source_split:
                 "tile_id",
                 "slide_id",
                 "patient_id",
-                "level1_label",
+                "classification_label",
                 "source_split",
                 "adjudicated",
                 "dataset",
@@ -154,7 +148,7 @@ def _write_supervision_csv(path: Path, rows: list[dict[str, Any]], source_split:
                     "tile_id": tile_id,
                     "slide_id": slide_id,
                     "patient_id": str(item.get("patient_id") or slide_id).strip(),
-                    "level1_label": str(item["l1"]).strip(),
+                    "classification_label": str(item["classification"]).strip(),
                     "source_split": source_split,
                     "adjudicated": "true",
                     "dataset": str(item.get("dataset") or Path(str(item.get("iac") or "")).parent.name).strip(),
@@ -184,20 +178,20 @@ def _collect_teacher_features(
 def _build_label_prototypes(
     rows: list[dict[str, Any]],
     features: list[np.ndarray],
-    l1_names: list[str],
-    l2_names: list[str],
+    classification_names: list[str],
+    spatial_names: list[str],
 ) -> tuple[list[np.ndarray], list[int]]:
     prototypes: list[np.ndarray] = []
     counts: list[int] = []
-    for label in l1_names:
-        selected = [feature for item, feature in zip(rows, features) if str(item.get("l1")) == label]
+    for label in classification_names:
+        selected = [feature for item, feature in zip(rows, features) if str(item.get("classification")) == label]
         prototypes.append(_mean_unit(selected, label))
         counts.append(len(selected))
-    for label in l2_names:
+    for label in spatial_names:
         selected = [
             feature
             for item, feature in zip(rows, features)
-            if label in {str(value) for value in (item.get("l2") or item.get("level2_labels") or [])}
+            if label in {str(value) for value in (item.get("spatial") or item.get("spatial_labels") or [])}
         ]
         prototypes.append(_mean_unit(selected, label))
         counts.append(len(selected))
@@ -218,27 +212,23 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     manifest = _load_manifest(manifest_path)
     payload, rows = _load_annotations(annotation_path)
-    l1_names = [str(name) for name in payload.get("l1_prototypes", [])]
-    if not l1_names:
-        raise ValueError("annotation JSON missing l1_prototypes")
-    # Teacher prototypes define the frozen exclusive L1 semantic axis; the
-    # geometry manifest supplies the independent spatial L2 supervision.
-    l2_names: list[str] = []
-    names = list(l1_names)
-    levels = [1] * len(l1_names)
-    exclusive = [True] * len(l1_names)
+    classification_names = [str(name) for name in payload.get("classification_prototypes", [])]
+    if not classification_names:
+        raise ValueError("annotation JSON missing classification_prototypes")
+    # Teacher prototypes define the frozen exclusive classification semantic axis; the
+    # geometry manifest supplies the independent spatial supervision.
+    spatial_names: list[str] = []
+    names = list(classification_names)
 
     teacher_dims: dict[str, int] = {}
     for teacher in TEACHERS:
         features, dim = _collect_teacher_features(manifest, rows, teacher)
         teacher_dims[teacher] = dim
-        prototypes, counts = _build_label_prototypes(rows, features, l1_names, l2_names)
+        prototypes, counts = _build_label_prototypes(rows, features, classification_names, spatial_names)
         _write_registry(
             output_dir / f"{teacher}_hcc_semantic_prototypes.pt",
             prototypes=prototypes,
             names=names,
-            levels=levels,
-            exclusive=exclusive,
             counts=counts,
             source={
                 "annotation_json": str(annotation_path),
@@ -255,7 +245,7 @@ def main() -> None:
         "training_manifest": str(manifest_path),
         "output_dir": str(output_dir),
         "annotations": len(rows),
-        "l1_prototypes": l1_names,
+        "classification_prototypes": classification_names,
         "teacher_dims": teacher_dims,
         "supervision_manifest": str(supervision_path),
     }
@@ -263,7 +253,7 @@ def main() -> None:
     print(
         "prototype_assets_ok "
         f"annotations={len(rows)} output_dir={output_dir} "
-        f"l1_classes={len(l1_names)}"
+        f"classification_classes={len(classification_names)}"
     )
 
 

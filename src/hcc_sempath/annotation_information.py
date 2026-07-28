@@ -491,37 +491,3 @@ def tail_plateau(
     )
     onset = int(tail[0]["sample_count"]) if stable else None
     return stable, onset
-
-
-def tail_low_gain(
-    curve: list[dict[str, object]],
-    *,
-    marginal_ratio_threshold: float,
-    confirmation_increments: int,
-) -> tuple[bool, int | None]:
-    """Decode the low-gain-only rule used by historical audit reports.
-
-    Current classification and spatial audits use :func:`tail_plateau`.
-    """
-    intervals = [
-        row
-        for row in curve
-        if math.isfinite(
-            _as_finite(row.get("information_gain_per_100_tiles"))
-        )
-    ]
-    if len(intervals) < confirmation_increments:
-        return False, None
-    gains = [
-        _as_finite(row["information_gain_per_100_tiles"])
-        for row in intervals
-    ]
-    threshold = max(gains, default=0.0) * marginal_ratio_threshold
-    tail = intervals[-confirmation_increments:]
-    stable = all(
-        _as_finite(row["information_gain_per_100_tiles"])
-        <= threshold + 1e-12
-        for row in tail
-    )
-    onset = int(tail[0]["sample_count"]) if stable else None
-    return stable, onset

@@ -73,7 +73,7 @@ class _FakeDataset:
             for name, dim in self.TEACHER_DIMS.items():
                 buf.teacher_features[name][slot.pos].fill_(float(gid))
             buf.prototype_mask[slot.pos] = bool(gid % 2)
-            buf.prototype_level1[slot.pos] = gid
+            buf.prototype_classification[slot.pos] = gid
             buf.tile_id[slot.pos] = str(gid)
 
 
@@ -172,13 +172,13 @@ def test_materialized_expert_loader_reuses_complete_bank() -> None:
                     "teacher": torch.arange(size).view(size, 1).float()
                 },
                 "prototype_mask": torch.ones(size, dtype=torch.bool),
-                "prototype_level1": torch.arange(size),
-                "l2_point_centers": zeros.float(),
-                "l2_brush_bag_ids": zeros.long(),
-                "l2_area_positive": zeros,
-                "l2_explicit_negative": zeros,
-                "l2_implicit_negative": zeros,
-                "l2_spatial_supervised": torch.zeros(
+                "prototype_classification": torch.arange(size),
+                "spatial_point_centers": zeros.float(),
+                "spatial_brush_bag_ids": zeros.long(),
+                "spatial_area_positive": zeros,
+                "spatial_explicit_negative": zeros,
+                "spatial_implicit_negative": zeros,
+                "spatial_supervised": torch.zeros(
                     (size, 2),
                     dtype=torch.bool,
                 ),
@@ -256,7 +256,7 @@ def test_teacher_and_prototype_payload_correct():
         for i, gid in enumerate(gids):
             assert torch.allclose(batch["teacher_features"]["t0"][i], torch.full((3,), float(gid)))
             assert torch.allclose(batch["teacher_features"]["t1"][i], torch.full((5,), float(gid)))
-            assert int(batch["prototype_level1"][i]) == gid
+            assert int(batch["prototype_classification"][i]) == gid
             assert bool(batch["prototype_mask"][i]) == bool(gid % 2)
         assert batch["images_uint8"] is True
         assert batch["images"].dtype == torch.uint8

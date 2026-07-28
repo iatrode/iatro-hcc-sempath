@@ -15,7 +15,7 @@ data:
   prototype_supervision_train_splits: [train]
   prototype_supervision_val_splits: [val]
   # Spatial JSON/JSONL supports point, brush, circle, and polygon geometries.
-  spatial_manifest_path: /path/to/prototypes/hcc_l2_spatial_annotations.json
+  spatial_manifest_path: /path/to/prototypes/hcc_spatial_annotations.json
   spatial_train_splits: [train]
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
@@ -25,7 +25,7 @@ data:
   dynamic_package_sampling: true
   tensor_collate: true
   package_chunk_size: 64
-  # Replay the fixed L1/L2 expert tiles throughout population distillation.
+  # Replay the fixed classification/spatial expert tiles throughout population distillation.
   expert_replay_interval_batches: 16
   expert_batch_size: 64
 
@@ -39,7 +39,7 @@ model:
     h_optimus_1: 1536
     uni2_h: 1536
     virchow2: 2560
-  l1_class_names:
+  classification_class_names:
     [HCC-tumor-well-differentiated, HCC-tumor-moderately-differentiated,
      HCC-tumor-poorly-differentiated, Background-liver,
      Inflammatory-stromal, Degenerative-material]
@@ -56,13 +56,13 @@ loss:
   relation_weight: 0.05
   semantic_weight: 0.02
   semantic_temperature: 1.0
-  primary_temperature: 1.0
+  classification_temperature: 1.0
   # Teacher-only representation shaping precedes all expert supervision.
-  # L1 and L2 then enter together and ramp on the same global-step clock.
+  # Classification and spatial supervision then enter together and ramp on the same global-step clock.
   expert_supervision_start_step: 3000
   expert_supervision_ramp_steps: 1000
   # PAMT-D teacher adjudication and dynamic student-prototype response.
-  pamtd_primary_temperature: 0.1
+  pamtd_classification_temperature: 0.1
   prototype_filter_weight: 0.5
   prototype_filter_alpha_min: 0.25
   prototype_filter_start_step: 4000
@@ -73,8 +73,8 @@ loss:
   zhcc_response_weight: 0.15
   zhcc_response_start_step: 4000
   zhcc_response_ramp_steps: 1000
-  l2_global_temperature: 0.1
-  l1_weight: 1.0
+  spatial_global_temperature: 0.1
+  classification_weight: 1.0
   spatial_weight: 0.1
   spatial_point_tolerance_cells: 1
   spatial_abundance_point_weight: 0.5

@@ -22,8 +22,8 @@ from .pamtd import (
     prototype_adjudicated_teacher_target,
     prototype_response_distillation_loss,
 )
-from .prototype_labels import DEFAULT_L1_CLASSES
-from .spatial_losses import l1_classification_loss, spatial_morphometry_loss
+from .prototype_labels import DEFAULT_CLASSIFICATION_CLASSES
+from .spatial_losses import classification_objective_loss, spatial_morphometry_loss
 from .utils import append_csv, ensure_dir, write_json
 
 
@@ -40,33 +40,33 @@ STEP_METRIC_PARTS = (
     "semantic",
     "pamtd_response",
     "teacher_alpha_mean",
-    "l1",
-    "l1_accuracy",
-    "l1_supervised_tiles",
-    "l2_spatial",
-    "l2_instance_point",
-    "l2_abundance_point",
-    "l2_brush_bag",
-    "l2_area_positive",
-    "l2_explicit_negative",
-    "l2_implicit_negative",
-    "l2_point_supervised_pairs",
-    "l2_brush_supervised_pairs",
-    "l2_area_supervised_pairs",
+    "classification",
+    "classification_accuracy",
+    "classification_supervised_tiles",
+    "spatial",
+    "spatial_instance_point",
+    "spatial_abundance_point",
+    "spatial_brush_bag",
+    "spatial_area_positive",
+    "spatial_explicit_negative",
+    "spatial_implicit_negative",
+    "spatial_point_supervised_pairs",
+    "spatial_brush_supervised_pairs",
+    "spatial_area_supervised_pairs",
 )
 STEP_METRIC_FIELDS = (
     "epoch",
     "global_step",
-    "l2_supervised_step",
+    "spatial_supervised_step",
     "tiles_seen_in_epoch",
     "lr",
     "scheduled_semantic_weight",
-    "scheduled_l1_weight",
+    "scheduled_classification_weight",
     "scheduled_spatial_weight",
     "scheduled_filter_weight",
     "scheduled_response_weight",
-    "l1_active",
-    "l2_active",
+    "classification_active",
+    "spatial_active",
     "loss",
     *STEP_METRIC_PARTS,
 )
@@ -86,23 +86,23 @@ class StepMetricsWriter:
         *,
         epoch: int,
         global_step: int,
-        l2_supervised_step: int,
+        spatial_supervised_step: int,
         tiles_seen_in_epoch: int,
         lr: float,
         loss_cfg: dict,
-        l1_active: bool,
-        l2_active: bool,
+        classification_active: bool,
+        spatial_active: bool,
         loss: torch.Tensor,
         parts: dict[str, torch.Tensor],
     ) -> None:
         row: dict[str, float | int] = {
             "epoch": int(epoch),
             "global_step": int(global_step),
-            "l2_supervised_step": int(l2_supervised_step),
+            "spatial_supervised_step": int(spatial_supervised_step),
             "tiles_seen_in_epoch": int(tiles_seen_in_epoch),
             "lr": float(lr),
             "scheduled_semantic_weight": float(loss_cfg["semantic_weight"]),
-            "scheduled_l1_weight": float(loss_cfg["l1_weight"]),
+            "scheduled_classification_weight": float(loss_cfg["classification_weight"]),
             "scheduled_spatial_weight": float(loss_cfg["spatial_weight"]),
             "scheduled_filter_weight": float(
                 loss_cfg["prototype_filter_weight"]
@@ -110,8 +110,8 @@ class StepMetricsWriter:
             "scheduled_response_weight": float(
                 loss_cfg["zhcc_response_weight"]
             ),
-            "l1_active": int(l1_active),
-            "l2_active": int(l2_active),
+            "classification_active": int(classification_active),
+            "spatial_active": int(spatial_active),
         }
         reference = loss.detach()
         tensor_values = torch.stack(
@@ -388,21 +388,21 @@ def _prepare_images(
     return images.sub_(mean).div_(std)
 
 
-def _l2_positive_from_batch(batch: dict) -> torch.Tensor:
+def _spatial_positive_from_batch(batch: dict) -> torch.Tensor:
     return (
-        (batch["l2_point_centers"] > 0)
-        | (batch["l2_brush_bag_ids"] > 0)
-        | batch["l2_area_positive"].to(dtype=torch.bool)
+        (batch["spatial_point_centers"] > 0)
+        | (batch["spatial_brush_bag_ids"] > 0)
+        | batch["spatial_area_positive"].to(dtype=torch.bool)
     ).flatten(2).any(dim=2)
 
 
-def _l2_global_targets_from_spatial(
+def _spatial_global_targets_from_spatial(
     batch: dict,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Summarize local ROI evidence without promoting local negatives."""
 
-    positive = _l2_positive_from_batch(batch)
-    complete_negative = batch["l2_explicit_negative"].to(
+    positive = _spatial_positive_from_batch(batch)
+    complete_negative = batch["spatial_explicit_negative"].to(
         dtype=torch.bool
     ).flatten(2).all(dim=2)
     return positive, positive | complete_negative
@@ -415,38 +415,38 @@ def _refresh_global_prototypes(
     cfg: dict,
     device: torch.device,
 ) -> dict[str, int | float]:
-    """Recompute exact L1 and global L2 prototypes from the complete bank."""
+    """Recompute exact classification and global spatial prototypes from the complete bank."""
 
     raw_model = getattr(model, "_orig_mod", model)
-    if raw_model.l1_prototypes is None:
-        raise RuntimeError("dynamic prototype refresh requires an L1 readout")
-    embedding_dim = int(raw_model.l1_prototypes.shape[1])
-    l1_sums = torch.zeros(
-        raw_model.l1_num_classes,
+    if raw_model.classification_prototypes is None:
+        raise RuntimeError("dynamic prototype refresh requires a classification readout")
+    embedding_dim = int(raw_model.classification_prototypes.shape[1])
+    classification_sums = torch.zeros(
+        raw_model.classification_num_classes,
         embedding_dim,
         device=device,
         dtype=torch.float32,
     )
-    l1_counts = torch.zeros(
-        raw_model.l1_num_classes,
+    classification_counts = torch.zeros(
+        raw_model.classification_num_classes,
         device=device,
         dtype=torch.float32,
     )
     component_count = int(raw_model.spatial_num_components)
-    l2_sums = torch.zeros(
+    spatial_sums = torch.zeros(
         component_count,
         embedding_dim,
         device=device,
         dtype=torch.float32,
     )
-    l2_counts = torch.zeros(
+    spatial_counts = torch.zeros(
         component_count,
         device=device,
         dtype=torch.float32,
     )
     teacher_sums = {
         name: torch.zeros_like(state.prototypes, dtype=torch.float32)
-        for name, state in raw_model.teacher_l2_prototypes.items()
+        for name, state in raw_model.teacher_spatial_prototypes.items()
     }
     normalization = _image_normalization(cfg, device)
     was_training = bool(raw_model.training)
@@ -465,25 +465,25 @@ def _refresh_global_prototypes(
                 raw_model.encode(images),
                 dim=-1,
             ).float()
-            mask, targets, _ = _move_l1_batch(batch, device)
+            mask, targets, _ = _move_classification_batch(batch, device)
             selected = F.one_hot(
-                targets.clamp(0, raw_model.l1_num_classes - 1),
-                num_classes=raw_model.l1_num_classes,
+                targets.clamp(0, raw_model.classification_num_classes - 1),
+                num_classes=raw_model.classification_num_classes,
             ).to(dtype=embedding_norm.dtype)
             selected = selected * mask.to(
                 dtype=embedding_norm.dtype
             ).unsqueeze(1)
-            l1_sums.add_(selected.transpose(0, 1) @ embedding_norm)
-            l1_counts.add_(selected.sum(dim=0))
+            classification_sums.add_(selected.transpose(0, 1) @ embedding_norm)
+            classification_counts.add_(selected.sum(dim=0))
 
             if component_count > 0:
-                positive = _l2_positive_from_batch(batch).to(
+                positive = _spatial_positive_from_batch(batch).to(
                     device=device,
                     dtype=embedding_norm.dtype,
                     non_blocking=device.type == "cuda",
                 )
-                l2_sums.add_(positive.transpose(0, 1) @ embedding_norm)
-                l2_counts.add_(positive.sum(dim=0))
+                spatial_sums.add_(positive.transpose(0, 1) @ embedding_norm)
+                spatial_counts.add_(positive.sum(dim=0))
                 teachers = _move_teachers(batch, device)
                 for name, features in teachers.items():
                     normalized = F.normalize(
@@ -496,19 +496,19 @@ def _refresh_global_prototypes(
             tile_count += len(batch["tile_id"])
     finally:
         raw_model.train(was_training)
-    raw_model.replace_l1_prototypes(l1_sums, l1_counts)
+    raw_model.replace_classification_prototypes(classification_sums, classification_counts)
     if component_count > 0:
-        raw_model.replace_global_l2_prototypes(
-            l2_sums,
-            l2_counts,
+        raw_model.replace_global_spatial_prototypes(
+            spatial_sums,
+            spatial_counts,
             teacher_sums,
         )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     return {
         "tiles": tile_count,
-        "l1_observations": int(l1_counts.sum().item()),
-        "l2_positive_observations": int(l2_counts.sum().item()),
+        "classification_observations": int(classification_counts.sum().item()),
+        "spatial_positive_observations": int(spatial_counts.sum().item()),
         "seconds": time.perf_counter() - started,
     }
 
@@ -548,7 +548,7 @@ def _refresh_spatial_prototypes(
     try:
         for batch in loader:
             spatial_sample_mask = batch[
-                "l2_spatial_supervised"
+                "spatial_supervised"
             ].any(dim=1)
             if not bool(spatial_sample_mask.any()):
                 continue
@@ -568,21 +568,21 @@ def _refresh_spatial_prototypes(
             active_host = {
                 key: batch[key][spatial_sample_mask]
                 for key in (
-                    "l2_point_centers",
-                    "l2_brush_bag_ids",
-                    "l2_area_positive",
-                    "l2_explicit_negative",
-                    "l2_implicit_negative",
+                    "spatial_point_centers",
+                    "spatial_brush_bag_ids",
+                    "spatial_area_positive",
+                    "spatial_explicit_negative",
+                    "spatial_implicit_negative",
                 )
             }
             active = _move_spatial_batch(active_host, device)
             observations = head.prototype_observation_sums(
-                outputs["l2_spatial_features"],
-                point_centers=active["l2_point_centers"],
-                brush_bag_ids=active["l2_brush_bag_ids"],
-                area_positive=active["l2_area_positive"],
-                explicit_negative=active["l2_explicit_negative"],
-                implicit_negative=active["l2_implicit_negative"],
+                outputs["spatial_features"],
+                point_centers=active["spatial_point_centers"],
+                brush_bag_ids=active["spatial_brush_bag_ids"],
+                area_positive=active["spatial_area_positive"],
+                explicit_negative=active["spatial_explicit_negative"],
+                implicit_negative=active["spatial_implicit_negative"],
             )
             for name, (sums, counts) in observations.items():
                 accumulated[name][0].add_(sums)
@@ -633,8 +633,8 @@ def _maybe_refresh_prototypes(
         _log(
             "dynamic_global_prototypes_refreshed "
             f"global_step={global_step} tiles={metrics['tiles']} "
-            f"l1_observations={metrics['l1_observations']} "
-            f"l2_positive_observations={metrics['l2_positive_observations']} "
+            f"classification_observations={metrics['classification_observations']} "
+            f"spatial_positive_observations={metrics['spatial_positive_observations']} "
             f"seconds={metrics['seconds']:.2f}"
         )
 
@@ -671,7 +671,7 @@ def _maybe_refresh_prototypes(
         )
 
 
-def _move_l1_batch(
+def _move_classification_batch(
     batch: dict,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, bool]:
@@ -681,7 +681,7 @@ def _move_l1_batch(
         torch.zeros(size, dtype=torch.bool),
     )
     target = batch.get(
-        "prototype_level1",
+        "prototype_classification",
         torch.full((size,), -1, dtype=torch.long),
     )
     return (
@@ -699,11 +699,11 @@ def _move_l1_batch(
 
 def _move_spatial_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
     keys = (
-        "l2_point_centers",
-        "l2_brush_bag_ids",
-        "l2_area_positive",
-        "l2_explicit_negative",
-        "l2_implicit_negative",
+        "spatial_point_centers",
+        "spatial_brush_bag_ids",
+        "spatial_area_positive",
+        "spatial_explicit_negative",
+        "spatial_implicit_negative",
     )
     result = {
         key: batch[key].to(
@@ -713,13 +713,13 @@ def _move_spatial_batch(batch: dict, device: torch.device) -> dict[str, torch.Te
         for key in keys
     }
     exclusion = batch.get(
-        "l2_instance_exclusion_support",
+        "spatial_instance_exclusion_support",
         torch.zeros_like(
-            batch["l2_area_positive"],
+            batch["spatial_area_positive"],
             dtype=torch.bool,
         ),
     )
-    result["l2_instance_exclusion_support"] = exclusion.to(
+    result["spatial_instance_exclusion_support"] = exclusion.to(
         device,
         non_blocking=device.type == "cuda",
     )
@@ -745,7 +745,7 @@ def scheduled_loss_config(
     epoch: int,
     global_step: int,
 ) -> dict[str, float | dict | bool]:
-    """Resolve the teacher-prior and parallel L1/L2 objective schedule."""
+    """Resolve the teacher-prior and parallel classification/spatial objective schedule."""
 
     loss_cfg = cfg["loss"]
     del epoch
@@ -764,11 +764,11 @@ def scheduled_loss_config(
             expert_ramp,
         ),
         "semantic_temperature": semantic_temperature,
-        "primary_temperature": float(
-            loss_cfg.get("primary_temperature", semantic_temperature)
+        "classification_temperature": float(
+            loss_cfg.get("classification_temperature", semantic_temperature)
         ),
-        "pamtd_primary_temperature": float(
-            loss_cfg.get("pamtd_primary_temperature", 0.1)
+        "pamtd_classification_temperature": float(
+            loss_cfg.get("pamtd_classification_temperature", 0.1)
         ),
         "feature_loss_type": str(loss_cfg.get("feature_loss_type", "cosine")),
         "prototype_filter_weight": _step_ramp(
@@ -795,11 +795,11 @@ def scheduled_loss_config(
             int(loss_cfg.get("zhcc_response_start_step", 0)),
             int(loss_cfg.get("zhcc_response_ramp_steps", 1000)),
         ),
-        "l2_global_temperature": float(
-            loss_cfg.get("l2_global_temperature", 0.1)
+        "spatial_global_temperature": float(
+            loss_cfg.get("spatial_global_temperature", 0.1)
         ),
-        "l1_weight": _step_ramp(
-            float(loss_cfg.get("l1_weight", 1.0)),
+        "classification_weight": _step_ramp(
+            float(loss_cfg.get("classification_weight", 1.0)),
             int(global_step),
             expert_start,
             expert_ramp,
@@ -977,14 +977,14 @@ def _write_tensorboard_batch(
         "feature",
         "relation",
         "semantic",
-        "l1",
-        "l2_spatial",
-        "l2_instance_point",
-        "l2_abundance_point",
-        "l2_brush_bag",
-        "l2_area_positive",
-        "l2_explicit_negative",
-        "l2_implicit_negative",
+        "classification",
+        "spatial",
+        "spatial_instance_point",
+        "spatial_abundance_point",
+        "spatial_brush_bag",
+        "spatial_area_positive",
+        "spatial_explicit_negative",
+        "spatial_implicit_negative",
     ):
         if key in parts:
             writer.add_scalar(
@@ -1008,7 +1008,7 @@ def run_epoch(
     max_batches: int | None = None,
     epoch: int = 1,
     global_step: int = 0,
-    l2_supervised_step: int = 0,
+    spatial_supervised_step: int = 0,
     summary_writer=None,
     collect_embeddings: bool = False,
     max_eval_batches: int | None = None,
@@ -1025,23 +1025,23 @@ def run_epoch(
         "semantic": 0.0,
         "pamtd_response": 0.0,
         "teacher_alpha_mean": 0.0,
-        "l1": 0.0,
-        "l1_accuracy": 0.0,
-        "l1_supervised_tiles": 0.0,
-        "l2_spatial": 0.0,
-        "l2_instance_point": 0.0,
-        "l2_abundance_point": 0.0,
-        "l2_brush_bag": 0.0,
-        "l2_area_positive": 0.0,
-        "l2_explicit_negative": 0.0,
-        "l2_implicit_negative": 0.0,
-        "l2_point_supervised_pairs": 0.0,
-        "l2_point_count": 0.0,
-        "l2_brush_supervised_pairs": 0.0,
-        "l2_brush_bag_count": 0.0,
-        "l2_area_supervised_pairs": 0.0,
-        "l2_explicit_negative_pairs": 0.0,
-        "l2_implicit_negative_pairs": 0.0,
+        "classification": 0.0,
+        "classification_accuracy": 0.0,
+        "classification_supervised_tiles": 0.0,
+        "spatial": 0.0,
+        "spatial_instance_point": 0.0,
+        "spatial_abundance_point": 0.0,
+        "spatial_brush_bag": 0.0,
+        "spatial_area_positive": 0.0,
+        "spatial_explicit_negative": 0.0,
+        "spatial_implicit_negative": 0.0,
+        "spatial_point_supervised_pairs": 0.0,
+        "spatial_point_count": 0.0,
+        "spatial_brush_supervised_pairs": 0.0,
+        "spatial_brush_bag_count": 0.0,
+        "spatial_area_supervised_pairs": 0.0,
+        "spatial_explicit_negative_pairs": 0.0,
+        "spatial_implicit_negative_pairs": 0.0,
     }
     gradient_totals: dict[str, float] = {}
     gradient_count = 0
@@ -1072,8 +1072,8 @@ def run_epoch(
         embeddings_data = {
             "embeddings": [],
             "prototype_masks": [],
-            "prototype_level1": [],
-            "l1_logits": [],
+            "prototype_classification": [],
+            "classification_logits": [],
             "students_by_teacher": {},
             "teachers_by_name": {},
         }
@@ -1122,26 +1122,26 @@ def run_epoch(
             n_tiles += int(images.shape[0])
             interval_tiles += int(images.shape[0])
             teachers = _move_teachers(batch, device)
-            l1_mask, l1_target, l1_is_active = _move_l1_batch(
+            classification_mask, classification_target, classification_is_active = _move_classification_batch(
                 batch,
                 device,
             )
-            spatial_sample_mask = batch["l2_spatial_supervised"].any(dim=1)
+            spatial_sample_mask = batch["spatial_supervised"].any(dim=1)
             spatial_is_active = bool(spatial_sample_mask.any())
             spatial_host = {
                 key: batch[key]
                 for key in (
-                    "l2_point_centers",
-                    "l2_brush_bag_ids",
-                    "l2_area_positive",
-                    "l2_explicit_negative",
-                    "l2_implicit_negative",
+                    "spatial_point_centers",
+                    "spatial_brush_bag_ids",
+                    "spatial_area_positive",
+                    "spatial_explicit_negative",
+                    "spatial_implicit_negative",
                 )
             }
-            spatial_host["l2_instance_exclusion_support"] = batch.get(
-                "l2_instance_exclusion_support",
+            spatial_host["spatial_instance_exclusion_support"] = batch.get(
+                "spatial_instance_exclusion_support",
                 torch.zeros_like(
-                    batch["l2_area_positive"],
+                    batch["spatial_area_positive"],
                     dtype=torch.bool,
                 ),
             )
@@ -1162,8 +1162,8 @@ def run_epoch(
                     global_step=global_step,
                 )
                 last_loss_cfg = loss_cfg
-                l1_objective_active = bool(
-                    l1_is_active and float(loss_cfg["l1_weight"]) > 0
+                classification_objective_active = bool(
+                    classification_is_active and float(loss_cfg["classification_weight"]) > 0
                 )
                 spatial_objective_active = bool(
                     spatial_is_active
@@ -1197,87 +1197,87 @@ def run_epoch(
                         ),
                     )
                     raw_model = getattr(model, "_orig_mod", model)
-                    l2_positive = None
-                    l2_known = None
-                    l2_target = None
+                    spatial_positive = None
+                    spatial_known = None
+                    spatial_target = None
                     if spatial_is_active:
                         if active_spatial_host is None:  # pragma: no cover
                             raise RuntimeError(
                                 "active spatial targets were not prepared"
                             )
                         (
-                            active_l2_positive,
-                            active_l2_known,
-                        ) = _l2_global_targets_from_spatial(
+                            active_spatial_positive,
+                            active_spatial_known,
+                        ) = _spatial_global_targets_from_spatial(
                             active_spatial_host
                         )
                         summary_shape = (
                             spatial_sample_mask.shape[0],
-                            active_l2_positive.shape[1],
+                            active_spatial_positive.shape[1],
                         )
-                        l2_positive_host = torch.zeros(
+                        spatial_positive_host = torch.zeros(
                             summary_shape,
                             dtype=torch.bool,
                         )
-                        l2_known_host = torch.zeros_like(
-                            l2_positive_host
+                        spatial_known_host = torch.zeros_like(
+                            spatial_positive_host
                         )
-                        l2_positive_host[spatial_sample_mask] = (
-                            active_l2_positive
+                        spatial_positive_host[spatial_sample_mask] = (
+                            active_spatial_positive
                         )
-                        l2_known_host[spatial_sample_mask] = (
-                            active_l2_known
+                        spatial_known_host[spatial_sample_mask] = (
+                            active_spatial_known
                         )
-                        l2_positive = l2_positive_host.to(
+                        spatial_positive = spatial_positive_host.to(
                             device,
                             non_blocking=device.type == "cuda",
                         )
-                        l2_known = l2_known_host.to(
+                        spatial_known = spatial_known_host.to(
                             device,
                             non_blocking=device.type == "cuda",
                         )
-                        l2_target = l2_positive.to(dtype=torch.float32)
+                        spatial_target = spatial_positive.to(dtype=torch.float32)
                     student_by_teacher = outputs["teacher_outputs"]
-                    teacher_l2_prototypes = {
+                    teacher_spatial_prototypes = {
                         name: (
                             state.prototypes,
                             state.counts,
                         )
-                        for name, state in raw_model.teacher_l2_prototypes.items()
+                        for name, state in raw_model.teacher_spatial_prototypes.items()
                     }
                     pamtd_temperature = float(
-                        loss_cfg["pamtd_primary_temperature"]
+                        loss_cfg["pamtd_classification_temperature"]
                     )
                     pamtd_student_logits = (
                         bounded_logits(
-                            outputs["l1_similarity"] / pamtd_temperature
+                            outputs["classification_similarity"] / pamtd_temperature
                         )
-                        if "l1_similarity" in outputs
+                        if "classification_similarity" in outputs
                         else None
                     )
                     adjudication = (
                         prototype_adjudicated_teacher_target(
                             teacher_by_name=teachers,
                             prototypes_by_teacher=prototypes,
-                            student_primary_response=torch.softmax(
+                            student_classification_response=torch.softmax(
                                 pamtd_student_logits,
                                 dim=-1,
                             ),
                             class_names=cfg["model"].get(
-                                "l1_class_names",
-                                DEFAULT_L1_CLASSES,
+                                "classification_class_names",
+                                DEFAULT_CLASSIFICATION_CLASSES,
                             ),
-                            teacher_l2_prototypes=teacher_l2_prototypes,
-                            student_l2_response=raw_model.global_l2_response(
+                            teacher_spatial_prototypes=teacher_spatial_prototypes,
+                            student_spatial_response=raw_model.global_spatial_response(
                                 outputs["embedding_norm"],
                                 temperature=float(
-                                    loss_cfg["l2_global_temperature"]
+                                    loss_cfg["spatial_global_temperature"]
                                 ),
                             ),
-                            l1_mask=l1_mask,
-                            l1_target=l1_target,
-                            l2_target=l2_target,
-                            l2_known=l2_known,
+                            classification_mask=classification_mask,
+                            classification_target=classification_target,
+                            spatial_target=spatial_target,
+                            spatial_known=spatial_known,
                             teacher_weights=loss_cfg.get(
                                 "teacher_weights"
                             ),
@@ -1296,9 +1296,9 @@ def run_epoch(
                             student_agreement_weight=float(
                                 loss_cfg["prototype_student_weight"]
                             ),
-                            primary_temperature=pamtd_temperature,
-                            l2_temperature=float(
-                                loss_cfg["l2_global_temperature"]
+                            classification_temperature=pamtd_temperature,
+                            spatial_temperature=float(
+                                loss_cfg["spatial_global_temperature"]
                             ),
                         )
                         if (
@@ -1320,7 +1320,7 @@ def run_epoch(
                         semantic_temperature=float(loss_cfg["semantic_temperature"]),
                         teacher_weights=loss_cfg.get("teacher_weights"),
                         feature_loss_type=str(loss_cfg["feature_loss_type"]),
-                        primary_temperature=float(loss_cfg["primary_temperature"]),
+                        classification_temperature=float(loss_cfg["classification_temperature"]),
                         teacher_sample_weights=(
                             adjudication.teacher_sample_weights
                             if adjudication is not None
@@ -1331,7 +1331,7 @@ def run_epoch(
                         assert pamtd_student_logits is not None
                         response_loss = prototype_response_distillation_loss(
                             pamtd_student_logits,
-                            adjudication.primary_target,
+                            adjudication.classification_target,
                             temperature=pamtd_temperature,
                             sample_weight=(
                                 adjudication.response_sample_weight
@@ -1343,22 +1343,22 @@ def run_epoch(
                     else:
                         response_loss = distillation_loss.new_zeros(())
                         alpha_mean = distillation_loss.new_ones(())
-                    if "l1_logits" in outputs and l1_is_active:
-                        l1_loss, l1_parts = l1_classification_loss(
-                            outputs["l1_logits"],
-                            l1_mask,
-                            l1_target,
+                    if "classification_logits" in outputs and classification_is_active:
+                        classification_loss, classification_parts = classification_objective_loss(
+                            outputs["classification_logits"],
+                            classification_mask,
+                            classification_target,
                         )
                     else:
-                        l1_loss = distillation_loss.new_zeros(())
-                        l1_parts = {
-                            "l1": l1_loss.detach(),
-                            "l1_accuracy": l1_loss.detach(),
-                            "l1_supervised_tiles": l1_loss.detach(),
+                        classification_loss = distillation_loss.new_zeros(())
+                        classification_parts = {
+                            "classification": classification_loss.detach(),
+                            "classification_accuracy": classification_loss.detach(),
+                            "classification_supervised_tiles": classification_loss.detach(),
                         }
                     if (
-                        "l2_instance_logits" in outputs
-                        and spatial_host["l2_point_centers"].numel() > 0
+                        "spatial_instance_logits" in outputs
+                        and spatial_host["spatial_point_centers"].numel() > 0
                     ):
                         if active_spatial_host is None:  # pragma: no cover
                             raise RuntimeError(
@@ -1369,28 +1369,28 @@ def run_epoch(
                             device,
                         )
                         spatial_loss, spatial_parts = spatial_morphometry_loss(
-                            instance_logits=outputs["l2_instance_logits"],
-                            abundance_logits=outputs["l2_abundance_logits"],
-                            point_centers=active_spatial["l2_point_centers"],
-                            brush_bag_ids=active_spatial["l2_brush_bag_ids"],
-                            area_positive=active_spatial["l2_area_positive"],
-                            explicit_negative=active_spatial["l2_explicit_negative"],
-                            implicit_negative=active_spatial["l2_implicit_negative"],
+                            instance_logits=outputs["spatial_instance_logits"],
+                            abundance_logits=outputs["spatial_abundance_logits"],
+                            point_centers=active_spatial["spatial_point_centers"],
+                            brush_bag_ids=active_spatial["spatial_brush_bag_ids"],
+                            area_positive=active_spatial["spatial_area_positive"],
+                            explicit_negative=active_spatial["spatial_explicit_negative"],
+                            implicit_negative=active_spatial["spatial_implicit_negative"],
                             instance_exclusion_support=active_spatial[
-                                "l2_instance_exclusion_support"
+                                "spatial_instance_exclusion_support"
                             ],
                             point_centers_host=active_spatial_host[
-                                "l2_point_centers"
+                                "spatial_point_centers"
                             ],
                             brush_bag_ids_host=active_spatial_host[
-                                "l2_brush_bag_ids"
+                                "spatial_brush_bag_ids"
                             ],
                             area_positive_host=active_spatial_host[
-                                "l2_area_positive"
+                                "spatial_area_positive"
                             ],
                             instance_exclusion_support_host=(
                                 active_spatial_host[
-                                    "l2_instance_exclusion_support"
+                                    "spatial_instance_exclusion_support"
                                 ]
                             ),
                             component_names=cfg["data"].get(
@@ -1420,25 +1420,25 @@ def run_epoch(
                         spatial_parts = {
                             key: spatial_loss.detach()
                             for key in (
-                                "l2_spatial",
-                                "l2_instance_point",
-                                "l2_abundance_point",
-                                "l2_brush_bag",
-                                "l2_area_positive",
-                                "l2_explicit_negative",
-                                "l2_implicit_negative",
-                                "l2_point_supervised_pairs",
-                                "l2_point_count",
-                                "l2_brush_supervised_pairs",
-                                "l2_brush_bag_count",
-                                "l2_area_supervised_pairs",
-                                "l2_explicit_negative_pairs",
-                                "l2_implicit_negative_pairs",
+                                "spatial",
+                                "spatial_instance_point",
+                                "spatial_abundance_point",
+                                "spatial_brush_bag",
+                                "spatial_area_positive",
+                                "spatial_explicit_negative",
+                                "spatial_implicit_negative",
+                                "spatial_point_supervised_pairs",
+                                "spatial_point_count",
+                                "spatial_brush_supervised_pairs",
+                                "spatial_brush_bag_count",
+                                "spatial_area_supervised_pairs",
+                                "spatial_explicit_negative_pairs",
+                                "spatial_implicit_negative_pairs",
                             )
                         }
                     global_objective = (
                         distillation_loss
-                        + float(loss_cfg["l1_weight"]) * l1_loss
+                        + float(loss_cfg["classification_weight"]) * classification_loss
                         + float(loss_cfg["zhcc_response_weight"])
                         * response_loss
                     )
@@ -1481,11 +1481,11 @@ def run_epoch(
                     if optimizer_stepped:
                         global_step += 1
                         if spatial_objective_active:
-                            l2_supervised_step += 1
+                            spatial_supervised_step += 1
 
             parts = {
                 **distillation_parts,
-                **l1_parts,
+                **classification_parts,
                 **spatial_parts,
                 "pamtd_response": response_loss.detach(),
                 "teacher_alpha_mean": alpha_mean.detach(),
@@ -1504,17 +1504,17 @@ def run_epoch(
                 step_metrics_writer.append(
                     epoch=epoch,
                     global_step=global_step,
-                    l2_supervised_step=l2_supervised_step,
+                    spatial_supervised_step=spatial_supervised_step,
                     tiles_seen_in_epoch=n_tiles,
                     lr=float(optimizer.param_groups[0]["lr"]),
                     loss_cfg=loss_cfg,
-                    l1_active=l1_objective_active,
-                    l2_active=spatial_objective_active,
+                    classification_active=classification_objective_active,
+                    spatial_active=spatial_objective_active,
                     loss=loss,
                     parts=parts,
                 )
             if train and optimizer_stepped and development_probe is not None:
-                development_probe(global_step, l2_supervised_step, epoch)
+                development_probe(global_step, spatial_supervised_step, epoch)
 
             if collect_embeddings and (
                 max_eval_batches is None or n_batches < max_eval_batches
@@ -1523,11 +1523,11 @@ def run_epoch(
                 embeddings_data["embeddings"].append(
                     outputs["embedding_norm"].detach().cpu()
                 )
-                embeddings_data["prototype_masks"].append(l1_mask.detach().cpu())
-                embeddings_data["prototype_level1"].append(l1_target.detach().cpu())
-                if "l1_logits" in outputs:
-                    embeddings_data["l1_logits"].append(
-                        outputs["l1_logits"].detach().cpu()
+                embeddings_data["prototype_masks"].append(classification_mask.detach().cpu())
+                embeddings_data["prototype_classification"].append(classification_target.detach().cpu())
+                if "classification_logits" in outputs:
+                    embeddings_data["classification_logits"].append(
+                        outputs["classification_logits"].detach().cpu()
                     )
                 for name, tensor in student_by_teacher.items():
                     embeddings_data["students_by_teacher"].setdefault(name, []).append(
@@ -1614,8 +1614,8 @@ def run_epoch(
     result["tiles"] = float(n_tiles)
     result["seconds"] = elapsed
     result["global_step_end"] = float(global_step)
-    result["l2_supervised_step_end"] = float(l2_supervised_step)
-    result["scheduled_l1_weight"] = float(last_loss_cfg["l1_weight"])
+    result["spatial_supervised_step_end"] = float(spatial_supervised_step)
+    result["scheduled_classification_weight"] = float(last_loss_cfg["classification_weight"])
     result["scheduled_spatial_weight"] = float(last_loss_cfg["spatial_weight"])
 
     if not collect_embeddings:
@@ -1633,10 +1633,10 @@ def run_epoch(
         },
         {
             "prototype_mask": torch.cat(embeddings_data["prototype_masks"]),
-            "prototype_level1": torch.cat(embeddings_data["prototype_level1"]),
-            "l1_logits": (
-                torch.cat(embeddings_data["l1_logits"])
-                if embeddings_data["l1_logits"]
+            "prototype_classification": torch.cat(embeddings_data["prototype_classification"]),
+            "classification_logits": (
+                torch.cat(embeddings_data["classification_logits"])
+                if embeddings_data["classification_logits"]
                 else torch.zeros((0, 0))
             ),
         },
@@ -1660,8 +1660,8 @@ def collect_embeddings(
     model.eval()
     embeddings = []
     masks = []
-    level1 = []
-    l1_logits = []
+    classification = []
+    classification_logits = []
     students_by_teacher: dict[str, list[torch.Tensor]] = {}
     teachers_by_name: dict[str, list[torch.Tensor]] = {}
     image_normalization = (
@@ -1690,11 +1690,11 @@ def collect_embeddings(
                 images = images.to(torch.float32).div_(255.0)
         outputs = model(images, run_spatial=False)
         embeddings.append(outputs["embedding_norm"].cpu())
-        mask, target, _ = _move_l1_batch(batch, torch.device("cpu"))
+        mask, target, _ = _move_classification_batch(batch, torch.device("cpu"))
         masks.append(mask)
-        level1.append(target)
-        if "l1_logits" in outputs:
-            l1_logits.append(outputs["l1_logits"].cpu())
+        classification.append(target)
+        if "classification_logits" in outputs:
+            classification_logits.append(outputs["classification_logits"].cpu())
         for name, tensor in outputs["teacher_outputs"].items():
             students_by_teacher.setdefault(name, []).append(tensor.cpu())
         for name, tensor in batch["teacher_features"].items():
@@ -1707,22 +1707,22 @@ def collect_embeddings(
         {name: torch.cat(values) for name, values in teachers_by_name.items()},
         {
             "prototype_mask": torch.cat(masks),
-            "prototype_level1": torch.cat(level1),
-            "l1_logits": torch.cat(l1_logits) if l1_logits else torch.zeros((0, 0)),
+            "prototype_classification": torch.cat(classification),
+            "classification_logits": torch.cat(classification_logits) if classification_logits else torch.zeros((0, 0)),
         },
     )
 
 
-def _l1_eval_metrics(supervised: dict[str, torch.Tensor]) -> dict[str, float]:
+def _classification_eval_metrics(supervised: dict[str, torch.Tensor]) -> dict[str, float]:
     mask = supervised["prototype_mask"].bool()
-    logits = supervised["l1_logits"]
+    logits = supervised["classification_logits"]
     if logits.numel() == 0 or not bool(mask.any()):
-        return {"l1_accuracy": 0.0, "l1_evaluated_tiles": 0.0}
-    target = supervised["prototype_level1"][mask]
+        return {"classification_accuracy": 0.0, "classification_evaluated_tiles": 0.0}
+    target = supervised["prototype_classification"][mask]
     prediction = logits[mask].argmax(dim=1)
     return {
-        "l1_accuracy": float((prediction == target).float().mean()),
-        "l1_evaluated_tiles": float(mask.sum()),
+        "classification_accuracy": float((prediction == target).float().mean()),
+        "classification_evaluated_tiles": float(mask.sum()),
     }
 
 
@@ -1747,8 +1747,8 @@ def fit(
     best_teacher_alignment = float(
         (resume_state or {}).get("best_teacher_alignment", float("-inf"))
     )
-    best_l1_accuracy = float(
-        (resume_state or {}).get("best_l1_accuracy", float("-inf"))
+    best_classification_accuracy = float(
+        (resume_state or {}).get("best_classification_accuracy", float("-inf"))
     )
     best_metrics = dict((resume_state or {}).get("best_metrics", {}))
     last_metrics = dict(
@@ -1760,8 +1760,8 @@ def fit(
     alignment_history = list((resume_state or {}).get("alignment_history", []))
     start_epoch = int((resume_state or {}).get("epoch", 0)) + 1
     global_step = int((resume_state or {}).get("global_step", 0))
-    l2_supervised_step = int(
-        (resume_state or {}).get("l2_supervised_step", 0)
+    spatial_supervised_step = int(
+        (resume_state or {}).get("spatial_supervised_step", 0)
     )
     scaler = torch.amp.GradScaler(
         "cuda",
@@ -1832,7 +1832,7 @@ def fit(
                 max_batches=development_probe_batches,
                 epoch=current_epoch,
                 global_step=step,
-                l2_supervised_step=spatial_step,
+                spatial_supervised_step=spatial_step,
             )
         finally:
             model.train(was_training)
@@ -1846,13 +1846,13 @@ def fit(
             {
                 "epoch": current_epoch,
                 "global_step": step,
-                "l2_supervised_step": spatial_step,
+                "spatial_supervised_step": spatial_step,
                 "probe_batches": development_probe_batches,
                 "scheduled_semantic_weight": float(
                     probe_loss_cfg["semantic_weight"]
                 ),
-                "scheduled_l1_weight": float(
-                    probe_loss_cfg["l1_weight"]
+                "scheduled_classification_weight": float(
+                    probe_loss_cfg["classification_weight"]
                 ),
                 "scheduled_spatial_weight": float(
                     probe_loss_cfg["spatial_weight"]
@@ -1877,15 +1877,15 @@ def fit(
                 max_batches=cfg["train"].get("max_train_batches"),
                 epoch=epoch,
                 global_step=global_step,
-                l2_supervised_step=l2_supervised_step,
+                spatial_supervised_step=spatial_supervised_step,
                 summary_writer=writer,
                 prototype_refresh_state=prototype_refresh_state,
                 step_metrics_writer=step_metrics_writer,
                 development_probe=run_development_probe,
             )
             global_step = int(train_metrics["global_step_end"])
-            l2_supervised_step = int(
-                train_metrics["l2_supervised_step_end"]
+            spatial_supervised_step = int(
+                train_metrics["spatial_supervised_step_end"]
             )
             val_iterator = iter(val_loader)
             try:
@@ -1900,7 +1900,7 @@ def fit(
                     max_batches=cfg["train"].get("max_val_batches"),
                     epoch=epoch,
                     global_step=global_step,
-                    l2_supervised_step=l2_supervised_step,
+                    spatial_supervised_step=spatial_supervised_step,
                     summary_writer=writer,
                     collect_embeddings=True,
                     max_eval_batches=cfg["train"].get(
@@ -1929,7 +1929,7 @@ def fit(
                     cfg["train"].get("eval_pairwise_max_samples", 4096)
                 ),
             )
-            l1_metrics = _l1_eval_metrics(supervised)
+            classification_metrics = _classification_eval_metrics(supervised)
             del val_embeddings, student_by_teacher, teacher_by_name, supervised
             _release_host_memory()
 
@@ -1951,7 +1951,7 @@ def fit(
             row = {
                 "epoch": epoch,
                 "global_step": global_step,
-                "l2_supervised_step": l2_supervised_step,
+                "spatial_supervised_step": spatial_supervised_step,
                 "dynamic_prototype_step": (
                     prototype_refresh_state.last_global_step
                     if prototype_refresh_state is not None
@@ -1965,7 +1965,7 @@ def fit(
                 "feature_loss_type": str(loss_cfg["feature_loss_type"]),
                 "lr": float(optimizer.param_groups[0]["lr"]),
                 "scheduled_semantic_weight": float(loss_cfg["semantic_weight"]),
-                "scheduled_l1_weight": float(loss_cfg["l1_weight"]),
+                "scheduled_classification_weight": float(loss_cfg["classification_weight"]),
                 "scheduled_spatial_weight": float(loss_cfg["spatial_weight"]),
                 **{f"train_{key}": value for key, value in train_metrics.items()},
                 **{f"val_{key}": value for key, value in val_metrics.items()},
@@ -1973,7 +1973,7 @@ def fit(
                     0.0 if not math.isfinite(teacher_alignment) else teacher_alignment
                 ),
                 **embedding_metrics,
-                **l1_metrics,
+                **classification_metrics,
             }
             alignment_history.append(
                 {
@@ -1991,17 +1991,17 @@ def fit(
             last_metrics = row
             improved_loss = val_metrics["loss"] < best_loss
             improved_alignment = teacher_alignment > best_teacher_alignment
-            improved_l1 = (
-                l1_metrics["l1_evaluated_tiles"] > 0
-                and l1_metrics["l1_accuracy"] > best_l1_accuracy
+            improved_classification = (
+                classification_metrics["classification_evaluated_tiles"] > 0
+                and classification_metrics["classification_accuracy"] > best_classification_accuracy
             )
             if improved_loss:
                 best_loss = val_metrics["loss"]
                 best_metrics = row
             if improved_alignment:
                 best_teacher_alignment = teacher_alignment
-            if improved_l1:
-                best_l1_accuracy = l1_metrics["l1_accuracy"]
+            if improved_classification:
+                best_classification_accuracy = classification_metrics["classification_accuracy"]
 
             raw_model = getattr(model, "_orig_mod", model)
             checkpoint = {
@@ -2011,7 +2011,7 @@ def fit(
                 "scaler": scaler.state_dict(),
                 "epoch": epoch,
                 "global_step": global_step,
-                "l2_supervised_step": l2_supervised_step,
+                "spatial_supervised_step": spatial_supervised_step,
                 "dynamic_prototype_step": (
                     prototype_refresh_state.last_global_step
                     if prototype_refresh_state is not None
@@ -2024,7 +2024,7 @@ def fit(
                 ),
                 "best_loss": best_loss,
                 "best_teacher_alignment": best_teacher_alignment,
-                "best_l1_accuracy": best_l1_accuracy,
+                "best_classification_accuracy": best_classification_accuracy,
                 "best_metrics": best_metrics,
                 "last_metrics": last_metrics,
                 "alignment_history": alignment_history,
@@ -2040,8 +2040,8 @@ def fit(
                 torch.save(checkpoint, checkpoints / "best.pt")
             if improved_alignment:
                 torch.save(checkpoint, checkpoints / "best_teacher_alignment.pt")
-            if improved_l1:
-                torch.save(checkpoint, checkpoints / "best_l1_accuracy.pt")
+            if improved_classification:
+                torch.save(checkpoint, checkpoints / "best_classification_accuracy.pt")
             if bool(
                 cfg["train"].get(
                     "early_stop_teacher_alignment",

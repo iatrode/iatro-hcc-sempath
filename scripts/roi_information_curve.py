@@ -244,13 +244,13 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _active_attributes(payload: dict[str, Any]) -> list[str]:
-    definitions = payload.get("label_definitions", {}).get("l2", [])
+    definitions = payload.get("label_definitions", {}).get("spatial", [])
     active = [
         str(item["id"])
         for item in definitions
         if isinstance(item, dict) and bool(item.get("active", True)) and item.get("id")
     ]
-    attributes = active or [str(value) for value in payload.get("l2_prototypes", [])]
+    attributes = active or [str(value) for value in payload.get("spatial_prototypes", [])]
     if not attributes:
         raise ValueError("annotation state has no active spatial attributes")
     return attributes

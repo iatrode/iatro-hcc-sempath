@@ -70,8 +70,8 @@ def resolve_ablation_config(
             name: base_prototypes[name] for name in active_teachers
         }
 
-    # Every condition replays the same complete L1/L2 expert tile union.
-    # A1/A3 mask L1 labels from the objective but retain the L1 images.
+    # Every condition replays the same complete classification/spatial expert tile union.
+    # A1/A3 mask classification labels from the objective but retain the classification images.
     resolved["data"]["expert_replay_prototype_manifest_path"] = base_prototype_manifest
     for key in ("train_tile_fraction", "val_tile_fraction"):
         if float(resolved["data"].get(key, 1.0)) != 0.1:

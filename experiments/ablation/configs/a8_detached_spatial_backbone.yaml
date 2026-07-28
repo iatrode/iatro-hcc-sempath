@@ -1,5 +1,5 @@
 # A8: A0 with local spatial-head gradients deliberately detached from the
-# shared encoder. L1/L2 schedules, L2 reliability evidence, and spatial-head
+# shared encoder. classification/spatial schedules, spatial reliability evidence, and spatial-head
 # training remain unchanged; only the dense spatial objective cannot update
 # z_hcc.
 

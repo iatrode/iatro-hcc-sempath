@@ -17,10 +17,7 @@ def test_load_prototype_registry_from_package(tmp_path: Path) -> None:
         {
             "version": 1,
             "prototypes": torch.randn(3, 4),
-            "names": ["primary_tumor", "primary_non_tumor", "lymphocyte_rich"],
-            "groups": ["primary_state", "primary_state", "microenvironment"],
-            "levels": [1, 1, 2],
-            "exclusive": [True, True, False],
+            "names": ["tumor_well", "tumor_moderate", "tumor_poor"],
             "thresholds": torch.tensor([0.6, 0.5, 0.4]),
             "source": {"curation": "synthetic"},
         },
@@ -31,12 +28,7 @@ def test_load_prototype_registry_from_package(tmp_path: Path) -> None:
 
     assert registry.count == 3
     assert registry.dim == 4
-    assert registry.names == ["primary_tumor", "primary_non_tumor", "lymphocyte_rich"]
-    assert registry.groups == ["primary_state", "primary_state", "microenvironment"]
-    assert registry.levels == [1, 1, 2]
-    assert registry.exclusive == [True, True, False]
-    assert registry.primary_indices == [0, 1]
-    assert registry.attribute_indices == [2]
+    assert registry.names == ["tumor_well", "tumor_moderate", "tumor_poor"]
     assert registry.thresholds is not None
     assert registry.source == {"curation": "synthetic", "path": str(package_path)}
     assert load_prototypes(package_path, expected_dim=4).shape == (3, 4)
@@ -48,10 +40,7 @@ def test_load_prototype_registry_from_directory_manifest(tmp_path: Path) -> None
     torch.save(
         {
             "prototypes": torch.ones(3, 5),
-            "names": ["primary_tumor", "primary_non_tumor", "fibrotic_stroma"],
-            "groups": ["primary_state", "primary_state", "stroma"],
-            "levels": [1, 1, 2],
-            "exclusive": [True, True, False],
+            "names": ["tumor_well", "tumor_moderate", "tumor_poor"],
         },
         prototype_dir / "custom.pt",
     )
@@ -61,15 +50,14 @@ def test_load_prototype_registry_from_directory_manifest(tmp_path: Path) -> None
     registry = load_prototype_registry(prototype_dir, expected_dim=5)
 
     assert registry.count == 3
-    assert registry.names == ["primary_tumor", "primary_non_tumor", "fibrotic_stroma"]
-    assert registry.groups == ["primary_state", "primary_state", "stroma"]
+    assert registry.names == ["tumor_well", "tumor_moderate", "tumor_poor"]
     assert registry.source == {"release": "test", "path": str(prototype_dir)}
 
 
 def test_load_prototype_registry_requires_names(tmp_path: Path) -> None:
     package_path = tmp_path / "missing_names.pt"
     torch.save(
-        {"prototypes": torch.zeros(3, 3), "levels": [1, 1, 2], "exclusive": [True, True, False]},
+        {"prototypes": torch.zeros(3, 3)},
         package_path,
     )
 
@@ -83,8 +71,6 @@ def test_load_prototype_registry_rejects_duplicate_names(tmp_path: Path) -> None
         {
             "prototypes": torch.zeros(3, 3),
             "names": ["dup", "dup", "attr"],
-            "levels": [1, 1, 2],
-            "exclusive": [True, True, False],
         },
         package_path,
     )
@@ -99,8 +85,6 @@ def test_load_prototype_registry_rejects_threshold_shape_mismatch(tmp_path: Path
         {
             "prototypes": torch.zeros(3, 3),
             "names": ["a", "b", "c"],
-            "levels": [1, 1, 2],
-            "exclusive": [True, True, False],
             "thresholds": torch.zeros(2),
         },
         package_path,
@@ -110,71 +94,34 @@ def test_load_prototype_registry_rejects_threshold_shape_mismatch(tmp_path: Path
         load_prototype_registry(package_path)
 
 
-def test_load_prototype_registry_rejects_nonexclusive_level_one(tmp_path: Path) -> None:
-    package_path = tmp_path / "bad_level_one.pt"
+def test_load_prototype_registry_requires_at_least_two_classes(tmp_path: Path) -> None:
+    package_path = tmp_path / "single_class.pt"
     torch.save(
         {
-            "prototypes": torch.zeros(2, 3),
-            "names": ["primary_tumor", "lymphocyte_rich"],
-            "levels": [1, 2],
-            "exclusive": [False, False],
+            "prototypes": torch.zeros(1, 3),
+            "names": ["tumor"],
         },
         package_path,
     )
 
-    with pytest.raises(ValueError, match="level-1 prototype must be exclusive"):
+    with pytest.raises(ValueError, match="at least two classification prototypes"):
         load_prototype_registry(package_path)
 
 
-def test_load_prototype_registry_rejects_exclusive_level_two(tmp_path: Path) -> None:
-    package_path = tmp_path / "bad_level_two.pt"
-    torch.save(
-        {
-            "prototypes": torch.zeros(2, 3),
-            "names": ["primary_tumor", "lymphocyte_rich"],
-            "levels": [1, 2],
-            "exclusive": [True, True],
-        },
-        package_path,
-    )
-
-    with pytest.raises(ValueError, match="level-2 prototype must be non-exclusive"):
-        load_prototype_registry(package_path)
-
-
-def test_load_prototype_registry_requires_primary_level(tmp_path: Path) -> None:
-    package_path = tmp_path / "missing_primary.pt"
-    torch.save(
-        {
-            "prototypes": torch.zeros(2, 3),
-            "names": ["lymphocyte_rich", "fibrotic_stroma"],
-            "levels": [2, 2],
-            "exclusive": [False, False],
-        },
-        package_path,
-    )
-
-    with pytest.raises(ValueError, match="level-1"):
-        load_prototype_registry(package_path)
-
-
-def test_l1_supervision_manifest_is_resolved_by_registry_names(tmp_path: Path) -> None:
+def test_classification_supervision_manifest_is_resolved_by_registry_names(tmp_path: Path) -> None:
     manifest_path = tmp_path / "prototype_supervision.csv"
     manifest_path.write_text(
-        "tile_id,level1_label,level2_labels,source_split,expert_a,expert_b,adjudicated\n"
-        "tile_1,primary_tumor,lymphocyte_rich;fibrotic_stroma,train,a,b,true\n"
-        "tile_2,primary_non_tumor,,val,a,b,true\n",
+        "tile_id,classification_label,source_split,adjudicated\n"
+        "tile_1,tumor,train,true\n"
+        "tile_2,non_tumor,val,true\n",
         encoding="utf-8",
     )
     registry = PrototypeRegistry(
-        prototypes=torch.randn(4, 3),
-        names=["primary_tumor", "primary_non_tumor", "lymphocyte_rich", "fibrotic_stroma"],
-        groups=["primary", "primary", "immune", "stroma"],
-        levels=[1, 1, 2, 2],
-        exclusive=[True, True, False, False],
+        prototypes=torch.randn(2, 3),
+        names=["tumor", "non_tumor"],
     )
 
     labels = load_prototype_labels(manifest_path, registry, allowed_source_splits={"train"})
 
     assert set(labels) == {"tile_1"}
-    assert labels["tile_1"].level1 == 0
+    assert labels["tile_1"].classification == 0

@@ -132,25 +132,25 @@ def test_spatial_calibration_freezes_all_component_readouts() -> None:
         for item in report["components"].values()
     )
     assert (
-        report["components"]["hepatocellular-parenchyma-present"][
+        report["components"]["hepatocellular-parenchyma"][
             "geometry_strata"
         ]["point"]["independent_slide_count"]
         == 1
     )
     assert (
-        report["components"]["hepatocellular-parenchyma-present"][
+        report["components"]["hepatocellular-parenchyma"][
             "slide_macro_f1"
         ]
         == 1.0
     )
     assert (
-        report["components"]["hepatocellular-parenchyma-present"][
+        report["components"]["hepatocellular-parenchyma"][
             "geometry_strata"
         ]["negative"]["f1"]
         is None
     )
     structure_strata = report["components"][
-        "steatosis-vacuolation-present"
+        "steatosis-vacuolation"
     ]["geometry_strata"]
     assert "mixed" in structure_strata
     assert "point" not in structure_strata
@@ -160,7 +160,7 @@ def test_spatial_calibration_freezes_all_component_readouts() -> None:
 def test_unknown_structure_measurement_pair_cannot_shift_threshold() -> None:
     base = _complete_validation_case()
     structure_index = DEFAULT_SPATIAL_COMPONENTS.index(
-        "steatosis-vacuolation-present"
+        "steatosis-vacuolation"
     )
     base["threshold_grid"] = [0.5, 0.8]
     base["abundance_probability"][0, structure_index, 2:5, 2:5] = 0.7
@@ -213,7 +213,7 @@ def test_completeness_only_measurement_negative_is_strong() -> None:
     _, report = calibrate_spatial_decoder(**case)
 
     assert (
-        report["components"]["necrosis-present"][
+        report["components"]["necrosis"][
             "measurement_weighted_fp"
         ]
         == 49.0
@@ -268,7 +268,7 @@ def test_dense_brush_is_one_mil_positive_not_dense_pixel_truth() -> None:
     # One point pair plus one brush bag: the 16 brush cells are not promoted
     # to 16 exact positives.
     assert (
-        report["components"]["hepatocellular-parenchyma-present"][
+        report["components"]["hepatocellular-parenchyma"][
             "measurement_tp"
         ]
         == 2.0
@@ -282,7 +282,7 @@ def test_instance_count_mae_is_count_error_not_localization_error() -> None:
 
     _, report = calibrate_spatial_decoder(**case)
     component = report["components"][
-        "hepatocellular-parenchyma-present"
+        "hepatocellular-parenchyma"
     ]
 
     assert component["instance_f1"] == 0.0
@@ -305,7 +305,7 @@ def test_bile_focus_minimum_uses_complete_negative_tiles() -> None:
 
     assert calibration["minimum_focus_cells"] == 2
     assert (
-        report["components"]["bile-pigment-present"][
+        report["components"]["bile-pigment"][
             "focus_count_mae"
         ]
         == 0.0

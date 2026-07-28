@@ -24,7 +24,7 @@ from hcc_sempath.spatial_schema import (
 # A finite tanh bound keeps probabilities away from the saturated 0.9-0.99 band
 # at training and deployment time. Shared by the loss modules so student and
 # teacher responses use the same response scale. The default limit of 4.0 caps
-# attribute sigmoids at ~0.982 and 4-class L1 softmax at ~0.999.
+# attribute sigmoids at ~0.982 and four-class classification softmax at ~0.999.
 LOGIT_LIMIT = 4.0
 PROB_EPS = 1e-4
 STUDENT_BACKBONE_NAME = "vit_small_patch14_dinov2"
@@ -136,7 +136,7 @@ class StudentEncoder(nn.Module):
         """Return the unchanged global embedding plus spatial ViT patch tokens."""
         tokens = self.backbone.forward_features(images)
         if tokens.ndim != 3:
-            raise ValueError(f"ROI-guided L2 requires token-shaped backbone features, got {tuple(tokens.shape)}")
+            raise ValueError(f"ROI-guided spatial requires token-shaped backbone features, got {tuple(tokens.shape)}")
         global_features = self.backbone.forward_head(tokens, pre_logits=True)
         prefix_tokens = int(getattr(self.backbone, "num_prefix_tokens", 1))
         patch_tokens = tokens[:, prefix_tokens:]
@@ -221,7 +221,7 @@ def _depthwise_conv_fused(
 
 
 class SpatialContextBlock(nn.Module):
-    """Residual multi-cell context at the dense L2 output grid."""
+    """Residual multi-cell context at the dense spatial output grid."""
 
     def __init__(self, dim: int, dilation: int) -> None:
         super().__init__()
@@ -721,18 +721,18 @@ class SpatialMorphometryHead(nn.Module):
             features = self.context(features)
         instance_logits, abundance_logits = self.prototype_logits(features)
         outputs = {
-            "l2_instance_logits": instance_logits,
-            "l2_instance_probabilities": torch.sigmoid(instance_logits),
-            "l2_instance_valid": self.instance_valid,
-            "l2_abundance_logits": abundance_logits,
-            "l2_abundance_probabilities": torch.sigmoid(abundance_logits),
+            "spatial_instance_logits": instance_logits,
+            "spatial_instance_probabilities": torch.sigmoid(instance_logits),
+            "spatial_instance_valid": self.instance_valid,
+            "spatial_abundance_logits": abundance_logits,
+            "spatial_abundance_probabilities": torch.sigmoid(abundance_logits),
         }
         if return_features:
-            outputs["l2_spatial_features"] = features
+            outputs["spatial_features"] = features
         return outputs
 
 
-class TeacherL2PrototypeState(nn.Module):
+class TeacherSpatialPrototypeState(nn.Module):
     """Frozen-teacher global component centroids used only for adjudication."""
 
     def __init__(self, component_count: int, teacher_dim: int) -> None:
@@ -754,19 +754,19 @@ class TeacherL2PrototypeState(nn.Module):
         sums: torch.Tensor,
         counts: torch.Tensor,
     ) -> None:
-        """Install exact frozen-teacher centroids from the complete L2 bank."""
+        """Install exact frozen-teacher centroids from the complete spatial bank."""
 
         sums = sums.to(device=self.prototypes.device, dtype=torch.float32)
         counts = counts.to(device=self.counts.device, dtype=torch.float32)
         if sums.shape != self.prototypes.shape:
             raise ValueError(
-                "teacher L2 prototype shape mismatch: "
+                "teacher spatial prototype shape mismatch: "
                 f"got={tuple(sums.shape)} "
                 f"expected={tuple(self.prototypes.shape)}"
             )
         if counts.shape != self.counts.shape:
             raise ValueError(
-                "teacher L2 prototype-count shape mismatch: "
+                "teacher spatial prototype-count shape mismatch: "
                 f"got={tuple(counts.shape)} expected={tuple(self.counts.shape)}"
             )
         normalized = F.normalize(
@@ -784,7 +784,7 @@ class TeacherL2PrototypeState(nn.Module):
 
 
 class HCCSemPathModel(nn.Module):
-    """Teacher-distilled HCC encoder with L1 and spatial L2 output heads."""
+    """Teacher-distilled HCC encoder with classification and spatial output heads."""
 
     def __init__(
         self,
@@ -796,7 +796,7 @@ class HCCSemPathModel(nn.Module):
         projector_hidden_dim: int = 2048,
         teacher_head_type: str = "linear",
         grad_checkpointing: bool = False,
-        l1_num_classes: int = 0,
+        classification_num_classes: int = 0,
         spatial_num_components: int = 0,
         spatial_dim: int = 256,
         spatial_output_stride: int = SPATIAL_OUTPUT_STRIDE,
@@ -823,28 +823,28 @@ class HCCSemPathModel(nn.Module):
                 for name, dim in teacher_dims.items()
             }
         )
-        self.l1_num_classes = int(l1_num_classes)
+        self.classification_num_classes = int(classification_num_classes)
         self.register_buffer(
-            "l1_prototypes",
+            "classification_prototypes",
             (
-                torch.zeros(self.l1_num_classes, embedding_dim)
-                if self.l1_num_classes > 0
+                torch.zeros(self.classification_num_classes, embedding_dim)
+                if self.classification_num_classes > 0
                 else None
             ),
             persistent=True,
         )
         self.register_buffer(
-            "l1_prototype_counts",
+            "classification_prototype_counts",
             (
-                torch.zeros(self.l1_num_classes)
-                if self.l1_num_classes > 0
+                torch.zeros(self.classification_num_classes)
+                if self.classification_num_classes > 0
                 else None
             ),
             persistent=True,
         )
-        self.l1_log_temperature = (
+        self.classification_log_temperature = (
             nn.Parameter(torch.tensor(math.log(0.1)))
-            if self.l1_num_classes > 0
+            if self.classification_num_classes > 0
             else None
         )
         self.spatial_num_components = int(spatial_num_components)
@@ -859,7 +859,7 @@ class HCCSemPathModel(nn.Module):
             else None
         )
         self.register_buffer(
-            "global_l2_prototypes",
+            "global_spatial_prototypes",
             (
                 torch.zeros(self.spatial_num_components, embedding_dim)
                 if self.spatial_num_components > 0
@@ -868,7 +868,7 @@ class HCCSemPathModel(nn.Module):
             persistent=True,
         )
         self.register_buffer(
-            "global_l2_prototype_counts",
+            "global_spatial_prototype_counts",
             (
                 torch.zeros(self.spatial_num_components)
                 if self.spatial_num_components > 0
@@ -876,9 +876,9 @@ class HCCSemPathModel(nn.Module):
             ),
             persistent=True,
         )
-        self.teacher_l2_prototypes = nn.ModuleDict(
+        self.teacher_spatial_prototypes = nn.ModuleDict(
             {
-                name: TeacherL2PrototypeState(
+                name: TeacherSpatialPrototypeState(
                     self.spatial_num_components,
                     int(dim),
                 )
@@ -899,71 +899,71 @@ class HCCSemPathModel(nn.Module):
         return {name: head(embedding) for name, head in self.teacher_heads.items()}
 
     @torch.no_grad()
-    def replace_l1_prototypes(
+    def replace_classification_prototypes(
         self,
         sums: torch.Tensor,
         counts: torch.Tensor,
     ) -> None:
-        """Install exact current-student L1 centroids from the full bank."""
+        """Install exact current-student classification centroids from the full bank."""
 
-        if self.l1_prototypes is None or self.l1_prototype_counts is None:
+        if self.classification_prototypes is None or self.classification_prototype_counts is None:
             return
-        sums = sums.to(device=self.l1_prototypes.device, dtype=torch.float32)
+        sums = sums.to(device=self.classification_prototypes.device, dtype=torch.float32)
         counts = counts.to(
-            device=self.l1_prototype_counts.device,
+            device=self.classification_prototype_counts.device,
             dtype=torch.float32,
         )
-        if sums.shape != self.l1_prototypes.shape:
+        if sums.shape != self.classification_prototypes.shape:
             raise ValueError(
-                f"L1 prototype shape mismatch: got={tuple(sums.shape)} "
-                f"expected={tuple(self.l1_prototypes.shape)}"
+                f"classification prototype shape mismatch: got={tuple(sums.shape)} "
+                f"expected={tuple(self.classification_prototypes.shape)}"
             )
-        if counts.shape != self.l1_prototype_counts.shape:
+        if counts.shape != self.classification_prototype_counts.shape:
             raise ValueError(
-                "L1 prototype-count shape mismatch: "
+                "classification prototype-count shape mismatch: "
                 f"got={tuple(counts.shape)} "
-                f"expected={tuple(self.l1_prototype_counts.shape)}"
+                f"expected={tuple(self.classification_prototype_counts.shape)}"
             )
         if bool((counts <= 0).any()):
             raise ValueError(
-                "the complete expert bank must contain every L1 class"
+                "the complete expert bank must contain every classification class"
             )
-        self.l1_prototypes.copy_(
+        self.classification_prototypes.copy_(
             F.normalize(
                 sums / counts.unsqueeze(-1),
                 dim=1,
             )
         )
-        self.l1_prototype_counts.copy_(counts)
+        self.classification_prototype_counts.copy_(counts)
 
-    def l1_prototype_logits(
+    def classification_prototype_logits(
         self,
         embedding_norm: torch.Tensor,
     ) -> torch.Tensor:
-        if self.l1_prototypes is None or self.l1_log_temperature is None:
-            raise RuntimeError("L1 prototype readout is not configured")
-        similarity = self.l1_prototype_similarity(embedding_norm)
-        temperature = self.l1_log_temperature.exp().clamp(0.03, 1.0)
+        if self.classification_prototypes is None or self.classification_log_temperature is None:
+            raise RuntimeError("classification prototype readout is not configured")
+        similarity = self.classification_prototype_similarity(embedding_norm)
+        temperature = self.classification_log_temperature.exp().clamp(0.03, 1.0)
         return bounded_logits(similarity / temperature)
 
-    def l1_prototype_similarity(
+    def classification_prototype_similarity(
         self,
         embedding_norm: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the raw cosine coordinate shared by L1 and PAMT-D.
+        """Return the raw cosine coordinate shared by classification and PAMT-D.
 
-        The deployable L1 classifier applies its learned temperature in
-        :meth:`l1_prototype_logits`. PAMT-D instead applies its fixed research
+        The deployable classification classifier applies its learned temperature in
+        :meth:`classification_prototype_logits`. PAMT-D instead applies its fixed research
         temperature exactly once to this common cosine coordinate.
         """
 
-        if self.l1_prototypes is None:
-            raise RuntimeError("L1 prototype readout is not configured")
+        if self.classification_prototypes is None:
+            raise RuntimeError("classification prototype readout is not configured")
         similarity = normalized_prototype_logits(
             embedding_norm,
-            self.l1_prototypes,
+            self.classification_prototypes,
         )
-        ready = (self.l1_prototype_counts > 0).view(1, -1)
+        ready = (self.classification_prototype_counts > 0).view(1, -1)
         similarity = torch.where(
             ready,
             similarity,
@@ -972,79 +972,79 @@ class HCCSemPathModel(nn.Module):
         return similarity
 
     @torch.no_grad()
-    def replace_global_l2_prototypes(
+    def replace_global_spatial_prototypes(
         self,
         student_sums: torch.Tensor,
         counts: torch.Tensor,
         teacher_sums: dict[str, torch.Tensor],
     ) -> None:
-        """Install exact global L2 reliability prototypes from the full bank."""
+        """Install exact global spatial reliability prototypes from the full bank."""
 
         if (
-            self.global_l2_prototypes is None
-            or self.global_l2_prototype_counts is None
+            self.global_spatial_prototypes is None
+            or self.global_spatial_prototype_counts is None
         ):
             return
-        if set(teacher_sums) != set(self.teacher_l2_prototypes):
+        if set(teacher_sums) != set(self.teacher_spatial_prototypes):
             raise ValueError(
-                "teacher L2 prototype names differ from model teachers: "
+                "teacher spatial prototype names differ from model teachers: "
                 f"got={sorted(teacher_sums)} "
-                f"expected={sorted(self.teacher_l2_prototypes)}"
+                f"expected={sorted(self.teacher_spatial_prototypes)}"
             )
         student_sums = student_sums.to(
-            device=self.global_l2_prototypes.device,
+            device=self.global_spatial_prototypes.device,
             dtype=torch.float32,
         )
         counts = counts.to(
-            device=self.global_l2_prototype_counts.device,
+            device=self.global_spatial_prototype_counts.device,
             dtype=torch.float32,
         )
-        if student_sums.shape != self.global_l2_prototypes.shape:
+        if student_sums.shape != self.global_spatial_prototypes.shape:
             raise ValueError(
-                "global L2 prototype shape mismatch: "
+                "global spatial prototype shape mismatch: "
                 f"got={tuple(student_sums.shape)} "
-                f"expected={tuple(self.global_l2_prototypes.shape)}"
+                f"expected={tuple(self.global_spatial_prototypes.shape)}"
             )
-        if counts.shape != self.global_l2_prototype_counts.shape:
+        if counts.shape != self.global_spatial_prototype_counts.shape:
             raise ValueError(
-                "global L2 prototype-count shape mismatch: "
+                "global spatial prototype-count shape mismatch: "
                 f"got={tuple(counts.shape)} "
-                f"expected={tuple(self.global_l2_prototype_counts.shape)}"
+                f"expected={tuple(self.global_spatial_prototype_counts.shape)}"
             )
         if bool((counts <= 0).any()):
             raise ValueError(
-                "the complete spatial expert bank must contain every L2 "
+                "the complete spatial expert bank must contain every spatial "
                 "component"
             )
-        self.global_l2_prototypes.copy_(
+        self.global_spatial_prototypes.copy_(
             F.normalize(
                 student_sums / counts.unsqueeze(-1),
                 dim=1,
             )
         )
-        self.global_l2_prototype_counts.copy_(counts)
-        for name, state in self.teacher_l2_prototypes.items():
+        self.global_spatial_prototype_counts.copy_(counts)
+        for name, state in self.teacher_spatial_prototypes.items():
             state.replace(teacher_sums[name], counts)
 
-    def global_l2_response(
+    def global_spatial_response(
         self,
         embedding_norm: torch.Tensor,
         *,
         temperature: float = 0.1,
     ) -> torch.Tensor:
         if (
-            self.global_l2_prototypes is None
-            or self.global_l2_prototype_counts is None
+            self.global_spatial_prototypes is None
+            or self.global_spatial_prototype_counts is None
         ):
             return embedding_norm.new_zeros((embedding_norm.shape[0], 0))
         logits = bounded_logits(
             normalized_prototype_logits(
                 embedding_norm,
-                self.global_l2_prototypes,
+                self.global_spatial_prototypes,
             )
             / float(temperature)
         )
-        ready = (self.global_l2_prototype_counts > 0).view(1, -1)
+        ready = (self.global_spatial_prototype_counts > 0).view(1, -1)
         return torch.where(
             ready,
             clamp_probability(torch.sigmoid(logits)),
@@ -1109,14 +1109,14 @@ class HCCSemPathModel(nn.Module):
                     return_features=return_spatial_features,
                 )
             )
-        if self.l1_prototypes is not None:
-            l1_similarity = self.l1_prototype_similarity(embedding_norm)
-            assert self.l1_log_temperature is not None
-            l1_temperature = self.l1_log_temperature.exp().clamp(0.03, 1.0)
-            l1_logits = bounded_logits(l1_similarity / l1_temperature)
-            outputs["l1_similarity"] = l1_similarity
-            outputs["l1_logits"] = l1_logits
-            outputs["l1_probabilities"] = F.softmax(l1_logits, dim=-1)
+        if self.classification_prototypes is not None:
+            classification_similarity = self.classification_prototype_similarity(embedding_norm)
+            assert self.classification_log_temperature is not None
+            classification_temperature = self.classification_log_temperature.exp().clamp(0.03, 1.0)
+            classification_logits = bounded_logits(classification_similarity / classification_temperature)
+            outputs["classification_similarity"] = classification_similarity
+            outputs["classification_logits"] = classification_logits
+            outputs["classification_probabilities"] = F.softmax(classification_logits, dim=-1)
         return outputs
 
 
@@ -1482,15 +1482,15 @@ def decode_spatial_morphometry(
     nms_kernel: int | Sequence[int] | None = None,
     minimum_focus_cells: int | None = None,
 ) -> dict[str, torch.Tensor | list[list[list[tuple[float, float, float]]]]]:
-    """Decode L2 maps according to each component's measurement contract.
+    """Decode spatial maps according to each component's measurement contract.
 
     Area-only components receive no fabricated instance count. Bile-pigment
     focus density is a thresholded connected-component descriptor, not a
     biological instance count or a directly supervised target.
     """
 
-    instance_probability = outputs["l2_instance_probabilities"].float()
-    abundance_probability = outputs["l2_abundance_probabilities"].float()
+    instance_probability = outputs["spatial_instance_probabilities"].float()
+    abundance_probability = outputs["spatial_abundance_probabilities"].float()
     if instance_probability.shape != abundance_probability.shape:
         raise ValueError(
             "instance/abundance map shape mismatch: "
@@ -1765,12 +1765,12 @@ def load_hcc_sempath_release(
 ) -> tuple[HCCSemPathModel, dict]:
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     if (
-        config.get("format") != "hcc-sempath-l1-spatial-state-dict"
+        config.get("format") != "hcc-sempath-classification-spatial-state-dict"
         or int(config.get("version", -1)) != 3
     ):
         raise ValueError(
             "unsupported HCC-SemPath release; expected "
-            "hcc-sempath-l1-spatial-state-dict version 3"
+            "hcc-sempath-classification-spatial-state-dict version 3"
         )
     model_config = config["model"]
     config["spatial_decoder_calibration"] = (
@@ -1808,7 +1808,7 @@ def load_hcc_sempath_release(
         pretrained=False,
         projector_type=model_config.get("projector_type", "linear"),
         projector_hidden_dim=int(model_config.get("projector_hidden_dim", 2048)),
-        l1_num_classes=int(model_config["l1_num_classes"]),
+        classification_num_classes=int(model_config["classification_num_classes"]),
         spatial_num_components=int(model_config["spatial_num_components"]),
         spatial_dim=int(model_config.get("spatial_dim", 256)),
         spatial_output_stride=int(

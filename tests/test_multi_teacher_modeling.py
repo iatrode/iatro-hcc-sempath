@@ -117,7 +117,7 @@ def test_spatial_model_exposes_instance_and_abundance_maps_without_changing_enco
         embedding_dim=11,
         teacher_dims={},
         pretrained=False,
-        l1_num_classes=4,
+        classification_num_classes=4,
         spatial_num_components=3,
         spatial_dim=13,
     ).eval()
@@ -127,9 +127,9 @@ def test_spatial_model_exposes_instance_and_abundance_maps_without_changing_enco
         outputs = model(images)
 
     torch.testing.assert_close(outputs["embedding"], direct)
-    assert outputs["l1_logits"].shape == (2, 4)
-    assert outputs["l2_instance_logits"].shape == (2, 3, 31, 31)
-    assert outputs["l2_abundance_logits"].shape == (2, 3, 31, 31)
+    assert outputs["classification_logits"].shape == (2, 4)
+    assert outputs["spatial_instance_logits"].shape == (2, 3, 31, 31)
+    assert outputs["spatial_abundance_logits"].shape == (2, 3, 31, 31)
 
 
 def test_spatial_model_only_materializes_selected_supervised_rows() -> None:
@@ -150,8 +150,8 @@ def test_spatial_model_only_materializes_selected_supervised_rows() -> None:
 
     assert outputs["embedding"].shape == (3, 11)
     assert outputs["teacher_outputs"]["teacher"].shape == (3, 5)
-    assert outputs["l2_instance_logits"].shape == (1, 3, 31, 31)
-    assert outputs["l2_abundance_logits"].shape == (1, 3, 31, 31)
+    assert outputs["spatial_instance_logits"].shape == (1, 3, 31, 31)
+    assert outputs["spatial_abundance_logits"].shape == (1, 3, 31, 31)
 
 
 @pytest.mark.parametrize(
@@ -196,8 +196,8 @@ def test_spatial_architecture_ablations_preserve_topology_and_bypass_only_named_
         torch.randn(1, 3, 224, 224),
         return_spatial_features=True,
     )
-    assert outputs["l2_spatial_features"].shape == (1, 13, 31, 31)
-    outputs["l2_spatial_features"].square().mean().backward()
+    assert outputs["spatial_features"].shape == (1, 13, 31, 31)
+    outputs["spatial_features"].square().mean().backward()
     assert ablated.spatial_head is not None
     inactive = [
         parameter
@@ -219,8 +219,8 @@ def test_spatial_detach_ablation_trains_head_without_shared_encoder() -> None:
     )
     outputs = model(torch.randn(1, 3, 224, 224), spatial_detach_backbone=True)
     (
-        outputs["l2_instance_logits"].sum()
-        + outputs["l2_abundance_logits"].sum()
+        outputs["spatial_instance_logits"].sum()
+        + outputs["spatial_abundance_logits"].sum()
     ).backward()
 
     assert any(parameter.grad is not None for parameter in model.spatial_head.parameters())
@@ -238,8 +238,8 @@ def test_spatial_objective_reaches_shared_encoder_by_default() -> None:
     )
     outputs = model(torch.randn(1, 3, 224, 224))
     (
-        outputs["l2_instance_logits"].sum()
-        + outputs["l2_abundance_logits"].sum()
+        outputs["spatial_instance_logits"].sum()
+        + outputs["spatial_abundance_logits"].sum()
     ).backward()
 
     assert any(
@@ -265,12 +265,12 @@ def test_fixed_spatial_head_suppresses_non_countable_instance_channels() -> None
     with torch.no_grad():
         outputs = model(torch.randn(1, 3, 224, 224))
 
-    assert outputs["l2_instance_valid"].tolist() == [
+    assert outputs["spatial_instance_valid"].tolist() == [
         spec.supports_instance_count
         for spec in spatial_component_specs(DEFAULT_SPATIAL_COMPONENTS)
     ]
-    invalid = ~outputs["l2_instance_valid"]
-    assert torch.all(outputs["l2_instance_probabilities"][:, invalid] < 1e-8)
+    invalid = ~outputs["spatial_instance_valid"]
+    assert torch.all(outputs["spatial_instance_probabilities"][:, invalid] < 1e-8)
 
 
 def test_spatial_gradient_diagnostic_uses_real_shared_backbone_tokens() -> None:
@@ -286,14 +286,14 @@ def test_spatial_gradient_diagnostic_uses_real_shared_backbone_tokens() -> None:
         torch.randn(1, 3, 224, 224),
         return_spatial_features=True,
     )
-    grid = outputs["l2_spatial_features"].shape[-2:]
+    grid = outputs["spatial_features"].shape[-2:]
     point_centers = torch.zeros((1, 2, *grid))
     point_centers[0, 0, grid[0] // 2, grid[1] // 2] = 1
     implicit_negative = torch.zeros((1, 2, *grid), dtype=torch.bool)
     implicit_negative[0, 0, 0, 0] = True
     _replace_spatial_prototypes(
         model.spatial_head,
-        outputs["l2_spatial_features"],
+        outputs["spatial_features"],
         point_centers=point_centers,
         brush_bag_ids=torch.zeros((1, 2, *grid), dtype=torch.long),
         area_positive=torch.zeros((1, 2, *grid), dtype=torch.bool),
@@ -301,7 +301,7 @@ def test_spatial_gradient_diagnostic_uses_real_shared_backbone_tokens() -> None:
         implicit_negative=implicit_negative,
     )
     _, abundance_logits = model.spatial_head.prototype_logits(
-        outputs["l2_spatial_features"]
+        outputs["spatial_features"]
     )
     global_objective = outputs["embedding"].square().mean()
     spatial_objective = abundance_logits.square().mean()
@@ -418,7 +418,7 @@ def test_spatial_prototype_replacement_uses_exact_bank_statistics() -> None:
 def test_structure_point_updates_instance_but_not_unknown_measurement_prototype() -> None:
     component_count = len(DEFAULT_SPATIAL_COMPONENTS)
     structure_index = DEFAULT_SPATIAL_COMPONENTS.index(
-        "vascular-structure-present"
+        "small-vessel"
     )
     head = SpatialMorphometryHead(
         student_dim=2,
@@ -451,14 +451,14 @@ def test_hcc_sempath_model_decodes_instances_and_uncalibrated_abundance() -> Non
         embedding_dim=11,
         teacher_dims={},
         pretrained=False,
-        l1_num_classes=4,
+        classification_num_classes=4,
         spatial_num_components=3,
         spatial_dim=12,
     )
     outputs = model(torch.randn(2, 3, 224, 224))
 
     assert outputs["teacher_outputs"] == {}
-    assert outputs["l1_probabilities"].shape == (2, 4)
+    assert outputs["classification_probabilities"].shape == (2, 4)
     decoded = decode_spatial_morphometry(
         outputs,
         instance_threshold=0.0,
@@ -477,7 +477,7 @@ def test_hcc_sempath_model_decodes_instances_and_uncalibrated_abundance() -> Non
 def test_spatial_decoder_masks_invalid_counts_and_derives_bile_focus_density() -> None:
     component_count = len(DEFAULT_SPATIAL_COMPONENTS)
     bile_index = DEFAULT_SPATIAL_COMPONENTS.index(
-        "bile-pigment-present"
+        "bile-pigment"
     )
     instance = torch.zeros((1, component_count, 5, 5))
     measurement = torch.zeros((1, component_count, 5, 5))
@@ -488,8 +488,8 @@ def test_spatial_decoder_masks_invalid_counts_and_derives_bile_focus_density() -
     measurement[0, bile_index, 3, 3] = 0.9
     decoded = decode_spatial_morphometry(
         {
-            "l2_instance_probabilities": instance,
-            "l2_abundance_probabilities": measurement,
+            "spatial_instance_probabilities": instance,
+            "spatial_abundance_probabilities": measurement,
         },
         instance_threshold=0.5,
         abundance_threshold=0.5,
@@ -522,8 +522,8 @@ def test_spatial_decoder_accepts_frozen_per_component_thresholds() -> None:
 
     decoded = decode_spatial_morphometry(
         {
-            "l2_instance_probabilities": instance,
-            "l2_abundance_probabilities": measurement,
+            "spatial_instance_probabilities": instance,
+            "spatial_abundance_probabilities": measurement,
         },
         component_names=["synthetic-a", "synthetic-b"],
         instance_threshold=[0.5, 0.7],
@@ -545,8 +545,8 @@ def test_spatial_decoder_collapses_a_flat_peak_to_one_instance() -> None:
 
     decoded = decode_spatial_morphometry(
         {
-            "l2_instance_probabilities": instance,
-            "l2_abundance_probabilities": measurement,
+            "spatial_instance_probabilities": instance,
+            "spatial_abundance_probabilities": measurement,
         },
         component_names=["synthetic"],
         instance_threshold=0.5,
@@ -577,7 +577,7 @@ def test_sparse_components_preserve_diagonal_eight_connectivity() -> None:
 def test_spatial_decoder_focus_minimum_uses_eight_connected_extent() -> None:
     component_count = len(DEFAULT_SPATIAL_COMPONENTS)
     bile_index = DEFAULT_SPATIAL_COMPONENTS.index(
-        "bile-pigment-present"
+        "bile-pigment"
     )
     instance = torch.zeros((1, component_count, 5, 5))
     measurement = torch.zeros_like(instance)
@@ -587,8 +587,8 @@ def test_spatial_decoder_focus_minimum_uses_eight_connected_extent() -> None:
 
     decoded = decode_spatial_morphometry(
         {
-            "l2_instance_probabilities": instance,
-            "l2_abundance_probabilities": measurement,
+            "spatial_instance_probabilities": instance,
+            "spatial_abundance_probabilities": measurement,
         },
         instance_threshold=0.5,
         abundance_threshold=0.5,
@@ -602,8 +602,8 @@ def test_spatial_decoder_focus_minimum_uses_eight_connected_extent() -> None:
 
 def test_spatial_decoder_requires_frozen_analysis_values() -> None:
     outputs = {
-        "l2_instance_probabilities": torch.zeros((1, 1, 3, 3)),
-        "l2_abundance_probabilities": torch.zeros((1, 1, 3, 3)),
+        "spatial_instance_probabilities": torch.zeros((1, 1, 3, 3)),
+        "spatial_abundance_probabilities": torch.zeros((1, 1, 3, 3)),
     }
 
     with pytest.raises(ValueError, match="frozen decoder calibration"):
@@ -694,7 +694,7 @@ def test_release_loader_uses_checkpoint_backbone_configuration(tmp_path: Path) -
         embedding_dim=11,
         teacher_dims={},
         pretrained=False,
-        l1_num_classes=4,
+        classification_num_classes=4,
         spatial_num_components=3,
         spatial_dim=12,
     )
@@ -704,13 +704,13 @@ def test_release_loader_uses_checkpoint_backbone_configuration(tmp_path: Path) -
     torch.save(release_state, checkpoint)
     config.write_text(
         json.dumps({
-            "format": "hcc-sempath-l1-spatial-state-dict",
+            "format": "hcc-sempath-classification-spatial-state-dict",
             "version": 3,
             "model": {
                 "backbone_name": "vit_tiny_patch16_224",
                 "embedding_dim": 11,
                 "projector_type": "linear",
-                "l1_num_classes": 4,
+                "classification_num_classes": 4,
                 "spatial_num_components": 3,
                 "spatial_dim": 12,
                 "spatial_output_stride": 7,
@@ -741,7 +741,7 @@ def test_release_loader_uses_checkpoint_backbone_configuration(tmp_path: Path) -
     )
 
 
-def test_release_loader_rejects_unsupported_classifier_format(
+def test_release_loader_rejects_invalid_release_format(
     tmp_path: Path,
 ) -> None:
     checkpoint = tmp_path / "release.pt"
@@ -750,7 +750,7 @@ def test_release_loader_rejects_unsupported_classifier_format(
     config.write_text(
         json.dumps(
             {
-                "format": "hcc-sempath-classifier-state-dict",
+                "format": "invalid-format",
                 "version": 1,
                 "model": {},
             }
@@ -774,17 +774,11 @@ def test_multi_teacher_distillation_loss_aggregates_named_heads() -> None:
     prototypes_by_teacher = {
         "teacher_a": PrototypeRegistry(
             prototypes=torch.randn(4, 5),
-            names=["primary_tumor", "primary_non_tumor", "lymphocyte_rich", "fibrotic_stroma"],
-            groups=["primary_state", "primary_state", "immune", "stroma"],
-            levels=[1, 1, 2, 2],
-            exclusive=[True, True, False, False],
+            names=["tumor", "non_tumor", "lymphocyte_rich", "fibrotic_stroma"],
         ),
         "teacher_b": PrototypeRegistry(
             prototypes=torch.randn(4, 7),
-            names=["primary_tumor", "primary_non_tumor", "lymphocyte_rich", "fibrotic_stroma"],
-            groups=["primary_state", "primary_state", "immune", "stroma"],
-            levels=[1, 1, 2, 2],
-            exclusive=[True, True, False, False],
+            names=["tumor", "non_tumor", "lymphocyte_rich", "fibrotic_stroma"],
         ),
     }
 

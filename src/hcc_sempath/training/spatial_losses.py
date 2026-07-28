@@ -56,38 +56,38 @@ def _raise_if_true(condition: torch.Tensor, message: str) -> None:
         raise ValueError(message)
 
 
-def l1_classification_loss(
-    l1_logits: torch.Tensor,
+def classification_objective_loss(
+    classification_logits: torch.Tensor,
     prototype_mask: torch.Tensor,
-    prototype_level1: torch.Tensor,
+    prototype_classification: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    mask = prototype_mask.to(device=l1_logits.device, dtype=torch.bool)
-    targets = prototype_level1.to(
-        device=l1_logits.device,
+    mask = prototype_mask.to(device=classification_logits.device, dtype=torch.bool)
+    targets = prototype_classification.to(
+        device=classification_logits.device,
         dtype=torch.long,
     )
     _raise_if_true(
         mask
-        & ((targets < 0) | (targets >= l1_logits.shape[1])),
-        f"L1 target out of range for {l1_logits.shape[1]} classes",
+        & ((targets < 0) | (targets >= classification_logits.shape[1])),
+        f"classification target out of range for {classification_logits.shape[1]} classes",
     )
-    weight = mask.to(dtype=l1_logits.dtype)
+    weight = mask.to(dtype=classification_logits.dtype)
     supervised_count = weight.sum()
     safe_targets = torch.where(mask, targets, torch.zeros_like(targets))
     per_tile = F.cross_entropy(
-        l1_logits,
+        classification_logits,
         safe_targets,
         reduction="none",
     )
     loss = (per_tile * weight).sum() / supervised_count.clamp_min(1)
     accuracy = (
-        (l1_logits.argmax(dim=1) == safe_targets).to(dtype=l1_logits.dtype)
+        (classification_logits.argmax(dim=1) == safe_targets).to(dtype=classification_logits.dtype)
         * weight
     ).sum() / supervised_count.clamp_min(1)
     return loss, {
-        "l1": loss.detach(),
-        "l1_supervised_tiles": supervised_count.detach(),
-        "l1_accuracy": accuracy.detach(),
+        "classification": loss.detach(),
+        "classification_supervised_tiles": supervised_count.detach(),
+        "classification_accuracy": accuracy.detach(),
     }
 
 
@@ -876,29 +876,29 @@ def spatial_morphometry_loss(
         + float(implicit_negative_weight) * implicit_loss
     )
     return total, {
-        "l2_spatial": total.detach(),
-        "l2_instance_point": instance_point.detach(),
-        "l2_abundance_point": abundance_point.detach(),
-        "l2_brush_bag": brush_bag.detach(),
-        "l2_area_positive": area_positive_loss.detach(),
-        "l2_explicit_negative": explicit_loss.detach(),
-        "l2_implicit_negative": implicit_loss.detach(),
-        "l2_point_supervised_pairs": point_pairs.sum().detach(),
-        "l2_point_count": point_counts.sum().detach(),
-        "l2_brush_supervised_pairs": torch.tensor(
+        "spatial": total.detach(),
+        "spatial_instance_point": instance_point.detach(),
+        "spatial_abundance_point": abundance_point.detach(),
+        "spatial_brush_bag": brush_bag.detach(),
+        "spatial_area_positive": area_positive_loss.detach(),
+        "spatial_explicit_negative": explicit_loss.detach(),
+        "spatial_implicit_negative": implicit_loss.detach(),
+        "spatial_point_supervised_pairs": point_pairs.sum().detach(),
+        "spatial_point_count": point_counts.sum().detach(),
+        "spatial_brush_supervised_pairs": torch.tensor(
             brush_pairs,
             device=instance_logits.device,
         ),
-        "l2_brush_bag_count": torch.tensor(
+        "spatial_brush_bag_count": torch.tensor(
             brush_bags,
             device=instance_logits.device,
         ),
-        "l2_area_supervised_pairs": area_pairs.sum().detach(),
-        "l2_explicit_negative_pairs": torch.maximum(
+        "spatial_area_supervised_pairs": area_pairs.sum().detach(),
+        "spatial_explicit_negative_pairs": torch.maximum(
             explicit_pairs_instance.sum(),
             explicit_pairs_abundance.sum(),
         ).detach(),
-        "l2_implicit_negative_pairs": torch.maximum(
+        "spatial_implicit_negative_pairs": torch.maximum(
             implicit_pairs_instance.sum(),
             implicit_pairs_abundance.sum(),
         ).detach(),

@@ -28,7 +28,7 @@ from hcc_sempath.training.config import (  # noqa: E402
     teacher_dims,
     teacher_names,
 )
-from hcc_sempath.training.prototype_labels import DEFAULT_L1_CLASSES  # noqa: E402
+from hcc_sempath.training.prototype_labels import DEFAULT_CLASSIFICATION_CLASSES  # noqa: E402
 from hcc_sempath.training.roi import (  # noqa: E402
     DEFAULT_SPATIAL_COMPONENTS,
     spatial_component_names,
@@ -60,11 +60,11 @@ def _release_contract(cfg: dict) -> dict:
                 "linear",
             ),
             "teacher_dims": teacher_dims(cfg, names),
-            "l1_class_names": [
+            "classification_class_names": [
                 str(name)
                 for name in cfg["model"].get(
-                    "l1_class_names",
-                    DEFAULT_L1_CLASSES,
+                    "classification_class_names",
+                    DEFAULT_CLASSIFICATION_CLASSES,
                 )
             ],
             "spatial_dim": int(cfg["model"].get("spatial_dim", 256)),
@@ -92,7 +92,7 @@ def _release_contract(cfg: dict) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export the L1-classification + L2-spatial HCC-SemPath release."
+        description="Export the classification + spatial HCC-SemPath release."
     )
     parser.add_argument(
         "--checkpoint",
@@ -129,9 +129,9 @@ def main() -> None:
             )
     names = teacher_names(cfg)
     dims = teacher_dims(cfg, names)
-    l1_names = [
+    classification_names = [
         str(name)
-        for name in cfg["model"].get("l1_class_names", DEFAULT_L1_CLASSES)
+        for name in cfg["model"].get("classification_class_names", DEFAULT_CLASSIFICATION_CLASSES)
     ]
     spatial_names = _resolved_spatial_names(cfg)
     spatial_dim = int(cfg["model"].get("spatial_dim", 256))
@@ -179,7 +179,7 @@ def main() -> None:
         projector_type=cfg["model"].get("projector_type", "linear"),
         projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
         teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),
-        l1_num_classes=len(l1_names),
+        classification_num_classes=len(classification_names),
         spatial_num_components=len(spatial_names),
         spatial_dim=spatial_dim,
         spatial_output_stride=spatial_stride,
@@ -204,28 +204,28 @@ def main() -> None:
         pretrained=False,
         projector_type=cfg["model"].get("projector_type", "linear"),
         projector_hidden_dim=int(cfg["model"].get("projector_hidden_dim", 2048)),
-        l1_num_classes=len(l1_names),
+        classification_num_classes=len(classification_names),
         spatial_num_components=len(spatial_names),
         spatial_dim=spatial_dim,
         spatial_output_stride=spatial_stride,
     )
     release_model.encoder.load_state_dict(training_model.encoder.state_dict())
     assert (
-        release_model.l1_prototypes is not None
-        and training_model.l1_prototypes is not None
-        and release_model.l1_prototype_counts is not None
-        and training_model.l1_prototype_counts is not None
-        and release_model.l1_log_temperature is not None
-        and training_model.l1_log_temperature is not None
+        release_model.classification_prototypes is not None
+        and training_model.classification_prototypes is not None
+        and release_model.classification_prototype_counts is not None
+        and training_model.classification_prototype_counts is not None
+        and release_model.classification_log_temperature is not None
+        and training_model.classification_log_temperature is not None
     )
     assert release_model.spatial_head is not None and training_model.spatial_head is not None
     with torch.no_grad():
-        release_model.l1_prototypes.copy_(training_model.l1_prototypes)
-        release_model.l1_prototype_counts.copy_(
-            training_model.l1_prototype_counts
+        release_model.classification_prototypes.copy_(training_model.classification_prototypes)
+        release_model.classification_prototype_counts.copy_(
+            training_model.classification_prototype_counts
         )
-        release_model.l1_log_temperature.copy_(
-            training_model.l1_log_temperature
+        release_model.classification_log_temperature.copy_(
+            training_model.classification_log_temperature
         )
     release_model.spatial_head.load_state_dict(training_model.spatial_head.state_dict())
     release_model.eval()
@@ -233,7 +233,7 @@ def main() -> None:
     release_model_digest = model_state_sha256(release_state)
 
     release_config = {
-        "format": "hcc-sempath-l1-spatial-state-dict",
+        "format": "hcc-sempath-classification-spatial-state-dict",
         "version": 3,
         "model": {
             "backbone_name": STUDENT_BACKBONE_NAME,
@@ -242,7 +242,7 @@ def main() -> None:
             "projector_hidden_dim": int(
                 cfg["model"].get("projector_hidden_dim", 2048)
             ),
-            "l1_num_classes": len(l1_names),
+            "classification_num_classes": len(classification_names),
             "spatial_num_components": len(spatial_names),
             "spatial_dim": spatial_dim,
             "spatial_output_stride": spatial_stride,
@@ -251,7 +251,7 @@ def main() -> None:
             "mean": cfg["data"].get("mean", [0.485, 0.456, 0.406]),
             "std": cfg["data"].get("std", [0.229, 0.224, 0.225]),
         },
-        "l1_names": l1_names,
+        "classification_names": classification_names,
         "spatial_component_names": spatial_names,
         "spatial_component_contracts": spatial_component_metadata(spatial_names),
         "spatial_decoder_calibration": calibration,

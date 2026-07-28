@@ -12,7 +12,7 @@ STRUCTURE_INSTANCE_AREA = "structure_instance_area"
 
 @dataclass(frozen=True)
 class SpatialComponentSpec:
-    """Scientific measurement contract for one L2 spatial component."""
+    """Scientific measurement contract for one spatial component."""
 
     name: str
     mode: str
@@ -24,28 +24,28 @@ class SpatialComponentSpec:
 
 DEFAULT_SPATIAL_COMPONENT_SPECS = (
     SpatialComponentSpec(
-        "hepatocellular-parenchyma-present",
+        "hepatocellular-parenchyma",
         CELL_INSTANCE_DENSITY,
         supports_instance_count=True,
         supports_density=True,
         supports_area=False,
     ),
     SpatialComponentSpec(
-        "necrosis-present",
+        "necrosis",
         CONTINUOUS_AREA,
         supports_instance_count=False,
         supports_density=False,
         supports_area=True,
     ),
     SpatialComponentSpec(
-        "hemorrhage-present",
+        "hemorrhage",
         CELL_INSTANCE_DENSITY,
         supports_instance_count=True,
         supports_density=True,
         supports_area=False,
     ),
     SpatialComponentSpec(
-        "bile-pigment-present",
+        "bile-pigment",
         PIGMENT_BURDEN,
         supports_instance_count=False,
         supports_density=False,
@@ -53,7 +53,7 @@ DEFAULT_SPATIAL_COMPONENT_SPECS = (
         supports_focus_density=True,
     ),
     SpatialComponentSpec(
-        "inflammatory-cell-present",
+        "inflammatory-cell",
         CELL_INSTANCE_DENSITY,
         supports_instance_count=True,
         supports_density=True,
@@ -67,21 +67,21 @@ DEFAULT_SPATIAL_COMPONENT_SPECS = (
         supports_area=False,
     ),
     SpatialComponentSpec(
-        "fibrous-stroma-present",
+        "fibrous-stroma",
         CONTINUOUS_AREA,
         supports_instance_count=False,
         supports_density=False,
         supports_area=True,
     ),
     SpatialComponentSpec(
-        "steatosis-vacuolation-present",
+        "steatosis-vacuolation",
         STRUCTURE_INSTANCE_AREA,
         supports_instance_count=True,
         supports_density=False,
         supports_area=True,
     ),
     SpatialComponentSpec(
-        "vascular-structure-present",
+        "small-vessel",
         STRUCTURE_INSTANCE_AREA,
         supports_instance_count=True,
         supports_density=False,
@@ -95,7 +95,7 @@ DEFAULT_SPATIAL_COMPONENT_SPECS = (
         supports_area=True,
     ),
     SpatialComponentSpec(
-        "ductular-portal-present",
+        "ductular-portal",
         STRUCTURE_INSTANCE_AREA,
         supports_instance_count=True,
         supports_density=False,

@@ -29,12 +29,12 @@ class PAMTDAdjudication:
     """Per-tile teacher reliability and the shared semantic response target."""
 
     teacher_sample_weights: dict[str, torch.Tensor]
-    primary_target: torch.Tensor
+    classification_target: torch.Tensor
     response_sample_weight: torch.Tensor
     diagnostics: dict[str, torch.Tensor]
 
 
-def _primary_response(
+def _classification_response(
     features: torch.Tensor,
     registry: PrototypeRegistry,
     *,
@@ -42,21 +42,18 @@ def _primary_response(
     temperature: float,
 ) -> torch.Tensor:
     if not math.isfinite(float(temperature)) or temperature <= 0:
-        raise ValueError(f"primary temperature must be positive, got {temperature}")
-    available = [
-        registry.names[index]
-        for index in registry.primary_indices
-    ]
+        raise ValueError(f"classification temperature must be positive, got {temperature}")
+    available = list(registry.names)
     positions = {name: index for index, name in enumerate(available)}
     missing = [name for name in class_names if name not in positions]
     if missing:
         raise ValueError(
-            f"teacher prototype registry is missing L1 classes: {missing}"
+            f"teacher prototype registry is missing classification classes: {missing}"
         )
     logits = bounded_logits(
         normalized_prototype_logits(
             features,
-            registry.primary_prototypes,
+            registry.prototypes,
         )
         / float(temperature)
     )
@@ -80,7 +77,7 @@ def _primary_response(
     )
 
 
-def _global_l2_response(
+def _global_spatial_response(
     features: torch.Tensor,
     prototypes: torch.Tensor,
     counts: torch.Tensor,
@@ -88,7 +85,7 @@ def _global_l2_response(
     temperature: float,
 ) -> torch.Tensor:
     if not math.isfinite(float(temperature)) or temperature <= 0:
-        raise ValueError(f"L2 temperature must be positive, got {temperature}")
+        raise ValueError(f"spatial temperature must be positive, got {temperature}")
     logits = bounded_logits(
         normalized_prototype_logits(features, prototypes)
         / float(temperature)
@@ -101,11 +98,11 @@ def _global_l2_response(
     )
 
 
-def _l1_agreement(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+def _classification_agreement(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     return (left * right).sum(dim=-1).clamp(0.0, 1.0)
 
 
-def _l2_agreement(
+def _spatial_agreement(
     left: torch.Tensor,
     right: torch.Tensor,
     valid: torch.Tensor,
@@ -126,28 +123,28 @@ def prototype_adjudicated_teacher_target(
     *,
     teacher_by_name: dict[str, torch.Tensor],
     prototypes_by_teacher: dict[str, PrototypeRegistry],
-    student_primary_response: torch.Tensor,
+    student_classification_response: torch.Tensor,
     class_names: list[str] | tuple[str, ...],
-    teacher_l2_prototypes: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
-    student_l2_response: torch.Tensor | None = None,
-    l1_mask: torch.Tensor | None = None,
-    l1_target: torch.Tensor | None = None,
-    l2_target: torch.Tensor | None = None,
-    l2_known: torch.Tensor | None = None,
+    teacher_spatial_prototypes: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    student_spatial_response: torch.Tensor | None = None,
+    classification_mask: torch.Tensor | None = None,
+    classification_target: torch.Tensor | None = None,
+    spatial_target: torch.Tensor | None = None,
+    spatial_known: torch.Tensor | None = None,
     teacher_weights: dict[str, float] | None = None,
     filter_strength: float = 1.0,
     alpha_min: float = 0.25,
     consensus_weight: float = 1.0,
     prototype_label_weight: float = 1.0,
     student_agreement_weight: float = 1.0,
-    l1_agreement_weight: float = 0.5,
-    l2_agreement_weight: float = 0.5,
-    primary_temperature: float = 0.1,
-    l2_temperature: float = 0.1,
+    classification_agreement_weight: float = 0.5,
+    spatial_agreement_weight: float = 0.5,
+    classification_temperature: float = 0.1,
+    spatial_temperature: float = 0.1,
 ) -> PAMTDAdjudication:
-    """Restore PAMT-D without turning spatial L2 back into a tile classifier.
+    """Restore PAMT-D without turning spatial back into a tile classifier.
 
-    L2 global responses are used only as a common reliability coordinate.
+    spatial global responses are used only as a common reliability coordinate.
     Human geometry remains the sole source of spatial targets and outputs.
     """
 
@@ -160,7 +157,7 @@ def prototype_adjudicated_teacher_target(
     if not teacher_by_name:
         raise ValueError("PAMT-D requires at least one teacher")
     if not class_names:
-        raise ValueError("PAMT-D requires the ordered L1 class names")
+        raise ValueError("PAMT-D requires the ordered classification class names")
     if not 0.0 <= float(filter_strength) <= 1.0:
         raise ValueError(
             f"filter_strength must be in [0, 1], got {filter_strength}"
@@ -191,229 +188,229 @@ def prototype_adjudicated_teacher_target(
         ("consensus_weight", consensus_weight),
         ("prototype_label_weight", prototype_label_weight),
         ("student_agreement_weight", student_agreement_weight),
-        ("l1_agreement_weight", l1_agreement_weight),
-        ("l2_agreement_weight", l2_agreement_weight),
+        ("classification_agreement_weight", classification_agreement_weight),
+        ("spatial_agreement_weight", spatial_agreement_weight),
     ):
         if not math.isfinite(float(value)) or float(value) < 0:
             raise ValueError(f"{label} must be finite and non-negative")
 
-    primary = {
-        name: _primary_response(
+    classification_by_teacher = {
+        name: _classification_response(
             teacher_by_name[name],
             prototypes_by_teacher[name],
             class_names=class_names,
-            temperature=primary_temperature,
+            temperature=classification_temperature,
         )
         for name in active_names
     }
-    primary_stack = torch.stack(
-        [primary[name] for name in active_names],
+    classification_stack = torch.stack(
+        [classification_by_teacher[name] for name in active_names],
         dim=0,
     )
-    if student_primary_response.shape != primary_stack.shape[1:]:
+    if student_classification_response.shape != classification_stack.shape[1:]:
         raise ValueError(
-            "student L1 response shape mismatch: "
-            f"student={tuple(student_primary_response.shape)} "
-            f"expected={tuple(primary_stack.shape[1:])}"
+            "student classification response shape mismatch: "
+            f"student={tuple(student_classification_response.shape)} "
+            f"expected={tuple(classification_stack.shape[1:])}"
         )
-    student_primary_response = clamp_probability(
-        student_primary_response.to(
-            device=primary_stack.device,
-            dtype=primary_stack.dtype,
+    student_classification_response = clamp_probability(
+        student_classification_response.to(
+            device=classification_stack.device,
+            dtype=classification_stack.dtype,
         ),
         normalize=True,
     )
 
-    l2_by_teacher: dict[str, torch.Tensor] = {}
-    if teacher_l2_prototypes:
+    spatial_by_teacher: dict[str, torch.Tensor] = {}
+    if teacher_spatial_prototypes:
         for name in active_names:
-            state = teacher_l2_prototypes.get(name)
+            state = teacher_spatial_prototypes.get(name)
             if state is None:
                 continue
-            l2_by_teacher[name] = _global_l2_response(
+            spatial_by_teacher[name] = _global_spatial_response(
                 teacher_by_name[name],
                 state[0],
                 state[1],
-                temperature=l2_temperature,
+                temperature=spatial_temperature,
             )
-    l2_ready = (
-        len(l2_by_teacher) == len(active_names)
-        and student_l2_response is not None
-        and student_l2_response.shape[1] > 0
+    spatial_ready = (
+        len(spatial_by_teacher) == len(active_names)
+        and student_spatial_response is not None
+        and student_spatial_response.shape[1] > 0
     )
-    if l2_ready:
+    if spatial_ready:
         valid_components = torch.stack(
             [
-                teacher_l2_prototypes[name][1] > 0
+                teacher_spatial_prototypes[name][1] > 0
                 for name in active_names
             ],
             dim=0,
         ).all(dim=0)
-        l2_available = valid_components.any()
-        use_l2 = True
+        spatial_available = valid_components.any()
+        use_spatial = True
     else:
         valid_components = None
-        l2_available = None
-        use_l2 = False
-    l2_stack = (
+        spatial_available = None
+        use_spatial = False
+    spatial_stack = (
         torch.stack(
-            [l2_by_teacher[name] for name in active_names],
+            [spatial_by_teacher[name] for name in active_names],
             dim=0,
         )
-        if use_l2
+        if use_spatial
         else None
     )
-    l2_valid = (
-        valid_components.view(1, -1).expand(primary_stack.shape[1], -1)
-        if use_l2 and valid_components is not None
+    spatial_valid = (
+        valid_components.view(1, -1).expand(classification_stack.shape[1], -1)
+        if use_spatial and valid_components is not None
         else None
     )
 
     sample_weights: dict[str, torch.Tensor] = {}
     diagnostics: dict[str, torch.Tensor] = {}
-    weighted_primary = torch.zeros_like(primary_stack[0])
-    primary_weight_sum = torch.zeros(
-        (primary_stack.shape[1], 1),
-        device=primary_stack.device,
-        dtype=primary_stack.dtype,
+    weighted_classification = torch.zeros_like(classification_stack[0])
+    classification_weight_sum = torch.zeros(
+        (classification_stack.shape[1], 1),
+        device=classification_stack.device,
+        dtype=classification_stack.dtype,
     )
     base_weight_sum = sum(base_weights[name] for name in active_names)
-    base_primary = sum(
-        primary[name] * base_weights[name]
+    base_classification = sum(
+        classification_by_teacher[name] * base_weights[name]
         for name in active_names
     )
-    base_primary_target = base_primary / float(base_weight_sum)
-    base_l2 = (
+    base_classification_target = base_classification / float(base_weight_sum)
+    base_spatial = (
         sum(
-            l2_by_teacher[name] * base_weights[name]
+            spatial_by_teacher[name] * base_weights[name]
             for name in active_names
         )
-        if use_l2
+        if use_spatial
         else None
     )
-    l1_mask_value = (
-        torch.zeros(primary_stack.shape[1], dtype=torch.bool, device=primary_stack.device)
-        if l1_mask is None
-        else l1_mask.to(device=primary_stack.device, dtype=torch.bool)
+    classification_mask_value = (
+        torch.zeros(classification_stack.shape[1], dtype=torch.bool, device=classification_stack.device)
+        if classification_mask is None
+        else classification_mask.to(device=classification_stack.device, dtype=torch.bool)
     )
-    l1_target_value = (
+    classification_target_value = (
         torch.full(
-            (primary_stack.shape[1],),
+            (classification_stack.shape[1],),
             -1,
             dtype=torch.long,
-            device=primary_stack.device,
+            device=classification_stack.device,
         )
-        if l1_target is None
-        else l1_target.to(device=primary_stack.device, dtype=torch.long)
+        if classification_target is None
+        else classification_target.to(device=classification_stack.device, dtype=torch.long)
     )
-    invalid_l1 = l1_mask_value & (
-        (l1_target_value < 0)
-        | (l1_target_value >= primary_stack.shape[-1])
+    invalid_classification = classification_mask_value & (
+        (classification_target_value < 0)
+        | (classification_target_value >= classification_stack.shape[-1])
     )
     _raise_if_true(
-        invalid_l1,
-        "L1 expert target is outside the prototype response range",
+        invalid_classification,
+        "classification expert target is outside the prototype response range",
     )
-    l2_target_value = (
+    spatial_target_value = (
         None
-        if l2_target is None
-        else l2_target.to(device=primary_stack.device, dtype=primary_stack.dtype)
+        if spatial_target is None
+        else spatial_target.to(device=classification_stack.device, dtype=classification_stack.dtype)
     )
-    l2_known_value = (
+    spatial_known_value = (
         None
-        if l2_known is None
-        else l2_known.to(device=primary_stack.device, dtype=torch.bool)
+        if spatial_known is None
+        else spatial_known.to(device=classification_stack.device, dtype=torch.bool)
     )
 
     for name in active_names:
         if len(active_names) == 1:
-            consensus = primary[name].new_ones(primary[name].shape[0])
+            consensus = classification_by_teacher[name].new_ones(classification_by_teacher[name].shape[0])
         else:
             peer_weight = base_weight_sum - base_weights[name]
-            consensus_primary = (
-                base_primary - primary[name] * base_weights[name]
+            consensus_classification = (
+                base_classification - classification_by_teacher[name] * base_weights[name]
             ) / float(peer_weight)
-            consensus = _l1_agreement(primary[name], consensus_primary)
-        student_agreement = _l1_agreement(
-            primary[name],
-            student_primary_response,
+            consensus = _classification_agreement(classification_by_teacher[name], consensus_classification)
+        student_agreement = _classification_agreement(
+            classification_by_teacher[name],
+            student_classification_response,
         )
-        if use_l2 and l2_stack is not None and l2_valid is not None:
+        if use_spatial and spatial_stack is not None and spatial_valid is not None:
             if len(active_names) == 1:
-                l2_consensus = consensus.new_ones(consensus.shape)
+                spatial_consensus = consensus.new_ones(consensus.shape)
             else:
-                assert base_l2 is not None
+                assert base_spatial is not None
                 peer_weight = base_weight_sum - base_weights[name]
-                consensus_l2 = (
-                    base_l2
-                    - l2_by_teacher[name] * base_weights[name]
+                consensus_spatial = (
+                    base_spatial
+                    - spatial_by_teacher[name] * base_weights[name]
                 ) / float(peer_weight)
-                l2_consensus = _l2_agreement(
-                    l2_by_teacher[name],
-                    consensus_l2,
-                    l2_valid,
+                spatial_consensus = _spatial_agreement(
+                    spatial_by_teacher[name],
+                    consensus_spatial,
+                    spatial_valid,
                 )
-            l2_student = _l2_agreement(
-                l2_by_teacher[name],
-                student_l2_response,
-                l2_valid,
+            spatial_student = _spatial_agreement(
+                spatial_by_teacher[name],
+                student_spatial_response,
+                spatial_valid,
             )
-            assert l2_available is not None
-            l2_consensus = torch.where(
-                l2_available,
-                l2_consensus,
+            assert spatial_available is not None
+            spatial_consensus = torch.where(
+                spatial_available,
+                spatial_consensus,
                 consensus,
             )
-            l2_student = torch.where(
-                l2_available,
-                l2_student,
+            spatial_student = torch.where(
+                spatial_available,
+                spatial_student,
                 student_agreement,
             )
-            axis_weight = float(l1_agreement_weight) + float(l2_agreement_weight)
+            axis_weight = float(classification_agreement_weight) + float(spatial_agreement_weight)
             if axis_weight > 0:
                 consensus = (
-                    float(l1_agreement_weight) * consensus
-                    + float(l2_agreement_weight) * l2_consensus
+                    float(classification_agreement_weight) * consensus
+                    + float(spatial_agreement_weight) * spatial_consensus
                 ) / axis_weight
                 student_agreement = (
-                    float(l1_agreement_weight) * student_agreement
-                    + float(l2_agreement_weight) * l2_student
+                    float(classification_agreement_weight) * student_agreement
+                    + float(spatial_agreement_weight) * spatial_student
                 ) / axis_weight
 
         expert_sum = torch.zeros_like(consensus)
         expert_denominator = torch.zeros_like(consensus)
-        safe_target = l1_target_value.clamp(
+        safe_target = classification_target_value.clamp(
             0,
-            primary_stack.shape[-1] - 1,
+            classification_stack.shape[-1] - 1,
         )
-        l1_expert = primary[name].gather(
+        classification_expert = classification_by_teacher[name].gather(
             1,
             safe_target.view(-1, 1),
         ).squeeze(1)
         expert_sum = expert_sum + torch.where(
-            l1_mask_value,
-            l1_expert,
-            torch.zeros_like(l1_expert),
+            classification_mask_value,
+            classification_expert,
+            torch.zeros_like(classification_expert),
         )
         expert_denominator = (
-            expert_denominator + l1_mask_value.float()
+            expert_denominator + classification_mask_value.float()
         )
         if (
-            use_l2
-            and l2_target_value is not None
-            and l2_known_value is not None
-            and l2_valid is not None
+            use_spatial
+            and spatial_target_value is not None
+            and spatial_known_value is not None
+            and spatial_valid is not None
         ):
-            valid = l2_known_value & l2_valid
+            valid = spatial_known_value & spatial_valid
             valid_count = valid.sum(dim=-1)
-            l2_expert = 1.0 - (
-                (l2_by_teacher[name] - l2_target_value).abs()
+            spatial_expert = 1.0 - (
+                (spatial_by_teacher[name] - spatial_target_value).abs()
                 * valid.float()
             ).sum(dim=-1) / valid_count.clamp_min(1)
             expert_sum = expert_sum + torch.where(
                 valid_count > 0,
-                l2_expert,
-                torch.zeros_like(l2_expert),
+                spatial_expert,
+                torch.zeros_like(spatial_expert),
             )
             expert_denominator = expert_denominator + (valid_count > 0).float()
         expert = expert_sum / expert_denominator.clamp_min(1.0)
@@ -438,28 +435,28 @@ def prototype_adjudicated_teacher_target(
 
         base_weight = base_weights[name]
         combined = alpha.view(-1, 1) * base_weight
-        weighted_primary = weighted_primary + primary[name] * combined
-        primary_weight_sum = primary_weight_sum + combined
+        weighted_classification = weighted_classification + classification_by_teacher[name] * combined
+        classification_weight_sum = classification_weight_sum + combined
 
     for name in names:
         if name not in sample_weights:
-            zeros = primary_stack.new_zeros(primary_stack.shape[1])
+            zeros = classification_stack.new_zeros(classification_stack.shape[1])
             sample_weights[name] = zeros
             diagnostics[f"{name}_alpha_mean"] = zeros.mean()
             diagnostics[f"{name}_reliability_mean"] = zeros.mean()
 
-    has_response_mass = primary_weight_sum > 0
-    primary_target = torch.where(
+    has_response_mass = classification_weight_sum > 0
+    classification_target = torch.where(
         has_response_mass,
-        weighted_primary / primary_weight_sum.clamp_min(1e-12),
-        base_primary_target,
+        weighted_classification / classification_weight_sum.clamp_min(1e-12),
+        base_classification_target,
     )
-    primary_target = clamp_probability(
-        primary_target,
+    classification_target = clamp_probability(
+        classification_target,
         normalize=True,
     )
     response_sample_weight = (
-        primary_weight_sum.squeeze(1) / float(base_weight_sum)
+        classification_weight_sum.squeeze(1) / float(base_weight_sum)
     ).clamp(0.0, 1.0)
     diagnostics["teacher_alpha_mean"] = torch.stack(
         [sample_weights[name].mean() for name in active_names]
@@ -469,7 +466,7 @@ def prototype_adjudicated_teacher_target(
     )
     return PAMTDAdjudication(
         teacher_sample_weights=sample_weights,
-        primary_target=primary_target.detach(),
+        classification_target=classification_target.detach(),
         response_sample_weight=response_sample_weight.detach(),
         diagnostics=diagnostics,
     )

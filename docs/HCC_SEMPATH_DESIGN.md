@@ -137,14 +137,14 @@ expert-updated student-space centroids:
 
 ```text
 z = normalize(project(CLS))
-l1_logits[k] = cosine(z, centroid_l1[k]) / temperature
+classification_logits[k] = cosine(z, centroid_classification[k]) / temperature
 ```
 
 Human classification labels define the complete centroid bank and use cross entropy on the
 resulting response. Centroids are no-gradient coordinates recomputed from the
 current student between optimizer steps; gradients from the response update
-`z_hcc`. Semantic distillation and PAMT-D use the six primary teacher
-prototypes.
+`z_hcc`. Semantic distillation and PAMT-D use the six class-conditioned
+teacher prototypes.
 
 ### Dense local branch
 
@@ -168,8 +168,8 @@ window.
 
 For each of eleven components the head emits:
 
-- `l2_instance_logits [B, 11, 32, 32]`;
-- `l2_abundance_logits [B, 11, 32, 32]`.
+- `spatial_instance_logits [B, 11, 32, 32]`;
+- `spatial_abundance_logits [B, 11, 32, 32]`.
 
 These maps are positive-versus-negative local prototype responses over the
 fused spatial features. One supervised tile/component contributes one centroid
@@ -234,7 +234,7 @@ The total objective is:
 ```text
 L = L_four_teacher(alpha_PAMTD)
   + lambda_response * L_student_prototype_response
-  + lambda_l1 * CE(T_cls)
+  + lambda_classification * CE(T_cls)
   + lambda_spatial * (
         L_instance_point_peak
       + lambda_abundance_point * L_abundance_point_peak

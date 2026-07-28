@@ -265,7 +265,7 @@ def main() -> None:
             cfg["model"].get("projector_hidden_dim", 2048)
         ),
         teacher_head_type=cfg["model"].get("teacher_head_type", "linear"),
-        l1_num_classes=len(cfg["model"]["l1_class_names"]),
+        classification_num_classes=len(cfg["model"]["classification_class_names"]),
         spatial_num_components=len(names),
         spatial_dim=int(cfg["model"].get("spatial_dim", 256)),
         spatial_output_stride=stride,
@@ -302,10 +302,10 @@ def main() -> None:
             )
             outputs = model(batch)
             instance_batches.append(
-                outputs["l2_instance_probabilities"].cpu()
+                outputs["spatial_instance_probabilities"].cpu()
             )
             abundance_batches.append(
-                outputs["l2_abundance_probabilities"].cpu()
+                outputs["spatial_abundance_probabilities"].cpu()
             )
     ordered_targets = [validation_targets[tile_id] for tile_id in tile_ids]
     ordered_metadata = [

@@ -356,7 +356,7 @@ def spatial_component_names(manifest_path: str | Path) -> list[str]:
 
     payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     definitions = (
-        payload.get("label_definitions", {}).get("l2", [])
+        payload.get("label_definitions", {}).get("spatial", [])
         if isinstance(payload, dict)
         else []
     )
@@ -368,7 +368,7 @@ def spatial_component_names(manifest_path: str | Path) -> list[str]:
         and bool(item.get("active", True))
     ]
     if not names and isinstance(payload, dict):
-        names = [str(value) for value in payload.get("l2_prototypes", [])]
+        names = [str(value) for value in payload.get("spatial_prototypes", [])]
     if not names:
         names = list(DEFAULT_SPATIAL_COMPONENTS)
     if tuple(names) != DEFAULT_SPATIAL_COMPONENTS:
@@ -944,8 +944,8 @@ def spatial_roi_payload(
     if item is None:
         item = empty_spatial_roi_target(component_count, grid_size)
     return {
-        "l2_point_centers": item.point_centers,
-        "l2_instance_exclusion_support": (
+        "spatial_point_centers": item.point_centers,
+        "spatial_instance_exclusion_support": (
             item.instance_exclusion_support
             if item.instance_exclusion_support is not None
             else torch.zeros_like(
@@ -953,9 +953,9 @@ def spatial_roi_payload(
                 dtype=torch.bool,
             )
         ),
-        "l2_brush_bag_ids": item.brush_bag_ids,
-        "l2_area_positive": item.area_positive,
-        "l2_explicit_negative": item.explicit_negative,
-        "l2_implicit_negative": item.implicit_negative,
-        "l2_spatial_supervised": item.supervised,
+        "spatial_brush_bag_ids": item.brush_bag_ids,
+        "spatial_area_positive": item.area_positive,
+        "spatial_explicit_negative": item.explicit_negative,
+        "spatial_implicit_negative": item.implicit_negative,
+        "spatial_supervised": item.supervised,
     }

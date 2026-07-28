@@ -39,7 +39,9 @@ def build_priority_manifest(annotation_paths: list[str | Path]) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a shared L1/L2 tile-priority manifest.")
+    parser = argparse.ArgumentParser(
+        description="Build a shared classification/spatial tile-priority manifest."
+    )
     parser.add_argument(
         "--annotations",
         action="append",

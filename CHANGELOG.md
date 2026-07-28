@@ -1,16 +1,18 @@
 # Changelog
 
-## 0.2.1
+## 0.2.0 — Unreleased
 
+- Define the first-release classification/spatial API and asset schema after
+  removing unpublished development terminology.
+- Define classification prototype registries as one ordered class bank;
+  spatial prototypes are represented only by the independent spatial branch.
+- Use the final eleven-component spatial taxonomy without presence suffixes,
+  including distinct `small-vessel` and `large-vessel` components.
 - Align the combined annotation audit, documentation, and annotation queue
   with the pooled fixed-probe plateau rule shared by classification and
   spatial supervision.
 - Record the source annotation digest and generation time in spatial
   information reports.
-- Retain read compatibility with historical per-teacher low-gain reports.
-
-## 0.2.0 — 2026-07-26
-
 - Restore the parallel classification/spatial training contract:
   teacher-only representation shaping is followed by one simultaneous
   expert-supervision ramp, with both objectives connected to the shared
@@ -34,9 +36,8 @@
   ordinary scrolling remains available elsewhere.
 - Add visible `1`–`9` shortcuts for selecting the first nine classification
   classes and use Space to save and advance.
-- Replace the deprecated initial classification annotation filename with the
-  final asset used after tumor-differentiation adjudication.
+- Use the final classification annotation asset after tumor-differentiation
+  adjudication.
 
-Model constructor signatures, checkpoint state-dict topology, spatial output
-semantics, and IAC dependencies are unchanged. Configurations using the removed
-asynchronous schedule keys must migrate to the common expert schedule.
+This is the first release contract. Earlier local checkpoints, configurations,
+and annotation schemas were development artifacts and are not supported.

@@ -3,13 +3,13 @@ inherits: matched_tenth.yaml
 # Ablation A2 — PAMT-D WITHOUT prototype-adjudicated teacher reliability.
 # Design doc §7 item 5.
 #
-# Single variable vs A0: prototype semantic supervision, L1 supervision, and
+# Single variable vs A0: prototype semantic supervision, classification supervision, and
 # the student response objective are retained, but reliability filtering is
 # disabled. Multi-teacher distillation therefore uses the configured base
 # teacher weights rather than per-tile adjudicated reliability. This isolates
 # the filtering part of PAMT-D under otherwise matched supervision.
 #
-# Prototype assets and the L1 supervision manifest remain inherited.
+# Prototype assets and the classification supervision manifest remain inherited.
 
 runtime:
   output_dir: outputs/experiments/ablation/a2_no_adjudication

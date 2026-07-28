@@ -55,17 +55,17 @@ def _prototype_payload(tile_id: str, prototype_labels: dict[str, PrototypeLabel]
     if not prototype_labels:
         return {
             "prototype_mask": False,
-            "prototype_level1": -1,
+            "prototype_classification": -1,
         }
     label = prototype_labels.get(tile_id)
     if label is None:
         return {
             "prototype_mask": False,
-            "prototype_level1": -1,
+            "prototype_classification": -1,
         }
     return {
         "prototype_mask": True,
-        "prototype_level1": label.level1,
+        "prototype_classification": label.classification,
     }
 
 
@@ -862,7 +862,7 @@ class PackageSampledDistillationDataset(Dataset):
         feat_stage = {name: np.empty((n, buf.teacher_features[name].shape[1]), dtype=np.float32) for name in teacher_names}
         pos_stage = np.empty(n, dtype=np.int64)
         mask_stage = np.zeros(n, dtype=bool)
-        l1_stage = np.full(n, -1, dtype=np.int64)
+        classification_stage = np.full(n, -1, dtype=np.int64)
         tid_stage: list = [None] * n
 
         for i, k in enumerate(order):
@@ -875,7 +875,7 @@ class PackageSampledDistillationDataset(Dataset):
                 proto = _prototype_payload(tile_id, self.prototype_labels)
                 tid_stage[i] = tile_id
                 mask_stage[i] = bool(proto["prototype_mask"])
-                l1_stage[i] = int(proto["prototype_level1"])
+                classification_stage[i] = int(proto["prototype_classification"])
                 buf.spatial_targets[int(pos_stage[i])] = self.spatial_targets.get(
                     tile_id
                 )
@@ -887,7 +887,7 @@ class PackageSampledDistillationDataset(Dataset):
             for name in teacher_names:
                 buf.teacher_features[name].index_copy_(0, pos_t, torch.from_numpy(feat_stage[name]))
             buf.prototype_mask.index_copy_(0, pos_t, torch.from_numpy(mask_stage))
-            buf.prototype_level1.index_copy_(0, pos_t, torch.from_numpy(l1_stage))
+            buf.prototype_classification.index_copy_(0, pos_t, torch.from_numpy(classification_stage))
             for i in range(n):
                 buf.tile_id[int(pos_stage[i])] = tid_stage[i]
         _probe.flush_thread()
@@ -1003,19 +1003,19 @@ class PackageSampledDistillationDataset(Dataset):
                 for name in teacher_names
             },
             "prototype_mask": torch.tensor([bool(item["prototype_mask"]) for item in batch], dtype=torch.bool),
-            "prototype_level1": torch.tensor([int(item["prototype_level1"]) for item in batch], dtype=torch.long),
-            "l2_point_centers": torch.stack([item["l2_point_centers"] for item in batch]),
-            "l2_instance_exclusion_support": torch.stack(
+            "prototype_classification": torch.tensor([int(item["prototype_classification"]) for item in batch], dtype=torch.long),
+            "spatial_point_centers": torch.stack([item["spatial_point_centers"] for item in batch]),
+            "spatial_instance_exclusion_support": torch.stack(
                 [
-                    item["l2_instance_exclusion_support"]
+                    item["spatial_instance_exclusion_support"]
                     for item in batch
                 ]
             ),
-            "l2_brush_bag_ids": torch.stack([item["l2_brush_bag_ids"] for item in batch]),
-            "l2_area_positive": torch.stack([item["l2_area_positive"] for item in batch]),
-            "l2_explicit_negative": torch.stack([item["l2_explicit_negative"] for item in batch]),
-            "l2_implicit_negative": torch.stack([item["l2_implicit_negative"] for item in batch]),
-            "l2_spatial_supervised": torch.stack([item["l2_spatial_supervised"] for item in batch]),
+            "spatial_brush_bag_ids": torch.stack([item["spatial_brush_bag_ids"] for item in batch]),
+            "spatial_area_positive": torch.stack([item["spatial_area_positive"] for item in batch]),
+            "spatial_explicit_negative": torch.stack([item["spatial_explicit_negative"] for item in batch]),
+            "spatial_implicit_negative": torch.stack([item["spatial_implicit_negative"] for item in batch]),
+            "spatial_supervised": torch.stack([item["spatial_supervised"] for item in batch]),
         }
 
     def close(self) -> None:
@@ -1101,20 +1101,20 @@ def collate_distillation(batch: list[dict]) -> dict:
             name: torch.stack([item["teacher_features"][name] for item in batch]) for name in teacher_names
         },
         "prototype_mask": torch.tensor([bool(item.get("prototype_mask", False)) for item in batch], dtype=torch.bool),
-        "prototype_level1": torch.tensor([int(item.get("prototype_level1", -1)) for item in batch], dtype=torch.long),
-        "l2_point_centers": torch.stack([item.get("l2_point_centers", torch.zeros((0, 0, 0))) for item in batch]),
-        "l2_instance_exclusion_support": torch.stack(
+        "prototype_classification": torch.tensor([int(item.get("prototype_classification", -1)) for item in batch], dtype=torch.long),
+        "spatial_point_centers": torch.stack([item.get("spatial_point_centers", torch.zeros((0, 0, 0))) for item in batch]),
+        "spatial_instance_exclusion_support": torch.stack(
             [
                 item.get(
-                    "l2_instance_exclusion_support",
+                    "spatial_instance_exclusion_support",
                     torch.zeros((0, 0, 0), dtype=torch.bool),
                 )
                 for item in batch
             ]
         ),
-        "l2_brush_bag_ids": torch.stack([item.get("l2_brush_bag_ids", torch.zeros((0, 0, 0), dtype=torch.long)) for item in batch]),
-        "l2_area_positive": torch.stack([item.get("l2_area_positive", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),
-        "l2_explicit_negative": torch.stack([item.get("l2_explicit_negative", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),
-        "l2_implicit_negative": torch.stack([item.get("l2_implicit_negative", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),
-        "l2_spatial_supervised": torch.stack([item.get("l2_spatial_supervised", torch.zeros(0, dtype=torch.bool)) for item in batch]),
+        "spatial_brush_bag_ids": torch.stack([item.get("spatial_brush_bag_ids", torch.zeros((0, 0, 0), dtype=torch.long)) for item in batch]),
+        "spatial_area_positive": torch.stack([item.get("spatial_area_positive", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),
+        "spatial_explicit_negative": torch.stack([item.get("spatial_explicit_negative", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),
+        "spatial_implicit_negative": torch.stack([item.get("spatial_implicit_negative", torch.zeros((0, 0, 0), dtype=torch.bool)) for item in batch]),
+        "spatial_supervised": torch.stack([item.get("spatial_supervised", torch.zeros(0, dtype=torch.bool)) for item in batch]),
     }

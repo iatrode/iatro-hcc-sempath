@@ -23,10 +23,19 @@ except ImportError as exc:  # pragma: no cover
 
 
 TEACHERS = ("gigapath", "h_optimus_1", "uni2_h", "virchow2")
-BASELINE_PARAMS = {"lr": 1e-4, "weight_decay": 1e-2}
+BASELINE_PARAMS = {
+    "lr": 1.5088805358242106e-4,
+    "weight_decay": 2.7941282807460287e-3,
+}
+SEEDED_PARAMS = (
+    BASELINE_PARAMS,
+    {"lr": 1.30e-4, "weight_decay": 3.0e-3},
+    {"lr": 1.70e-4, "weight_decay": 3.0e-3},
+    {"lr": 1.50e-4, "weight_decay": 7.0e-3},
+)
 SEARCH_SPACE = {
-    "lr": {"low": 3e-5, "high": 2e-4, "log": True},
-    "weight_decay": {"low": 1e-3, "high": 5e-2, "log": True},
+    "lr": {"low": 9e-5, "high": 2.1e-4, "log": True},
+    "weight_decay": {"low": 1e-3, "high": 1.2e-2, "log": True},
 }
 RESULT_METRICS = (
     "train_loss",
@@ -34,19 +43,19 @@ RESULT_METRICS = (
     "train_relation",
     "train_semantic",
     "train_pamtd_response",
-    "train_l1",
-    "train_l1_accuracy",
-    "train_l2_spatial",
-    "train_l2_instance_point",
-    "train_l2_abundance_point",
-    "train_l2_brush_bag",
-    "train_l2_area_positive",
-    "train_l2_explicit_negative",
-    "train_l2_implicit_negative",
+    "train_classification",
+    "train_classification_accuracy",
+    "train_spatial",
+    "train_spatial_instance_point",
+    "train_spatial_abundance_point",
+    "train_spatial_brush_bag",
+    "train_spatial_area_positive",
+    "train_spatial_explicit_negative",
+    "train_spatial_implicit_negative",
     "teacher_alignment_score",
     "train_tiles_per_sec",
     "global_step",
-    "l2_supervised_step",
+    "spatial_supervised_step",
 )
 
 
@@ -196,7 +205,7 @@ def trial_config(base_cfg: dict[str, Any], trial: optuna.Trial, output_dir: Path
     cfg.setdefault("train", {})
     cfg["runtime"]["output_dir"] = str(output_dir)
 
-    # Optuna uses a deterministic one-tenth population view. The fixed L1/L2
+    # Optuna uses a deterministic one-tenth population view. The fixed classification/spatial
     # expert banks remain complete and identical across trials.
     cfg["data"]["train_tile_fraction"] = 0.10
     cfg["data"]["val_tile_fraction"] = 0.10
@@ -244,7 +253,7 @@ def score_row(row: dict[str, str], objective: str) -> float:
         return result
 
     teacher_alignment = value("teacher_alignment_score")
-    l1_acc = value("l1_accuracy")
+    classification_acc = value("classification_accuracy")
     train_tiles_per_sec = value("train_tiles_per_sec")
     train_loss = value("train_loss", required=objective == "train_loss")
     if objective == "train_loss":
@@ -253,9 +262,9 @@ def score_row(row: dict[str, str], objective: str) -> float:
         return teacher_alignment
     if objective == "speed":
         return train_tiles_per_sec
-    if objective == "l1_accuracy":
-        return l1_acc
-    return teacher_alignment + 0.25 * l1_acc
+    if objective == "classification_accuracy":
+        return classification_acc
+    return teacher_alignment + 0.25 * classification_acc
 
 
 def export_study_artifacts(
@@ -418,7 +427,7 @@ def main() -> None:
     parser.add_argument("--storage", default="sqlite:///runtime/optuna/hcc_sempath_tenth_spatial.db")
     parser.add_argument("--output-root", default="runtime/optuna_runs")
     parser.add_argument("--annotation-json", default="")
-    parser.add_argument("--prototype-asset-dir", default="artifacts/prototypes/hcc_annotation_final_l1")
+    parser.add_argument("--prototype-asset-dir", default="artifacts/prototypes/hcc_annotation_final_classification")
     parser.add_argument("--python", default="python")
     parser.add_argument("--n-trials", type=int, default=24)
     parser.add_argument("--epochs", type=int, default=10)
@@ -426,7 +435,7 @@ def main() -> None:
     parser.add_argument("--poll-sec", type=float, default=20.0)
     parser.add_argument(
         "--objective",
-        choices=["train_loss", "combined", "teacher_alignment", "l1_accuracy", "speed"],
+        choices=["train_loss", "combined", "teacher_alignment", "classification_accuracy", "speed"],
         default="train_loss",
     )
     parser.add_argument("--sampler-seed", type=int, default=13)
@@ -477,7 +486,8 @@ def main() -> None:
         sampler=sampler,
         pruner=pruner,
     )
-    study.enqueue_trial(BASELINE_PARAMS, skip_if_exists=True)
+    for params in SEEDED_PARAMS:
+        study.enqueue_trial(params, skip_if_exists=True)
     commit = source_commit(repo)
     manifest = {
         "study_name": args.study_name,
@@ -494,7 +504,7 @@ def main() -> None:
         ),
         "epochs_per_trial": int(args.epochs),
         "population_fraction": 0.10,
-        "complete_l1_l2_expert_banks": True,
+        "complete_classification_spatial_expert_banks": True,
         "n_trials_requested": int(args.n_trials),
         "timeout_hours": float(args.timeout_hours),
         "runtime_seed": int(base_cfg["runtime"]["seed"]),
@@ -507,6 +517,7 @@ def main() -> None:
             else "MedianPruner(n_startup_trials=2,n_warmup_steps=1,interval_steps=1)"
         ),
         "baseline_params": BASELINE_PARAMS,
+        "seeded_params": list(SEEDED_PARAMS),
         "search_space": SEARCH_SPACE,
         "fixed_loss_config": base_cfg.get("loss", {}),
     }
