@@ -131,6 +131,8 @@ def _load_records(
                 tile_id,
                 {
                     "split": split,
+                    "package_path": record.get("iac") or record.get("iac_path"),
+                    "row": record.get("row"),
                     "complete_all": False,
                     "count_complete": None,
                     "measurement_complete": None,
@@ -168,6 +170,8 @@ def _load_records(
             complete_all = bool(tile.get("roi_complete_all", False))
             tile_metadata[tile_id] = {
                 "split": split,
+                "package_path": tile.get("iac") or tile.get("iac_path"),
+                "row": tile.get("row"),
                 "complete_all": complete_all,
                 "count_complete": tile.get("roi_count_complete"),
                 "measurement_complete": tile.get(
@@ -213,6 +217,8 @@ def _load_records_from_annotation_list(
             tile_id,
             {
                 "split": split,
+                "package_path": record.get("iac") or record.get("iac_path"),
+                "row": record.get("row"),
                 "complete_all": False,
                 "count_complete": None,
                 "measurement_complete": None,
@@ -235,6 +241,31 @@ def _load_records_from_annotation_list(
         )
         records.append(record)
     return records, tile_metadata
+
+
+def load_spatial_tile_locations(
+    manifest_path: str | Path | None,
+    *,
+    allowed_splits: set[str] | None = None,
+) -> dict[str, tuple[str, int]]:
+    """Return fixed package/row provenance without opening any IAC package."""
+
+    if manifest_path is None:
+        return {}
+    _, tile_metadata = _load_records(Path(manifest_path))
+    locations: dict[str, tuple[str, int]] = {}
+    for tile_id, metadata in tile_metadata.items():
+        if (
+            allowed_splits is not None
+            and str(metadata["split"]) not in allowed_splits
+        ):
+            continue
+        package_path = str(metadata.get("package_path") or "").strip()
+        row = metadata.get("row")
+        if not package_path or row in (None, ""):
+            continue
+        locations[str(tile_id)] = (package_path, int(row))
+    return locations
 
 
 def _completion_names(

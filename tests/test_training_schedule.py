@@ -25,6 +25,7 @@ from hcc_sempath.training.train import (
     _build_optimizer,
     _configure_compiled_training_for_gradient_diagnostics,
     _resume_contract,
+    _resolve_target_epochs,
 )
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
@@ -878,5 +879,22 @@ def test_spatial_fit_reports_terminal_epoch_and_sets_epoch_before_iter(
     )
     assert checkpoint["training_complete"] is True
     assert checkpoint["expected_epochs"] == 2
+    assert checkpoint["optimizer_hyperparameters"][0]["lr"] == pytest.approx(0.1)
+    assert checkpoint["scheduler_contract"]["name"] == "none"
+    assert checkpoint["scheduler_contract"]["planned_epochs"] == 2
     assert events.index(("train_set", 0)) < events.index(("train_iter", 0))
     assert events.index(("train_set", 1)) < events.index(("train_iter", 1))
+
+
+def test_resume_target_epochs_are_absolute_and_restartable() -> None:
+    cfg = {"train": {"epochs": 3}}
+    completed = {"epoch": 3, "expected_epochs": 3}
+    extended = {"epoch": 4, "expected_epochs": 6}
+
+    assert _resolve_target_epochs(cfg, completed, 6) == 6
+    assert _resolve_target_epochs(cfg, extended, 0) == 6
+
+    with pytest.raises(ValueError, match="configured epochs"):
+        _resolve_target_epochs(cfg, completed, 2)
+    with pytest.raises(ValueError, match="checkpoint epoch"):
+        _resolve_target_epochs(cfg, extended, 3)

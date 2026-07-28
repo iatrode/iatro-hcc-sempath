@@ -35,8 +35,9 @@ from hcc_sempath.training.train import (
     BatchSlot,
     _PackageShuffleBatchLoader,
     _assert_disjoint_package_cohorts,
+    _assert_disjoint_package_paths,
     _freeze_optimizer_visible_contract,
-    _verify_frozen_supervision_assets,
+    _verify_optimizer_visible_packages,
     _alloc_batch_buffer,
     _target_rows_by_package,
     _validation_package_keep_indices,
@@ -146,7 +147,23 @@ def test_multi_package_dataset_uses_external_slide_split(tmp_path: Path) -> None
     np.testing.assert_allclose(batch["teacher_features"]["toy"][1].numpy(), np.full((4,), 20, dtype=np.float32))
 
 
-def test_package_splits_reject_same_patient_across_slides(
+def test_package_splits_reject_exact_package_overlap(
+    tmp_path: Path,
+) -> None:
+    train_tile, _ = _write_package(
+        tmp_path,
+        "slide_train",
+        10,
+        patient_id="shared-patient",
+    )
+    with pytest.raises(ValueError, match="package overlap"):
+        _assert_disjoint_package_paths(
+            [str(train_tile)],
+            [str(train_tile)],
+        )
+
+
+def test_offline_cohort_check_rejects_same_patient_across_packages(
     tmp_path: Path,
 ) -> None:
     train_tile, _ = _write_package(
@@ -161,7 +178,6 @@ def test_package_splits_reject_same_patient_across_slides(
         20,
         patient_id="shared-patient",
     )
-
     with pytest.raises(ValueError, match="cohort leakage"):
         _assert_disjoint_package_cohorts(
             [str(train_tile)],
@@ -169,7 +185,7 @@ def test_package_splits_reject_same_patient_across_slides(
         )
 
 
-def test_optimizer_visible_contract_freezes_packages_and_assets(
+def test_optimizer_visible_contract_records_package_sizes(
     tmp_path: Path,
 ) -> None:
     population, _ = _write_package(
@@ -182,13 +198,7 @@ def test_optimizer_visible_contract_freezes_packages_and_assets(
         "replay",
         20,
     )
-    spatial = tmp_path / "spatial.json"
-    spatial.write_text('{"version": 1}', encoding="utf-8")
-    cfg = {
-        "data": {
-            "spatial_manifest_path": str(spatial),
-        }
-    }
+    cfg = {"data": {}}
 
     _freeze_optimizer_visible_contract(
         cfg,
@@ -200,29 +210,11 @@ def test_optimizer_visible_contract_freezes_packages_and_assets(
     assert cfg["data"]["optimizer_visible_tile_packages"] == sorted(
         [str(population.resolve()), str(replay.resolve())]
     )
-    assert (
-        len(cfg["data"]["optimizer_visible_contract_sha256"])
-        == 64
-    )
-    first_asset_digest = cfg["data"]["supervision_asset_sha256"][
-        "data.spatial_manifest_path"
+    assert cfg["data"]["optimizer_visible_tile_package_sizes"] == [
+        population.stat().st_size,
+        replay.stat().st_size,
     ]
-    _verify_frozen_supervision_assets(cfg)
-    spatial.write_text('{"version": 2}', encoding="utf-8")
-    with pytest.raises(ValueError, match="changed"):
-        _verify_frozen_supervision_assets(cfg)
-    _freeze_optimizer_visible_contract(
-        cfg,
-        population_packages=[str(population)],
-        expert_packages=[str(replay)],
-        expert_replay_enabled=True,
-    )
-    assert (
-        cfg["data"]["supervision_asset_sha256"][
-            "data.spatial_manifest_path"
-        ]
-        != first_asset_digest
-    )
+    _verify_optimizer_visible_packages(cfg)
 
 
 def test_dataset_adds_dynamic_prototype_supervision_fields(tmp_path: Path) -> None:
@@ -257,7 +249,10 @@ def test_expert_row_resolution_reads_only_requested_tile_ids(
 
     rows = _target_rows_by_package(
         [str(tile_a), str(tile_b)],
-        {"slide_a_0000001", "slide_b_0000000"},
+        {
+            "slide_a_0000001": (tile_a.name, 1),
+            "slide_b_0000000": (tile_b.name, 0),
+        },
     )
 
     assert rows[0].tolist() == [1]
@@ -272,7 +267,10 @@ def test_expert_row_resolution_rejects_tile_outside_train_packages(
     with pytest.raises(ValueError, match="outside the training split"):
         _target_rows_by_package(
             [str(tile_a)],
-            {"slide_a_0000000", "missing_tile"},
+            {
+                "slide_a_0000000": (tile_a.name, 0),
+                "missing_tile": ("missing.tiles.iac", 0),
+            },
         )
 
 
@@ -283,26 +281,23 @@ def test_expert_row_resolution_can_find_subset_without_missing_error(
 
     rows = _target_rows_by_package(
         [str(tile_a)],
-        {"slide_a_0000000", "outside"},
+        {
+            "slide_a_0000000": (tile_a.name, 0),
+            "outside": ("outside.tiles.iac", 0),
+        },
         require_all=False,
     )
 
     assert rows[0].tolist() == [0]
 
 
-def test_validation_exclusion_covers_same_patient_across_packages(
+def test_validation_exclusion_removes_exact_expert_package(
     tmp_path: Path,
 ) -> None:
     expert, _ = _write_package(
         tmp_path,
         "slide_expert",
         10,
-        patient_id="shared",
-    )
-    related, _ = _write_package(
-        tmp_path,
-        "slide_related",
-        20,
         patient_id="shared",
     )
     independent, _ = _write_package(
@@ -313,7 +308,7 @@ def test_validation_exclusion_covers_same_patient_across_packages(
     )
 
     keep = _validation_package_keep_indices(
-        [str(related), str(independent)],
+        [str(expert), str(independent)],
         [str(expert)],
     )
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from collections.abc import Iterator
@@ -294,10 +295,23 @@ def _feature_package_matches_tile_stem(feature_path: Path, tile_stem: str) -> bo
     return feature_stem == tile_stem or feature_stem.startswith(f"{tile_stem}.")
 
 
+def _read_package_headers(
+    paths: list[Path],
+) -> dict[Path, dict]:
+    unique = list(dict.fromkeys(paths))
+    if not unique:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(32, len(unique))) as executor:
+        values = executor.map(read_header, unique)
+        return dict(zip(unique, values, strict=True))
+
+
 def validate_teacher_feature_package_pairs(
     image_tile_package_paths: list[str | Path],
     teacher_cache_package_paths: dict[str, list[str | Path]],
     expected_dims: dict[str, int] | None = None,
+    *,
+    package_headers: dict[Path, dict] | None = None,
 ) -> list[int]:
     """Fast package-pair validation using names and IAC headers only."""
     tile_paths = [Path(path) for path in image_tile_package_paths]
@@ -313,9 +327,19 @@ def validate_teacher_feature_package_pairs(
                 f"teacher={name} features={len(paths)} tiles={len(tile_paths)}"
             )
 
+    if package_headers is None:
+        package_headers = _read_package_headers(
+            tile_paths
+            + [
+                path
+                for paths in teacher_paths_by_name.values()
+                for path in paths
+            ]
+        )
+
     counts: list[int] = []
     for package_idx, tile_path in enumerate(tile_paths):
-        tile_header = read_header(tile_path)
+        tile_header = package_headers[tile_path]
         if tile_header.get("payload_type") != "image_tiles":
             raise ValueError(f"not an image tile package: {tile_path}")
         tile_stem = _strip_required_suffix(tile_path, ".tiles.iac")
@@ -323,11 +347,9 @@ def validate_teacher_feature_package_pairs(
         if count <= 0:
             raise ValueError(f"empty tile package: {tile_path}")
         counts.append(count)
-        tile_record_ids: list[str] | None = None
-        feature_ids_by_path: dict[Path, list[str]] = {}
         for teacher_name, feature_paths in teacher_paths_by_name.items():
             feature_path = feature_paths[package_idx]
-            feature_header = read_header(feature_path)
+            feature_header = package_headers[feature_path]
             payload_type = feature_header.get("payload_type")
             if payload_type not in {"teacher_features", MERGED_FEATURE_PAYLOAD_TYPE}:
                 raise ValueError(f"not a teacher feature package: teacher={teacher_name} path={feature_path}")
@@ -346,25 +368,6 @@ def validate_teacher_feature_package_pairs(
                 teachers = {str(name) for name in feature_header.get("teachers", [])}
                 if teacher_name not in teachers:
                     raise ValueError(f"merged feature package missing teacher={teacher_name}: path={feature_path}")
-            if tile_record_ids is None:
-                _, _, tile_records = read_tables(tile_path)
-                tile_record_ids = [
-                    str(value)
-                    for value in tile_records.column("tile_id").to_pylist()
-                ]
-            feature_ids = feature_ids_by_path.get(feature_path)
-            if feature_ids is None:
-                _, _, feature_records = read_tables(feature_path)
-                feature_ids = [
-                    str(value)
-                    for value in feature_records.column("tile_id").to_pylist()
-                ]
-                feature_ids_by_path[feature_path] = feature_ids
-            if feature_ids != tile_record_ids:
-                raise ValueError(
-                    "feature/tile tile_id order mismatch: "
-                    f"teacher={teacher_name} path={feature_path}"
-                )
             for key in ("tile_width", "tile_height", "stride_x", "stride_y"):
                 if int(feature_header[key]) != int(tile_header[key]):
                     raise ValueError(
@@ -530,13 +533,25 @@ class PackageSampledDistillationDataset(Dataset):
         self.active_tile_reader: TilePackageReader | None = None
         self.active_feature_readers: dict[Path, object] = {}
         self.active_teacher_feature_paths: dict[str, Path] = {}
+        package_headers = _read_package_headers(
+            self.tile_paths
+            + [
+                path
+                for paths in self.teacher_package_paths.values()
+                for path in paths
+            ]
+        )
         counts = validate_teacher_feature_package_pairs(
             self.tile_paths,
             self.teacher_package_paths,
             expected_dims=expected_dims,
+            package_headers=package_headers,
         )
         self.package_counts = counts
-        self.sequential_iac_rows = all(int(read_header(path).get("row_order_seed", 0) or 0) > 0 for path in self.tile_paths)
+        self.sequential_iac_rows = all(
+            int(package_headers[path].get("row_order_seed", 0) or 0) > 0
+            for path in self.tile_paths
+        )
         self.cumulative_counts: list[int] = []
         running_total = 0
         for count in counts:

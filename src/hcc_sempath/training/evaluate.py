@@ -40,11 +40,10 @@ from .roi import spatial_component_names
 from .train import (
     _PackageShuffleBatchLoader,
     _assert_disjoint_package_cohorts,
-    _optimizer_visible_contract_sha256,
     _paths_from_data,
     _teacher_paths_from_data,
     _validation_package_keep_indices,
-    _verify_frozen_supervision_assets,
+    _verify_optimizer_visible_packages,
 )
 from .utils import write_json
 
@@ -112,6 +111,7 @@ def _checkpoint_config_contract(cfg: dict) -> dict:
         "expert_batch_size",
         "spatial_component_names",
         "optimizer_visible_tile_packages",
+        "optimizer_visible_tile_package_sizes",
         "optimizer_visible_contract_sha256",
         "supervision_asset_sha256",
     ):
@@ -186,7 +186,7 @@ def main() -> None:
     requested_cfg = load_config(args.config)
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg = _use_checkpoint_config(requested_cfg, payload)
-    _verify_frozen_supervision_assets(cfg)
+    _verify_optimizer_visible_packages(cfg)
     device = torch.device(cfg["runtime"]["device"])
     manifest_path = cfg["data"].get("train_manifest_path")
     if manifest_path:
@@ -222,16 +222,9 @@ def main() -> None:
         optimizer_packages = cfg["data"].get(
             "optimizer_visible_tile_packages"
         )
-        optimizer_digest = str(
-            cfg["data"].get(
-                "optimizer_visible_contract_sha256",
-                "",
-            )
-        )
         if (
             not isinstance(optimizer_packages, list)
             or not optimizer_packages
-            or len(optimizer_digest) != 64
         ):
             raise ValueError(
                 "checkpoint has no frozen optimizer-visible cohort contract"
@@ -239,13 +232,6 @@ def main() -> None:
         optimizer_packages = [
             str(path) for path in optimizer_packages
         ]
-        if (
-            _optimizer_visible_contract_sha256(optimizer_packages)
-            != optimizer_digest
-        ):
-            raise ValueError(
-                "optimizer-visible cohort changed after checkpoint creation"
-            )
         keep = _validation_package_keep_indices(
             tile_packages,
             optimizer_packages,
@@ -272,11 +258,6 @@ def main() -> None:
             "checkpoint evaluation requires native "
             f"{STUDENT_IMAGE_SIZE}px tiles, got {image_size}"
         )
-    for package_path in tile_packages[1:]:
-        metadata = read_package_metadata(package_path)
-        candidate_size = (int(metadata["tile_height"]), int(metadata["tile_width"]))
-        if candidate_size != image_size:
-            raise ValueError(f"tile package size mismatch: {package_path} has {candidate_size}, expected {image_size}")
     classification_class_names = [
         str(name)
         for name in cfg["model"].get("classification_class_names", DEFAULT_CLASSIFICATION_CLASSES)

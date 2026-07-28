@@ -70,13 +70,6 @@ def _load_fixed_student_pretraining(backbone: nn.Module) -> None:
         raise FileNotFoundError(
             f"fixed DINOv2-S/14 pretrained weight is missing; expected one of: {expected}"
         )
-    with STUDENT_PRETRAINED_PATH.open("rb") as handle:
-        digest = hashlib.file_digest(handle, "sha256").hexdigest()
-    if digest != STUDENT_PRETRAINED_SHA256:
-        raise ValueError(
-            "fixed DINOv2-S/14 pretrained weight checksum mismatch: "
-            f"expected={STUDENT_PRETRAINED_SHA256} got={digest} path={STUDENT_PRETRAINED_PATH}"
-        )
     state = _read_fixed_student_pretraining(STUDENT_PRETRAINED_PATH)
     state = checkpoint_filter_fn(state, backbone)
     backbone.load_state_dict(state, strict=True)

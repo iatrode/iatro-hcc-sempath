@@ -22,6 +22,8 @@ class PrototypeLabel:
     tile_id: str
     classification: int
     source_split: str
+    package_path: str | None = None
+    row: int | None = None
 
 
 def _truthy(value: str | None) -> bool:
@@ -70,5 +72,14 @@ def load_prototype_labels(
                 tile_id=tile_id,
                 classification=int(classification_index[classification_name]),
                 source_split=source_split,
+                package_path=(
+                    str(row.get("iac") or row.get("iac_path") or "").strip()
+                    or None
+                ),
+                row=(
+                    int(row["row"])
+                    if str(row.get("row") or "").strip()
+                    else None
+                ),
             )
     return labels

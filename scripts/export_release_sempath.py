@@ -156,17 +156,29 @@ def main() -> None:
                 canonical_payload_sha256(research_contract)
             ),
             expected_optimizer_visible_contract_sha256=str(
-                cfg["data"].get(
-                    "optimizer_visible_contract_sha256",
-                    "",
+                canonical_payload_sha256(
+                    {
+                        "packages": cfg["data"].get(
+                            "optimizer_visible_tile_packages",
+                            [],
+                        ),
+                        "sizes": cfg["data"].get(
+                            "optimizer_visible_tile_package_sizes",
+                            [],
+                        ),
+                    }
                 )
             ),
             expected_supervision_assets_sha256=(
                 canonical_payload_sha256(
-                    cfg["data"].get(
-                        "supervision_asset_sha256",
-                        {},
-                    )
+                    {
+                        "prototype_supervision_manifest_path": cfg[
+                            "data"
+                        ].get("prototype_supervision_manifest_path"),
+                        "spatial_manifest_path": cfg["data"].get(
+                            "spatial_manifest_path"
+                        ),
+                    }
                 )
             ),
         )

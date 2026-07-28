@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +25,6 @@ from ..modeling.models import (
     SPATIAL_PATCH_PADDING,
     STUDENT_PRETRAINED_PATH,
     STUDENT_PRETRAINED_SHA256,
-    canonical_payload_sha256,
 )
 from .config import (
     embedding_dim,
@@ -53,6 +51,7 @@ from .roi import (
     SpatialRoiTarget,
     build_spatial_roi_targets,
     empty_spatial_roi_target,
+    load_spatial_tile_locations,
     spatial_component_names,
 )
 from .utils import seed_everything
@@ -844,110 +843,123 @@ class _InterleavedBatchLoader:
 
 def _target_rows_by_package(
     package_paths: list[str],
-    target_tile_ids: set[str],
+    target_locations: dict[str, tuple[str, int]],
     *,
     require_all: bool = True,
 ) -> dict[int, np.ndarray]:
-    """Resolve a small fixed expert set without materializing all tile records."""
+    """Resolve fixed expert rows from annotation provenance alone."""
 
-    if not target_tile_ids:
+    if not target_locations:
         return {}
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
-    rows_by_package: dict[int, np.ndarray] = {}
-    found: set[str] = set()
-    duplicates: set[str] = set()
-    value_set = None
-    for package_idx, package_path in enumerate(package_paths):
-        _, _, record_table = read_tables(package_path)
-        tile_ids = record_table.column("tile_id")
-        if value_set is None or value_set.type != tile_ids.type:
-            value_set = pa.array(sorted(target_tile_ids), type=tile_ids.type)
-        matched = pc.indices_nonzero(
-            pc.is_in(tile_ids, value_set=value_set)
-        ).to_numpy(zero_copy_only=False)
-        if matched.size == 0:
+    normalized_packages = [
+        str(Path(path).resolve()).replace("\\", "/")
+        for path in package_paths
+    ]
+    rows: dict[int, list[int]] = {}
+    missing: list[str] = []
+    for tile_id, (declared_path, row) in target_locations.items():
+        suffix = str(declared_path).replace("\\", "/").lstrip("./")
+        matches = [
+            index
+            for index, package_path in enumerate(normalized_packages)
+            if package_path == suffix
+            or package_path.endswith(f"/{suffix}")
+        ]
+        if not matches:
+            basename = Path(suffix).name
+            matches = [
+                index
+                for index, package_path in enumerate(normalized_packages)
+                if Path(package_path).name == basename
+            ]
+        if len(matches) > 1:
+            raise ValueError(
+                "expert package provenance is ambiguous: "
+                f"tile={tile_id} package={declared_path}"
+            )
+        if not matches:
+            missing.append(tile_id)
             continue
-        resolved_rows: list[int] = []
-        for row in matched.tolist():
-            tile_id = str(tile_ids[int(row)].as_py())
-            if tile_id in found:
-                duplicates.add(tile_id)
-            found.add(tile_id)
-            resolved_rows.append(int(row))
-        rows_by_package[package_idx] = np.asarray(
-            resolved_rows,
-            dtype=np.int64,
-        )
-    if duplicates:
-        sample = ", ".join(sorted(duplicates)[:3])
-        raise ValueError(
-            "expert tile_id appears in multiple training packages: "
-            f"count={len(duplicates)} sample={sample}"
-        )
-    missing = sorted(target_tile_ids.difference(found))
+        if int(row) < 0:
+            raise ValueError(f"negative expert row: tile={tile_id} row={row}")
+        rows.setdefault(matches[0], []).append(int(row))
     if missing and require_all:
         raise ValueError(
             "expert supervision references tiles outside the training split: "
             f"count={len(missing)} sample={', '.join(missing[:3])}"
         )
-    return rows_by_package
-
-
-def _package_cohort_ids(
-    package_paths: list[str],
-) -> tuple[set[str], set[str]]:
-    """Read aggregate patient/slide identities without materializing tiles."""
-
-    patient_ids: set[str] = set()
-    slide_ids: set[str] = set()
-    for package_path in package_paths:
-        _, slide_table, _ = read_tables(package_path)
-        if "patient_id" in slide_table.column_names:
-            patient_ids.update(
-                str(value)
-                for value in slide_table.column("patient_id").to_pylist()
-                if value not in (None, "")
-            )
-        if "slide_id" in slide_table.column_names:
-            slide_ids.update(
-                str(value)
-                for value in slide_table.column("slide_id").to_pylist()
-                if value not in (None, "")
-            )
-    return patient_ids, slide_ids
+    return {
+        package_index: np.asarray(sorted(set(package_rows)), dtype=np.int64)
+        for package_index, package_rows in rows.items()
+    }
 
 
 def _validation_package_keep_indices(
     validation_packages: list[str],
     expert_packages: list[str],
 ) -> list[int]:
-    """Exclude every validation package sharing an expert patient or slide."""
+    """Exclude exact expert packages from the validation package list."""
 
-    expert_paths = set(expert_packages)
-    expert_patients, expert_slides = _package_cohort_ids(expert_packages)
-    keep: list[int] = []
-    for index, package_path in enumerate(validation_packages):
-        if package_path in expert_paths:
-            continue
-        patients, slides = _package_cohort_ids([package_path])
-        if patients & expert_patients or slides & expert_slides:
-            continue
-        keep.append(index)
-    return keep
+    expert_paths = {str(Path(path).resolve()) for path in expert_packages}
+    return [
+        index
+        for index, package_path in enumerate(validation_packages)
+        if str(Path(package_path).resolve()) not in expert_paths
+    ]
+
+
+def _assert_disjoint_package_paths(
+    train_packages: list[str],
+    validation_packages: list[str],
+) -> None:
+    """Fail if an exact package path occurs in both prepared splits."""
+
+    train_paths = {str(Path(path).resolve()) for path in train_packages}
+    validation_paths = {
+        str(Path(path).resolve()) for path in validation_packages
+    }
+    overlap = train_paths & validation_paths
+    if overlap:
+        raise ValueError(
+            "train/validation package overlap: "
+            f"count={len(overlap)} sample={next(iter(sorted(overlap)))}"
+        )
+
+
+def _package_cohort_ids(
+    package_paths: list[str],
+) -> tuple[set[str], set[str]]:
+    """Read patient/slide identities for offline calibration provenance."""
+
+    patient_ids: set[str] = set()
+    slide_ids: set[str] = set()
+    for package_path in package_paths:
+        _, slide_table, _ = read_tables(package_path)
+        for field, destination in (
+            ("patient_id", patient_ids),
+            ("slide_id", slide_ids),
+        ):
+            if field in slide_table.column_names:
+                destination.update(
+                    str(value)
+                    for value in slide_table.column(field).to_pylist()
+                    if value not in (None, "")
+                )
+    return patient_ids, slide_ids
 
 
 def _assert_disjoint_package_cohorts(
     train_packages: list[str],
     validation_packages: list[str],
 ) -> None:
-    """Fail before training if package splits share a patient or slide."""
+    """Verify patient/slide separation for offline evaluation artifacts."""
 
     train_patients, train_slides = _package_cohort_ids(train_packages)
-    val_patients, val_slides = _package_cohort_ids(validation_packages)
-    patient_overlap = train_patients & val_patients
-    slide_overlap = train_slides & val_slides
+    validation_patients, validation_slides = _package_cohort_ids(
+        validation_packages
+    )
+    patient_overlap = train_patients & validation_patients
+    slide_overlap = train_slides & validation_slides
     if patient_overlap or slide_overlap:
         raise ValueError(
             "train/validation cohort leakage: "
@@ -988,6 +1000,10 @@ def _resume_contract(cfg: dict) -> dict:
         "prefetch_factor",
         "persistent_workers",
         "package_pin_memory",
+        "optimizer_visible_tile_packages",
+        "optimizer_visible_tile_package_sizes",
+        "optimizer_visible_contract_sha256",
+        "supervision_asset_sha256",
     ):
         contract.get("data", {}).pop(key, None)
     for key in (
@@ -1002,83 +1018,6 @@ def _resume_contract(cfg: dict) -> dict:
     return contract
 
 
-def _file_sha256(path: str | Path) -> str:
-    with Path(path).open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
-
-
-def _optimizer_visible_contract_sha256(
-    package_paths: list[str],
-) -> str:
-    """Digest package identity/cohort metadata without persisting identifiers."""
-
-    packages = []
-    for package_path in sorted(
-        set(str(Path(path).resolve()) for path in package_paths)
-    ):
-        _, slide_table, record_table = read_tables(package_path)
-        packages.append(
-            {
-                "path": package_path,
-                "record_count": int(record_table.num_rows),
-                "patient_ids": sorted(
-                    str(value)
-                    for value in (
-                        slide_table.column("patient_id").to_pylist()
-                        if "patient_id" in slide_table.column_names
-                        else []
-                    )
-                    if value not in (None, "")
-                ),
-                "slide_ids": sorted(
-                    str(value)
-                    for value in (
-                        slide_table.column("slide_id").to_pylist()
-                        if "slide_id" in slide_table.column_names
-                        else []
-                    )
-                    if value not in (None, "")
-                ),
-            }
-        )
-    return canonical_payload_sha256(
-        {"version": 1, "packages": packages}
-    )
-
-
-def _supervision_asset_sha256(cfg: dict) -> dict[str, str]:
-    assets: dict[str, str] = {}
-    for key in (
-        "prototype_supervision_manifest_path",
-        "expert_replay_prototype_manifest_path",
-        "spatial_manifest_path",
-        "prototype_path",
-    ):
-        path = cfg["data"].get(key)
-        if path:
-            assets[f"data.{key}"] = _file_sha256(path)
-    prototype_paths = cfg["data"].get("prototype_paths")
-    if isinstance(prototype_paths, dict):
-        for teacher, path in sorted(prototype_paths.items()):
-            if path:
-                assets[
-                    f"data.prototype_paths.{teacher}"
-                ] = _file_sha256(path)
-    return assets
-
-
-def _verify_frozen_supervision_assets(cfg: dict) -> None:
-    expected = cfg["data"].get("supervision_asset_sha256")
-    if not isinstance(expected, dict) or not expected:
-        raise ValueError(
-            "checkpoint has no frozen supervision-asset digests"
-        )
-    if _supervision_asset_sha256(cfg) != expected:
-        raise ValueError(
-            "supervision assets changed after checkpoint creation"
-        )
-
-
 def _freeze_optimizer_visible_contract(
     cfg: dict,
     *,
@@ -1086,7 +1025,7 @@ def _freeze_optimizer_visible_contract(
     expert_packages: list[str],
     expert_replay_enabled: bool,
 ) -> None:
-    """Freeze exact optimizer inputs and mutable supervision asset contents."""
+    """Record a cheap package-list/byte-size resume guard."""
 
     visible = list(population_packages)
     if expert_replay_enabled:
@@ -1095,13 +1034,21 @@ def _freeze_optimizer_visible_contract(
         set(str(Path(path).resolve()) for path in visible)
     )
     cfg["data"]["optimizer_visible_tile_packages"] = frozen_packages
-    cfg["data"]["optimizer_visible_contract_sha256"] = (
-        _optimizer_visible_contract_sha256(frozen_packages)
-    )
+    cfg["data"]["optimizer_visible_tile_package_sizes"] = [
+        Path(path).stat().st_size for path in frozen_packages
+    ]
 
-    cfg["data"]["supervision_asset_sha256"] = (
-        _supervision_asset_sha256(cfg)
-    )
+
+def _verify_optimizer_visible_packages(cfg: dict) -> None:
+    packages = cfg["data"].get("optimizer_visible_tile_packages")
+    sizes = cfg["data"].get("optimizer_visible_tile_package_sizes")
+    if not isinstance(packages, list) or not isinstance(sizes, list):
+        raise ValueError("checkpoint has no optimizer-visible package list")
+    if len(packages) != len(sizes):
+        raise ValueError("optimizer-visible package count changed")
+    current = [Path(path).stat().st_size for path in packages]
+    if current != [int(size) for size in sizes]:
+        raise ValueError("optimizer-visible package size changed")
 
 
 def _validate_resume_contract(cfg: dict, resume_state: dict) -> None:
@@ -1113,6 +1060,28 @@ def _validate_resume_contract(cfg: dict, resume_state: dict) -> None:
             "resume config changes the model, loss, data, or optimization "
             "contract; start a separate run instead"
         )
+
+
+def _resolve_target_epochs(
+    cfg: dict,
+    resume_state: dict | None,
+    requested: int,
+) -> int:
+    configured = int(cfg["train"]["epochs"])
+    checkpoint_epoch = int((resume_state or {}).get("epoch", 0))
+    checkpoint_target = int(
+        (resume_state or {}).get("expected_epochs", configured)
+    )
+    target = int(requested) if int(requested) > 0 else checkpoint_target
+    if target < configured:
+        raise ValueError(
+            f"target epochs must be at least configured epochs ({configured})"
+        )
+    if target < checkpoint_epoch:
+        raise ValueError(
+            f"target epochs ({target}) precede checkpoint epoch ({checkpoint_epoch})"
+        )
+    return target
 
 
 def _limit_records(records: list, limit: int, seed: int) -> list:
@@ -1296,6 +1265,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train HCC-SemPath distillation model.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", default="")
+    parser.add_argument(
+        "--target-epochs",
+        type=int,
+        default=0,
+        help=(
+            "Absolute terminal epoch for a resumed run. The original LR schedule "
+            "is preserved and remains clamped at min_lr after its planned end."
+        ),
+    )
     args = parser.parse_args()
     cfg = load_config(args.config)
     cfg["research_contract"] = {
@@ -1363,7 +1341,7 @@ def main() -> None:
             for name, paths in train_teacher_packages.items()
         }
     if manifest_path or explicit_split_packages:
-        _assert_disjoint_package_cohorts(
+        _assert_disjoint_package_paths(
             train_tile_packages,
             val_tile_packages,
         )
@@ -1417,11 +1395,6 @@ def main() -> None:
     expected_image_size = (STUDENT_IMAGE_SIZE, STUDENT_IMAGE_SIZE)
     if image_size != expected_image_size:
         raise ValueError(f"fixed student expects native tiles {expected_image_size}, got {image_size}")
-    for package_path in all_tile_packages[1:]:
-        metadata = read_package_metadata(package_path)
-        candidate_size = (int(metadata["tile_height"]), int(metadata["tile_width"]))
-        if candidate_size != image_size:
-            raise ValueError(f"tile package size mismatch: {package_path} has {candidate_size}, expected {image_size}")
     spatial_manifest_path = cfg["data"].get("spatial_manifest_path")
     component_names = spatial_component_names(spatial_manifest_path) if spatial_manifest_path else []
     cfg["data"]["spatial_component_names"] = list(component_names)
@@ -1434,14 +1407,15 @@ def main() -> None:
         if spatial_manifest_path
         else (0, 0)
     )
+    spatial_train_splits = set(
+        cfg["data"].get("spatial_train_splits", ["train"])
+    )
     train_spatial_targets = build_spatial_roi_targets(
         spatial_manifest_path,
         component_names=component_names,
         image_size=image_size,
         grid_size=spatial_grid_size,
-        allowed_splits=set(
-            cfg["data"].get("spatial_train_splits", ["train"])
-        ),
+        allowed_splits=spatial_train_splits,
         point_tolerance_cells=int(
             cfg["loss"].get("spatial_point_tolerance_cells", 1)
         ),
@@ -1453,11 +1427,33 @@ def main() -> None:
     expert_tile_ids = set(replay_prototype_labels).union(
         train_spatial_targets
     )
+    expert_locations: dict[str, tuple[str, int]] = {}
+    for tile_id, label in replay_prototype_labels.items():
+        if label.package_path is not None and label.row is not None:
+            expert_locations[tile_id] = (label.package_path, label.row)
+    for tile_id, location in load_spatial_tile_locations(
+        spatial_manifest_path,
+        allowed_splits=spatial_train_splits,
+    ).items():
+        previous = expert_locations.get(tile_id)
+        if previous is not None and previous != location:
+            raise ValueError(
+                "classification/spatial provenance mismatch: "
+                f"tile={tile_id} classification={previous} spatial={location}"
+            )
+        expert_locations[tile_id] = location
+    missing_locations = sorted(expert_tile_ids.difference(expert_locations))
+    if missing_locations:
+        raise ValueError(
+            "expert annotation is missing fixed IAC package/row provenance: "
+            f"count={len(missing_locations)} "
+            f"sample={', '.join(missing_locations[:3])}"
+        )
     expert_rows_by_package: dict[int, np.ndarray] = {}
     if expert_tile_ids:
         resolved_rows = _target_rows_by_package(
             expert_tile_packages,
-            expert_tile_ids,
+            expert_locations,
         )
         selected_indices = sorted(resolved_rows)
         selected_paths = {
@@ -1837,6 +1833,8 @@ def main() -> None:
             for key, value in resume_state["model"].items()
         }
         model.load_state_dict(state)
+    elif int(args.target_epochs) > 0:
+        raise ValueError("--target-epochs requires --resume")
     if bool(cfg["train"].get("compile", False)):
         _configure_compiled_training_for_gradient_diagnostics()
         model = torch.compile(model)
@@ -1846,6 +1844,11 @@ def main() -> None:
     scheduler = build_lr_scheduler(optimizer, cfg, len(train_loader))
     if resume_state and scheduler is not None and resume_state.get("scheduler") is not None:
         scheduler.load_state_dict(resume_state["scheduler"])
+    target_epochs = _resolve_target_epochs(
+        cfg,
+        resume_state,
+        int(args.target_epochs),
+    )
     metrics = fit(
         model,
         train_loader,
@@ -1856,6 +1859,7 @@ def main() -> None:
         cfg,
         scheduler=scheduler,
         resume_state=resume_state,
+        target_epochs=target_epochs,
         prototype_refresh_loader=prototype_refresh_loader,
         spatial_prototype_refresh_loader=(
             spatial_prototype_refresh_loader

@@ -860,6 +860,40 @@ def build_lr_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
+def _optimizer_hyperparameters(
+    optimizer: torch.optim.Optimizer,
+) -> list[dict]:
+    """Return the complete restart-relevant optimizer settings without parameters."""
+
+    return [
+        {
+            key: value
+            for key, value in group.items()
+            if key != "params"
+        }
+        for group in optimizer.state_dict()["param_groups"]
+    ]
+
+
+def _scheduler_contract(cfg: dict, steps_per_epoch: int) -> dict:
+    """Describe the LR trajectory independently of the scheduler pickle state."""
+
+    scheduler = str(cfg["train"].get("scheduler", "none")).lower()
+    planned_epochs = int(cfg["train"]["epochs"])
+    return {
+        "name": scheduler,
+        "base_lr": float(cfg["train"].get("lr", 0.0)),
+        "min_lr": float(cfg["train"].get("min_lr", 0.0)),
+        "warmup_steps": int(cfg["train"].get("lr_warmup_steps", 0)),
+        "steps_per_epoch": int(steps_per_epoch),
+        "planned_epochs": planned_epochs,
+        "planned_total_steps": planned_epochs * int(steps_per_epoch),
+        "terminal_behavior": (
+            "clamp_at_min_lr" if scheduler == "cosine" else "unchanged"
+        ),
+    }
+
+
 def _rng_state() -> dict:
     state = {
         "python": random.getstate(),
@@ -879,9 +913,24 @@ def _restore_rng_state(state: dict | None) -> None:
     if "numpy" in state:
         np.random.set_state(state["numpy"])
     if "torch" in state:
-        torch.set_rng_state(state["torch"])
+        torch.set_rng_state(
+            torch.as_tensor(
+                state["torch"],
+                dtype=torch.uint8,
+                device="cpu",
+            ).contiguous()
+        )
     if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        torch.cuda.set_rng_state_all(
+            [
+                torch.as_tensor(
+                    value,
+                    dtype=torch.uint8,
+                    device="cpu",
+                ).contiguous()
+                for value in state["cuda"]
+            ]
+        )
 
 
 def _log(message: str) -> None:
@@ -1737,6 +1786,7 @@ def fit(
     *,
     scheduler=None,
     resume_state: dict | None = None,
+    target_epochs: int | None = None,
     prototype_refresh_loader=None,
     spatial_prototype_refresh_loader=None,
 ) -> dict:
@@ -1759,7 +1809,45 @@ def fit(
     )
     alignment_history = list((resume_state or {}).get("alignment_history", []))
     start_epoch = int((resume_state or {}).get("epoch", 0)) + 1
+    previous_expected_epochs = int(
+        (resume_state or {}).get(
+            "expected_epochs",
+            cfg["train"]["epochs"],
+        )
+    )
+    expected_epochs = int(
+        target_epochs
+        if target_epochs is not None
+        else previous_expected_epochs
+    )
+    if expected_epochs < start_epoch - 1:
+        raise ValueError(
+            "target epochs precede the checkpoint epoch: "
+            f"target={expected_epochs} checkpoint={start_epoch - 1}"
+        )
     global_step = int((resume_state or {}).get("global_step", 0))
+    continuation_history = list(
+        (resume_state or {}).get("continuation_history", [])
+    )
+    if resume_state is not None and expected_epochs > previous_expected_epochs:
+        continuation_history.append(
+            {
+                "checkpoint_epoch": start_epoch - 1,
+                "checkpoint_global_step": global_step,
+                "previous_expected_epochs": previous_expected_epochs,
+                "target_epochs": expected_epochs,
+                "lr_terminal_behavior": (
+                    "clamp_at_min_lr"
+                    if str(cfg["train"].get("scheduler", "none")).lower()
+                    == "cosine"
+                    else "unchanged"
+                ),
+            }
+        )
+    write_json(
+        output_dir / "continuation_history.json",
+        {"extensions": continuation_history},
+    )
     spatial_supervised_step = int(
         (resume_state or {}).get("spatial_supervised_step", 0)
     )
@@ -1862,7 +1950,7 @@ def fit(
         )
 
     try:
-        for epoch in range(start_epoch, int(cfg["train"]["epochs"]) + 1):
+        for epoch in range(start_epoch, expected_epochs + 1):
             _set_loader_epoch(train_loader, epoch - 1)
             train_metrics = run_epoch(
                 model,
@@ -2007,7 +2095,14 @@ def fit(
             checkpoint = {
                 "model": raw_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "optimizer_hyperparameters": _optimizer_hyperparameters(
+                    optimizer
+                ),
                 "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                "scheduler_contract": _scheduler_contract(
+                    cfg,
+                    len(train_loader),
+                ),
                 "scaler": scaler.state_dict(),
                 "epoch": epoch,
                 "global_step": global_step,
@@ -2031,9 +2126,10 @@ def fit(
                 "rng_state": _rng_state(),
                 "config": cfg,
                 "training_complete": (
-                    epoch >= int(cfg["train"]["epochs"])
+                    epoch >= expected_epochs
                 ),
-                "expected_epochs": int(cfg["train"]["epochs"]),
+                "expected_epochs": expected_epochs,
+                "continuation_history": continuation_history,
             }
             torch.save(checkpoint, checkpoints / "last.pt")
             if improved_loss:

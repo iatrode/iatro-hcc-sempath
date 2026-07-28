@@ -43,6 +43,7 @@ from hcc_sempath.training.manifest import (  # noqa: E402
 )
 from hcc_sempath.training.roi import (  # noqa: E402
     build_spatial_roi_targets,
+    load_spatial_tile_locations,
     load_spatial_validation_metadata,
     spatial_component_names,
 )
@@ -52,9 +53,9 @@ from hcc_sempath.training.spatial_validation import (  # noqa: E402
 from hcc_sempath.training.train import (  # noqa: E402
     _assert_disjoint_package_cohorts,
     _package_cohort_ids,
-    _optimizer_visible_contract_sha256,
     _paths_from_data,
     _target_rows_by_package,
+    _verify_optimizer_visible_packages,
 )
 
 
@@ -102,9 +103,9 @@ def _split_tile_packages(cfg: dict, split: str) -> list[str]:
 
 def _load_validation_images(
     packages: list[str],
-    target_ids: set[str],
+    target_locations: dict[str, tuple[str, int]],
 ) -> tuple[list[str], torch.Tensor, list[str], list[str]]:
-    rows = _target_rows_by_package(packages, target_ids)
+    rows = _target_rows_by_package(packages, target_locations)
     tile_ids: list[str] = []
     images: list[torch.Tensor] = []
     slide_ids: list[str] = []
@@ -134,31 +135,12 @@ def _optimizer_visible_packages(
     packages = cfg["data"].get(
         "optimizer_visible_tile_packages"
     )
-    expected_digest = str(
-        cfg["data"].get(
-            "optimizer_visible_contract_sha256",
-            "",
-        )
-    )
-    if (
-        not isinstance(packages, list)
-        or not packages
-        or len(expected_digest) != 64
-    ):
+    if not isinstance(packages, list) or not packages:
         raise ValueError(
             "checkpoint has no frozen optimizer-visible cohort contract"
         )
     resolved = [str(path) for path in packages]
-    actual_digest = _optimizer_visible_contract_sha256(resolved)
-    if actual_digest != expected_digest:
-        raise ValueError(
-            "optimizer-visible cohort changed after checkpoint creation"
-        )
-    assets = cfg["data"].get("supervision_asset_sha256")
-    if not isinstance(assets, dict) or not assets:
-        raise ValueError(
-            "checkpoint has no frozen supervision-asset digests"
-        )
+    _verify_optimizer_visible_packages(cfg)
     return resolved
 
 
@@ -232,7 +214,10 @@ def main() -> None:
         raise ValueError("independent spatial validation split is empty")
     tile_ids, images, validation_packages, slide_ids = _load_validation_images(
         packages,
-        set(validation_targets),
+        load_spatial_tile_locations(
+            args.annotation,
+            allowed_splits=validation_splits,
+        ),
     )
     validation_metadata = load_spatial_validation_metadata(
         args.annotation,
@@ -358,11 +343,25 @@ def main() -> None:
                 "slide_ids": sorted(validation_slides),
             }
         ),
-        "optimizer_visible_contract_sha256": cfg["data"][
-            "optimizer_visible_contract_sha256"
-        ],
+        "optimizer_visible_contract_sha256": canonical_payload_sha256(
+            {
+                "packages": cfg["data"][
+                    "optimizer_visible_tile_packages"
+                ],
+                "sizes": cfg["data"][
+                    "optimizer_visible_tile_package_sizes"
+                ],
+            }
+        ),
         "supervision_assets_sha256": canonical_payload_sha256(
-            cfg["data"].get("supervision_asset_sha256", {})
+            {
+                "prototype_supervision_manifest_path": cfg["data"].get(
+                    "prototype_supervision_manifest_path"
+                ),
+                "spatial_manifest_path": cfg["data"].get(
+                    "spatial_manifest_path"
+                ),
+            }
         ),
         "terminal_epoch": int(payload["epoch"]),
         "expected_epochs": int(payload["expected_epochs"]),
