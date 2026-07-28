@@ -151,6 +151,36 @@ def test_interleaved_batch_cursor_resumes_at_exact_next_output():
         assert list(loader) == expected[cursor:]
 
 
+def test_interleaved_cursor_reaches_data_loader_batch_sampler():
+    class BatchSampler:
+        def __init__(self):
+            self.cursor = 0
+
+        def set_batch_cursor(self, cursor):
+            self.cursor = int(cursor)
+
+    class DataLoaderLike:
+        def __init__(self, values):
+            self.values = values
+            self.batch_sampler = BatchSampler()
+
+        def __len__(self):
+            return len(self.values)
+
+        def __iter__(self):
+            cursor = self.batch_sampler.cursor
+            self.batch_sampler.cursor = 0
+            return iter(self.values[cursor:])
+
+    population = DataLoaderLike(["p0", "p1", "p2", "p3", "p4"])
+    expert = DataLoaderLike(["e0", "e1", "e2"])
+    loader = _InterleavedBatchLoader(population, expert, interval=2)
+
+    loader.set_batch_cursor(4)
+
+    assert list(loader) == ["p2", "p3", "e2", "p4"]
+
+
 def test_first_expert_batch_does_not_wait_for_population_decode():
     class _SlowPopulationIterator:
         def __init__(self) -> None:

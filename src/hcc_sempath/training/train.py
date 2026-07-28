@@ -843,6 +843,15 @@ class _InterleavedBatchLoader:
         ) // self.interval
         return population_batches + expert_batches
 
+    @staticmethod
+    def _batch_cursor_setter(loader):
+        setter = getattr(loader, "set_batch_cursor", None)
+        if callable(setter):
+            return setter
+        batch_sampler = getattr(loader, "batch_sampler", None)
+        setter = getattr(batch_sampler, "set_batch_cursor", None)
+        return setter if callable(setter) else None
+
     def __iter__(self):
         start_batch = self._start_batch
         self._start_batch = 0
@@ -864,16 +873,10 @@ class _InterleavedBatchLoader:
             > self._output_batches_for_population(population_consumed)
             - population_consumed
         )
-        population_cursor = getattr(
-            self.population_loader,
-            "set_batch_cursor",
-            None,
+        population_cursor = self._batch_cursor_setter(
+            self.population_loader
         )
-        expert_cursor = getattr(
-            self.expert_loader,
-            "set_batch_cursor",
-            None,
-        )
+        expert_cursor = self._batch_cursor_setter(self.expert_loader)
         if population_consumed and not callable(population_cursor):
             raise RuntimeError(
                 "population loader cannot resume from a batch cursor"
