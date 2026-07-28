@@ -4,11 +4,11 @@ HCC-SemPath learns an HCC-specific pathology representation from four cached
 pathology teachers and a small, fixed expert-supervision stream. The model
 combines:
 
-- six-class global L1 tissue-state classification;
-- eleven-component L2 spatial morphometry from class-routed point, circle, and
+- six-class global classification prototype supervision;
+- eleven-component spatial prototype supervision from class-routed point, circle, and
   brush annotations.
 
-The L2 branch maps eleven components into annotation-grounded instance count,
+The spatial branch maps eleven components into annotation-grounded instance count,
 local density, occupied area, and bile-pigment focus-density measurements.
 Each component exposes the measurements defined by its biological and
 annotation semantics.
@@ -38,8 +38,8 @@ hcc-sempath --help
 ```text
 HCC image-tile IAC packages + four teacher-feature IAC streams
   -> shared DINOv2-S/14 HCC representation
-  -> L1 six-class global readout
-  -> L2 eleven-component spatial instance/measurement maps
+  -> six-class classification prototype readout
+  -> eleven-component spatial prototype and measurement maps
   -> independently calibrated count/density/area outputs
 ```
 
@@ -64,7 +64,7 @@ hcc-sempath train \
   --resume outputs/hcc_sempath_v2/checkpoints/last.pt
 ```
 
-Evaluate retained teacher alignment and L1:
+Evaluate retained teacher alignment and classification:
 
 ```bash
 hcc-sempath evaluate \
@@ -98,21 +98,16 @@ exhaustive validation truth.
 
 ## Annotation workspace
 
-The local `annotations/` directory stores review state and may contain local
-paths or case identifiers, so the complete directory is excluded from Git. The
-active files are:
-
-- `hcc_prototype_review.final_l1.json`: stable L1
-  supervision;
-- `hcc_shared_priority_tiles.json`: shared L1/L2 priority boundary;
-- `hcc_l2_roi_v2.json`: eleven-component point/circle/brush L2 state.
+Annotation states may contain local paths or case identifiers and must remain
+outside the public repository. Use an ignored local workspace or a controlled
+private study repository.
 
 Seed the shared boundary once:
 
 ```bash
 hcc-sempath build-priority-list \
-  --annotations annotations/hcc_prototype_review.final_l1.json \
-  --output annotations/hcc_shared_priority_tiles.json
+  --annotations /private/study/classification_state.json \
+  --output /private/study/shared_priority_tiles.json
 ```
 
 Start the combined annotation service:
@@ -120,14 +115,15 @@ Start the combined annotation service:
 ```bash
 hcc-sempath annotate-prototypes \
   --input /path/to/image_tile_iac_root \
-  --l1-state annotations/hcc_prototype_review.final_l1.json \
-  --l2-state annotations/hcc_l2_roi_v2.json \
-  --priority-manifest annotations/hcc_shared_priority_tiles.json \
-  --roi-candidate-manifest annotations/hcc_l2_roi_v2_candidates.json
+  --l1-state /private/study/classification_state.json \
+  --l2-state /private/study/spatial_state.json \
+  --priority-manifest /private/study/shared_priority_tiles.json \
+  --roi-candidate-manifest /private/study/spatial_candidates.json \
+  --roi-information-report /private/study/spatial_information_report.json
 ```
 
-The interface exposes separate L1 classification and L2 ROI workspaces over a
-shared priority boundary. Existing component candidates prioritize the L2
+The interface exposes separate classification and spatial-annotation workspaces over a
+shared priority boundary. Existing component candidates prioritize the spatial
 queue, and the four-teacher information report increases priority for spatial
 components that still need coverage.
 
@@ -137,12 +133,12 @@ tile boundary:
 ```bash
 hcc-sempath annotate-prototypes \
   --input /path/to/image_tile_iac_root \
-  --l1-state annotations/hcc_tumor_differentiation_review.json \
-  --l2-state annotations/hcc_l2_roi_v2.json \
-  --priority-manifest annotations/hcc_shared_priority_tiles.json \
-  --roi-candidate-manifest annotations/hcc_l2_roi_v2_candidates.json \
-  --l1-review-manifest annotations/hcc_tumor_differentiation_review_manifest.json \
-  --l2-review-manifest annotations/hcc_l2_roi_rereview_manifest.json
+  --l1-state /private/study/classification_review.json \
+  --l2-state /private/study/spatial_state.json \
+  --priority-manifest /private/study/shared_priority_tiles.json \
+  --roi-candidate-manifest /private/study/spatial_candidates.json \
+  --l1-review-manifest /private/study/classification_review_manifest.json \
+  --l2-review-manifest /private/study/spatial_review_manifest.json
 ```
 
 Each review manifest contains a stable `review_id` and the ordered
@@ -160,11 +156,11 @@ changes; CSV exports include both IDs and display names.
 
 Random navigation filters tiles below 30% estimated tissue by default. The
 `--min-tissue-fraction` option changes this threshold, and `0` disables tissue
-filtering. L2 navigation first consumes existing component candidates, ordered
+filtering. Spatial navigation first consumes existing component candidates, ordered
 by the current information-curve deficit. The interface reports exhausted
 candidate inventories that still require additional coverage.
 
-The fixed L2 classes are:
+The fixed spatial components are:
 
 1. `hepatocellular-parenchyma`
 2. `necrosis`
@@ -206,23 +202,28 @@ Each completeness field accepts a component-to-boolean map or `true` for all
 components. These fields provide the exhaustive endpoint truth used by
 calibration.
 
-Run the annotation stopping audit from the repository root:
+Run the reusable spatial stopping audit from the repository root:
 
 ```bash
-python scripts/check_annotation_information_curves.py
+python scripts/roi_information_curve.py \
+  --annotation-json /private/study/spatial_state.json \
+  --teacher-feature-packages \
+    'gigapath=/features/gigapath/*.iac,h_optimus_1=/features/h1/*.iac,uni2_h=/features/uni2/*.iac,virchow2=/features/virchow2/*.iac' \
+  --output-root /private/study/spatial_information_curve
 ```
 
-The audit recomputes L1 and per-component L2 curves in all four frozen teacher
-spaces and writes aggregate reports under
-`artifacts/diagnostics/annotation_information_curve_current/`. Annotation
-stops after repeated low-information-gain tails and geometry/slide QC pass in
-every teacher space. The fixed-probe curve supplies the stopping decision;
-new-batch novelty remains a secondary discovery diagnostic.
+The audit recomputes per-component curves in all four frozen teacher spaces.
+Annotation
+stops after the pooled four-teacher-by-resample plateau reaches the same
+fixed-probe threshold used by the classification audit and geometry/slide QC
+passes. Per-teacher support remains diagnostic; new-batch novelty remains a
+secondary discovery diagnostic.
+Each spatial report records the source annotation SHA-256 and generation time;
+a report is current only when that digest matches the annotation file.
 
 ## Maintained documentation
 
 - [`docs/HCC_SEMPATH_DESIGN.md`](docs/HCC_SEMPATH_DESIGN.md): active
   scientific, supervision, validation, and release contract.
-- [`TODO.md`](TODO.md): unfinished empirical and release gates only.
 - [`experiments/README.md`](experiments/README.md): tracked experiment
   protocols and generated-output boundary.

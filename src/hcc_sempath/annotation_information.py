@@ -499,11 +499,9 @@ def tail_low_gain(
     marginal_ratio_threshold: float,
     confirmation_increments: int,
 ) -> tuple[bool, int | None]:
-    """Confirm a low-gain tail without imposing a centroid model.
+    """Decode the low-gain-only rule used by historical audit reports.
 
-    This is the L2 spatial-annotation gate. Unlike L1 prototypes, an L2
-    component is deliberately multi-modal, so movement of one global centre is
-    not a scientifically valid stopping condition.
+    Current classification and spatial audits use :func:`tail_plateau`.
     """
     intervals = [
         row

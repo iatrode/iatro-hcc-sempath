@@ -1,4 +1,4 @@
-# HCC-SemPath: L1 Classification and L2 Spatial Morphometry
+# HCC-SemPath: Parallel Classification and Spatial Prototype Supervision
 
 Status: active design of record. This is the scientific, supervision,
 implementation, validation, and release contract.
@@ -8,22 +8,24 @@ implementation, validation, and release contract.
 HCC-SemPath learns two complementary pathology representations from one fixed
 DINOv2-S/14 tile encoder:
 
-1. a six-class, mutually exclusive Level-1 tissue-state classification;
-2. weakly supervised spatial Level-2 morphometry for eleven HCC components,
+1. a six-class, mutually exclusive classification task
+   \(\mathcal{T}_{\mathrm{cls}}\);
+2. weakly supervised spatial morphometry task
+   \(\mathcal{T}_{\mathrm{spatial}}\) for eleven HCC components,
    supporting component location, instance count, local abundance, and
    calibrated area where the supervision permits it.
 
-L1 and L2 are parallel expert-supervision axes over the shared representation.
+The two tasks are parallel expert-supervision axes over the shared representation.
 Neither head consumes the other head's features, logits, labels, or outputs.
 
 ```text
 image -> shared DINOv2-S/14 encoder
       -> z_hcc -> four teacher projection heads
-               -> L1 global prototype readout
-      -> patch/local features -> L2 spatial prototype readouts
+               -> classification prototype readout
+      -> patch/local features -> spatial prototype readouts
 ```
 
-The L2 branch produces spatial component maps and calibrated morphometric
+The spatial branch produces component maps and calibrated morphometric
 measurements. No-gradient global component centroids provide the PAMT-D
 reliability coordinate during training.
 
@@ -40,14 +42,14 @@ several attention cells. A useful spatial head therefore needs:
 - component-aware interpretation of point, circle, and brush marks.
 
 The hypothesis is that fusing these signals can preserve the pretrained
-teacher representation while sparse expert L1/L2 constraints reshape the
+teacher representation while sparse expert classification and spatial constraints reshape the
 shared `z_hcc` toward scientifically interpretable global and local outputs.
 
 ## 3. Fixed semantic contract
 
-### Level 1
+### Classification task
 
-The global L1 classes, in fixed order, are:
+The global classification classes, in fixed order, are:
 
 1. `HCC-tumor-well-differentiated`
 2. `HCC-tumor-moderately-differentiated`
@@ -58,7 +60,7 @@ The global L1 classes, in fixed order, are:
 
 The output is one six-way softmax.
 
-### Level 2
+### Spatial task
 
 The spatial components, in fixed order, are:
 
@@ -114,21 +116,21 @@ The student architecture and initialization remain fixed to pretrained
 DINOv2-S/14 at native 224-pixel input.
 All existing teacher feature caches remain usable. The four teachers shape the
 shared representation through feature and relation distillation. The stable
-L1 annotations define teacher-specific six-class prototypes and periodically
+classification annotations define teacher-specific six-class prototypes and periodically
 recomputed student-space class centroids. Every student refresh re-encodes the
 complete fixed 2,400-tile bank with the current encoder; a compute mini-batch
 is only a memory chunk and never defines the prototype pool. Their responses provide both HCC semantic
-supervision and per-tile PAMT-D teacher reliability, while direct L1
+supervision and per-tile PAMT-D teacher reliability, while direct classification
 cross-entropy supervises the human boundary.
 
-In parallel, sparse L2 spatial constraints define exact full-bank local
+In parallel, sparse spatial constraints define exact full-bank local
 positive/negative component prototypes and reshape local features and the
 shared encoder while four-teacher distillation stabilizes `z_hcc`.
 Teacher-space component centroids participate in per-tile reliability
-adjudication. Expert point, circle, and brush geometry supplies the L2 spatial
+adjudication. Expert point, circle, and brush geometry supplies the spatial
 targets.
 
-### L1 head
+### Classification head
 
 The normalized global embedding is read against six no-gradient,
 expert-updated student-space centroids:
@@ -138,7 +140,7 @@ z = normalize(project(CLS))
 l1_logits[k] = cosine(z, centroid_l1[k]) / temperature
 ```
 
-Human L1 labels define the complete centroid bank and use cross entropy on the
+Human classification labels define the complete centroid bank and use cross entropy on the
 resulting response. Centroids are no-gradient coordinates recomputed from the
 current student between optimizer steps; gradients from the response update
 `z_hcc`. Semantic distillation and PAMT-D use the six primary teacher
@@ -181,7 +183,7 @@ A component prototype is a semantic readout coordinate after the trainable
 local, semantic, fusion, and nonlinear context transformations. Morphological
 variants, including heterogeneous hepatocellular nuclei, receive independent
 spatial loss at their annotated locations and map into the shared component
-coordinate. The L2 annotation gate measures fixed-probe coverage across the
+coordinate. The spatial annotation gate measures fixed-probe coverage across the
 four teacher spaces.
 
 The instance tensor retains fixed eleven-class topology. Capability masks
@@ -219,7 +221,7 @@ point/brush cell annotations supervise resolved instances and unresolved
 abundance separately.
 
 PAMT-D combines teacher base weights and per-tile reliability as
-`w_m * alpha_mi`. Feature and L1-semantic losses are normalized jointly over
+`w_m * alpha_mi`. Feature and classification-semantic losses are normalized jointly over
 teacher-by-tile mass; relation loss uses `w_m * alpha_mi * alpha_mj` over
 teacher-by-pair mass. The student and teachers enter adjudication through the
 same fixed-temperature cosine coordinate, with the temperature applied once.
@@ -232,7 +234,7 @@ The total objective is:
 ```text
 L = L_four_teacher(alpha_PAMTD)
   + lambda_response * L_student_prototype_response
-  + lambda_l1 * CE(L1)
+  + lambda_l1 * CE(T_cls)
   + lambda_spatial * (
         L_instance_point_peak
       + lambda_abundance_point * L_abundance_point_peak
@@ -253,7 +255,7 @@ Explicit negatives define the prototype boundary whenever available.
 ## 7. Optimization
 
 Training begins with four-teacher feature and relation distillation alone.
-After the teacher-only interval, prototype-semantic, L1, and L2 supervision
+After the teacher-only interval, prototype-semantic, classification, and spatial supervision
 enter together and ramp on one global optimizer-step clock:
 
 ```text
@@ -261,8 +263,8 @@ expert_supervision_start_step  3000
 expert_supervision_ramp_steps  1000
 ```
 
-Both L1 and L2 reach the shared encoder from their first non-zero supervised
-update. Detaching L2 from the shared encoder is restricted to the named A8
+Both expert tasks reach the shared encoder from their first non-zero supervised
+update. Detaching the spatial task from the shared encoder is restricted to the named A8
 mechanism ablation. PAMT-D reliability filtering and student-response matching
 begin after the common expert ramp and then increase to their configured
 strength. Global and spatial gradient norms, spatial gradient share, and
@@ -274,7 +276,7 @@ development subset every 1,000 optimizer steps. Epoch summaries remain in
 `metrics.csv`; they are not the sole source for convergence or stopping
 analysis.
 
-The fixed L1/L2 expert-tile union is replayed at a configured interval among
+The fixed classification/spatial expert-tile union is replayed at a configured interval among
 population batches. This keeps both dynamic prototype systems and direct
 human supervision active throughout training without changing the full-corpus
 four-teacher objective. The union is decoded once into a host-memory bank;
@@ -290,28 +292,29 @@ decision boundary when available.
 
 ## 8. Data organization
 
-- L1 uses the frozen 2,400-tile expert classification asset, with 400 tiles
+- The classification task uses the frozen 2,400-tile expert asset, with 400 tiles
   per class.
-- L2 uses the current eleven-class spatial annotation manifest.
+- The spatial task uses the current eleven-component annotation manifest.
 - Both assets are intentionally small expert interventions on the
   population-scale four-teacher representation; neither is expected to label
   the full corpus.
 - The union of their training tiles is replayed throughout population
   distillation; newly annotated tiles enter the same union automatically.
 - Formal mechanism ablations use one fixed 10% population subset and the
-  complete fixed L1/L2 expert union for three epochs. The selected Optuna trial
+  complete fixed classification/spatial expert union for three epochs. The selected Optuna trial
   is A0; every other condition inherits its seed, hyperparameters, schedule,
   and subset without retuning.
 - The shared priority list serves the stable 3,000 tiles first and expands
   outside that boundary only when still-growing component curves require more
   examples.
-- Per-component annotation sufficiency is measured separately in each of the
-  four frozen teacher feature spaces on one
-  fixed, slide-separated probe while a nested reference set grows. Remaining
-  task-space novelty is therefore monotone non-increasing. Annotation stops
-  only after every teacher has consecutive low-information-gain tail
-  increments and slide/geometry QC passes in every teacher space.
-- The L2 curve x-axis is unique component-positive tiles rather than clicks or
+- Per-component annotation sufficiency is measured on fixed,
+  slide-separated probes while nested reference sets grow in each of the four
+  frozen teacher feature spaces. Remaining task-space novelty is therefore
+  monotone non-increasing. The stopping decision pools teacher-by-resample
+  curves exactly as the classification audit does; per-teacher support remains
+  diagnostic. Annotation stops after the pooled plateau is confirmed and
+  slide/geometry QC passes.
+- The spatial curve x-axis is unique component-positive tiles rather than clicks or
   strokes. Point/circle/brush counts, component-specific measurement
   capabilities, slide balance, rasterization failures, and annotation
   conflicts are independent QC. Raw RGB or an untrained DINO representation is
@@ -319,7 +322,7 @@ decision boundary when available.
 - The fixed-probe plateau must repeat across slide-aware resamples and
   consecutive tail increments. New-batch discovery novelty may rebound and is
   reported only as a secondary diagnostic, never as a stopping signal.
-- The final L2 tile count is the union required for all eleven component curves
+- The final spatial tile count is the union required for all eleven component curves
   to pass. Early-saturating components stop consuming annotation effort;
   still-growing components drive subsequent tile selection.
 - Existing component candidates prioritize the annotation queue.
@@ -329,7 +332,7 @@ decision boundary when available.
 
 ## 9. Validation
 
-Training records validation loss, L1 accuracy when validation labels exist,
+Training records validation loss, classification accuracy when validation labels exist,
 and retained teacher alignment. The terminal checkpoint after the prescribed
 schedule enters independent spatial validation on a slide-separated expert
 asset.
@@ -357,9 +360,9 @@ and includes complete-negative tiles when selecting bile minimum-focus size.
 
 Validation tile IDs must resolve inside the requested manifest `val`/`exval`
 partition, which must be patient/slide-disjoint from the entire
-optimizer-visible population plus L1/L2 expert replay cohort. The terminal
+optimizer-visible population plus the classification/spatial expert replay cohort. The terminal
 checkpoint freezes the exact optimizer-visible package list, an aggregate
-package/cohort digest, and SHA-256 digests of mutable L1/L2/prototype
+package/cohort digest, and SHA-256 digests of mutable classification/spatial/prototype
 supervision assets. Resume, independent evaluation, and calibration never
 reconstruct that contract from a later directory scan. The aggregate
 report contains component/mode, point/circle/brush/mixed strata, slide-macro
@@ -374,7 +377,7 @@ the prespecified baseline.
 
 ## 10. Release and downstream boundary
 
-The released pathology tower owns the frozen encoder, normalized `z_hcc`, L1
+The released pathology tower owns the frozen encoder, normalized `z_hcc`, classification
 readout, spatial instance/measurement maps, capability masks, calibrated
 measurements, preprocessing metadata, and provenance. Downstream systems
 consume these outputs through a one-way, versioned interface while the released
@@ -398,7 +401,7 @@ HCC-SemPath contributes one HCC-specific representation with:
 
 ## 12. Implementation and acceptance map
 
-- `modeling/models.py`: dynamic L1/local L2 prototype readouts, dense fused
+- `modeling/models.py`: dynamic classification/local spatial prototype readouts, dense fused
   spatial features, and decoder.
 - `spatial_schema.py`: fixed eleven-class measurement capabilities.
 - `training/roi.py`: instance centres, instance-exclusion support, density
@@ -408,9 +411,9 @@ HCC-SemPath contributes one HCC-specific representation with:
 - `training/pamtd.py`: per-tile four-teacher adjudication and shared semantic
   response target.
 - `training/engine.py`: active objective, exact full-bank dynamic prototype
-  refresh, common L1/L2 intervention schedule, step-level metrics, and fixed
+  refresh, common classification/spatial intervention schedule, step-level metrics, and fixed
   intra-epoch development probes.
-- `training/train.py`: L1/L2 ingestion, fixed expert-tile replay and prototype
+- `training/train.py`: classification/spatial ingestion, fixed expert-tile replay and prototype
   loaders, and frozen
   optimizer/supervision contracts.
 - `training/spatial_validation.py`: independent completeness-aware calibration
@@ -429,7 +432,7 @@ Implementation conformance requires:
    pigment components;
 3. unmarked cells in unresolved mixtures remain ignored; only explicit
    negative marks or complete-negative review create negative targets;
-4. teacher-only distillation precedes a simultaneous L1/L2 ramp, and both
+4. teacher-only distillation precedes a simultaneous classification/spatial ramp, and both
    expert objectives reach the shared encoder from their first active update;
 5. undefined component/measurement pairs remain invalid;
 6. annotation sufficiency is determined by component-wise information

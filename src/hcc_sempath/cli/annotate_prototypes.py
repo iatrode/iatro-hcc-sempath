@@ -66,14 +66,6 @@ L2_PROTOTYPES = [
 
 # Spatial ROI taxonomy.
 ROI_L2_PROTOTYPES = list(L2_PROTOTYPES)
-DEFAULT_ROI_INFORMATION_REPORT = (
-    Path(__file__).resolve().parents[3]
-    / "artifacts"
-    / "diagnostics"
-    / "annotation_information_curve_current"
-    / "l2"
-    / "roi_information_report.json"
-)
 ROI_INFORMATION_SUPPORT_THRESHOLD = 0.80
 
 
@@ -172,7 +164,7 @@ class RoiCandidateQueue:
                 name: {
                     "status": "unmeasured",
                     "urgency": 1.0,
-                    "minimum_teacher_support": 0.0,
+                    "information_support": 0.0,
                 }
                 for name in self.attributes
             }
@@ -195,7 +187,7 @@ class RoiCandidateQueue:
                     name: {
                         "status": "unmeasured",
                         "urgency": 1.0,
-                        "minimum_teacher_support": 0.0,
+                        "information_support": 0.0,
                     }
                     for name in self.attributes
                 }
@@ -204,18 +196,27 @@ class RoiCandidateQueue:
             for name in self.attributes:
                 value = raw_attributes.get(name, {})
                 status = str(value.get("status", "not_assessable"))
-                supports = value.get(
-                    "teacher_low_gain_support_by_teacher_ratio",
+                pooled_support = value.get(
+                    "tail_plateau_support_by_ratio",
                     {},
-                ).get("0.35", {})
-                finite_supports = [
-                    float(support)
-                    for support in supports.values()
-                    if isinstance(support, (int, float))
-                ]
-                minimum_support = (
-                    min(finite_supports) if finite_supports else 0.0
-                )
+                ).get("0.35")
+                if isinstance(pooled_support, (int, float)):
+                    information_support = float(pooled_support)
+                else:
+                    # Compatibility with reports generated before the
+                    # pooled classification/spatial stopping rule.
+                    legacy_supports = value.get(
+                        "teacher_low_gain_support_by_teacher_ratio",
+                        {},
+                    ).get("0.35", {})
+                    finite_supports = [
+                        float(support)
+                        for support in legacy_supports.values()
+                        if isinstance(support, (int, float))
+                    ]
+                    information_support = (
+                        min(finite_supports) if finite_supports else 0.0
+                    )
                 if status == "provisionally_stable":
                     urgency = 0.0
                 elif status == "coverage_limited":
@@ -223,7 +224,8 @@ class RoiCandidateQueue:
                 elif status == "still_growing":
                     support_gap = max(
                         0.0,
-                        ROI_INFORMATION_SUPPORT_THRESHOLD - minimum_support,
+                        ROI_INFORMATION_SUPPORT_THRESHOLD
+                        - information_support,
                     ) / ROI_INFORMATION_SUPPORT_THRESHOLD
                     urgency = 1.0 + support_gap
                 else:
@@ -231,7 +233,7 @@ class RoiCandidateQueue:
                 policy[name] = {
                     "status": status,
                     "urgency": urgency,
-                    "minimum_teacher_support": minimum_support,
+                    "information_support": information_support,
                 }
             self._information_report_mtime_ns = mtime_ns
             self._information_policy = policy
@@ -972,7 +974,7 @@ class AnnotationState:
             current["name"] = clean_name
         elif operation == "archive":
             if level == "l1" and sum(bool(item["active"]) for item in definitions) <= 1 and current["active"]:
-                raise ValueError("L1 requires at least one active label")
+                raise ValueError("classification requires at least one active label")
             current["active"] = False
         elif operation == "restore":
             current["active"] = True
@@ -981,7 +983,7 @@ class AnnotationState:
             if references:
                 raise ValueError(f"label has {references} annotation reference(s); archive it instead")
             if level == "l1" and current["active"] and sum(bool(item["active"]) for item in definitions) <= 1:
-                raise ValueError("L1 requires at least one active label")
+                raise ValueError("classification requires at least one active label")
             definitions.remove(current)
         else:
             raise ValueError(f"unknown label operation: {operation}")
@@ -1055,14 +1057,14 @@ class AnnotationState:
         known_l1 = {item["id"] for item in self.label_definitions["l1"]}
         known_l2 = {item["id"] for item in self.label_definitions["l2"]}
         if l1 not in known_l1:
-            raise ValueError(f"unknown L1 prototype: {l1}")
+            raise ValueError(f"unknown classification prototype: {l1}")
         unknown_l2 = sorted(set(l2) - known_l2)
         if unknown_l2:
-            raise ValueError(f"unknown L2 prototype(s): {unknown_l2}")
+            raise ValueError(f"unknown spatial prototype(s): {unknown_l2}")
         roi = list(roi or [])
         for item in roi:
             if item.get("attribute") not in known_l2:
-                raise ValueError(f"unknown ROI L2 attribute: {item.get('attribute')}")
+                raise ValueError(f"unknown spatial attribute: {item.get('attribute')}")
             if item.get("state", "positive") not in {"positive", "negative"}:
                 raise ValueError(f"unknown ROI state: {item.get('state')}")
             geometry = item.get("geometry")
@@ -1090,7 +1092,7 @@ class AnnotationState:
                 raise ValueError(f"ROI class cannot be both positive and negative: {conflict}")
             if set(l2) != positive_roi:
                 raise ValueError(
-                    f"tile-level L2 selections must equal positive ROI attributes: "
+                    f"spatial selections must equal positive ROI attributes: "
                     f"selected={sorted(l2)} roi={sorted(positive_roi)}"
                 )
         payload = {
@@ -1799,7 +1801,7 @@ class AnnotationData:
             processed_tile_ids = annotated_tile_ids | skipped_tile_ids
 
             # 2. Within the shared 3000-tile boundary, component-presence
-            # records make L2 random navigation purposeful.
+            # records make spatial random navigation purposeful.
             if self.priority_queue is not None:
                 shared_remaining_ids = {
                     item["tile_id"] for item in self.priority_queue.candidates
@@ -1842,7 +1844,7 @@ class AnnotationData:
                             "selection": "component_presence_navigation_hint",
                         }
 
-            # 3. Both L1 classification and L2 ROI exhaust the same shared tile boundary first.
+            # 3. Both expert tasks exhaust the same shared tile boundary first.
             if self.priority_queue is not None:
                 priority_remaining = [
                     item for item in self.priority_queue.candidates
@@ -2601,7 +2603,7 @@ function toggleRoiClass(name){pushUndo();roiPlan=null;if(roiAttribute===name){ro
 function hasPositiveRoi(attribute){return roi.some(item=>item.attribute===attribute&&item.geometry&&item.state!=='negative')}
 function roiClassIcon(attribute,state){return state==='negative'?'−':hasPositiveRoi(attribute)?'●':'○'}
 function renderRoiClassBar(){const bar=document.getElementById('roiClassBar'); if(!bar)return; bar.style.display=ROI_MODE?'flex':'none'; bar.innerHTML=''; if(!ROI_MODE)return; const all=document.createElement('button'); all.type='button'; all.className='roiClassButton'+(roiAttribute===ROI_ALL?' selected':''); all.style.borderLeftColor='#111827'; all.textContent='All'; all.onclick=()=>{roiPlan=null;roiAttribute=ROI_ALL;renderLabels();renderRoi()}; bar.appendChild(all); L2.forEach(x=>{const state=roiClassState[x]||'open';const positive=hasPositiveRoi(x);const b=document.createElement('button'); b.type='button'; b.className='roiClassButton'+(roiAttribute===x?' selected':''); b.style.borderLeftColor=state==='negative'?'#111827':roiColor(x); b.textContent=`${roiClassIcon(x,state)} ${labelName('l2',x)}`; b.title=state==='negative'?'Explicit negative; click again to return to positive/uncertain.':positive?'Positive ROI present; clear its ROI before marking this class negative.':'Positive or uncertain by default; no positive ROI yet. Click selected class again to mark explicit negative.'; b.onclick=()=>toggleRoiClass(x); bar.appendChild(b)})}
-function renderLabels(){renderRoiClassBar();const a=document.getElementById('l1');a.innerHTML='';document.getElementById('l2').innerHTML='';if(MODE==='l1'){const l1Max=Math.max(1,...Object.values(l1Counts));L1.forEach((x,index)=>a.appendChild(prototypeButton('l1',x,l1===x,l1Counts[x]||0,l1Max,()=>{l1=x;renderLabels()},index<9?String(index+1):'')))}document.getElementById('roiStatus').textContent=ROI_MODE?(roiAttribute===ROI_ALL?'All ROI classes visible. Select one L2 class before drawing. Unmarked classes stay unknown/ignored unless explicitly toggled negative.':`Drawing ROI for: ${labelName('l2',roiAttribute)}. Unmarked classes stay unknown/ignored unless explicitly toggled negative.`):'';applyModeLayout();}
+function renderLabels(){renderRoiClassBar();const a=document.getElementById('l1');a.innerHTML='';document.getElementById('l2').innerHTML='';if(MODE==='l1'){const l1Max=Math.max(1,...Object.values(l1Counts));L1.forEach((x,index)=>a.appendChild(prototypeButton('l1',x,l1===x,l1Counts[x]||0,l1Max,()=>{l1=x;renderLabels()},index<9?String(index+1):'')))}document.getElementById('roiStatus').textContent=ROI_MODE?(roiAttribute===ROI_ALL?'All spatial classes visible. Select one class before drawing. Unmarked classes stay unknown/ignored unless explicitly toggled negative.':`Drawing ROI for: ${labelName('l2',roiAttribute)}. Unmarked classes stay unknown/ignored unless explicitly toggled negative.`):'';applyModeLayout();}
 function roiPoint(ev,clamp=false){const r=document.getElementById('roiCanvas').getBoundingClientRect();let x=(ev.clientX-r.left)/r.width,y=(ev.clientY-r.top)/r.height;if(clamp){x=Math.max(0,Math.min(1,x));y=Math.max(0,Math.min(1,y))}return{x,y}}
 function applyTileZoom(){const stage=document.getElementById('tileStage'); if(!stage)return; stage.style.transform=`scale(${tileScale})`; stage.style.marginRight=(224*(tileScale-1))+'px'; stage.style.marginBottom=(224*(tileScale-1))+'px'}
 function setTileZoom(scale){tileScale=Math.min(6,Math.max(1,scale));applyTileZoom();const input=document.getElementById('tileZoom'),value=document.getElementById('tileZoomValue');if(input)input.value=tileScale;if(value)value.textContent=`${tileScale.toFixed(1)}×`}
@@ -2632,11 +2634,11 @@ function eraseBrushGeometry(item,center,eraserRadius){const geometry=item.geomet
 function eraseCurrentClassAt(center,eraserRadius){const next=[];for(const item of roi){const geometry=item.geometry;if(item.attribute!==roiAttribute||!geometry){next.push(item);continue}if(geometry.type==='point'){if(pointDistanceSq(geometry.point,center)>eraserRadius**2)next.push(item)}else if(geometry.type==='circle'){if(pointDistanceSq(geometry.center,center)>(geometry.radius+eraserRadius)**2)next.push(item)}else if(geometry.type==='brush')next.push(...eraseBrushGeometry(item,center,eraserRadius));else next.push(item)}roi=next}
 function eraseCurrentClassAlong(start,end,eraserRadius){for(const point of densifyPath([start,end],Math.max(.002,eraserRadius/2)))eraseCurrentClassAt(point,eraserRadius)}
 function finishEraserStroke(ev=null){if(roiDrawing?.tool!=='eraser')return false;if(ev&&roiDrawing.pointerId!==ev.pointerId)return false;const c=document.getElementById('roiCanvas'),pointerId=roiDrawing.pointerId;roiDrawing=null;roiPreview=null;if(c.hasPointerCapture(pointerId))c.releasePointerCapture(pointerId);syncPositiveLabels();renderRoi();document.getElementById('status').textContent=`Erased ${labelName('l2',roiAttribute)} within the selected range.`;return true}
-function setupEraser(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerdown',ev=>{if(ev.button!==0||roiTool!=='eraser')return;ev.preventDefault();ev.stopImmediatePropagation();if(roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one L2 ROI class before erasing.';return}if(roiClassState[roiAttribute]==='negative'){document.getElementById('status').textContent='This ROI class is marked negative. Toggle it back before erasing.';return}const p=roiPoint(ev);pushUndo();roiPlan=null;roiDrawing={tool:'eraser',pointerId:ev.pointerId,points:[[p.x,p.y]],width:brushWidth()};eraseCurrentClassAt([p.x,p.y],roiDrawing.width/2);c.setPointerCapture(ev.pointerId);renderRoi()},{capture:true});c.addEventListener('pointermove',ev=>{if(roiDrawing?.tool!=='eraser'||roiDrawing.pointerId!==ev.pointerId)return;ev.preventDefault();ev.stopImmediatePropagation();const p=roiPoint(ev),next=[p.x,p.y],previous=roiDrawing.points[roiDrawing.points.length-1];roiCursor=p;roiDrawing.points.push(next);eraseCurrentClassAlong(previous,next,roiDrawing.width/2);renderRoi()},{capture:true});window.addEventListener('pointerup',ev=>finishEraserStroke(ev),true);window.addEventListener('pointercancel',ev=>finishEraserStroke(ev),true);window.addEventListener('mouseup',()=>finishEraserStroke(),true);window.addEventListener('blur',()=>finishEraserStroke());c.addEventListener('lostpointercapture',()=>finishEraserStroke())}
+function setupEraser(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerdown',ev=>{if(ev.button!==0||roiTool!=='eraser')return;ev.preventDefault();ev.stopImmediatePropagation();if(roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one spatial class before erasing.';return}if(roiClassState[roiAttribute]==='negative'){document.getElementById('status').textContent='This ROI class is marked negative. Toggle it back before erasing.';return}const p=roiPoint(ev);pushUndo();roiPlan=null;roiDrawing={tool:'eraser',pointerId:ev.pointerId,points:[[p.x,p.y]],width:brushWidth()};eraseCurrentClassAt([p.x,p.y],roiDrawing.width/2);c.setPointerCapture(ev.pointerId);renderRoi()},{capture:true});c.addEventListener('pointermove',ev=>{if(roiDrawing?.tool!=='eraser'||roiDrawing.pointerId!==ev.pointerId)return;ev.preventDefault();ev.stopImmediatePropagation();const p=roiPoint(ev),next=[p.x,p.y],previous=roiDrawing.points[roiDrawing.points.length-1];roiCursor=p;roiDrawing.points.push(next);eraseCurrentClassAlong(previous,next,roiDrawing.width/2);renderRoi()},{capture:true});window.addEventListener('pointerup',ev=>finishEraserStroke(ev),true);window.addEventListener('pointercancel',ev=>finishEraserStroke(ev),true);window.addEventListener('mouseup',()=>finishEraserStroke(),true);window.addEventListener('blur',()=>finishEraserStroke());c.addEventListener('lostpointercapture',()=>finishEraserStroke())}
 function updateRoiCursor(ev){const p=roiPoint(ev);roiCursor=((roiTool==='brush'||roiTool==='eraser')&&roiAttribute!==ROI_ALL&&roiClassState[roiAttribute]!=='negative')?p:null;renderRoi()}
 function setupTileUndo(){document.getElementById('tileStage').addEventListener('contextmenu',ev=>{if(!ROI_MODE)return;ev.preventDefault();ev.stopPropagation();undoRoi()})}
 function finishRoiStroke(ev=null){if(!roiDrawing||roiDrawing.tool==='eraser')return false;if(ev&&roiDrawing.pointerId!==ev.pointerId)return false;const c=document.getElementById('roiCanvas'),drawing=roiDrawing,pointerId=drawing.pointerId,p=ev?roiPoint(ev):(drawing.last||drawing.start);roiDrawing=null;roiPreview=null;pushUndo();roiPlan=null;if(drawing.tool==='circle'){const dx=p.x-drawing.start.x,dy=p.y-drawing.start.y;roi.push({attribute:drawing.attribute,state:'positive',review_complete:false,geometry:{type:'circle',coordinate_space:'normalized',center:[drawing.start.x,drawing.start.y],radius:Math.sqrt(dx*dx+dy*dy)}})}else{const finalPoint=[p.x,p.y],lastPoint=drawing.points[drawing.points.length-1];if(!lastPoint||pointDistanceSq(lastPoint,finalPoint)>1e-12)drawing.points.push(finalPoint);roi.push({attribute:drawing.attribute,state:'positive',review_complete:false,geometry:{type:'brush',coordinate_space:'normalized',points:drawing.points,width:drawing.width}})}if(c.hasPointerCapture(pointerId))c.releasePointerCapture(pointerId);syncPositiveLabels();renderRoi();return true}
-function setupRoi(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerenter',ev=>updateRoiCursor(ev));c.addEventListener('pointerleave',()=>{roiCursor=null;renderRoi()});c.addEventListener('pointerdown',ev=>{if(ev.button!==0)return;if(ROI_MODE&&roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one L2 ROI class before drawing.';return}if(!roiAttribute)return;if(roiClassState[roiAttribute]==='negative'){document.getElementById('status').textContent='This ROI class is marked negative. Toggle it back before drawing.';return}if(roiTool==='point'){pushUndo();roiPlan=null;const p=roiPoint(ev);roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'point',coordinate_space:'normalized',point:[p.x,p.y],radius:.018}});syncPositiveLabels();renderRoi();return}const p=roiPoint(ev);roiDrawing={tool:roiTool,attribute:roiAttribute,pointerId:ev.pointerId,start:p,last:p,points:[[p.x,p.y]],width:brushWidth()};roiPreview=null;c.setPointerCapture(ev.pointerId)});c.addEventListener('pointermove',ev=>{updateRoiCursor(ev);if(!roiDrawing||roiDrawing.tool==='eraser'||roiDrawing.pointerId!==ev.pointerId)return;const p=roiPoint(ev);roiDrawing.last=p;if(roiDrawing.tool==='circle'){const dx=p.x-roiDrawing.start.x,dy=p.y-roiDrawing.start.y;roiPreview={attribute:roiDrawing.attribute,state:'positive',review_complete:false,geometry:{type:'circle',coordinate_space:'normalized',center:[roiDrawing.start.x,roiDrawing.start.y],radius:Math.sqrt(dx*dx+dy*dy)}}}else{roiDrawing.points.push([p.x,p.y]);roiPreview={attribute:roiDrawing.attribute,state:'positive',review_complete:false,geometry:{type:'brush',coordinate_space:'normalized',points:roiDrawing.points,width:roiDrawing.width}}}renderRoi()});window.addEventListener('pointerup',ev=>finishRoiStroke(ev),true);window.addEventListener('pointercancel',ev=>finishRoiStroke(ev),true);window.addEventListener('mouseup',()=>finishRoiStroke(),true);window.addEventListener('blur',()=>finishRoiStroke());c.addEventListener('lostpointercapture',()=>finishRoiStroke())}
+function setupRoi(){const c=document.getElementById('roiCanvas');c.addEventListener('pointerenter',ev=>updateRoiCursor(ev));c.addEventListener('pointerleave',()=>{roiCursor=null;renderRoi()});c.addEventListener('pointerdown',ev=>{if(ev.button!==0)return;if(ROI_MODE&&roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one spatial class before drawing.';return}if(!roiAttribute)return;if(roiClassState[roiAttribute]==='negative'){document.getElementById('status').textContent='This ROI class is marked negative. Toggle it back before drawing.';return}if(roiTool==='point'){pushUndo();roiPlan=null;const p=roiPoint(ev);roi.push({attribute:roiAttribute,state:'positive',review_complete:false,geometry:{type:'point',coordinate_space:'normalized',point:[p.x,p.y],radius:.018}});syncPositiveLabels();renderRoi();return}const p=roiPoint(ev);roiDrawing={tool:roiTool,attribute:roiAttribute,pointerId:ev.pointerId,start:p,last:p,points:[[p.x,p.y]],width:brushWidth()};roiPreview=null;c.setPointerCapture(ev.pointerId)});c.addEventListener('pointermove',ev=>{updateRoiCursor(ev);if(!roiDrawing||roiDrawing.tool==='eraser'||roiDrawing.pointerId!==ev.pointerId)return;const p=roiPoint(ev);roiDrawing.last=p;if(roiDrawing.tool==='circle'){const dx=p.x-roiDrawing.start.x,dy=p.y-roiDrawing.start.y;roiPreview={attribute:roiDrawing.attribute,state:'positive',review_complete:false,geometry:{type:'circle',coordinate_space:'normalized',center:[roiDrawing.start.x,roiDrawing.start.y],radius:Math.sqrt(dx*dx+dy*dy)}}}else{roiDrawing.points.push([p.x,p.y]);roiPreview={attribute:roiDrawing.attribute,state:'positive',review_complete:false,geometry:{type:'brush',coordinate_space:'normalized',points:roiDrawing.points,width:roiDrawing.width}}}renderRoi()});window.addEventListener('pointerup',ev=>finishRoiStroke(ev),true);window.addEventListener('pointercancel',ev=>finishRoiStroke(ev),true);window.addEventListener('mouseup',()=>finishRoiStroke(),true);window.addEventListener('blur',()=>finishRoiStroke());c.addEventListener('lostpointercapture',()=>finishRoiStroke())}
 function overviewIsOpen(){return !document.getElementById('overviewOverlay').classList.contains('hidden')}
 function setThumbnailSrc(){if(!overviewIsOpen())return;const img=document.getElementById('thumb'); const loading=document.getElementById('thumbLoading'); const token=`${Date.now()}-${pkg}`; const row=current?`&row=${current.row}`:''; img.dataset.token=String(token); loading.style.display='block'; loading.textContent='Building overview...'; img.style.display='none'; img.onload=()=>{if(img.dataset.token!==String(token)) return; loading.style.display='none'; img.style.display='block'; if(img.resetPanZoom)img.resetPanZoom();}; img.onerror=()=>{if(img.dataset.token===String(token)) loading.textContent='Overview failed to load.';}; img.src=authed(scoped(`/api/thumbnail?package=${pkg}${row}&thumb_token=${encodeURIComponent(token)}&t=${Date.now()}`));}
 function openOverview(){document.getElementById('overviewOverlay').classList.remove('hidden');setThumbnailSrc()}
@@ -2764,7 +2766,7 @@ async function forwardTile(){if(REVIEW_MODE){await reviewStep(1);return}const ne
 async function save(){
     try {
         if(!current){await nextRandom(); return;}
-        if(!ROI_MODE&&!l1){document.getElementById('status').textContent='Select one L1 primary prototype first.'; return;}
+        if(!ROI_MODE&&!l1){document.getElementById('status').textContent='Select one classification prototype first.'; return;}
         if(ROI_MODE&&roiPlan){document.getElementById('status').textContent='Choose Accept visible matches or Start from scratch before saving.';return;}
         const positives=new Set(roi.filter(item=>item.geometry&&item.state!=='negative').map(item=>item.attribute));
         const negativeAttrs=L2.filter(attribute=>roiClassState[attribute]==='negative');
@@ -2944,14 +2946,14 @@ function setupContextNavigator(){
     });
     viewport.addEventListener('pointercancel',()=>{contextDrag=null;contextRequest++;contextPendingWindow=null;viewport.classList.remove('dragging')});
 }
-function renderModeNav(){const nav=document.getElementById('modeNav');nav.innerHTML='';MODES.forEach(mode=>{const b=document.createElement('button');b.type='button';b.textContent=mode.toUpperCase();b.classList.toggle('active',mode===MODE);b.disabled=mode===MODE;b.onclick=()=>{const url=new URL(location.href);url.searchParams.set('mode',mode);url.searchParams.delete('version');if(AUTH_TOKEN)url.searchParams.set('token',AUTH_TOKEN);location.href=url.toString()};nav.appendChild(b)});document.getElementById('title').textContent=MODE==='l1'?'L1 classification':'L2 ROI annotation';}
+function renderModeNav(){const nav=document.getElementById('modeNav');nav.innerHTML='';MODES.forEach(mode=>{const b=document.createElement('button');b.type='button';b.textContent=mode==='l1'?'Classification':'Spatial';b.classList.toggle('active',mode===MODE);b.disabled=mode===MODE;b.onclick=()=>{const url=new URL(location.href);url.searchParams.set('mode',mode);url.searchParams.delete('version');if(AUTH_TOKEN)url.searchParams.set('token',AUTH_TOKEN);location.href=url.toString()};nav.appendChild(b)});document.getElementById('title').textContent=MODE==='l1'?'Classification prototype supervision':'Spatial prototype supervision';}
 function versionStorageKey(){return `hcc_sempath_annotation_version:${MODE}`}
 function renderVersions(){const select=document.getElementById('versionSelect');select.innerHTML='';VERSIONS.forEach(item=>{const option=document.createElement('option');option.value=item.id;option.textContent=`${item.name} (${item.annotations})`;option.selected=item.id===VERSION;select.appendChild(option)});}
 async function createVersion(){const name=document.getElementById('newVersionName').value.trim();const status=document.getElementById('versionStatus');if(!name){status.textContent='Enter a version name.';return}try{const result=await api('/api/versions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:MODE,name,source_version:VERSION})});const url=new URL(location.href);url.searchParams.set('version',result.created);localStorage.setItem(versionStorageKey(),result.created);if(AUTH_TOKEN)url.searchParams.set('token',AUTH_TOKEN);location.href=url.toString()}catch(e){status.textContent=e.message||String(e)}}
 function labelDrafts(){return Object.fromEntries([...document.querySelectorAll('#labelEditor input[data-label-id]')].map(input=>[input.dataset.labelId,input.value]));}
 function renderLabelEditor(drafts={}){const level=MODE;document.getElementById('labelDialogTitle').textContent=`${level.toUpperCase()} label management · ${VERSION}`;const root=document.getElementById('labelEditor');root.innerHTML='';(LABELS.levels[level]||[]).forEach(item=>{const row=document.createElement('div');row.className='labelEditorRow';const badge=document.createElement('span');badge.className='muted';badge.textContent=item.active?'Active':'Archived';const input=document.createElement('input');input.value=drafts[item.id]??item.name;input.dataset.labelId=item.id;input.disabled=!item.active;const rename=document.createElement('button');rename.type='button';rename.textContent='Rename';rename.disabled=!item.active;rename.onclick=()=>changeLabel(level,'rename',item.id,input.value);const state=document.createElement('button');state.type='button';state.textContent=item.active?'Archive':'Restore';state.onclick=()=>changeLabel(level,item.active?'archive':'restore',item.id,'');const remove=document.createElement('button');remove.type='button';remove.textContent='Delete';remove.onclick=()=>{if(window.confirm(`Delete label "${item.name}"?`))changeLabel(level,'delete',item.id,'')};row.append(badge,input,rename,state,remove);root.appendChild(row)});pendingLabelAdds.forEach(name=>{const row=document.createElement('div');row.className='labelEditorRow';row.innerHTML=`<span class=muted>Pending new</span><span>${name}</span>`;root.appendChild(row)});}
 async function changeLabel(level,operation,labelId,name,preserveDrafts=false){const status=document.getElementById('labelStatus');const drafts=preserveDrafts?labelDrafts():{};try{LABELS=await api('/api/labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:MODE,level,operation,label_id:labelId,name})});L1=LABELS.levels.l1.filter(x=>x.active).map(x=>x.id);L2=LABELS.levels.l2.filter(x=>x.active).map(x=>x.id);renderLabelEditor(drafts);renderLabels();status.textContent='Saved.'}catch(e){status.textContent=e.message||String(e)}}
-function clearSelectedRoiClass(){if(roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one L2 ROI class before clearing.';return}const cleared=roiAttribute;pushUndo();roi=roi.filter(x=>x.attribute!==cleared);delete roiClassState[cleared];delete roiExclusionOverrides[cleared];roiDrawing=null;roiPreview=null;roiCursor=null;roiPlan=null;syncPositiveLabels();renderRoi();document.getElementById('status').textContent=`Cleared ROI state for: ${labelName('l2',cleared)}.`}
+function clearSelectedRoiClass(){if(roiAttribute===ROI_ALL){document.getElementById('status').textContent='Select one spatial class before clearing.';return}const cleared=roiAttribute;pushUndo();roi=roi.filter(x=>x.attribute!==cleared);delete roiClassState[cleared];delete roiExclusionOverrides[cleared];roiDrawing=null;roiPreview=null;roiCursor=null;roiPlan=null;syncPositiveLabels();renderRoi();document.getElementById('status').textContent=`Cleared ROI state for: ${labelName('l2',cleared)}.`}
 setupEraser();setupRoi();setupTileUndo();document.querySelectorAll('[data-roi-tool]').forEach(button=>button.addEventListener('click',()=>selectRoiTool(button.dataset.roiTool)));document.getElementById('roiUndo').onclick=undoRoi;document.getElementById('roiRedo').onclick=redoRoi;document.getElementById('roiClear').onclick=clearSelectedRoiClass;selectRoiTool('point',false);
 document.getElementById('roiPlanGenerate').onclick=generateRoiPlan;document.getElementById('roiPlanAccept').onclick=acceptRoiPlan;document.getElementById('roiPlanRestart').onclick=restartRoiFromScratch;
 document.getElementById('roiSimilarity').addEventListener('input',renderRoi);
@@ -3204,14 +3206,14 @@ def make_handler(
                         str(payload.get("version") or qs.get("version", [None])[0]) if (payload.get("version") or qs.get("version")) else None,
                     )
                     if not selected_data.roi_mode:
-                        raise ValueError("ROI similarity is available only in L2 mode")
+                        raise ValueError("ROI similarity is available only in spatial mode")
                     if roi_plan_generator is None:
                         raise ValueError("ROI similarity generator is not configured")
                     index = int(payload["package"])
                     row = int(payload["row"])
                     attribute = str(payload["attribute"])
                     if attribute not in selected_data.state.l2_prototypes:
-                        raise ValueError(f"unknown L2 ROI attribute: {attribute}")
+                        raise ValueError(f"unknown spatial attribute: {attribute}")
                     tile_png = selected_data.viewer(index).read_tile_png(row)
                     LOG.info(
                         "roi_similarity_request iac=%s row=%d attribute=%s seeds=%d",
@@ -3348,10 +3350,12 @@ def make_handler(
 
 
 def _annotation_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Open a browser UI for L1/L2 prototype tile annotation.")
+    parser = argparse.ArgumentParser(
+        description="Open the classification/spatial prototype annotation UI."
+    )
     parser.add_argument("--input", required=True, help="IAC file or directory containing image-tile IAC packages.")
-    parser.add_argument("--l1-state", required=True, help="L1 classification JSON state file.")
-    parser.add_argument("--l2-state", required=True, help="L2 ROI JSON state file.")
+    parser.add_argument("--l1-state", required=True, help="Classification JSON state file.")
+    parser.add_argument("--l2-state", required=True, help="Spatial annotation JSON state file.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765, help="Use 0 to pick a free port.")
     parser.add_argument("--token", default="", help="Annotation UI auth token; overrides the persisted state .auth-token when set.")
@@ -3364,13 +3368,13 @@ def _annotation_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--priority-manifest",
         required=True,
-        help="Shared mutable tile-priority manifest used by both L1 classification and L2 ROI.",
+        help="Shared mutable tile-priority manifest used by both expert tasks.",
     )
     parser.add_argument(
         "--l1-review-manifest",
         default="",
         help=(
-            "Optional read-only strict tile list for an L1 review pass. "
+            "Optional read-only strict tile list for a classification review pass. "
             "Navigation stops when this list is complete."
         ),
     )
@@ -3387,7 +3391,7 @@ def _annotation_parser() -> argparse.ArgumentParser:
         "--l2-review-manifest",
         default="",
         help=(
-            "Optional read-only strict tile list for an L2 review pass. "
+            "Optional read-only strict tile list for a spatial review pass. "
             "Navigation stops when this list is complete."
         ),
     )
@@ -3396,7 +3400,7 @@ def _annotation_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Optional component-presence candidate manifest used to prioritize "
-            "L2 navigation within the shared tile boundary."
+            "spatial navigation within the shared tile boundary."
         ),
     )
     parser.add_argument(
@@ -3411,10 +3415,18 @@ def _annotation_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--roi-information-report",
+        default="",
+        help=(
+            "Optional current spatial information-curve report used to "
+            "prioritize deficient components."
+        ),
+    )
+    parser.add_argument(
         "--review-existing",
         action="store_true",
         help=(
-            "Open the shared L1/L2 UI in review mode: show only saved "
+            "Open the shared classification/spatial UI in review mode: show only saved "
             "annotations and navigate them in deterministic order."
         ),
     )
@@ -3445,8 +3457,8 @@ def main() -> None:
         value.strip() for value in args.include_packages.split(",") if value.strip()
     ]
     roi_information_report = (
-        DEFAULT_ROI_INFORMATION_REPORT
-        if DEFAULT_ROI_INFORMATION_REPORT.is_file()
+        Path(args.roi_information_report)
+        if args.roi_information_report
         else None
     )
     l1_initial = AnnotationData(

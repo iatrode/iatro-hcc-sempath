@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit whether current L2 ROI tiles cover all four teacher feature spaces."""
+"""Audit spatial-annotation coverage in four teacher feature spaces."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import math
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -251,7 +252,7 @@ def _active_attributes(payload: dict[str, Any]) -> list[str]:
     ]
     attributes = active or [str(value) for value in payload.get("l2_prototypes", [])]
     if not attributes:
-        raise ValueError("annotation state has no active L2 ROI attributes")
+        raise ValueError("annotation state has no active spatial attributes")
     return attributes
 
 
@@ -484,12 +485,12 @@ def _extract_teacher_features(
         "source": "four frozen teacher feature caches used by training",
         "teachers": list(teacher_paths),
         "teacher_dimensions": dimensions,
-        "teacher_feature_packages": {
-            teacher: [str(path) for path in paths]
+        "teacher_feature_package_count": {
+            teacher: len(paths)
             for teacher, paths in teacher_paths.items()
         },
         "representation": (
-            "one L2-normalized cached global feature per positive ROI tile "
+            "one unit-normalized cached global feature per positive spatial tile "
             "and teacher; no raw-DINO or trained-student substitute"
         ),
         "positive_tile_count": len(needed_tile_ids),
@@ -515,6 +516,14 @@ def _slide_round_robin(samples: list[RoiFeatureSample], seed: int) -> list[str]:
         ],
         seed=seed,
     )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _checkpoints(total: int, requested: list[int]) -> list[int]:
@@ -582,12 +591,12 @@ def _status(
     if tail_stable:
         return (
             "provisionally_stable",
-            "the pooled teacher-by-resample curves pass the L1 fixed-probe "
+            "the pooled teacher-by-resample curves pass the classification fixed-probe "
             "tail criterion",
         )
     return (
         "still_growing",
-        "the pooled teacher-by-resample curves do not yet reach the L1 "
+        "the pooled teacher-by-resample curves do not yet reach the classification "
         "fixed-probe support threshold",
     )
 
@@ -621,7 +630,7 @@ def evaluate_information(
         )
     teachers = sorted({sample.teacher for sample in samples})
     if not teachers:
-        raise ValueError("teacher-space L2 audit requires teacher features")
+        raise ValueError("teacher-space spatial audit requires teacher features")
     coverage_by_attribute = {row["attribute"]: row for row in coverage_rows}
     summary_rows: list[dict[str, Any]] = []
     curve_rows: list[dict[str, Any]] = []
@@ -857,44 +866,45 @@ def _plot(
         squeeze=False,
     )
     for attribute, axis in zip(attributes, axes.flat):
-        teacher_curves = attribute_report[attribute].get(
-            "teacher_curves",
-            {},
-        )
-        for teacher, rows in teacher_curves.items():
+        rows = attribute_report[attribute].get("curve", [])
+        if rows:
+            x = [int(row["sample_count"]) for row in rows]
+            y = [
+                float(row["remaining_novelty_mean"])
+                if row["remaining_novelty_mean"] != ""
+                else np.nan
+                for row in rows
+            ]
+            low = [
+                float(row["remaining_novelty_mean_ci_low"])
+                if row["remaining_novelty_mean_ci_low"] != ""
+                else np.nan
+                for row in rows
+            ]
+            high = [
+                float(row["remaining_novelty_mean_ci_high"])
+                if row["remaining_novelty_mean_ci_high"] != ""
+                else np.nan
+                for row in rows
+            ]
             axis.plot(
-                [int(row["sample_count"]) for row in rows],
-                [
-                    float(row["remaining_novelty_mean"])
-                    if row["remaining_novelty_mean"] != ""
-                    else np.nan
-                    for row in rows
-                ],
+                x,
+                y,
                 marker="o",
                 markersize=3,
-                linewidth=1.4,
-                label=teacher,
+                linewidth=1.8,
             )
+            axis.fill_between(x, low, high, alpha=0.18, linewidth=0)
         summary = next(row for row in summary_rows if row["attribute"] == attribute)
         axis.set_title(f"{attribute}\n{summary['status']} · N={summary['positive_tile_count']}", fontsize=9)
-        axis.set_xlabel("reference positive ROI tiles")
-        axis.set_ylabel("remaining novelty", color="#1f77b4")
+        axis.set_xlabel("nested reference tile count")
+        axis.set_ylabel("fixed-probe remaining novelty")
         axis.grid(alpha=0.2)
     for axis in axes.flat[len(attributes) :]:
         axis.set_visible(False)
-    handles, labels = axes.flat[0].get_legend_handles_labels()
-    if handles:
-        figure.legend(
-            handles,
-            labels,
-            loc="outside lower center",
-            ncols=len(labels),
-            fontsize=8,
-        )
     path.parent.mkdir(parents=True, exist_ok=True)
     figure.suptitle(
-        "Current L2 ROI coverage across four teacher spaces "
-        "(monotone fixed-probe novelty)",
+        "Spatial annotation coverage: fixed probe under nested reference growth",
         fontsize=14,
     )
     figure.savefig(path, dpi=180)
@@ -912,7 +922,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     if set(teacher_paths) != EXPECTED_TEACHERS:
         raise ValueError(
-            "L2 task-space audit requires exactly the four training teachers: "
+            "Spatial task-space audit requires exactly the four training teachers: "
             f"expected={sorted(EXPECTED_TEACHERS)} "
             f"observed={sorted(teacher_paths)}"
         )
@@ -951,7 +961,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     report = {
         "audit_type": "roi_annotation_information_curve",
         "claim_scope": "pre-training annotation information coverage",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "annotation_json": str(annotation_path),
+        "annotation_sha256": _sha256(annotation_path),
         "annotation_state_version": payload.get("version"),
         "annotation_tile_count": len(items),
         "attributes": attribute_report,
@@ -968,7 +980,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "support": (
                 "the decision pools teacher-by-resample curves exactly as "
-                "the L1 fixed-probe audit does; per-teacher support remains "
+                "the classification fixed-probe audit does; per-teacher support remains "
                 "diagnostic and does not independently veto a component"
             ),
             "geometry_role": (
@@ -996,8 +1008,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "negative_evidence": "coverage QC only; no single negative center is assumed",
         },
         "status_meanings": {
-            "provisionally_stable": "pooled teacher-by-resample support reaches the L1 threshold",
-            "still_growing": "pooled teacher-by-resample support remains below the L1 threshold",
+            "provisionally_stable": "pooled teacher-by-resample support reaches the classification threshold",
+            "still_growing": "pooled teacher-by-resample support remains below the classification threshold",
             "coverage_limited": "tail support passes but slide/geometry coverage fails QC",
             "not_assessable": "too few tiles, increments, or independent slides to test stability",
         },
@@ -1037,12 +1049,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--annotation-json",
-        default=str(REPO_ROOT / "annotations" / "hcc_l2_roi_v2.json"),
+        required=True,
         help="Current ROI annotation state JSON",
     )
     parser.add_argument(
         "--output-root",
-        default=str(REPO_ROOT / "artifacts" / "diagnostics" / "roi_information_curve_current"),
+        default="outputs/roi_information_curve",
     )
     parser.add_argument(
         "--teacher-feature-packages",

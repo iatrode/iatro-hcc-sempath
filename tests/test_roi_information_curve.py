@@ -153,7 +153,10 @@ def test_curve_is_nested_and_reports_finite_metrics_after_first_increment() -> N
 
 def test_parser_defaults_to_pretraining_audit_configuration() -> None:
     module = _load_module()
-    args = module.build_parser().parse_args([])
+    args = module.build_parser().parse_args(
+        ["--annotation-json", "/private/study/spatial_state.json"]
+    )
+    assert args.annotation_json == "/private/study/spatial_state.json"
     assert args.resamples == 16
     assert args.elbow_ratio == 0.35
     assert args.teacher_feature_packages == ""

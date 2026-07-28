@@ -1175,7 +1175,7 @@ def _fixed_probe_l1_information(
                 "equal teacher contribution after per-teacher fixed-probe curves"
             ),
             "class_aggregation": (
-                "global L1 probe coverage weights L1 classes equally"
+                "global classification probe coverage weights classes equally"
             ),
             "resamples": resamples,
             "probe_slide_fraction": probe_slide_fraction,
@@ -1248,7 +1248,7 @@ def _browser_matched_umap_2d(features: np.ndarray) -> np.ndarray:
     try:
         import umap  # type: ignore
     except Exception as exc:
-        raise RuntimeError("umap-learn is required for browser-matched L1 UMAP QC") from exc
+        raise RuntimeError("umap-learn is required for browser-matched classification UMAP QC") from exc
 
     x = _normalize_rows(features)
     n = x.shape[0]
@@ -1402,7 +1402,7 @@ def _plot_pca_qc(
             continue
         raw_labels = [_prototype_sample_labels(prototype_sample, level) for prototype_sample in common_prototype_samples]
         labels_by_prototype_sample = _compress_multilabels(raw_labels, max_categories)
-        level_name = "L1" if level == "l1" else "L2"
+        level_name = "classification" if level == "l1" else "spatial"
         label_note = "single-label" if level == "l1" else "multi-label expanded; one tile may appear under multiple labels"
 
         _log(f"plot PCA QC: teacher-averaged {level_name}, tiles={len(common_prototype_samples)}", enabled=verbose)
@@ -1459,7 +1459,7 @@ def _plot_browser_matched_l1_umap_qc(
         if all(prototype_sample.tile_id in pca_features_by_teacher[teacher] for teacher in teacher_names)
     ]
     if len(common_tile_ids) < 3:
-        _log("browser-matched L1 UMAP QC skipped: fewer than 3 common tiles across teachers", enabled=verbose)
+        _log("browser-matched classification UMAP QC skipped: fewer than 3 common tiles across teachers", enabled=verbose)
         return
 
     prototype_samples_by_id = {prototype_sample.tile_id: prototype_sample for prototype_sample in prototype_samples}
@@ -1468,7 +1468,7 @@ def _plot_browser_matched_l1_umap_qc(
     label_names = sorted(set(labels))
 
     _log(
-        "plot browser-matched L1 UMAP QC: "
+        "plot browser-matched classification UMAP QC: "
         f"tiles={len(common_prototype_samples)} n_neighbors={DEFAULT_BROWSER_UMAP_NEIGHBORS} "
         f"min_dist={DEFAULT_BROWSER_UMAP_MIN_DIST} random_state={DEFAULT_BROWSER_UMAP_RANDOM_STATE}",
         enabled=verbose,
@@ -1477,7 +1477,7 @@ def _plot_browser_matched_l1_umap_qc(
         fused = _browser_matched_fused_features(pca_features_by_teacher, teacher_names, common_tile_ids)
         coords = _browser_matched_umap_2d(fused)
     except RuntimeError as exc:
-        _log(f"browser-matched L1 UMAP QC skipped: {exc}", enabled=verbose)
+        _log(f"browser-matched classification UMAP QC skipped: {exc}", enabled=verbose)
         return
 
     palette = dict(zip(label_names, plt.rcParams["axes.prop_cycle"].by_key()["color"]))
@@ -1515,7 +1515,7 @@ def _plot_browser_matched_l1_umap_qc(
         pass
 
     ax.set_title(
-        "L1 QC UMAP at max N="
+        "Classification QC UMAP at max N="
         f"{len(prototype_samples)}: browser-matched fused teacher features\n"
         f"UMAP cosine, n_neighbors={DEFAULT_BROWSER_UMAP_NEIGHBORS}, "
         f"min_dist={DEFAULT_BROWSER_UMAP_MIN_DIST}, random_state={DEFAULT_BROWSER_UMAP_RANDOM_STATE}"
@@ -1725,7 +1725,7 @@ def _plot_curves(
 
     _log("plot fixed-probe coverage curves", enabled=verbose)
     fixed_units = [
-        ("all L1", fixed_probe_information["global"]),
+        ("all classification", fixed_probe_information["global"]),
         *sorted(fixed_probe_information["classes"].items()),
     ]
     ncols = 3
@@ -1764,7 +1764,7 @@ def _plot_curves(
     for axis in axes_arr[len(fixed_units) :]:
         axis.axis("off")
     fig.suptitle(
-        "L1 annotation coverage: fixed probe under nested reference growth"
+        "Classification annotation coverage: fixed probe under nested reference growth"
     )
     save(fig, "infospace_information_summary")
     plt.close(fig)
@@ -2021,7 +2021,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         level1_names = []
     if "l2" not in prototype_levels:
         level2_names = []
-    _log(f"prototype labels: L1={len(level1_names)} L2={len(level2_names)}", enabled=verbose)
+    _log(
+        "prototype labels: "
+        f"classification={len(level1_names)} spatial={len(level2_names)}",
+        enabled=verbose,
+    )
 
     teacher_paths = _resolve_teacher_paths(args)
     _log(f"teachers resolved: {list(teacher_paths)}", enabled=verbose)

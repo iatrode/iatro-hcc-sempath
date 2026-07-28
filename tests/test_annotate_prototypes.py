@@ -172,6 +172,7 @@ def test_annotation_cli_always_requires_l1_and_l2_roi_workspaces() -> None:
         "--l2-review-manifest", "l2-review.json",
         "--include-packages", "301/a.iac,301/b.iac",
         "--roi-candidate-manifest", "roi-candidates.json",
+        "--roi-information-report", "roi-information.json",
         "--roi-priority-attributes", "vascular-structure-present,ductular-portal-present",
         "--review-existing",
     ])
@@ -180,6 +181,7 @@ def test_annotation_cli_always_requires_l1_and_l2_roi_workspaces() -> None:
     )
     assert not any("--state" in action.option_strings for action in parser._actions)
     assert args.roi_candidate_manifest == "roi-candidates.json"
+    assert args.roi_information_report == "roi-information.json"
     assert args.l1_review_manifest == "l1-review.json"
     assert args.l2_review_manifest == "l2-review.json"
     assert args.include_packages == "301/a.iac,301/b.iac"
@@ -204,7 +206,10 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "document.getElementById('prototypeLabels').style.display=l1Mode?'block':'none'" in HTML
     assert "document.getElementById('l1Section').style.display=l1Mode?'block':'none'" in HTML
     assert "document.getElementById('l2Section').style.display='none'" in HTML
-    assert "MODE==='l1'?'L1 classification':'L2 ROI annotation'" in HTML
+    assert (
+        "MODE==='l1'?'Classification prototype supervision':"
+        "'Spatial prototype supervision'"
+    ) in HTML
     assert "index<9?String(index+1):''" in HTML
     assert "class=chipShortcut" in HTML
     assert "await showRecord(rec.record);closeOverview();" in HTML
@@ -220,7 +225,7 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert "l1=L1[index];renderLabels()" in HTML
     assert "ev.code==='Space'" in HTML
     assert "if(!ev.repeat)save()" in HTML
-    assert "All ROI classes visible. Select one L2 class before drawing." in HTML
+    assert "All spatial classes visible. Select one class before drawing." in HTML
     assert "currentCandidate" not in HTML
     assert "function hasPositiveRoi(attribute)" in HTML
     assert "function roiClassIcon(attribute,state)" in HTML
@@ -701,6 +706,9 @@ def _write_roi_information_report(
         support = 0.0 if status == "not_assessable" else 0.5
         attributes[name] = {
             "status": status,
+            "tail_plateau_support_by_ratio": {
+                "0.35": support,
+            },
             "teacher_low_gain_support_by_teacher_ratio": {
                 "0.35": {
                     teacher: support
