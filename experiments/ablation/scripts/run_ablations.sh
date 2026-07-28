@@ -76,5 +76,15 @@ done
 
 for condition in "${conditions[@]}"; do
   run_config="$temp_root/${condition}.yaml"
-  "${PYTHON_CMD[@]}" -m hcc_sempath.cli.main train --config "$run_config"
+  output_dir="$(
+    "${PYTHON_CMD[@]}" -c \
+      'import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))["runtime"]["output_dir"])' \
+      "$run_config"
+  )"
+  checkpoint="$output_dir/checkpoints/last.pt"
+  train_args=(-m hcc_sempath.cli.main train --config "$run_config")
+  if [ -f "$checkpoint" ]; then
+    train_args+=(--resume "$checkpoint")
+  fi
+  "${PYTHON_CMD[@]}" "${train_args[@]}"
 done

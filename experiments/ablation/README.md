@@ -1,9 +1,12 @@
 # Formal 1/10 Ablation Matrix
 
-The selected three-epoch Optuna trial is the formal A0 reference. A1-A12 reuse
-its exact 10% population subset, fixed classification/spatial expert banks, seed, optimizer,
-learning-rate schedule, intervention schedule, loss weights, and evaluation
-protocol. Each condition runs once and changes only the mechanism stated
+The selected three-epoch Optuna trial supplies the formal A0 hyperparameters.
+A1-A12 reuse its exact 10% population subset, fixed classification/spatial
+expert banks, seed, optimizer, learning-rate schedule, intervention schedule,
+loss weights, and evaluation protocol. Each ablation has a six-epoch safety
+ceiling and uses the same step-level development-loss early-stop rule
+(1000-step probe interval, evaluation from step 4000, relative gain 0.005,
+patience 2). Each condition runs once and changes only the mechanism stated
 below. Hyperparameters are not retuned per condition.
 
 | ID | Change from A0 | Primary contrast |

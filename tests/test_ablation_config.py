@@ -106,7 +106,12 @@ def test_all_conditions_reuse_the_selected_a0_budget_and_schedule(
         )
         assert resolved["data"]["train_tile_fraction"] == pytest.approx(0.1)
         assert resolved["data"]["val_tile_fraction"] == pytest.approx(0.1)
-        assert resolved["train"]["epochs"] == 3
+        assert resolved["train"]["epochs"] == 6
+        assert resolved["train"]["development_probe_interval_steps"] == 1000
+        assert resolved["train"]["development_early_stop"] is True
+        assert resolved["train"]["development_early_stop_min_step"] == 4000
+        assert resolved["train"]["development_early_stop_relative_delta"] == pytest.approx(0.005)
+        assert resolved["train"]["development_early_stop_patience"] == 2
         assert resolved["runtime"]["seed"] == 13
         assert resolved["train"]["lr"] == pytest.approx(0.00018)
         assert resolved["train"]["weight_decay"] == pytest.approx(0.005)

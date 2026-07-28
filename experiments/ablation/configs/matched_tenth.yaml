@@ -1,12 +1,13 @@
 # Shared formal ablation budget. The supplied base must be the selected Optuna
-# A0 trial; these values restate its fixed comparison population and duration.
+# A0 trial; these values restate its fixed comparison population and give
+# development-loss early stopping enough room to determine the duration.
 
 data:
   train_tile_fraction: 0.10
   val_tile_fraction: 0.10
 
 train:
-  epochs: 3
+  epochs: 6
   max_val_batches: 1
   max_eval_batches: 1
   checkpoint_interval_steps: 1000

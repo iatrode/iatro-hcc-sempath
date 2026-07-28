@@ -76,8 +76,11 @@ def resolve_ablation_config(
     for key in ("train_tile_fraction", "val_tile_fraction"):
         if float(resolved["data"].get(key, 1.0)) != 0.1:
             raise ValueError(f"matched ablation requires data.{key}=0.1")
-    if int(resolved["train"]["epochs"]) != 3:
-        raise ValueError("matched ablation requires train.epochs=3")
+    if int(resolved["train"]["epochs"]) != 6:
+        raise ValueError(
+            "matched ablation requires train.epochs=6 so step-level "
+            "development early stopping can determine the endpoint"
+        )
 
     condition_name = Path(
         condition.get("runtime", {}).get(
