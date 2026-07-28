@@ -25,7 +25,10 @@ from hcc_sempath.spatial_schema import (
 )
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 from hcc_sempath.training.losses import multi_teacher_distillation_loss
-from hcc_sempath.training.engine import _objective_gradient_diagnostics
+from hcc_sempath.training.engine import (
+    _bucket_spatial_sample_mask,
+    _objective_gradient_diagnostics,
+)
 
 
 def _replace_spatial_prototypes(
@@ -153,6 +156,34 @@ def test_spatial_model_only_materializes_selected_supervised_rows() -> None:
     assert outputs["teacher_outputs"]["teacher"].shape == (3, 5)
     assert outputs["spatial_instance_logits"].shape == (1, 3, 31, 31)
     assert outputs["spatial_abundance_logits"].shape == (1, 3, 31, 31)
+
+
+def test_spatial_mask_padding_preserves_supervised_row_outputs() -> None:
+    torch.manual_seed(23)
+    model = HCCSemPathModel(
+        backbone_name="vit_tiny_patch16_224",
+        embedding_dim=11,
+        teacher_dims={},
+        pretrained=False,
+        spatial_num_components=3,
+        spatial_dim=13,
+    ).eval()
+    images = torch.randn(5, 3, 224, 224)
+    supervised = torch.tensor([False, True, True, False, True])
+    compute = _bucket_spatial_sample_mask(supervised)
+    supervised_positions = supervised[compute].nonzero(as_tuple=False).flatten()
+
+    with torch.no_grad():
+        reference = model(images, spatial_sample_mask=supervised)
+        padded = model(images, spatial_sample_mask=compute)
+
+    for key in ("spatial_instance_logits", "spatial_abundance_logits"):
+        torch.testing.assert_close(
+            padded[key][supervised_positions],
+            reference[key],
+            rtol=1e-5,
+            atol=1e-6,
+        )
 
 
 @pytest.mark.parametrize(

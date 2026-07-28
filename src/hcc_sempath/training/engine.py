@@ -443,6 +443,33 @@ def _spatial_global_targets_from_spatial(
     return positive, positive | complete_negative
 
 
+def _bucket_spatial_sample_mask(
+    sample_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Pad active spatial rows to a bounded set of compiled batch shapes.
+
+    The input mask is produced by the CPU dataloader. Added rows have no
+    spatial supervision, so they only stabilize the spatial-head compute
+    shape and remain ignored by every spatial loss.
+    """
+
+    if sample_mask.ndim != 1 or sample_mask.dtype is not torch.bool:
+        raise ValueError("spatial sample mask must be a one-dimensional bool tensor")
+    active_count = int(sample_mask.sum().item())
+    if active_count == 0:
+        return sample_mask
+    bucket_size = min(
+        1 << (active_count - 1).bit_length(),
+        int(sample_mask.numel()),
+    )
+    if bucket_size == active_count:
+        return sample_mask
+    compute_mask = sample_mask.clone()
+    padding_indices = (~sample_mask).nonzero(as_tuple=False).flatten()
+    compute_mask[padding_indices[: bucket_size - active_count]] = True
+    return compute_mask
+
+
 @torch.inference_mode()
 def _refresh_global_prototypes(
     model,
@@ -1231,6 +1258,11 @@ def run_epoch(
             )
             spatial_sample_mask = batch["spatial_supervised"].any(dim=1)
             spatial_is_active = bool(spatial_sample_mask.any())
+            spatial_compute_mask = (
+                _bucket_spatial_sample_mask(spatial_sample_mask)
+                if spatial_is_active
+                else spatial_sample_mask
+            )
             spatial_host = {
                 key: batch[key]
                 for key in (
@@ -1250,7 +1282,7 @@ def run_epoch(
             )
             active_spatial_host = (
                 {
-                    key: value[spatial_sample_mask]
+                    key: value[spatial_compute_mask]
                     for key, value in spatial_host.items()
                 }
                 if spatial_is_active
@@ -1303,7 +1335,7 @@ def run_epoch(
                         ),
                         run_spatial=spatial_objective_active,
                         spatial_sample_mask=(
-                            spatial_sample_mask
+                            spatial_compute_mask
                             if spatial_objective_active
                             else None
                         ),
@@ -1334,10 +1366,10 @@ def run_epoch(
                         spatial_known_host = torch.zeros_like(
                             spatial_positive_host
                         )
-                        spatial_positive_host[spatial_sample_mask] = (
+                        spatial_positive_host[spatial_compute_mask] = (
                             active_spatial_positive
                         )
-                        spatial_known_host[spatial_sample_mask] = (
+                        spatial_known_host[spatial_compute_mask] = (
                             active_spatial_known
                         )
                         spatial_positive = spatial_positive_host.to(
@@ -1566,6 +1598,8 @@ def run_epoch(
                     global_step=global_step,
                     classification_active=classification_objective_active,
                     spatial_active=spatial_objective_active,
+                    spatial_sample_count=int(spatial_sample_mask.sum().item()),
+                    spatial_compute_count=int(spatial_compute_mask.sum().item()),
                 )
 
                 if (

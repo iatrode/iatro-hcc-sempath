@@ -855,6 +855,69 @@ def test_spatial_loss_routes_point_brush_and_negative_gradients() -> None:
     assert parts["spatial_implicit_negative_pairs"].item() == 1
 
 
+def test_unsupervised_padding_preserves_spatial_loss_and_gradient() -> None:
+    torch.manual_seed(31)
+    reference_instance = torch.randn((1, 1, 5, 5), requires_grad=True)
+    reference_abundance = torch.randn((1, 1, 5, 5), requires_grad=True)
+    point_centers = torch.zeros_like(reference_instance)
+    point_centers[0, 0, 2, 2] = 1
+    brush_bag_ids = torch.zeros_like(reference_instance, dtype=torch.long)
+    area_positive = torch.zeros_like(reference_instance, dtype=torch.bool)
+    explicit_negative = torch.zeros_like(reference_instance, dtype=torch.bool)
+    explicit_negative[0, 0, 0, 0] = True
+    implicit_negative = torch.zeros_like(reference_instance, dtype=torch.bool)
+
+    reference_loss, _ = spatial_morphometry_loss(
+        instance_logits=reference_instance,
+        abundance_logits=reference_abundance,
+        point_centers=point_centers,
+        brush_bag_ids=brush_bag_ids,
+        area_positive=area_positive,
+        explicit_negative=explicit_negative,
+        implicit_negative=implicit_negative,
+    )
+    reference_loss.backward()
+
+    padded_instance = torch.cat(
+        [reference_instance.detach(), torch.randn_like(reference_instance)],
+        dim=0,
+    ).requires_grad_(True)
+    padded_abundance = torch.cat(
+        [reference_abundance.detach(), torch.randn_like(reference_abundance)],
+        dim=0,
+    ).requires_grad_(True)
+    padded_loss, _ = spatial_morphometry_loss(
+        instance_logits=padded_instance,
+        abundance_logits=padded_abundance,
+        point_centers=torch.cat([point_centers, torch.zeros_like(point_centers)]),
+        brush_bag_ids=torch.cat(
+            [brush_bag_ids, torch.zeros_like(brush_bag_ids)]
+        ),
+        area_positive=torch.cat(
+            [area_positive, torch.zeros_like(area_positive)]
+        ),
+        explicit_negative=torch.cat(
+            [explicit_negative, torch.zeros_like(explicit_negative)]
+        ),
+        implicit_negative=torch.cat(
+            [implicit_negative, torch.zeros_like(implicit_negative)]
+        ),
+    )
+    padded_loss.backward()
+
+    torch.testing.assert_close(padded_loss, reference_loss)
+    torch.testing.assert_close(
+        padded_instance.grad[:1],
+        reference_instance.grad,
+    )
+    torch.testing.assert_close(
+        padded_abundance.grad[:1],
+        reference_abundance.grad,
+    )
+    assert padded_instance.grad[1:].abs().sum().item() == 0
+    assert padded_abundance.grad[1:].abs().sum().item() == 0
+
+
 @pytest.mark.parametrize("top_fraction", [0.25, 0.5, 1.0])
 def test_vectorized_brush_bag_loss_matches_reference_values_and_gradients(
     top_fraction: float,

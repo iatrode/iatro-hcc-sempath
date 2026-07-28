@@ -8,6 +8,7 @@ import pytest
 from hcc_sempath.training.config import teacher_dims, teacher_names, validate_training_config
 from hcc_sempath.training.engine import (
     _amp_enabled,
+    _bucket_spatial_sample_mask,
     _normalize_uint8_images_fp16,
     _spatial_global_targets_from_spatial,
     _objective_gradient_diagnostics,
@@ -36,6 +37,24 @@ from hcc_sempath.training.train import (
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 import torch
+
+
+@pytest.mark.parametrize(
+    ("mask", "expected"),
+    [
+        ([False, False, False], [False, False, False]),
+        ([False, True, False], [False, True, False]),
+        ([False, True, False, False, True], [False, True, False, False, True]),
+        (
+            [True, False, True, False, True, False, False, False],
+            [True, True, True, False, True, False, False, False],
+        ),
+    ],
+)
+def test_spatial_compute_mask_uses_power_of_two_buckets(mask, expected) -> None:
+    actual = _bucket_spatial_sample_mask(torch.tensor(mask, dtype=torch.bool))
+
+    assert actual.tolist() == expected
 
 
 def test_cuda_amp_precision_is_shared_by_training_and_evaluation() -> None:
