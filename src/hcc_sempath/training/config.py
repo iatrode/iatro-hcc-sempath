@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 import math
 import random
@@ -166,8 +168,18 @@ def embedding_dim(cfg: dict) -> int:
     return int(cfg["model"].get("embedding_dim", cfg["model"].get("teacher_dim", 256)))
 
 
+@lru_cache(maxsize=None)
 def _package_record_count(path: Path) -> int:
     return int(read_header(path)["num_records"])
+
+
+def _package_record_counts(paths: list[Path]) -> dict[Path, int]:
+    unique = list(dict.fromkeys(paths))
+    if not unique:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(32, len(unique))) as executor:
+        counts = executor.map(_package_record_count, unique)
+        return dict(zip(unique, counts, strict=True))
 
 
 def _select_package_fraction(
@@ -569,20 +581,22 @@ def manifest_data_paths(cfg: dict, manifest: dict, split: str) -> tuple[list[str
     tile_paths = manifest_tile_packages(manifest, split)
     fraction_key = "train_tile_fraction" if split == "train" else f"{split}_tile_fraction"
     fraction = float(data.get(fraction_key, 1.0))
-    tile_paths = _select_package_fraction(
-        tile_paths,
-        {path: _package_record_count(path) for path in tile_paths},
-        fraction=fraction,
-        seed=int(cfg.get("runtime", {}).get("seed", 13)) + (0 if split == "train" else 1),
-    )
+    if fraction < 1.0:
+        tile_paths = _select_package_fraction(
+            tile_paths,
+            _package_record_counts(tile_paths),
+            fraction=fraction,
+            seed=int(cfg.get("runtime", {}).get("seed", 13)) + (0 if split == "train" else 1),
+        )
+    else:
+        tile_paths = sorted(tile_paths)
     tile_packages = [str(path) for path in tile_paths]
     feature_packages = {name: [] for name in teachers}
-    for tile_path in tile_paths:
+
+    def resolve_feature_paths(tile_path: Path) -> dict[str, str]:
         merged_path = _existing_merged_feature_package_for_tile(cfg, manifest, tile_path, teachers, feature_root)
         if merged_path is not None:
-            for name in teachers:
-                feature_packages[name].append(str(merged_path))
-            continue
+            return {name: str(merged_path) for name in teachers}
         per_tile = manifest_teacher_feature_packages_for_tiles(
             manifest=manifest,
             tile_paths=[tile_path],
@@ -590,6 +604,16 @@ def manifest_data_paths(cfg: dict, manifest: dict, split: str) -> tuple[list[str
             feature_root=feature_root,
             feature_suffix_template=data.get("feature_suffix_template", ".{teacher}.features.iac"),
         )
-        for name, paths in per_tile.items():
-            feature_packages[name].append(str(paths[0]))
+        return {
+            name: str(paths[0])
+            for name, paths in per_tile.items()
+        }
+
+    with ThreadPoolExecutor(
+        max_workers=min(32, max(1, len(tile_paths)))
+    ) as executor:
+        resolved_features = executor.map(resolve_feature_paths, tile_paths)
+        for per_tile in resolved_features:
+            for name in teachers:
+                feature_packages[name].append(per_tile[name])
     return tile_packages, feature_packages

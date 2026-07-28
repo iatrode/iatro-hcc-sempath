@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from . import _pipeline_probe as _probe
 from ..modeling.models import bounded_logits
 from .losses import multi_teacher_distillation_loss
 from .metrics import evaluate_teacher_outputs
@@ -1147,6 +1148,14 @@ def run_epoch(
             except StopIteration:
                 break
             data_wait = time.perf_counter() - data_wait_start
+            _probe.timeline_event(
+                "batch.data_wait",
+                seconds=data_wait,
+                epoch=epoch,
+                batch=n_batches,
+                global_step=global_step,
+                phase=phase,
+            )
             will_log = (
                 progress_bar is None
                 and log_interval > 0
@@ -1219,6 +1228,7 @@ def run_epoch(
                     and float(loss_cfg["spatial_weight"]) > 0
                 )
                 if train:
+                    refresh_start = time.perf_counter()
                     _maybe_refresh_prototypes(
                         model=model,
                         cfg=cfg,
@@ -1226,6 +1236,14 @@ def run_epoch(
                         state=prototype_refresh_state,
                         global_step=global_step,
                     )
+                    _probe.timeline_event(
+                        "batch.prototype_refresh",
+                        seconds=time.perf_counter() - refresh_start,
+                        epoch=epoch,
+                        batch=n_batches,
+                        global_step=global_step,
+                    )
+                forward_loss_start = time.perf_counter()
                 with torch.autocast(
                     device_type=device.type,
                     enabled=_amp_enabled(device, cfg, train),
@@ -1495,6 +1513,15 @@ def run_epoch(
                         float(loss_cfg["spatial_weight"]) * spatial_loss
                     )
                     loss = global_objective + spatial_objective
+                _probe.timeline_event(
+                    "batch.forward_and_loss",
+                    seconds=time.perf_counter() - forward_loss_start,
+                    epoch=epoch,
+                    batch=n_batches,
+                    global_step=global_step,
+                    classification_active=classification_objective_active,
+                    spatial_active=spatial_objective_active,
+                )
 
                 if (
                     train
@@ -1518,12 +1545,21 @@ def run_epoch(
                     last_gradient_step = global_step
 
                 if train:
+                    optimizer_start = time.perf_counter()
                     optimizer_stepped = _optimizer_step(
                         loss=loss,
                         model=model,
                         optimizer=optimizer,
                         scaler=scaler,
                         max_grad_norm=max_grad_norm,
+                    )
+                    _probe.timeline_event(
+                        "batch.backward_optimizer",
+                        seconds=time.perf_counter() - optimizer_start,
+                        epoch=epoch,
+                        batch=n_batches,
+                        global_step=global_step,
+                        spatial_active=spatial_objective_active,
                     )
                     if scheduler is not None and optimizer_stepped:
                         scheduler.step()
@@ -1563,7 +1599,15 @@ def run_epoch(
                     parts=parts,
                 )
             if train and optimizer_stepped and development_probe is not None:
+                probe_start = time.perf_counter()
                 development_probe(global_step, spatial_supervised_step, epoch)
+                _probe.timeline_event(
+                    "batch.development_probe",
+                    seconds=time.perf_counter() - probe_start,
+                    epoch=epoch,
+                    batch=n_batches,
+                    global_step=global_step,
+                )
 
             if collect_embeddings and (
                 max_eval_batches is None or n_batches < max_eval_batches
@@ -1590,6 +1634,14 @@ def run_epoch(
                     )
 
             n_batches += 1
+            _probe.timeline_event(
+                "batch.total",
+                seconds=time.perf_counter() - batch_start,
+                epoch=epoch,
+                batch=n_batches,
+                global_step=global_step,
+                phase=phase,
+            )
             if (
                 summary_writer is not None
                 and tensorboard_batch_interval > 0

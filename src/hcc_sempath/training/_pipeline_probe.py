@@ -15,6 +15,7 @@ Report is printed by the loader every ``report()`` call (per N batches).
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 import threading
 from collections import defaultdict
@@ -23,6 +24,52 @@ from time import perf_counter
 ON = bool(os.environ.get("HCC_PIPELINE_PROBE"))
 PROC_ON = bool(os.environ.get("HCC_PIPELINE_PROBE_PROC"))
 LOG_PATH = os.environ.get("HCC_PIPELINE_PROBE_LOG", os.path.join(tempfile.gettempdir(), "hcc_pipeline_probe.log"))
+TIMELINE_ON = bool(os.environ.get("HCC_TIMELINE_TRACE"))
+TIMELINE_PATH = os.environ.get(
+    "HCC_TIMELINE_TRACE_PATH",
+    os.path.join(tempfile.gettempdir(), "hcc_timeline.jsonl"),
+)
+TIMELINE_THRESHOLD = float(
+    os.environ.get("HCC_TIMELINE_TRACE_THRESHOLD_SEC", "0.05")
+)
+TIMELINE_CUDA_SYNC = bool(os.environ.get("HCC_TIMELINE_CUDA_SYNC"))
+_timeline_lock = threading.Lock()
+_timeline_origin = perf_counter()
+
+
+def timeline_event(
+    name: str,
+    *,
+    seconds: float | None = None,
+    force: bool = False,
+    **fields,
+) -> None:
+    """Append one slow-path event without requiring ptrace/container privileges."""
+
+    if not TIMELINE_ON:
+        return
+    if (
+        seconds is not None
+        and not force
+        and float(seconds) < TIMELINE_THRESHOLD
+    ):
+        return
+    payload = {
+        "elapsed_sec": perf_counter() - _timeline_origin,
+        "name": str(name),
+        "pid": os.getpid(),
+        "thread": threading.get_ident(),
+        **fields,
+    }
+    if seconds is not None:
+        payload["seconds"] = float(seconds)
+    line = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    with _timeline_lock:
+        try:
+            with open(TIMELINE_PATH, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            pass
 
 _CLK_TCK = 100.0
 try:

@@ -855,7 +855,7 @@ def _target_rows_by_package(
         str(Path(path).resolve()).replace("\\", "/")
         for path in package_paths
     ]
-    rows: dict[int, list[int]] = {}
+    targets_by_package: dict[int, dict[str, int]] = {}
     missing: list[str] = []
     for tile_id, (declared_path, row) in target_locations.items():
         suffix = str(declared_path).replace("\\", "/").lstrip("./")
@@ -882,16 +882,52 @@ def _target_rows_by_package(
             continue
         if int(row) < 0:
             raise ValueError(f"negative expert row: tile={tile_id} row={row}")
-        rows.setdefault(matches[0], []).append(int(row))
+        targets_by_package.setdefault(matches[0], {})[tile_id] = int(row)
     if missing and require_all:
         raise ValueError(
             "expert supervision references tiles outside the training split: "
             f"count={len(missing)} sample={', '.join(missing[:3])}"
         )
-    return {
-        package_index: np.asarray(sorted(set(package_rows)), dtype=np.int64)
-        for package_index, package_rows in rows.items()
-    }
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    rows: dict[int, np.ndarray] = {}
+    unresolved: list[str] = []
+    for package_index, targets in targets_by_package.items():
+        _, _, record_table = read_tables(package_paths[package_index])
+        tile_ids = record_table.column("tile_id")
+        resolved: dict[str, int] = {}
+        for tile_id, declared_row in targets.items():
+            if (
+                declared_row < len(tile_ids)
+                and str(tile_ids[declared_row].as_py()) == tile_id
+            ):
+                resolved[tile_id] = declared_row
+        remaining = set(targets).difference(resolved)
+        if remaining:
+            value_set = pa.array(sorted(remaining), type=tile_ids.type)
+            matched = pc.indices_nonzero(
+                pc.is_in(tile_ids, value_set=value_set)
+            ).to_numpy(zero_copy_only=False)
+            for row in matched.tolist():
+                tile_id = str(tile_ids[int(row)].as_py())
+                if tile_id in resolved:
+                    raise ValueError(
+                        "duplicate expert tile_id within package: "
+                        f"tile={tile_id} package={package_paths[package_index]}"
+                    )
+                resolved[tile_id] = int(row)
+        unresolved.extend(sorted(set(targets).difference(resolved)))
+        rows[package_index] = np.asarray(
+            sorted(resolved.values()),
+            dtype=np.int64,
+        )
+    if unresolved and require_all:
+        raise ValueError(
+            "expert tile_id is absent from its declared training package: "
+            f"count={len(unresolved)} sample={', '.join(unresolved[:3])}"
+        )
+    return rows
 
 
 def _validation_package_keep_indices(
@@ -1275,7 +1311,9 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    _probe.timeline_event("startup.begin", force=True)
     cfg = load_config(args.config)
+    _probe.timeline_event("startup.config_loaded", force=True)
     cfg["research_contract"] = {
         "student_backbone": STUDENT_BACKBONE_NAME,
         "student_pretrained": True,
@@ -1340,6 +1378,13 @@ def main() -> None:
             name: list(paths)
             for name, paths in train_teacher_packages.items()
         }
+    _probe.timeline_event(
+        "startup.package_paths_resolved",
+        force=True,
+        train_packages=len(train_tile_packages),
+        validation_packages=len(val_tile_packages),
+        expert_packages=len(expert_tile_packages),
+    )
     if manifest_path or explicit_split_packages:
         _assert_disjoint_package_paths(
             train_tile_packages,
@@ -1389,6 +1434,12 @@ def main() -> None:
             ),
         )
     )
+    _probe.timeline_event(
+        "startup.classification_assets_loaded",
+        force=True,
+        train_labels=len(train_prototype_labels),
+        replay_labels=len(replay_prototype_labels),
+    )
     all_tile_packages = sorted(set(train_tile_packages + val_tile_packages))
     tile_metadata = read_package_metadata(all_tile_packages[0])
     image_size = (int(tile_metadata["tile_height"]), int(tile_metadata["tile_width"]))
@@ -1424,6 +1475,11 @@ def main() -> None:
     # intentionally carry no spatial targets; localization is evaluated externally
     # only after the training run is frozen.
     val_spatial_targets = {}
+    _probe.timeline_event(
+        "startup.spatial_assets_loaded",
+        force=True,
+        spatial_tiles=len(train_spatial_targets),
+    )
     expert_tile_ids = set(replay_prototype_labels).union(
         train_spatial_targets
     )
@@ -1620,6 +1676,12 @@ def main() -> None:
             spatial_targets=val_spatial_targets,
             **spatial_dataset_kwargs,
         )
+    _probe.timeline_event(
+        "startup.population_datasets_built",
+        force=True,
+        train_tiles=len(train_ds),
+        validation_tiles=len(val_ds),
+    )
     num_workers = int(cfg["data"]["num_workers"])
     loader_kwargs = {
         "batch_size": cfg["train"]["batch_size"],
@@ -1699,6 +1761,7 @@ def main() -> None:
             collate_fn=collate_distillation,
             **loader_kwargs,
         )
+    _probe.timeline_event("startup.population_loaders_built", force=True)
     replay_interval = int(
         cfg["data"].get("expert_replay_interval_batches", 16)
     )
@@ -1745,6 +1808,11 @@ def main() -> None:
             prefetch_factor=int(
                 cfg["data"].get("prefetch_factor", 2)
             ),
+        )
+        _probe.timeline_event(
+            "startup.expert_bank_materialized",
+            force=True,
+            expert_tiles=len(expert_bank),
         )
         if train_prototype_labels:
             prototype_refresh_loader = _InMemoryExpertBatchLoader(
@@ -1809,6 +1877,7 @@ def main() -> None:
         spatial_dim=int(cfg["model"].get("spatial_dim", 256)),
         spatial_output_stride=spatial_stride,
     ).to(device)
+    _probe.timeline_event("startup.model_constructed", force=True)
     if model.spatial_head is not None:
         model.spatial_head.use_local_branch = bool(
             cfg["model"].get("spatial_use_local_branch", True)
@@ -1827,6 +1896,7 @@ def main() -> None:
     resume_state = None
     if args.resume:
         resume_state = torch.load(args.resume, map_location=device, weights_only=False)
+        _probe.timeline_event("startup.checkpoint_loaded", force=True)
         _validate_resume_contract(cfg, resume_state)
         state = {
             key.removeprefix("_orig_mod."): value
@@ -1838,7 +1908,9 @@ def main() -> None:
     if bool(cfg["train"].get("compile", False)):
         _configure_compiled_training_for_gradient_diagnostics()
         model = torch.compile(model)
+    _probe.timeline_event("startup.model_compile_wrapped", force=True)
     optimizer = _build_optimizer(model, cfg, device)
+    _probe.timeline_event("startup.optimizer_built", force=True)
     if resume_state and "optimizer" in resume_state:
         optimizer.load_state_dict(resume_state["optimizer"])
     scheduler = build_lr_scheduler(optimizer, cfg, len(train_loader))
@@ -1865,6 +1937,7 @@ def main() -> None:
             spatial_prototype_refresh_loader
         ),
     )
+    _probe.timeline_event("startup.fit_returned", force=True)
     print("train_ok " + " ".join(f"{k}={v}" for k, v in metrics.items()))
 
 

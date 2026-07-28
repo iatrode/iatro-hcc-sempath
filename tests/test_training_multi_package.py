@@ -259,6 +259,19 @@ def test_expert_row_resolution_reads_only_requested_tile_ids(
     assert rows[1].tolist() == [0]
 
 
+def test_expert_row_resolution_recovers_from_reordered_iac_rows(
+    tmp_path: Path,
+) -> None:
+    tile_a, _ = _write_package(tmp_path, "slide_a", 10, count=3)
+
+    rows = _target_rows_by_package(
+        [str(tile_a)],
+        {"slide_a_0000002": (tile_a.name, 0)},
+    )
+
+    assert rows[0].tolist() == [2]
+
+
 def test_expert_row_resolution_rejects_tile_outside_train_packages(
     tmp_path: Path,
 ) -> None:

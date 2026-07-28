@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -725,6 +727,183 @@ def _dilate(mask: torch.Tensor, radius: int) -> torch.Tensor:
     return value[0, 0] > 0
 
 
+def _build_spatial_tile_target(
+    tile_id: str,
+    *,
+    component_names: list[str],
+    positions: dict[str, int],
+    specs: list,
+    tile_records: list[dict[str, Any]],
+    tile_metadata: dict[str, Any],
+    image_size: tuple[int, int],
+    grid_size: tuple[int, int],
+    point_tolerance_cells: int,
+) -> tuple[str, SpatialRoiTarget]:
+    target = empty_spatial_roi_target(len(component_names), grid_size)
+    point_centers = target.point_centers.clone()
+    instance_exclusion_support = target.instance_exclusion_support.clone()
+    brush_bag_ids = target.brush_bag_ids.clone()
+    area_positive = target.area_positive.clone()
+    explicit_negative = target.explicit_negative.clone()
+    implicit_negative = target.implicit_negative.clone()
+
+    by_component: dict[str, list[dict[str, Any]]] = {}
+    for record in tile_records:
+        by_component.setdefault(str(record["attribute"]), []).append(record)
+    complete_all = bool(tile_metadata.get("complete_all", False))
+    components_to_process = set(by_component)
+    if complete_all:
+        components_to_process.update(component_names)
+
+    for component in components_to_process:
+        idx = positions[component]
+        spec = specs[idx]
+        complete_negative = False
+        structure_brush_geometries: list[dict[str, Any]] = []
+        for record in by_component.get(component, []):
+            geometry = record.get("geometry")
+            state = str(record.get("state", "positive")).lower()
+            if state not in {"positive", "negative"}:
+                raise ValueError(
+                    f"ROI state must be positive or negative, got {state!r}"
+                )
+            if geometry is None:
+                if not bool(record.get("review_complete", False)):
+                    raise ValueError(
+                        "ROI record requires geometry or "
+                        f"review_complete=true: tile={tile_id}"
+                    )
+                if state != "negative":
+                    raise ValueError(
+                        "geometry-free ROI completion must be negative: "
+                        f"tile={tile_id} component={component}"
+                    )
+                complete_negative = True
+                continue
+
+            kind = _geometry_kind(geometry)
+            if state == "positive":
+                if spec.mode == CELL_INSTANCE_DENSITY:
+                    if kind in POINT_GEOMETRIES:
+                        _add_point_center(
+                            point_centers[idx],
+                            geometry,
+                            image_size=image_size,
+                        )
+                    elif kind in CIRCLE_GEOMETRIES:
+                        _add_geometry_center(
+                            point_centers[idx],
+                            geometry,
+                            image_size=image_size,
+                        )
+                        instance_exclusion_support[idx] |= geometry_token_mask(
+                            geometry,
+                            image_size=image_size,
+                            grid_size=grid_size,
+                        )
+                    else:
+                        _add_brush_bag(
+                            brush_bag_ids[idx],
+                            geometry,
+                            image_size=image_size,
+                        )
+                elif spec.mode == STRUCTURE_INSTANCE_AREA:
+                    if kind in POINT_GEOMETRIES:
+                        _add_geometry_center(
+                            point_centers[idx],
+                            geometry,
+                            image_size=image_size,
+                        )
+                    elif kind in CIRCLE_GEOMETRIES:
+                        _add_geometry_center(
+                            point_centers[idx],
+                            geometry,
+                            image_size=image_size,
+                        )
+                        _add_area_support(
+                            area_positive[idx],
+                            geometry,
+                            image_size=image_size,
+                        )
+                        instance_exclusion_support[idx] |= geometry_token_mask(
+                            geometry,
+                            image_size=image_size,
+                            grid_size=grid_size,
+                        )
+                    else:
+                        structure_brush_geometries.append(geometry)
+                        _add_area_support(
+                            area_positive[idx],
+                            geometry,
+                            image_size=image_size,
+                        )
+                        instance_exclusion_support[idx] |= geometry_token_mask(
+                            geometry,
+                            image_size=image_size,
+                            grid_size=grid_size,
+                        )
+                elif spec.mode == PIGMENT_BURDEN:
+                    _add_area_support(
+                        area_positive[idx],
+                        geometry,
+                        image_size=image_size,
+                        dilation_cells=0,
+                    )
+                elif spec.mode == CONTINUOUS_AREA:
+                    _add_area_support(
+                        area_positive[idx],
+                        geometry,
+                        image_size=image_size,
+                    )
+                else:  # pragma: no cover - guarded by spatial schema
+                    raise ValueError(
+                        f"unsupported spatial mode: {spec.mode!r}"
+                    )
+            else:
+                explicit_negative[idx] |= geometry_token_mask(
+                    geometry,
+                    image_size=image_size,
+                    grid_size=grid_size,
+                )
+
+        if structure_brush_geometries:
+            _add_connected_geometry_centers(
+                point_centers[idx],
+                structure_brush_geometries,
+                image_size=image_size,
+            )
+
+        positive_support = _dilate(
+            point_centers[idx] > 0,
+            point_tolerance_cells,
+        ) | (brush_bag_ids[idx] > 0) | area_positive[idx]
+        if complete_negative:
+            if bool(positive_support.any()):
+                raise ValueError(
+                    "component cannot be both complete-negative and positive: "
+                    f"tile={tile_id} component={component}"
+                )
+            explicit_negative[idx].fill_(True)
+        overlap = (
+            positive_support | instance_exclusion_support[idx]
+        ) & explicit_negative[idx]
+        if bool(overlap.any()):
+            raise ValueError(
+                "positive and explicit-negative ROI geometry overlap: "
+                f"tile={tile_id} component={component} "
+                f"cells={int(overlap.sum())}"
+            )
+
+    return tile_id, SpatialRoiTarget(
+        point_centers=point_centers,
+        instance_exclusion_support=instance_exclusion_support,
+        brush_bag_ids=brush_bag_ids,
+        area_positive=area_positive,
+        explicit_negative=explicit_negative,
+        implicit_negative=implicit_negative,
+    )
+
+
 def build_spatial_roi_targets(
     manifest_path: str | Path | None,
     *,
@@ -777,191 +956,27 @@ def build_spatial_roi_targets(
         )
     )
 
-    result: dict[str, SpatialRoiTarget] = {}
-    for tile_id in sorted(tile_ids):
-        target = empty_spatial_roi_target(len(component_names), grid_size)
-        point_centers = target.point_centers.clone()
-        instance_exclusion_support = (
-            target.instance_exclusion_support.clone()
+    ordered_tile_ids = sorted(tile_ids)
+    workers = min(
+        max(1, int(os.environ.get("HCC_ROI_BUILD_WORKERS", "32"))),
+        max(1, len(ordered_tile_ids)),
+    )
+
+    def build_one(tile_id: str) -> tuple[str, SpatialRoiTarget]:
+        return _build_spatial_tile_target(
+            tile_id,
+            component_names=component_names,
+            positions=positions,
+            specs=specs,
+            tile_records=grouped.get(tile_id, []),
+            tile_metadata=eligible_metadata.get(tile_id, {}),
+            image_size=image_size,
+            grid_size=grid_size,
+            point_tolerance_cells=point_tolerance_cells,
         )
-        brush_bag_ids = target.brush_bag_ids.clone()
-        area_positive = target.area_positive.clone()
-        explicit_negative = target.explicit_negative.clone()
-        implicit_negative = target.implicit_negative.clone()
 
-        tile_records = grouped.get(tile_id, [])
-        by_component: dict[str, list[dict[str, Any]]] = {}
-        for record in tile_records:
-            by_component.setdefault(str(record["attribute"]), []).append(record)
-        complete_all = bool(
-            eligible_metadata.get(tile_id, {}).get("complete_all", False)
-        )
-
-        components_to_process = set(by_component)
-        if complete_all:
-            components_to_process.update(component_names)
-
-        for component in components_to_process:
-            idx = positions[component]
-            spec = specs[idx]
-            complete_negative = False
-            structure_brush_geometries: list[dict[str, Any]] = []
-            for record in by_component.get(component, []):
-                geometry = record.get("geometry")
-                state = str(record.get("state", "positive")).lower()
-                if state not in {"positive", "negative"}:
-                    raise ValueError(
-                        f"ROI state must be positive or negative, got {state!r}"
-                    )
-                if geometry is None:
-                    if not bool(record.get("review_complete", False)):
-                        raise ValueError(
-                            "ROI record requires geometry or "
-                            f"review_complete=true: tile={tile_id}"
-                        )
-                    if state != "negative":
-                        raise ValueError(
-                            "geometry-free ROI completion must be negative: "
-                            f"tile={tile_id} component={component}"
-                        )
-                    complete_negative = True
-                    continue
-
-                kind = _geometry_kind(geometry)
-                if state == "positive":
-                    if spec.mode == CELL_INSTANCE_DENSITY:
-                        if kind in POINT_GEOMETRIES:
-                            _add_point_center(
-                                point_centers[idx],
-                                geometry,
-                                image_size=image_size,
-                            )
-                        elif kind in CIRCLE_GEOMETRIES:
-                            _add_geometry_center(
-                                point_centers[idx],
-                                geometry,
-                                image_size=image_size,
-                            )
-                            instance_exclusion_support[
-                                idx
-                            ] |= geometry_token_mask(
-                                geometry,
-                                image_size=image_size,
-                                grid_size=grid_size,
-                            )
-                        else:
-                            _add_brush_bag(
-                                brush_bag_ids[idx],
-                                geometry,
-                                image_size=image_size,
-                            )
-                    elif spec.mode == STRUCTURE_INSTANCE_AREA:
-                        if kind in POINT_GEOMETRIES:
-                            _add_geometry_center(
-                                point_centers[idx],
-                                geometry,
-                                image_size=image_size,
-                            )
-                        elif kind in CIRCLE_GEOMETRIES:
-                            _add_geometry_center(
-                                point_centers[idx],
-                                geometry,
-                                image_size=image_size,
-                            )
-                            _add_area_support(
-                                area_positive[idx],
-                                geometry,
-                                image_size=image_size,
-                            )
-                            instance_exclusion_support[
-                                idx
-                            ] |= geometry_token_mask(
-                                geometry,
-                                image_size=image_size,
-                                grid_size=grid_size,
-                            )
-                        else:
-                            structure_brush_geometries.append(geometry)
-                            _add_area_support(
-                                area_positive[idx],
-                                geometry,
-                                image_size=image_size,
-                            )
-                            instance_exclusion_support[
-                                idx
-                            ] |= geometry_token_mask(
-                                geometry,
-                                image_size=image_size,
-                                grid_size=grid_size,
-                            )
-                    elif spec.mode == PIGMENT_BURDEN:
-                        _add_area_support(
-                            area_positive[idx],
-                            geometry,
-                            image_size=image_size,
-                            # A pigment point is one observed burden seed. The
-                            # click tolerance is localization uncertainty, not
-                            # an inferred biological extent.
-                            dilation_cells=0,
-                        )
-                    elif spec.mode == CONTINUOUS_AREA:
-                        _add_area_support(
-                            area_positive[idx],
-                            geometry,
-                            image_size=image_size,
-                        )
-                    else:  # pragma: no cover - guarded by spatial schema
-                        raise ValueError(
-                            f"unsupported spatial mode: {spec.mode!r}"
-                        )
-                else:
-                    explicit_negative[idx] |= geometry_token_mask(
-                        geometry,
-                        image_size=image_size,
-                        grid_size=grid_size,
-                    )
-
-            if structure_brush_geometries:
-                _add_connected_geometry_centers(
-                    point_centers[idx],
-                    structure_brush_geometries,
-                    image_size=image_size,
-                )
-
-            positive_support = _dilate(
-                point_centers[idx] > 0,
-                point_tolerance_cells,
-            ) | (brush_bag_ids[idx] > 0) | area_positive[idx]
-            if complete_negative:
-                if bool(positive_support.any()):
-                    raise ValueError(
-                        "component cannot be both complete-negative and positive: "
-                        f"tile={tile_id} component={component}"
-                    )
-                explicit_negative[idx].fill_(True)
-            overlap = (
-                positive_support | instance_exclusion_support[idx]
-            ) & explicit_negative[idx]
-            if bool(overlap.any()):
-                raise ValueError(
-                    "positive and explicit-negative ROI geometry overlap: "
-                    f"tile={tile_id} component={component} "
-                    f"cells={int(overlap.sum())}"
-                )
-
-            # Unmarked cells remain ignore. A positive mark establishes only
-            # the supplied evidence; it cannot prove that every other cell is
-            # negative in a deliberately sparse or mixed ROI annotation.
-
-        result[tile_id] = SpatialRoiTarget(
-            point_centers=point_centers,
-            instance_exclusion_support=instance_exclusion_support,
-            brush_bag_ids=brush_bag_ids,
-            area_positive=area_positive,
-            explicit_negative=explicit_negative,
-            implicit_negative=implicit_negative,
-        )
-    return result
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        return dict(executor.map(build_one, ordered_tile_ids))
 
 
 def spatial_roi_payload(
