@@ -13,6 +13,11 @@ import yaml
 
 from iatro.iac.adapters.features import FeatureCacheReader
 
+from hcc_sempath.training.feature_pack_merge import (
+    MergedTeacherFeatureCacheReader,
+    is_merged_teacher_feature_package,
+)
+
 
 TILE_SUFFIX = ".tiles.iac"
 TEACHERS = ("gigapath", "h_optimus_1", "uni2_h", "virchow2")
@@ -89,10 +94,28 @@ def _feature_path(manifest: dict[str, Any], item: dict[str, Any], teacher: str) 
     return matches[0]
 
 
-def _read_feature(path: Path, row: int) -> np.ndarray:
+def _read_features(
+    path: Path,
+    rows: list[int],
+    teacher: str,
+) -> np.ndarray:
+    if is_merged_teacher_feature_package(path):
+        merged_reader = MergedTeacherFeatureCacheReader(path)
+        try:
+            return merged_reader.read_features_many_at(rows, [teacher])[teacher]
+        finally:
+            merged_reader.close()
     reader = FeatureCacheReader(path)
     try:
-        return reader.read_feature_at(int(row)).astype(np.float32, copy=False).reshape(-1)
+        return np.stack(
+            [
+                reader.read_feature_at(int(row))
+                .astype(np.float32, copy=False)
+                .reshape(-1)
+                for row in rows
+            ],
+            axis=0,
+        )
     finally:
         reader.close()
 
@@ -163,16 +186,31 @@ def _collect_teacher_features(
     rows: list[dict[str, Any]],
     teacher: str,
 ) -> tuple[list[np.ndarray], int]:
-    features: list[np.ndarray] = []
+    grouped: dict[Path, list[tuple[int, int]]] = {}
+    for index, item in enumerate(rows):
+        path = _feature_path(manifest, item, teacher)
+        grouped.setdefault(path, []).append((index, int(item["row"])))
+
+    collected: list[np.ndarray | None] = [None] * len(rows)
     dim = 0
-    for item in rows:
-        feature = _read_feature(_feature_path(manifest, item, teacher), int(item["row"]))
-        if dim == 0:
-            dim = int(feature.shape[0])
-        elif int(feature.shape[0]) != dim:
-            raise ValueError(f"feature dim mismatch teacher={teacher}: got={feature.shape[0]} expected={dim}")
-        features.append(feature)
-    return features, dim
+    for path, indexed_rows in grouped.items():
+        matrix = _read_features(
+            path,
+            [row for _, row in indexed_rows],
+            teacher,
+        )
+        for (index, _), feature in zip(indexed_rows, matrix, strict=True):
+            if dim == 0:
+                dim = int(feature.shape[0])
+            elif int(feature.shape[0]) != dim:
+                raise ValueError(
+                    f"feature dim mismatch teacher={teacher}: "
+                    f"got={feature.shape[0]} expected={dim}"
+                )
+            collected[index] = feature
+    if any(feature is None for feature in collected):
+        raise RuntimeError(f"incomplete feature collection for teacher={teacher}")
+    return [feature for feature in collected if feature is not None], dim
 
 
 def _build_label_prototypes(
