@@ -533,6 +533,12 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
     if int(cfg.get("train", {}).get("step_metrics_flush_steps", 50)) <= 0:
         raise ValueError("train.step_metrics_flush_steps must be positive")
     if int(
+        cfg.get("train", {}).get("checkpoint_interval_steps", 1000)
+    ) < 0:
+        raise ValueError(
+            "train.checkpoint_interval_steps must be non-negative"
+        )
+    if int(
         cfg.get("train", {}).get("development_probe_interval_steps", 0)
     ) < 0:
         raise ValueError(

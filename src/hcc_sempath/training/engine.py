@@ -252,8 +252,32 @@ def _set_loader_epoch(loader, epoch: int) -> None:
         candidate = getattr(loader, name, None)
         setter = getattr(candidate, "set_epoch", None)
         if callable(setter):
-            setter(int(epoch))
-            return
+                setter(int(epoch))
+                return
+
+
+def _set_loader_batch_cursor(loader, batch: int) -> None:
+    batch = int(batch)
+    if batch <= 0:
+        return
+    setter = getattr(loader, "set_batch_cursor", None)
+    if callable(setter):
+        setter(batch)
+        return
+    candidate = getattr(loader, "batch_sampler", None)
+    setter = getattr(candidate, "set_batch_cursor", None)
+    if callable(setter):
+        setter(batch)
+        return
+    raise RuntimeError(
+        "training loader cannot resume from a mid-epoch batch cursor"
+    )
+
+
+def _atomic_torch_save(payload: dict, path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
 
 
 def _optimizer_step(
@@ -1068,9 +1092,11 @@ def run_epoch(
     prototype_refresh_state: PrototypeRefreshState | None = None,
     step_metrics_writer: StepMetricsWriter | None = None,
     development_probe: Callable[[int, int, int], None] | None = None,
+    step_checkpoint: Callable[[int, int, int, int, dict], None] | None = None,
+    resume_epoch_accumulator: dict | None = None,
 ) -> dict[str, float] | tuple[dict[str, float], tuple]:
     model.train(train)
-    totals: dict[str, torch.Tensor | float] = {
+    default_totals: dict[str, torch.Tensor | float] = {
         "loss": 0.0,
         "feature": 0.0,
         "relation": 0.0,
@@ -1095,11 +1121,22 @@ def run_epoch(
         "spatial_explicit_negative_pairs": 0.0,
         "spatial_implicit_negative_pairs": 0.0,
     }
-    gradient_totals: dict[str, float] = {}
-    gradient_count = 0
-    last_gradient_step = global_step - GRADIENT_DIAGNOSTIC_INTERVAL_STEPS
-    n_batches = 0
-    n_tiles = 0
+    resumed = resume_epoch_accumulator if train else None
+    totals = {
+        **default_totals,
+        **dict((resumed or {}).get("totals", {})),
+    }
+    gradient_totals = dict((resumed or {}).get("gradient_totals", {}))
+    gradient_count = int((resumed or {}).get("gradient_count", 0))
+    last_gradient_step = int(
+        (resumed or {}).get(
+            "last_gradient_step",
+            global_step - GRADIENT_DIAGNOSTIC_INTERVAL_STEPS,
+        )
+    )
+    n_batches = int((resumed or {}).get("batches", 0))
+    n_tiles = int((resumed or {}).get("tiles", 0))
+    prior_elapsed = float((resumed or {}).get("seconds", 0.0))
     start = time.perf_counter()
     interval_start = start
     interval_tiles = 0
@@ -1596,17 +1633,6 @@ def run_epoch(
                     loss=loss,
                     parts=parts,
                 )
-            if train and optimizer_stepped and development_probe is not None:
-                probe_start = time.perf_counter()
-                development_probe(global_step, spatial_supervised_step, epoch)
-                _probe.timeline_event(
-                    "batch.development_probe",
-                    seconds=time.perf_counter() - probe_start,
-                    epoch=epoch,
-                    batch=n_batches,
-                    global_step=global_step,
-                )
-
             if collect_embeddings and (
                 max_eval_batches is None or n_batches < max_eval_batches
             ):
@@ -1632,6 +1658,42 @@ def run_epoch(
                     )
 
             n_batches += 1
+            if train and optimizer_stepped and step_checkpoint is not None:
+                checkpoint_totals = {
+                    key: (
+                        float(value.detach().cpu())
+                        if isinstance(value, torch.Tensor)
+                        else float(value)
+                    )
+                    for key, value in totals.items()
+                }
+                step_checkpoint(
+                    global_step,
+                    spatial_supervised_step,
+                    epoch,
+                    n_batches,
+                    {
+                        "totals": checkpoint_totals,
+                        "gradient_totals": dict(gradient_totals),
+                        "gradient_count": gradient_count,
+                        "last_gradient_step": last_gradient_step,
+                        "batches": n_batches,
+                        "tiles": n_tiles,
+                        "seconds": (
+                            prior_elapsed + time.perf_counter() - start
+                        ),
+                    },
+                )
+            if train and optimizer_stepped and development_probe is not None:
+                probe_start = time.perf_counter()
+                development_probe(global_step, spatial_supervised_step, epoch)
+                _probe.timeline_event(
+                    "batch.development_probe",
+                    seconds=time.perf_counter() - probe_start,
+                    epoch=epoch,
+                    batch=n_batches,
+                    global_step=global_step,
+                )
             _probe.timeline_event(
                 "batch.total",
                 seconds=time.perf_counter() - batch_start,
@@ -1696,7 +1758,10 @@ def run_epoch(
 
     if n_batches == 0:
         raise ValueError(f"{phase} loader produced no batches")
-    elapsed = max(time.perf_counter() - start, 1e-9)
+    elapsed = max(
+        prior_elapsed + time.perf_counter() - start,
+        1e-9,
+    )
     result: dict[str, float] = {}
     for key, value in totals.items():
         mean_value = value / n_batches
@@ -1858,7 +1923,15 @@ def fit(
         )
     )
     alignment_history = list((resume_state or {}).get("alignment_history", []))
-    start_epoch = int((resume_state or {}).get("epoch", 0)) + 1
+    resume_batch_in_epoch = int(
+        (resume_state or {}).get("batch_in_epoch", 0)
+    )
+    checkpoint_epoch = int((resume_state or {}).get("epoch", 0))
+    start_epoch = (
+        checkpoint_epoch
+        if resume_batch_in_epoch > 0
+        else checkpoint_epoch + 1
+    )
     previous_expected_epochs = int(
         (resume_state or {}).get(
             "expected_epochs",
@@ -1930,6 +2003,98 @@ def fit(
         output_dir / "step_metrics.csv",
         flush_steps=int(cfg["train"].get("step_metrics_flush_steps", 50)),
     )
+    checkpoint_interval_steps = int(
+        cfg["train"].get("checkpoint_interval_steps", 1000)
+    )
+
+    def checkpoint_payload(
+        *,
+        epoch: int,
+        batch_in_epoch: int,
+        epoch_accumulator: dict | None,
+        training_complete: bool,
+    ) -> dict:
+        raw_model = getattr(model, "_orig_mod", model)
+        return {
+            "model": raw_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "optimizer_hyperparameters": _optimizer_hyperparameters(
+                optimizer
+            ),
+            "scheduler": (
+                scheduler.state_dict()
+                if scheduler is not None
+                else None
+            ),
+            "scheduler_contract": _scheduler_contract(
+                cfg,
+                len(train_loader),
+            ),
+            "scaler": scaler.state_dict(),
+            "epoch": int(epoch),
+            "batch_in_epoch": int(batch_in_epoch),
+            "epoch_accumulator": epoch_accumulator,
+            "global_step": global_step,
+            "spatial_supervised_step": spatial_supervised_step,
+            "dynamic_prototype_step": (
+                prototype_refresh_state.last_global_step
+                if prototype_refresh_state is not None
+                else None
+            ),
+            "dynamic_spatial_prototype_global_step": (
+                prototype_refresh_state.last_spatial_global_step
+                if prototype_refresh_state is not None
+                else None
+            ),
+            "best_loss": best_loss,
+            "best_teacher_alignment": best_teacher_alignment,
+            "best_classification_accuracy": (
+                best_classification_accuracy
+            ),
+            "best_metrics": best_metrics,
+            "last_metrics": last_metrics,
+            "alignment_history": alignment_history,
+            "rng_state": _rng_state(),
+            "config": cfg,
+            "training_complete": bool(training_complete),
+            "expected_epochs": expected_epochs,
+            "continuation_history": continuation_history,
+        }
+
+    def save_step_checkpoint(
+        step: int,
+        spatial_step: int,
+        current_epoch: int,
+        batch_in_epoch: int,
+        epoch_accumulator: dict,
+    ) -> None:
+        nonlocal global_step, spatial_supervised_step
+        if (
+            checkpoint_interval_steps <= 0
+            or step % checkpoint_interval_steps != 0
+            or batch_in_epoch >= len(train_loader)
+        ):
+            return
+        global_step = int(step)
+        spatial_supervised_step = int(spatial_step)
+        step_metrics_writer.flush()
+        started = time.perf_counter()
+        _atomic_torch_save(
+            checkpoint_payload(
+                epoch=current_epoch,
+                batch_in_epoch=batch_in_epoch,
+                epoch_accumulator=epoch_accumulator,
+                training_complete=False,
+            ),
+            checkpoints / "last.pt",
+        )
+        _log(
+            "step_checkpoint "
+            f"epoch={current_epoch} batch={batch_in_epoch} "
+            f"global_step={step} "
+            f"seconds={time.perf_counter() - started:.2f}"
+        )
+
     development_probe_interval = int(
         cfg["train"].get("development_probe_interval_steps", 0) or 0
     )
@@ -2002,6 +2167,19 @@ def fit(
     try:
         for epoch in range(start_epoch, expected_epochs + 1):
             _set_loader_epoch(train_loader, epoch - 1)
+            epoch_accumulator = None
+            if epoch == start_epoch and resume_batch_in_epoch > 0:
+                _set_loader_batch_cursor(
+                    train_loader,
+                    resume_batch_in_epoch,
+                )
+                epoch_accumulator = (resume_state or {}).get(
+                    "epoch_accumulator"
+                )
+                if epoch_accumulator is None:
+                    raise ValueError(
+                        "mid-epoch checkpoint has no epoch accumulator"
+                    )
             train_metrics = run_epoch(
                 model,
                 train_loader,
@@ -2020,7 +2198,10 @@ def fit(
                 prototype_refresh_state=prototype_refresh_state,
                 step_metrics_writer=step_metrics_writer,
                 development_probe=run_development_probe,
+                step_checkpoint=save_step_checkpoint,
+                resume_epoch_accumulator=epoch_accumulator,
             )
+            resume_batch_in_epoch = 0
             global_step = int(train_metrics["global_step_end"])
             spatial_supervised_step = int(
                 train_metrics["spatial_supervised_step_end"]
@@ -2141,53 +2322,25 @@ def fit(
             if improved_classification:
                 best_classification_accuracy = classification_metrics["classification_accuracy"]
 
-            raw_model = getattr(model, "_orig_mod", model)
-            checkpoint = {
-                "model": raw_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "optimizer_hyperparameters": _optimizer_hyperparameters(
-                    optimizer
-                ),
-                "scheduler": scheduler.state_dict() if scheduler is not None else None,
-                "scheduler_contract": _scheduler_contract(
-                    cfg,
-                    len(train_loader),
-                ),
-                "scaler": scaler.state_dict(),
-                "epoch": epoch,
-                "global_step": global_step,
-                "spatial_supervised_step": spatial_supervised_step,
-                "dynamic_prototype_step": (
-                    prototype_refresh_state.last_global_step
-                    if prototype_refresh_state is not None
-                    else None
-                ),
-                "dynamic_spatial_prototype_global_step": (
-                    prototype_refresh_state.last_spatial_global_step
-                    if prototype_refresh_state is not None
-                    else None
-                ),
-                "best_loss": best_loss,
-                "best_teacher_alignment": best_teacher_alignment,
-                "best_classification_accuracy": best_classification_accuracy,
-                "best_metrics": best_metrics,
-                "last_metrics": last_metrics,
-                "alignment_history": alignment_history,
-                "rng_state": _rng_state(),
-                "config": cfg,
-                "training_complete": (
-                    epoch >= expected_epochs
-                ),
-                "expected_epochs": expected_epochs,
-                "continuation_history": continuation_history,
-            }
-            torch.save(checkpoint, checkpoints / "last.pt")
+            checkpoint = checkpoint_payload(
+                epoch=epoch,
+                batch_in_epoch=0,
+                epoch_accumulator=None,
+                training_complete=epoch >= expected_epochs,
+            )
+            _atomic_torch_save(checkpoint, checkpoints / "last.pt")
             if improved_loss:
-                torch.save(checkpoint, checkpoints / "best.pt")
+                _atomic_torch_save(checkpoint, checkpoints / "best.pt")
             if improved_alignment:
-                torch.save(checkpoint, checkpoints / "best_teacher_alignment.pt")
+                _atomic_torch_save(
+                    checkpoint,
+                    checkpoints / "best_teacher_alignment.pt",
+                )
             if improved_classification:
-                torch.save(checkpoint, checkpoints / "best_classification_accuracy.pt")
+                _atomic_torch_save(
+                    checkpoint,
+                    checkpoints / "best_classification_accuracy.pt",
+                )
             if bool(
                 cfg["train"].get(
                     "early_stop_teacher_alignment",

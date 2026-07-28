@@ -383,6 +383,7 @@ def test_run_epoch_joint_classification_spatial_route_keeps_full_bank_prototypes
         },
     }
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+    checkpoints = []
 
     result = run_epoch(
         model,
@@ -392,10 +393,16 @@ def test_run_epoch_joint_classification_spatial_route_keeps_full_bank_prototypes
         torch.device("cpu"),
         cfg,
         train=True,
+        step_checkpoint=lambda *args: checkpoints.append(args),
     )
 
     assert result["global_step_end"] == 1
     assert result["spatial_supervised_step_end"] == 1
+    assert len(checkpoints) == 1
+    assert checkpoints[0][:4] == (1, 1, 1, 1)
+    assert checkpoints[0][4]["batches"] == 1
+    assert checkpoints[0][4]["tiles"] == 1
+    assert checkpoints[0][4]["totals"]["loss"] > 0
     torch.testing.assert_close(model.classification_prototypes, classification_before)
     torch.testing.assert_close(
         model.spatial_head.instance_prototypes,
@@ -755,6 +762,18 @@ def test_training_config_rejects_unsupported_profiling_controls() -> None:
         validate_training_config(cfg, ["teacher"])
 
 
+def test_training_config_rejects_negative_checkpoint_interval() -> None:
+    cfg = {
+        "data": {"teachers": ["teacher"]},
+        "model": {"teacher_dims": {"teacher": 8}},
+        "loss": {},
+        "train": {"checkpoint_interval_steps": -1},
+    }
+
+    with pytest.raises(ValueError, match="checkpoint_interval_steps"):
+        validate_training_config(cfg, ["teacher"])
+
+
 def test_training_config_rejects_degenerate_pamtd_reliability() -> None:
     cfg = {
         "data": {
@@ -907,3 +926,114 @@ def test_resume_target_epochs_are_absolute_and_restartable() -> None:
         _resolve_target_epochs(cfg, completed, 2)
     with pytest.raises(ValueError, match="checkpoint epoch"):
         _resolve_target_epochs(cfg, extended, 3)
+
+
+def test_fit_resumes_the_same_epoch_from_saved_batch_cursor(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    events = []
+
+    class Loader:
+        def __len__(self):
+            return 10
+
+        def set_epoch(self, epoch):
+            events.append(("epoch", int(epoch)))
+
+        def set_batch_cursor(self, batch):
+            events.append(("cursor", int(batch)))
+
+        def __iter__(self):
+            return iter(())
+
+    train_calls = []
+
+    def fake_run_epoch(*args, train: bool, epoch: int, **kwargs):
+        if train:
+            train_calls.append(
+                (epoch, kwargs.get("resume_epoch_accumulator"))
+            )
+            return {
+                "loss": 0.1,
+                "global_step_end": kwargs["global_step"] + 1,
+                "spatial_supervised_step_end": kwargs[
+                    "spatial_supervised_step"
+                ],
+            }
+        return (
+            {"loss": 0.1},
+            (
+                torch.zeros((1, 2)),
+                {"teacher": torch.zeros((1, 2))},
+                {"teacher": torch.zeros((1, 2))},
+                {
+                    "prototype_mask": torch.zeros(1, dtype=torch.bool),
+                    "prototype_classification": torch.full((1,), -1),
+                    "classification_logits": torch.zeros((0, 0)),
+                },
+            ),
+        )
+
+    monkeypatch.setattr(
+        "hcc_sempath.training.engine.run_epoch",
+        fake_run_epoch,
+    )
+    monkeypatch.setattr(
+        "hcc_sempath.training.engine.evaluate_teacher_outputs",
+        lambda *args, **kwargs: {"teacher_feature_cosine": 0.5},
+    )
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    accumulator = {
+        "totals": {"loss": 3.0},
+        "gradient_totals": {},
+        "gradient_count": 0,
+        "last_gradient_step": 1000,
+        "batches": 3,
+        "tiles": 1536,
+        "seconds": 1.0,
+    }
+    cfg = {
+        "runtime": {"output_dir": str(tmp_path), "seed": 13},
+        "data": {"spatial_manifest_path": "spatial.json"},
+        "model": {},
+        "loss": {
+            "relation_weight": 0.0,
+            "semantic_weight": 0.0,
+            "classification_weight": 0.0,
+            "spatial_weight": 0.0,
+        },
+        "train": {
+            "epochs": 3,
+            "amp": False,
+            "topk": 1,
+            "tensorboard": False,
+            "early_stop_teacher_alignment": False,
+        },
+    }
+
+    fit(
+        model,
+        Loader(),
+        Loader(),
+        None,
+        optimizer,
+        torch.device("cpu"),
+        cfg,
+        resume_state={
+            "epoch": 2,
+            "batch_in_epoch": 3,
+            "epoch_accumulator": accumulator,
+            "expected_epochs": 3,
+            "global_step": 2000,
+        },
+    )
+
+    resume_epoch_position = events.index(("epoch", 1))
+    assert events[resume_epoch_position : resume_epoch_position + 2] == [
+        ("epoch", 1),
+        ("cursor", 3),
+    ]
+    assert train_calls[0] == (2, accumulator)
+    assert train_calls[1] == (3, None)

@@ -109,6 +109,9 @@ train:
   # Every optimizer step is retained in a buffered append-only CSV. The fixed
   # development probe supplies intra-epoch loss curves on an unchanged subset.
   step_metrics_flush_steps: 50
+  # Atomic, exactly resumable mid-epoch checkpoint. Full-corpus epochs are too
+  # long to use epoch boundaries as the only recovery point.
+  checkpoint_interval_steps: 1000
   development_probe_interval_steps: 1000
   development_probe_batches: 64
   # Re-encode the complete fixed expert banks in the evolving student.
