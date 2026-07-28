@@ -473,8 +473,8 @@ def main() -> None:
         optuna.pruners.NopPruner()
         if int(args.epochs) <= 1
         else optuna.pruners.MedianPruner(
-            n_startup_trials=2,
-            n_warmup_steps=1,
+            n_startup_trials=1,
+            n_warmup_steps=2,
             interval_steps=1,
         )
     )
@@ -514,7 +514,7 @@ def main() -> None:
         "pruner": (
             "NopPruner"
             if int(args.epochs) <= 1
-            else "MedianPruner(n_startup_trials=2,n_warmup_steps=1,interval_steps=1)"
+            else "MedianPruner(n_startup_trials=1,n_warmup_steps=2,interval_steps=1)"
         ),
         "baseline_params": BASELINE_PARAMS,
         "seeded_params": list(SEEDED_PARAMS),
