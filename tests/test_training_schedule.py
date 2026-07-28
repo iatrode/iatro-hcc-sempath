@@ -12,6 +12,7 @@ from hcc_sempath.training.engine import (
     _spatial_global_targets_from_spatial,
     _objective_gradient_diagnostics,
     _optimizer_step,
+    _scalar_epoch_metrics,
     _should_stop_for_alignment,
     _development_early_stop_state_from_csv,
     _truncate_csv_after_step,
@@ -962,6 +963,22 @@ def test_resume_terminal_epoch_comes_only_from_config() -> None:
 
     with pytest.raises(ValueError, match="checkpoint epoch"):
         _resolve_configured_epochs({"train": {"epochs": 3}}, extended)
+
+
+def test_development_metrics_exclude_internal_continuation_state() -> None:
+    metrics = {
+        "loss": 0.25,
+        "tiles": 512.0,
+        "epoch_accumulator_end": {
+            "totals": {"loss": 0.25},
+            "batches": 1,
+        },
+    }
+
+    assert _scalar_epoch_metrics(metrics) == {
+        "loss": 0.25,
+        "tiles": 512.0,
+    }
 
 
 def test_resume_truncates_metric_rows_after_checkpoint_step(tmp_path) -> None:

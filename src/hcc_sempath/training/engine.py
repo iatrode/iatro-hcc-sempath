@@ -274,6 +274,16 @@ def _set_loader_batch_cursor(loader, batch: int) -> None:
     )
 
 
+def _scalar_epoch_metrics(metrics: dict) -> dict[str, float]:
+    """Keep public metric rows separate from internal continuation state."""
+
+    return {
+        str(key): float(value)
+        for key, value in metrics.items()
+        if isinstance(value, Number)
+    }
+
+
 def _atomic_torch_save(payload: dict, path: Path) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
@@ -2321,7 +2331,8 @@ def fit(
             epoch=current_epoch,
             global_step=step,
         )
-        probe_loss = float(probe_metrics["loss"])
+        probe_scalars = _scalar_epoch_metrics(probe_metrics)
+        probe_loss = probe_scalars["loss"]
         relative_improvement, development_stop_requested = (
             _update_development_early_stop_state(
                 early_stop_state,
@@ -2338,10 +2349,7 @@ def fit(
             "global_step": int(step),
             "spatial_supervised_step": int(spatial_step),
             "early_stopped": development_stop_requested,
-            **{
-                key: float(value)
-                for key, value in probe_metrics.items()
-            },
+            **probe_scalars,
         }
         append_csv(
             output_dir / "development_metrics.csv",
@@ -2364,7 +2372,7 @@ def fit(
                     early_stop_state.get("consecutive_low_gain", 0)
                 ),
                 "early_stop_triggered": development_stop_requested,
-                **probe_metrics,
+                **probe_scalars,
             },
         )
         if development_stop_requested:
