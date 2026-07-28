@@ -298,9 +298,10 @@ decision boundary when available.
   the full corpus.
 - The union of their training tiles is replayed throughout population
   distillation; newly annotated tiles enter the same union automatically.
-- Reduced-duration ablations retain the full population stream and complete
-  fixed L1/L2 expert union. Only training duration and the named mechanism
-  differ across matched conditions.
+- Formal mechanism ablations use one fixed 10% population subset and the
+  complete fixed L1/L2 expert union for three epochs. The selected Optuna trial
+  is A0; every other condition inherits its seed, hyperparameters, schedule,
+  and subset without retuning.
 - The shared priority list serves the stable 3,000 tiles first and expands
   outside that boundary only when still-growing component curves require more
   examples.
@@ -426,12 +427,13 @@ Implementation conformance requires:
 1. point, circle, and brush follow the component table above;
 2. capability masks exclude biological instance counts from area-only and
    pigment components;
-3. unresolved mixtures retain weak-background semantics;
+3. unmarked cells in unresolved mixtures remain ignored; only explicit
+   negative marks or complete-negative review create negative targets;
 4. teacher-only distillation precedes a simultaneous L1/L2 ramp, and both
    expert objectives reach the shared encoder from their first active update;
 5. undefined component/measurement pairs remain invalid;
 6. annotation sufficiency is determined by component-wise information
    plateaus, not a preset tile quota;
-7. reduced-duration ablations retain the full population and complete expert
-   union;
+7. formal ablations retain the same fixed 10% population subset and complete
+   expert union, and differ only by the named mechanism;
 8. only an independently calibrated terminal checkpoint can become a release.

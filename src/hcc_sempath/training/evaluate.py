@@ -383,6 +383,16 @@ def main() -> None:
         spatial_dim=int(cfg["model"].get("spatial_dim", 256)),
         spatial_output_stride=int(cfg["model"].get("spatial_output_stride", 7)),
     ).to(device)
+    if model.spatial_head is not None:
+        model.spatial_head.use_local_branch = bool(
+            cfg["model"].get("spatial_use_local_branch", True)
+        )
+        model.spatial_head.use_semantic_branch = bool(
+            cfg["model"].get("spatial_use_semantic_branch", True)
+        )
+        model.spatial_head.use_context = bool(
+            cfg["model"].get("spatial_use_context", True)
+        )
     model.load_state_dict(
         {
             key.removeprefix("_orig_mod."): value

@@ -1,4 +1,4 @@
-inherits: tenth_duration_full_population.yaml
+inherits: matched_tenth.yaml
 
 # Ablation A3 — single-teacher student distillation without the global HCC
 # prototype coordinate or L1 supervision; matched L2 spatial supervision

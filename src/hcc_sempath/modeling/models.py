@@ -288,6 +288,9 @@ class SpatialMorphometryHead(nn.Module):
         self.component_count = int(component_count)
         self.output_stride = int(output_stride)
         self.patch_padding = int(patch_padding)
+        self.use_local_branch = True
+        self.use_semantic_branch = True
+        self.use_context = True
         if self.component_count == len(DEFAULT_SPATIAL_COMPONENTS):
             specs = spatial_component_specs(DEFAULT_SPATIAL_COMPONENTS)
             instance_valid = torch.tensor(
@@ -642,58 +645,80 @@ class SpatialMorphometryHead(nn.Module):
         detach_backbone: bool,
         return_features: bool = False,
     ) -> dict[str, torch.Tensor]:
-        weight = patch_projection.weight.detach() if detach_backbone else patch_projection.weight
-        bias = patch_projection.bias
-        if bias is not None and detach_backbone:
-            bias = bias.detach()
-        local_tokens = F.conv2d(
-            images,
-            weight,
-            bias,
-            stride=self.output_stride,
-            padding=self.patch_padding,
-        )
-        batch, token_count, dim = patch_tokens.shape
-        if token_count != patch_grid[0] * patch_grid[1]:
-            raise ValueError(
-                f"patch-token/grid mismatch: tokens={token_count} grid={patch_grid[0]}x{patch_grid[1]}"
+        local_features: torch.Tensor | None = None
+        spatial_size: tuple[int, int] | None = None
+        if self.use_local_branch:
+            weight = patch_projection.weight.detach() if detach_backbone else patch_projection.weight
+            bias = patch_projection.bias
+            if bias is not None and detach_backbone:
+                bias = bias.detach()
+            local_tokens = F.conv2d(
+                images,
+                weight,
+                bias,
+                stride=self.output_stride,
+                padding=self.patch_padding,
             )
-        semantic_tokens = patch_tokens.detach() if detach_backbone else patch_tokens
-        semantic_map = semantic_tokens.transpose(1, 2).reshape(
-            batch,
-            dim,
-            patch_grid[0],
-            patch_grid[1],
-        )
-        semantic_map = F.interpolate(
-            semantic_map,
-            size=local_tokens.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
+            spatial_size = tuple(int(value) for value in local_tokens.shape[-2:])
+            local_features = _pointwise_conv_as_linear(
+                self.local_projection,
+                local_tokens,
+            )
+
+        semantic_features: torch.Tensor | None = None
+        if self.use_semantic_branch:
+            batch, token_count, dim = patch_tokens.shape
+            if token_count != patch_grid[0] * patch_grid[1]:
+                raise ValueError(
+                    f"patch-token/grid mismatch: tokens={token_count} grid={patch_grid[0]}x{patch_grid[1]}"
+                )
+            if spatial_size is None:
+                kernel_height, kernel_width = patch_projection.kernel_size
+                spatial_size = (
+                    (images.shape[-2] + 2 * self.patch_padding - kernel_height)
+                    // self.output_stride
+                    + 1,
+                    (images.shape[-1] + 2 * self.patch_padding - kernel_width)
+                    // self.output_stride
+                    + 1,
+                )
+            semantic_tokens = patch_tokens.detach() if detach_backbone else patch_tokens
+            semantic_map = semantic_tokens.transpose(1, 2).reshape(
+                batch,
+                dim,
+                patch_grid[0],
+                patch_grid[1],
+            )
+            semantic_map = F.interpolate(
+                semantic_map,
+                size=spatial_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+            semantic_features = _pointwise_conv_as_linear(
+                self.semantic_projection,
+                semantic_map,
+            )
+
+        if local_features is None:
+            assert semantic_features is not None
+            local_features = torch.zeros_like(semantic_features)
+        if semantic_features is None:
+            semantic_features = torch.zeros_like(local_features)
         features = torch.cat(
-            [
-                _pointwise_conv_as_linear(
-                    self.local_projection,
-                    local_tokens,
-                ),
-                _pointwise_conv_as_linear(
-                    self.semantic_projection,
-                    semantic_map,
-                ),
-            ],
+            [local_features, semantic_features],
             dim=1,
         )
-        features = self.context(
-            F.gelu(
-                self.fusion[1](
-                    _pointwise_conv_as_linear(
-                        self.fusion[0],
-                        features,
-                    )
+        features = F.gelu(
+            self.fusion[1](
+                _pointwise_conv_as_linear(
+                    self.fusion[0],
+                    features,
                 )
             )
         )
+        if self.use_context:
+            features = self.context(features)
         instance_logits, abundance_logits = self.prototype_logits(features)
         outputs = {
             "l2_instance_logits": instance_logits,

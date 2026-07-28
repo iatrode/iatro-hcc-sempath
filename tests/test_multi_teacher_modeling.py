@@ -154,6 +154,60 @@ def test_spatial_model_only_materializes_selected_supervised_rows() -> None:
     assert outputs["l2_abundance_logits"].shape == (1, 3, 31, 31)
 
 
+@pytest.mark.parametrize(
+    ("model_kwargs", "inactive_parameter_prefix"),
+    [
+        ({"spatial_use_local_branch": False}, "local_projection."),
+        ({"spatial_use_semantic_branch": False}, "semantic_projection."),
+        ({"spatial_use_context": False}, "context."),
+    ],
+)
+def test_spatial_architecture_ablations_preserve_topology_and_bypass_only_named_path(
+    model_kwargs: dict[str, bool],
+    inactive_parameter_prefix: str,
+) -> None:
+    torch.manual_seed(19)
+    reference = HCCSemPathModel(
+        backbone_name="vit_tiny_patch16_224",
+        embedding_dim=11,
+        teacher_dims={},
+        pretrained=False,
+        spatial_num_components=2,
+        spatial_dim=13,
+    )
+    ablated = HCCSemPathModel(
+        backbone_name="vit_tiny_patch16_224",
+        embedding_dim=11,
+        teacher_dims={},
+        pretrained=False,
+        spatial_num_components=2,
+        spatial_dim=13,
+    )
+    assert ablated.spatial_head is not None
+    for key, value in model_kwargs.items():
+        setattr(
+            ablated.spatial_head,
+            key.removeprefix("spatial_"),
+            value,
+        )
+
+    assert reference.state_dict().keys() == ablated.state_dict().keys()
+    outputs = ablated(
+        torch.randn(1, 3, 224, 224),
+        return_spatial_features=True,
+    )
+    assert outputs["l2_spatial_features"].shape == (1, 13, 31, 31)
+    outputs["l2_spatial_features"].square().mean().backward()
+    assert ablated.spatial_head is not None
+    inactive = [
+        parameter
+        for name, parameter in ablated.spatial_head.named_parameters()
+        if name.startswith(inactive_parameter_prefix)
+    ]
+    assert inactive
+    assert all(parameter.grad is None for parameter in inactive)
+
+
 def test_spatial_detach_ablation_trains_head_without_shared_encoder() -> None:
     model = HCCSemPathModel(
         backbone_name="vit_tiny_patch16_224",

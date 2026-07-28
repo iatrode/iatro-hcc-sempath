@@ -1,4 +1,4 @@
-inherits: tenth_duration_full_population.yaml
+inherits: matched_tenth.yaml
 
 # Ablation A2 — PAMT-D WITHOUT prototype-adjudicated teacher reliability.
 # Design doc §7 item 5.

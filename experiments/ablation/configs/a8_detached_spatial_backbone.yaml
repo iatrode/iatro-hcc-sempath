@@ -1,8 +1,9 @@
-# A8: A0 with L2 gradients deliberately detached from the shared encoder.
-# L1 and L2 retain the same activation and weight ramp as A0; only L2 feedback
-# into zhcc is removed.
+# A8: A0 with local spatial-head gradients deliberately detached from the
+# shared encoder. L1/L2 schedules, L2 reliability evidence, and spatial-head
+# training remain unchanged; only the dense spatial objective cannot update
+# z_hcc.
 
-inherits: tenth_duration_full_population.yaml
+inherits: matched_tenth.yaml
 
 runtime:
   output_dir: outputs/experiments/ablation/a8_detached_spatial_backbone

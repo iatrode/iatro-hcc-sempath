@@ -410,6 +410,21 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
             f"{unsupported_spatial_model_keys}"
         )
     for key in (
+        "spatial_use_local_branch",
+        "spatial_use_semantic_branch",
+        "spatial_use_context",
+    ):
+        if key in cfg.get("model", {}) and not isinstance(cfg["model"][key], bool):
+            raise ValueError(f"model.{key} must be boolean")
+    if not (
+        bool(cfg.get("model", {}).get("spatial_use_local_branch", True))
+        or bool(cfg.get("model", {}).get("spatial_use_semantic_branch", True))
+    ):
+        raise ValueError(
+            "model.spatial_use_local_branch and "
+            "model.spatial_use_semantic_branch cannot both be false"
+        )
+    for key in (
         "relation_weight",
         "semantic_weight",
         "l1_weight",

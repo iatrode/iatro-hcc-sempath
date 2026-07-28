@@ -595,6 +595,42 @@ def test_training_config_validates_brush_bag_fraction() -> None:
         validate_training_config(cfg, ["teacher"])
 
 
+@pytest.mark.parametrize(
+    "key",
+    (
+        "spatial_use_local_branch",
+        "spatial_use_semantic_branch",
+        "spatial_use_context",
+    ),
+)
+def test_training_config_validates_spatial_ablation_booleans(
+    key: str,
+) -> None:
+    cfg = {
+        "data": {"teachers": ["teacher"]},
+        "model": {"teacher_dims": {"teacher": 8}, key: 0},
+        "loss": {},
+    }
+
+    with pytest.raises(ValueError, match=key):
+        validate_training_config(cfg, ["teacher"])
+
+
+def test_training_config_requires_one_spatial_observation_branch() -> None:
+    cfg = {
+        "data": {"teachers": ["teacher"]},
+        "model": {
+            "teacher_dims": {"teacher": 8},
+            "spatial_use_local_branch": False,
+            "spatial_use_semantic_branch": False,
+        },
+        "loss": {},
+    }
+
+    with pytest.raises(ValueError, match="cannot both be false"):
+        validate_training_config(cfg, ["teacher"])
+
+
 def test_training_config_rejects_unsupported_schedule_keys() -> None:
     cfg = {
         "data": {"teachers": ["teacher"]},

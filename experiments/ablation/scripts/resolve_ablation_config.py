@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
 
 import yaml
@@ -21,12 +20,23 @@ def resolve_ablation_config(
     base_path: str | Path,
     condition_path: str | Path,
     *,
-    seed: int | None = None,
+    output_root: str | Path | None = None,
 ) -> dict:
-    """Overlay one matched full-population, tenth-duration ablation condition."""
+    """Overlay one condition on the selected formal 1/10 Optuna A0 trial."""
 
     base = load_config(base_path)
-    full_epochs = int(base["train"]["epochs"])
+    if float(base["data"].get("train_tile_fraction", 1.0)) != 0.1:
+        raise ValueError(
+            "formal ablations require the selected A0 trial with "
+            "data.train_tile_fraction=0.1"
+        )
+    if float(base["data"].get("val_tile_fraction", 1.0)) != 0.1:
+        raise ValueError(
+            "formal ablations require the selected A0 trial with "
+            "data.val_tile_fraction=0.1"
+        )
+    if int(base["train"]["epochs"]) != 3:
+        raise ValueError("formal ablations require the selected three-epoch A0 trial")
     condition_path = Path(condition_path)
     condition = _raw_config(condition_path)
     parent = condition.get("inherits")
@@ -48,10 +58,6 @@ def resolve_ablation_config(
     base_prototypes = base.get("data", {}).get("prototype_paths")
     resolved = _deep_merge(base, parent_overlay)
     resolved = _deep_merge(resolved, condition)
-    resolved["train"]["epochs"] = max(
-        1,
-        int(math.ceil(full_epochs / 10.0)),
-    )
     # A single-teacher condition reuses that teacher's deployment asset. The
     # repository-relative path in the tracked overlay is only documentation.
     condition_prototypes = condition.get("data", {}).get(
@@ -59,31 +65,29 @@ def resolve_ablation_config(
         ...,
     )
     active_teachers = [str(name) for name in resolved["data"]["teachers"]]
-    if (
-        condition_prototypes is not None
-        and isinstance(base_prototypes, dict)
-    ):
+    if condition_prototypes is not None and isinstance(base_prototypes, dict):
         resolved["data"]["prototype_paths"] = {
-            name: base_prototypes[name]
-            for name in active_teachers
+            name: base_prototypes[name] for name in active_teachers
         }
 
-    # All conditions use the complete population stream and replay the same
-    # full L1/L2 expert tile union. A1/A3 mask L1 labels from the objective but
-    # retain these images in the replay stream.
-    resolved["data"][
-        "expert_replay_prototype_manifest_path"
-    ] = base_prototype_manifest
+    # Every condition replays the same complete L1/L2 expert tile union.
+    # A1/A3 mask L1 labels from the objective but retain the L1 images.
+    resolved["data"]["expert_replay_prototype_manifest_path"] = base_prototype_manifest
     for key in ("train_tile_fraction", "val_tile_fraction"):
-        if float(resolved["data"].get(key, 1.0)) != 1.0:
-            raise ValueError(
-                f"matched ablation requires data.{key}=1.0"
-            )
-    if seed is not None:
-        resolved["runtime"]["seed"] = int(seed)
-        resolved["runtime"]["output_dir"] = str(
-            Path(resolved["runtime"]["output_dir"]) / f"seed_{int(seed)}"
+        if float(resolved["data"].get(key, 1.0)) != 0.1:
+            raise ValueError(f"matched ablation requires data.{key}=0.1")
+    if int(resolved["train"]["epochs"]) != 3:
+        raise ValueError("matched ablation requires train.epochs=3")
+
+    condition_name = Path(
+        condition.get("runtime", {}).get(
+            "output_dir",
+            condition_path.stem,
         )
+    ).name
+    if output_root is None:
+        output_root = Path(base["runtime"]["output_dir"]).parent / "formal_ablations"
+    resolved["runtime"]["output_dir"] = str(Path(output_root) / condition_name)
     return resolved
 
 
@@ -94,13 +98,13 @@ def main() -> None:
     parser.add_argument("--base", required=True)
     parser.add_argument("--condition", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--seed", type=int)
+    parser.add_argument("--output-root")
     args = parser.parse_args()
 
     resolved = resolve_ablation_config(
         args.base,
         args.condition,
-        seed=args.seed,
+        output_root=args.output_root,
     )
 
     output = Path(args.output)

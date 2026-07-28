@@ -1820,6 +1820,16 @@ def main() -> None:
         spatial_dim=int(cfg["model"].get("spatial_dim", 256)),
         spatial_output_stride=spatial_stride,
     ).to(device)
+    if model.spatial_head is not None:
+        model.spatial_head.use_local_branch = bool(
+            cfg["model"].get("spatial_use_local_branch", True)
+        )
+        model.spatial_head.use_semantic_branch = bool(
+            cfg["model"].get("spatial_use_semantic_branch", True)
+        )
+        model.spatial_head.use_context = bool(
+            cfg["model"].get("spatial_use_context", True)
+        )
     if spatial_manifest_path and model.spatial_head is not None:
         if spatial_grid_size != (32, 32):
             raise ValueError(
