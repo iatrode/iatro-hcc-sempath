@@ -13,6 +13,7 @@ from hcc_sempath.modeling.models import (
     _depthwise_conv_fused,
     _pointwise_conv_as_linear,
     _sparse_connected_components_8,
+    bounded_logits,
     decode_spatial_morphometry,
     load_hcc_sempath_release,
     model_state_sha256,
@@ -342,6 +343,103 @@ def test_spatial_prototypes_separate_positive_and_negative_local_patterns() -> N
 
     assert instance[0, 0, 0, 0] > instance[0, 0, 0, 1]
     assert measurement[0, 0, 0, 0] > measurement[0, 0, 0, 1]
+
+
+def test_batched_spatial_prototype_logits_match_independent_reference() -> None:
+    torch.manual_seed(29)
+    head = SpatialMorphometryHead(
+        student_dim=4,
+        component_count=3,
+        spatial_dim=4,
+    )
+    for name in (
+        "instance_prototypes",
+        "instance_negative_prototypes",
+        "instance_implicit_negative_prototypes",
+        "measurement_prototypes",
+        "measurement_negative_prototypes",
+        "measurement_implicit_negative_prototypes",
+    ):
+        getattr(head, name).copy_(torch.randn(3, 4))
+    for name in (
+        "instance_prototype_counts",
+        "instance_negative_prototype_counts",
+        "instance_implicit_negative_prototype_counts",
+        "measurement_prototype_counts",
+        "measurement_negative_prototype_counts",
+        "measurement_implicit_negative_prototype_counts",
+    ):
+        getattr(head, name).copy_(torch.tensor([2.0, 0.0, 3.0]))
+    features = torch.randn(2, 4, 3, 3, requires_grad=True)
+
+    actual = head.prototype_logits(features)
+
+    normalized = torch.nn.functional.normalize(features.float(), dim=1)
+
+    def reference(
+        positive,
+        positive_counts,
+        negative,
+        negative_counts,
+        implicit_negative,
+        implicit_negative_counts,
+        log_temperature,
+        bias,
+    ):
+        def similarity(prototypes):
+            return torch.einsum(
+                "bdhw,kd->bkhw",
+                normalized,
+                torch.nn.functional.normalize(prototypes.float(), dim=1),
+            )
+
+        positive_similarity = similarity(positive)
+        negative_similarity = similarity(negative)
+        implicit_similarity = similarity(implicit_negative)
+        negative_response = torch.where(
+            (negative_counts > 0).view(1, -1, 1, 1),
+            negative_similarity,
+            torch.where(
+                (implicit_negative_counts > 0).view(1, -1, 1, 1),
+                implicit_similarity,
+                torch.zeros_like(implicit_similarity),
+            ),
+        )
+        response = torch.where(
+            (positive_counts > 0).view(1, -1, 1, 1),
+            positive_similarity,
+            torch.zeros_like(positive_similarity),
+        ) - negative_response
+        temperature = log_temperature.exp().clamp(0.03, 1.0).view(
+            1, -1, 1, 1
+        )
+        return bounded_logits(
+            response / temperature + bias.view(1, -1, 1, 1)
+        )
+
+    expected_instance = reference(
+        head.instance_prototypes,
+        head.instance_prototype_counts,
+        head.instance_negative_prototypes,
+        head.instance_negative_prototype_counts,
+        head.instance_implicit_negative_prototypes,
+        head.instance_implicit_negative_prototype_counts,
+        head.instance_log_temperature,
+        head.instance_bias,
+    ).masked_fill(~head.instance_valid.view(1, -1, 1, 1), -20.0)
+    expected_measurement = reference(
+        head.measurement_prototypes,
+        head.measurement_prototype_counts,
+        head.measurement_negative_prototypes,
+        head.measurement_negative_prototype_counts,
+        head.measurement_implicit_negative_prototypes,
+        head.measurement_implicit_negative_prototype_counts,
+        head.measurement_log_temperature,
+        head.measurement_bias,
+    )
+
+    assert torch.allclose(actual[0], expected_instance, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(actual[1], expected_measurement, atol=1e-6, rtol=1e-6)
 
 
 def test_vectorized_spatial_centroids_match_pair_balanced_reference() -> None:

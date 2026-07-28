@@ -538,33 +538,16 @@ class SpatialMorphometryHead(nn.Module):
             destination_counts.copy_(counts)
 
     @staticmethod
-    def _prototype_response(
-        features: torch.Tensor,
-        positive: torch.Tensor,
+    def _prototype_response_from_similarities(
+        positive_similarity: torch.Tensor,
         positive_counts: torch.Tensor,
-        negative: torch.Tensor,
+        negative_similarity: torch.Tensor,
         negative_counts: torch.Tensor,
-        implicit_negative: torch.Tensor,
+        implicit_negative_similarity: torch.Tensor,
         implicit_negative_counts: torch.Tensor,
         log_temperature: torch.Tensor,
         bias: torch.Tensor,
     ) -> torch.Tensor:
-        normalized_features = F.normalize(features.float(), dim=1)
-        positive_similarity = torch.einsum(
-            "bdhw,kd->bkhw",
-            normalized_features,
-            F.normalize(positive.float(), dim=1),
-        )
-        negative_similarity = torch.einsum(
-            "bdhw,kd->bkhw",
-            normalized_features,
-            F.normalize(negative.float(), dim=1),
-        )
-        implicit_negative_similarity = torch.einsum(
-            "bdhw,kd->bkhw",
-            normalized_features,
-            F.normalize(implicit_negative.float(), dim=1),
-        )
         positive_ready = (positive_counts > 0).view(1, -1, 1, 1)
         negative_ready = (negative_counts > 0).view(1, -1, 1, 1)
         implicit_negative_ready = (
@@ -601,13 +584,29 @@ class SpatialMorphometryHead(nn.Module):
         self,
         features: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        instance_logits = self._prototype_response(
-            features,
+        normalized_features = F.normalize(features.float(), dim=1)
+        prototype_groups = (
             self.instance_prototypes,
-            self.instance_prototype_counts,
             self.instance_negative_prototypes,
-            self.instance_negative_prototype_counts,
             self.instance_implicit_negative_prototypes,
+            self.measurement_prototypes,
+            self.measurement_negative_prototypes,
+            self.measurement_implicit_negative_prototypes,
+        )
+        similarities = torch.einsum(
+            "bdhw,gd->bghw",
+            normalized_features,
+            F.normalize(
+                torch.cat(prototype_groups, dim=0).float(),
+                dim=1,
+            ),
+        ).chunk(len(prototype_groups), dim=1)
+        instance_logits = self._prototype_response_from_similarities(
+            similarities[0],
+            self.instance_prototype_counts,
+            similarities[1],
+            self.instance_negative_prototype_counts,
+            similarities[2],
             self.instance_implicit_negative_prototype_counts,
             self.instance_log_temperature,
             self.instance_bias,
@@ -615,13 +614,12 @@ class SpatialMorphometryHead(nn.Module):
             ~self.instance_valid.view(1, -1, 1, 1),
             -20.0,
         )
-        measurement_logits = self._prototype_response(
-            features,
-            self.measurement_prototypes,
+        measurement_logits = self._prototype_response_from_similarities(
+            similarities[3],
             self.measurement_prototype_counts,
-            self.measurement_negative_prototypes,
+            similarities[4],
             self.measurement_negative_prototype_counts,
-            self.measurement_implicit_negative_prototypes,
+            similarities[5],
             self.measurement_implicit_negative_prototype_counts,
             self.measurement_log_temperature,
             self.measurement_bias,
