@@ -4,12 +4,20 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-CONDA_BIN="${CONDA_BIN:-$(command -v conda || true)}"
-if [ -z "$CONDA_BIN" ] || [ ! -x "$CONDA_BIN" ]; then
-  echo "hcc-camoe conda launcher not found: $CONDA_BIN" >&2
-  exit 2
+if [ -n "${HCC_SEMPATH_PYTHON:-}" ]; then
+  if [ ! -x "$HCC_SEMPATH_PYTHON" ]; then
+    echo "HCC_SEMPATH_PYTHON is not executable: $HCC_SEMPATH_PYTHON" >&2
+    exit 2
+  fi
+  PYTHON_CMD=("$HCC_SEMPATH_PYTHON")
+else
+  CONDA_BIN="${CONDA_BIN:-$(command -v conda || true)}"
+  if [ -z "$CONDA_BIN" ] || [ ! -x "$CONDA_BIN" ]; then
+    echo "hcc-camoe conda launcher not found: $CONDA_BIN" >&2
+    exit 2
+  fi
+  PYTHON_CMD=("$CONDA_BIN" run --no-capture-output -n hcc-camoe python)
 fi
-PYTHON_CMD=("$CONDA_BIN" run --no-capture-output -n hcc-camoe python)
 export PYTHONPATH="${PYTHONPATH:-}:$REPO_ROOT/src"
 
 temp_root=""
