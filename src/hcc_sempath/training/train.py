@@ -197,15 +197,20 @@ class _ChunkPlanBatchSampler:
         self.reshuffle_each_epoch = bool(reshuffle_each_epoch)
         self.drop_last = bool(drop_last)
         self._epoch = 0
+        self._start_batch = 0
 
     def __iter__(self):
         epoch_seed = self.seed + self._epoch if self.reshuffle_each_epoch else self.seed
         if self.reshuffle_each_epoch:
             self._epoch += 1
+        start_batch = self._start_batch
+        self._start_batch = 0
         chunks = self.dataset.iter_global_index_chunks(self.chunk_size, epoch_seed)
         if not chunks:
             return
         flat = np.concatenate(chunks)
+        if start_batch:
+            flat = flat[start_batch * self.batch_size :]
         n = len(flat)
         for start in range(0, n, self.batch_size):
             end = start + self.batch_size
@@ -221,6 +226,10 @@ class _ChunkPlanBatchSampler:
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
+        self._start_batch = 0
+
+    def set_batch_cursor(self, batch: int) -> None:
+        self._start_batch = max(0, int(batch))
 
 
 class _PackageShuffleBatchLoader:
@@ -270,6 +279,7 @@ class _PackageShuffleBatchLoader:
         self.seed = int(seed)
         self.reshuffle_each_epoch = bool(reshuffle_each_epoch)
         self._epoch = 0
+        self._start_batch = 0
         self.chunk_size = max(1, int(chunk_size or self.batch_size))
         # Back-pressure ceiling, measured in decoded-but-unconsumed rows.
         self.max_outstanding_rows = max(self.batch_size, self.batch_size * max(1, int(buffer_batches)))
@@ -294,6 +304,11 @@ class _PackageShuffleBatchLoader:
     def set_epoch(self, epoch: int) -> None:
         self._stop_active()
         self._epoch = int(epoch)
+        self._start_batch = 0
+
+    def set_batch_cursor(self, batch: int) -> None:
+        self._stop_active()
+        self._start_batch = max(0, int(batch))
 
     def _draw_batch(self, buffer: list[dict], rng: np.random.Generator) -> list[dict]:
         take = min(self.batch_size, len(buffer))
@@ -377,6 +392,8 @@ class _PackageShuffleBatchLoader:
         epoch_seed = self.seed + self._epoch if self.reshuffle_each_epoch else self.seed
         if self.reshuffle_each_epoch:
             self._epoch += 1
+        start_batch = self._start_batch
+        self._start_batch = 0
         _probe.set_config(
             num_workers=self.num_workers,
             batch_size=self.batch_size,
@@ -392,6 +409,18 @@ class _PackageShuffleBatchLoader:
         tasks: list[tuple[int, np.ndarray]] = list(
             self.dataset.iter_package_row_chunks(self.chunk_size, epoch_seed)
         )
+        skip_rows = start_batch * self.batch_size
+        if skip_rows:
+            remaining: list[tuple[int, np.ndarray]] = []
+            for package_idx, rows in tasks:
+                if skip_rows >= len(rows):
+                    skip_rows -= len(rows)
+                    continue
+                if skip_rows:
+                    rows = rows[skip_rows:]
+                    skip_rows = 0
+                remaining.append((package_idx, rows))
+            tasks = remaining
         num_tasks = len(tasks)
         if num_tasks == 0:
             return
@@ -704,6 +733,7 @@ class _InMemoryExpertBatchLoader:
         self.seed = int(seed)
         self._epoch = 0
         self._cycle = 0
+        self._start_batch = 0
 
     def __len__(self) -> int:
         return (
@@ -715,8 +745,14 @@ class _InMemoryExpertBatchLoader:
             self.seed + self._epoch * 1_000_003 + self._cycle
         )
         self._cycle += 1
+        start_batch = self._start_batch
+        self._start_batch = 0
         order = rng.permutation(self.indices)
-        for start in range(0, len(order), self.batch_size):
+        for start in range(
+            start_batch * self.batch_size,
+            len(order),
+            self.batch_size,
+        ):
             selected = torch.from_numpy(
                 order[start : start + self.batch_size].copy()
             ).long()
@@ -725,6 +761,13 @@ class _InMemoryExpertBatchLoader:
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
         self._cycle = 0
+        self._start_batch = 0
+
+    def set_batch_cursor(self, batch: int) -> None:
+        batch = max(0, int(batch))
+        batches_per_cycle = len(self)
+        self._cycle = batch // batches_per_cycle
+        self._start_batch = batch % batches_per_cycle
 
 
 def _global_indices_for_package_rows(
@@ -787,6 +830,7 @@ class _InterleavedBatchLoader:
         self.population_loader = population_loader
         self.expert_loader = expert_loader
         self.interval = int(interval)
+        self._start_batch = 0
         if self.interval <= 0:
             raise ValueError(
                 f"expert replay interval must be positive, got {interval}"
@@ -800,6 +844,48 @@ class _InterleavedBatchLoader:
         return population_batches + expert_batches
 
     def __iter__(self):
+        start_batch = self._start_batch
+        self._start_batch = 0
+        population_consumed = 0
+        expert_consumed = 0
+        for population_index in range(len(self.population_loader)):
+            if population_index % self.interval == 0:
+                if start_batch == 0:
+                    break
+                start_batch -= 1
+                expert_consumed += 1
+            if start_batch == 0:
+                break
+            start_batch -= 1
+            population_consumed += 1
+        first_expert_already_consumed = (
+            population_consumed % self.interval == 0
+            and expert_consumed
+            > self._output_batches_for_population(population_consumed)
+            - population_consumed
+        )
+        population_cursor = getattr(
+            self.population_loader,
+            "set_batch_cursor",
+            None,
+        )
+        expert_cursor = getattr(
+            self.expert_loader,
+            "set_batch_cursor",
+            None,
+        )
+        if population_consumed and not callable(population_cursor):
+            raise RuntimeError(
+                "population loader cannot resume from a batch cursor"
+            )
+        if expert_consumed and not callable(expert_cursor):
+            raise RuntimeError(
+                "expert loader cannot resume from a batch cursor"
+            )
+        if callable(population_cursor):
+            population_cursor(population_consumed)
+        if callable(expert_cursor):
+            expert_cursor(expert_consumed)
         population_iterator = iter(self.population_loader)
         expert_iterator = iter(self.expert_loader)
         try:
@@ -808,8 +894,17 @@ class _InterleavedBatchLoader:
             # blocking on the first population result, so those workers can
             # fill the prefetch queue while the GPU processes expert
             # supervision.
-            for batch_index in range(1, len(self.population_loader) + 1):
-                if (batch_index - 1) % self.interval == 0:
+            for batch_index in range(
+                population_consumed + 1,
+                len(self.population_loader) + 1,
+            ):
+                if (
+                    (batch_index - 1) % self.interval == 0
+                    and not (
+                        first_expert_already_consumed
+                        and batch_index == population_consumed + 1
+                    )
+                ):
                     try:
                         expert_batch = next(expert_iterator)
                     except StopIteration:
@@ -828,6 +923,7 @@ class _InterleavedBatchLoader:
                     close()
 
     def set_epoch(self, epoch: int) -> None:
+        self._start_batch = 0
         for loader in (self.population_loader, self.expert_loader):
             setter = getattr(loader, "set_epoch", None)
             if callable(setter):
@@ -839,6 +935,15 @@ class _InterleavedBatchLoader:
                 if callable(setter):
                     setter(int(epoch))
                     break
+
+    def set_batch_cursor(self, batch: int) -> None:
+        self._start_batch = max(0, int(batch))
+
+    def _output_batches_for_population(self, population_batches: int) -> int:
+        expert_batches = (
+            population_batches + self.interval - 1
+        ) // self.interval
+        return population_batches + expert_batches
 
 
 def _target_rows_by_package(

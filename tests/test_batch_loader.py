@@ -123,6 +123,34 @@ def test_expert_batches_are_interleaved_at_a_fixed_population_interval():
     assert len(loader) == 8
 
 
+def test_interleaved_batch_cursor_resumes_at_exact_next_output():
+    class CursorLoader:
+        def __init__(self, values):
+            self.values = values
+            self.cursor = 0
+
+        def __len__(self):
+            return len(self.values)
+
+        def __iter__(self):
+            cursor = self.cursor
+            self.cursor = 0
+            return iter(self.values[cursor:])
+
+        def set_batch_cursor(self, cursor):
+            self.cursor = int(cursor)
+
+    expected = ["e0", "p0", "p1", "e1", "p2", "p3", "e2", "p4"]
+    for cursor in range(len(expected)):
+        loader = _InterleavedBatchLoader(
+            CursorLoader(["p0", "p1", "p2", "p3", "p4"]),
+            CursorLoader(["e0", "e1", "e2"]),
+            interval=2,
+        )
+        loader.set_batch_cursor(cursor)
+        assert list(loader) == expected[cursor:]
+
+
 def test_first_expert_batch_does_not_wait_for_population_decode():
     class _SlowPopulationIterator:
         def __init__(self) -> None:
