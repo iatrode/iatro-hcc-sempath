@@ -6,6 +6,7 @@ import pytest
 
 from hcc_sempath.training.config import teacher_dims, teacher_names, validate_training_config
 from hcc_sempath.training.engine import (
+    _amp_enabled,
     _normalize_uint8_images_fp16,
     _spatial_global_targets_from_spatial,
     _objective_gradient_diagnostics,
@@ -30,6 +31,14 @@ from hcc_sempath.training.train import (
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 import torch
+
+
+def test_cuda_amp_precision_is_shared_by_training_and_evaluation() -> None:
+    cfg = {"train": {"amp": True}}
+
+    assert _amp_enabled(torch.device("cuda"), cfg)
+    assert not _amp_enabled(torch.device("cpu"), cfg)
+    assert not _amp_enabled(torch.device("cuda"), {"train": {"amp": False}})
 
 
 def test_fused_image_normalization_matches_existing_amp_input() -> None:

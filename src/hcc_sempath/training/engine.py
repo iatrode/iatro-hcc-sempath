@@ -727,8 +727,10 @@ def _move_spatial_batch(batch: dict, device: torch.device) -> dict[str, torch.Te
     return result
 
 
-def _amp_enabled(device: torch.device, cfg: dict, train: bool) -> bool:
-    return bool(train and cfg["train"].get("amp", False) and device.type == "cuda")
+def _amp_enabled(device: torch.device, cfg: dict) -> bool:
+    """Use the configured CUDA precision consistently for training and evaluation."""
+
+    return bool(cfg["train"].get("amp", False) and device.type == "cuda")
 
 
 def _step_ramp(target: float, global_step: int, start_step: int, ramp_steps: int) -> float:
@@ -1168,11 +1170,7 @@ def run_epoch(
                 cfg,
                 device,
                 normalization=image_normalization,
-                amp_input=bool(
-                    train
-                    and cfg["train"].get("amp", False)
-                    and device.type == "cuda"
-                ),
+                amp_input=_amp_enabled(device, cfg),
             )
             if will_log and device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -1246,7 +1244,7 @@ def run_epoch(
                 forward_loss_start = time.perf_counter()
                 with torch.autocast(
                     device_type=device.type,
-                    enabled=_amp_enabled(device, cfg, train),
+                    enabled=_amp_enabled(device, cfg),
                 ):
                     outputs = model(
                         images,
