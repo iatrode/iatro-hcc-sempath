@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -765,6 +766,59 @@ def test_positive_and_explicit_negative_overlap_is_rejected(
             image_size=(224, 224),
             grid_size=(32, 32),
         )
+
+
+def test_parallel_raster_workers_do_not_enter_torch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "spatial.json"
+    _write_records(
+        path,
+        [
+            {
+                "tile_id": f"tile-{index}",
+                "attribute": "necrosis",
+                "split": "train",
+                "state": "positive",
+                "geometry": {
+                    "type": "brush",
+                    "points": [[20, 20], [80 + index, 80]],
+                    "width": 12,
+                },
+            }
+            for index in range(4)
+        ],
+    )
+    from hcc_sempath.training import roi
+
+    original = roi._geometry_pixel_support_numpy
+    original_interpolate = roi.F.interpolate
+    main_thread_id = threading.get_ident()
+    worker_thread_ids: set[int] = set()
+
+    def observed_rasterize(*args, **kwargs):
+        worker_thread_ids.add(threading.get_ident())
+        return original(*args, **kwargs)
+
+    def observed_interpolate(*args, **kwargs):
+        assert threading.get_ident() == main_thread_id
+        return original_interpolate(*args, **kwargs)
+
+    monkeypatch.setattr(roi, "_geometry_pixel_support_numpy", observed_rasterize)
+    monkeypatch.setattr(roi.F, "interpolate", observed_interpolate)
+    monkeypatch.setenv("HCC_ROI_RASTER_WORKERS", "4")
+
+    targets = build_spatial_roi_targets(
+        path,
+        component_names=["necrosis"],
+        image_size=(224, 224),
+        grid_size=(32, 32),
+    )
+
+    assert len(targets) == 4
+    assert worker_thread_ids
+    assert main_thread_id not in worker_thread_ids
 
 
 def test_spatial_loss_routes_point_brush_and_negative_gradients() -> None:

@@ -91,6 +91,19 @@ class SpatialValidationMetadata:
     geometry_modes: tuple[tuple[str, ...], ...]  # [K], point/circle/brush/negative
 
 
+@dataclass(frozen=True)
+class _PreparedGeometrySupports:
+    """Raster supports prepared before semantic target assembly.
+
+    Worker threads only execute PIL/NumPy rasterization. All Torch resampling
+    is deliberately batched on the calling thread so a Python thread pool
+    cannot recursively enter Torch's intra-op thread pool.
+    """
+
+    grid: dict[int, torch.Tensor]
+    pixel: dict[int, torch.Tensor]
+
+
 def empty_spatial_roi_target(
     component_count: int,
     grid_size: tuple[int, int],
@@ -453,11 +466,11 @@ def _radius_pixels(
     return max(0.5, radius)
 
 
-def _geometry_pixel_support(
+def _geometry_pixel_support_numpy(
     geometry: dict[str, Any],
     *,
     image_size: tuple[int, int],
-) -> torch.Tensor:
+) -> np.ndarray:
     """Rasterize drawing support without interpreting it as occupied area."""
 
     image_h, image_w = image_size
@@ -525,7 +538,134 @@ def _geometry_pixel_support(
         )
     else:  # pragma: no cover - guarded by _geometry_kind
         raise ValueError(f"unsupported ROI geometry type: {kind!r}")
-    return torch.from_numpy(np.asarray(canvas, dtype=np.uint8) > 0)
+    return np.asarray(canvas, dtype=np.uint8) > 0
+
+
+def _geometry_pixel_support(
+    geometry: dict[str, Any],
+    *,
+    image_size: tuple[int, int],
+) -> torch.Tensor:
+    return torch.from_numpy(
+        _geometry_pixel_support_numpy(
+            geometry,
+            image_size=image_size,
+        )
+    )
+
+
+def _prepare_geometry_supports(
+    records: list[dict[str, Any]],
+    *,
+    positions: dict[str, int],
+    specs: list,
+    image_size: tuple[int, int],
+    grid_size: tuple[int, int],
+) -> _PreparedGeometrySupports:
+    """Rasterize in parallel, then reduce every support in batched Torch calls."""
+
+    geometries: list[dict[str, Any]] = []
+    retain_pixel: set[int] = set()
+    seen: set[int] = set()
+    for record in records:
+        geometry = record.get("geometry")
+        if not isinstance(geometry, dict) or _geometry_kind(geometry) == "point":
+            continue
+        key = id(geometry)
+        if key not in seen:
+            seen.add(key)
+            geometries.append(geometry)
+        component = str(record["attribute"])
+        spec = specs[positions[component]]
+        if (
+            spec.mode == STRUCTURE_INSTANCE_AREA
+            and _geometry_kind(geometry) in BRUSH_GEOMETRIES
+        ):
+            retain_pixel.add(key)
+
+    if not geometries:
+        return _PreparedGeometrySupports(grid={}, pixel={})
+
+    workers = min(
+        max(1, int(os.environ.get("HCC_ROI_RASTER_WORKERS", "32"))),
+        len(geometries),
+    )
+
+    def rasterize(geometry: dict[str, Any]) -> np.ndarray:
+        return _geometry_pixel_support_numpy(
+            geometry,
+            image_size=image_size,
+        )
+
+    grid_supports: dict[int, torch.Tensor] = {}
+    pixel_supports: dict[int, torch.Tensor] = {}
+    chunk_size = max(
+        1,
+        int(os.environ.get("HCC_ROI_TORCH_BATCH_SIZE", "128")),
+    )
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        and os.environ.get("HCC_ROI_BUILD_DEVICE", "cuda").lower() == "cuda"
+        else "cpu"
+    )
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        rasterized = executor.map(rasterize, geometries)
+        chunk_geometries: list[dict[str, Any]] = []
+        chunk_masks: list[np.ndarray] = []
+        for geometry, mask in zip(geometries, rasterized, strict=True):
+            chunk_geometries.append(geometry)
+            chunk_masks.append(mask)
+            if len(chunk_masks) < chunk_size:
+                continue
+            _reduce_geometry_chunk(
+                chunk_geometries,
+                chunk_masks,
+                grid_size=grid_size,
+                device=device,
+                retain_pixel=retain_pixel,
+                grid_supports=grid_supports,
+                pixel_supports=pixel_supports,
+            )
+            chunk_geometries.clear()
+            chunk_masks.clear()
+        if chunk_masks:
+            _reduce_geometry_chunk(
+                chunk_geometries,
+                chunk_masks,
+                grid_size=grid_size,
+                device=device,
+                retain_pixel=retain_pixel,
+                grid_supports=grid_supports,
+                pixel_supports=pixel_supports,
+            )
+    return _PreparedGeometrySupports(
+        grid=grid_supports,
+        pixel=pixel_supports,
+    )
+
+
+def _reduce_geometry_chunk(
+    geometries: list[dict[str, Any]],
+    masks: list[np.ndarray],
+    *,
+    grid_size: tuple[int, int],
+    device: torch.device,
+    retain_pixel: set[int],
+    grid_supports: dict[int, torch.Tensor],
+    pixel_supports: dict[int, torch.Tensor],
+) -> None:
+    pixel_batch = torch.from_numpy(np.stack(masks, axis=0))
+    reduced = F.interpolate(
+        pixel_batch[:, None].to(device=device, dtype=torch.float32),
+        size=grid_size,
+        mode="area",
+    )[:, 0].gt(0).cpu()
+    for index, geometry in enumerate(geometries):
+        key = id(geometry)
+        grid_supports[key] = reduced[index]
+        if key in retain_pixel:
+            pixel_supports[key] = pixel_batch[index].clone()
 
 
 def geometry_token_mask(
@@ -533,6 +673,7 @@ def geometry_token_mask(
     *,
     image_size: tuple[int, int],
     grid_size: tuple[int, int],
+    prepared: _PreparedGeometrySupports | None = None,
 ) -> torch.Tensor:
     """Return grid cells touched by one annotation geometry."""
 
@@ -555,6 +696,11 @@ def geometry_token_mask(
         mask[row, col] = True
         return mask
 
+    if prepared is not None:
+        support = prepared.grid.get(id(geometry))
+        if support is not None:
+            return support
+
     mask = _geometry_pixel_support(
         geometry,
         image_size=image_size,
@@ -568,11 +714,13 @@ def _add_point_center(
     geometry: dict[str, Any],
     *,
     image_size: tuple[int, int],
+    prepared: _PreparedGeometrySupports | None = None,
 ) -> None:
     support = geometry_token_mask(
         geometry,
         image_size=image_size,
         grid_size=tuple(point_centers.shape),
+        prepared=prepared,
     )
     point_centers[support] += 1.0
 
@@ -582,11 +730,13 @@ def _add_geometry_center(
     geometry: dict[str, Any],
     *,
     image_size: tuple[int, int],
+    prepared: _PreparedGeometrySupports | None = None,
 ) -> None:
     support = geometry_token_mask(
         geometry,
         image_size=image_size,
         grid_size=tuple(point_centers.shape),
+        prepared=prepared,
     )
     _add_support_center(point_centers, support)
 
@@ -606,46 +756,12 @@ def _add_support_center(
     point_centers[int(row), int(col)] += 1.0
 
 
-def _connected_supports(mask: torch.Tensor) -> list[torch.Tensor]:
-    """Split a 2-D mask into 8-connected components."""
-
-    if mask.ndim != 2:
-        raise ValueError(f"connected-component mask must be 2-D, got {mask.shape}")
-    height, width = mask.shape
-    visited = torch.zeros_like(mask, dtype=torch.bool)
-    result: list[torch.Tensor] = []
-    for start_row, start_col in mask.nonzero(as_tuple=False).tolist():
-        if bool(visited[start_row, start_col]):
-            continue
-        component = torch.zeros_like(mask, dtype=torch.bool)
-        pending = [(int(start_row), int(start_col))]
-        visited[start_row, start_col] = True
-        while pending:
-            row, col = pending.pop()
-            component[row, col] = True
-            for row_delta in (-1, 0, 1):
-                for col_delta in (-1, 0, 1):
-                    if row_delta == 0 and col_delta == 0:
-                        continue
-                    next_row = row + row_delta
-                    next_col = col + col_delta
-                    if (
-                        0 <= next_row < height
-                        and 0 <= next_col < width
-                        and bool(mask[next_row, next_col])
-                        and not bool(visited[next_row, next_col])
-                    ):
-                        visited[next_row, next_col] = True
-                        pending.append((next_row, next_col))
-        result.append(component)
-    return result
-
-
 def _add_connected_geometry_centers(
     point_centers: torch.Tensor,
     geometries: list[dict[str, Any]],
     *,
     image_size: tuple[int, int],
+    prepared: _PreparedGeometrySupports | None = None,
 ) -> None:
     """Count connected structure-brush support, not individual pen strokes.
 
@@ -657,13 +773,42 @@ def _add_connected_geometry_centers(
     # Split instances before output-grid reduction. Reducing the union first
     # can make nearby but pixel-disjoint structures touch on the coarse grid
     # and incorrectly collapse them into one object.
-    union = torch.zeros(image_size, dtype=torch.bool)
-    for geometry in geometries:
-        union |= _geometry_pixel_support(
-            geometry,
-            image_size=image_size,
+    pixel_masks = [
+        (
+            prepared.pixel[id(geometry)]
+            if prepared is not None and id(geometry) in prepared.pixel
+            else _geometry_pixel_support(geometry, image_size=image_size)
         )
-    for pixel_support in _connected_supports(union):
+        for geometry in geometries
+    ]
+    stacked = torch.stack(pixel_masks, dim=0)
+    dilated = F.max_pool2d(
+        stacked[:, None].to(dtype=torch.float32),
+        kernel_size=3,
+        stride=1,
+        padding=1,
+    )[:, 0] > 0
+    adjacency = (
+        dilated[:, None] & stacked[None, :]
+    ).flatten(2).any(dim=2)
+    groups: list[list[int]] = []
+    remaining = set(range(len(pixel_masks)))
+    while remaining:
+        pending = [remaining.pop()]
+        group: list[int] = []
+        while pending:
+            current = pending.pop()
+            group.append(current)
+            neighbours = {
+                other
+                for other in remaining
+                if bool(adjacency[current, other])
+            }
+            remaining.difference_update(neighbours)
+            pending.extend(neighbours)
+        groups.append(group)
+    for group in groups:
+        pixel_support = stacked[group].any(dim=0)
         grid_support = F.interpolate(
             pixel_support.to(dtype=torch.float32)[None, None],
             size=tuple(point_centers.shape),
@@ -678,11 +823,13 @@ def _add_area_support(
     *,
     image_size: tuple[int, int],
     dilation_cells: int = 0,
+    prepared: _PreparedGeometrySupports | None = None,
 ) -> None:
     support = geometry_token_mask(
         geometry,
         image_size=image_size,
         grid_size=tuple(area_positive.shape),
+        prepared=prepared,
     )
     if not bool(support.any()):
         raise ValueError("area geometry maps to zero spatial cells")
@@ -695,11 +842,13 @@ def _add_brush_bag(
     geometry: dict[str, Any],
     *,
     image_size: tuple[int, int],
+    prepared: _PreparedGeometrySupports | None = None,
 ) -> None:
     support = geometry_token_mask(
         geometry,
         image_size=image_size,
         grid_size=tuple(bag_ids.shape),
+        prepared=prepared,
     )
     if not bool(support.any()):
         raise ValueError("density-brush geometry maps to zero spatial cells")
@@ -738,6 +887,7 @@ def _build_spatial_tile_target(
     image_size: tuple[int, int],
     grid_size: tuple[int, int],
     point_tolerance_cells: int,
+    prepared: _PreparedGeometrySupports | None = None,
 ) -> tuple[str, SpatialRoiTarget]:
     target = empty_spatial_roi_target(len(component_names), grid_size)
     point_centers = target.point_centers.clone()
@@ -789,23 +939,27 @@ def _build_spatial_tile_target(
                             point_centers[idx],
                             geometry,
                             image_size=image_size,
+                            prepared=prepared,
                         )
                     elif kind in CIRCLE_GEOMETRIES:
                         _add_geometry_center(
                             point_centers[idx],
                             geometry,
                             image_size=image_size,
+                            prepared=prepared,
                         )
                         instance_exclusion_support[idx] |= geometry_token_mask(
                             geometry,
                             image_size=image_size,
                             grid_size=grid_size,
+                            prepared=prepared,
                         )
                     else:
                         _add_brush_bag(
                             brush_bag_ids[idx],
                             geometry,
                             image_size=image_size,
+                            prepared=prepared,
                         )
                 elif spec.mode == STRUCTURE_INSTANCE_AREA:
                     if kind in POINT_GEOMETRIES:
@@ -813,22 +967,26 @@ def _build_spatial_tile_target(
                             point_centers[idx],
                             geometry,
                             image_size=image_size,
+                            prepared=prepared,
                         )
                     elif kind in CIRCLE_GEOMETRIES:
                         _add_geometry_center(
                             point_centers[idx],
                             geometry,
                             image_size=image_size,
+                            prepared=prepared,
                         )
                         _add_area_support(
                             area_positive[idx],
                             geometry,
                             image_size=image_size,
+                            prepared=prepared,
                         )
                         instance_exclusion_support[idx] |= geometry_token_mask(
                             geometry,
                             image_size=image_size,
                             grid_size=grid_size,
+                            prepared=prepared,
                         )
                     else:
                         structure_brush_geometries.append(geometry)
@@ -836,11 +994,13 @@ def _build_spatial_tile_target(
                             area_positive[idx],
                             geometry,
                             image_size=image_size,
+                            prepared=prepared,
                         )
                         instance_exclusion_support[idx] |= geometry_token_mask(
                             geometry,
                             image_size=image_size,
                             grid_size=grid_size,
+                            prepared=prepared,
                         )
                 elif spec.mode == PIGMENT_BURDEN:
                     _add_area_support(
@@ -848,12 +1008,14 @@ def _build_spatial_tile_target(
                         geometry,
                         image_size=image_size,
                         dilation_cells=0,
+                        prepared=prepared,
                     )
                 elif spec.mode == CONTINUOUS_AREA:
                     _add_area_support(
                         area_positive[idx],
                         geometry,
                         image_size=image_size,
+                        prepared=prepared,
                     )
                 else:  # pragma: no cover - guarded by spatial schema
                     raise ValueError(
@@ -864,6 +1026,7 @@ def _build_spatial_tile_target(
                     geometry,
                     image_size=image_size,
                     grid_size=grid_size,
+                    prepared=prepared,
                 )
 
         if structure_brush_geometries:
@@ -871,6 +1034,7 @@ def _build_spatial_tile_target(
                 point_centers[idx],
                 structure_brush_geometries,
                 image_size=image_size,
+                prepared=prepared,
             )
 
         positive_support = _dilate(
@@ -956,14 +1120,19 @@ def build_spatial_roi_targets(
         )
     )
 
-    ordered_tile_ids = sorted(tile_ids)
-    workers = min(
-        max(1, int(os.environ.get("HCC_ROI_BUILD_WORKERS", "32"))),
-        max(1, len(ordered_tile_ids)),
+    prepared = _prepare_geometry_supports(
+        [
+            record
+            for tile_id in sorted(tile_ids)
+            for record in grouped.get(tile_id, [])
+        ],
+        positions=positions,
+        specs=specs,
+        image_size=image_size,
+        grid_size=grid_size,
     )
-
-    def build_one(tile_id: str) -> tuple[str, SpatialRoiTarget]:
-        return _build_spatial_tile_target(
+    return dict(
+        _build_spatial_tile_target(
             tile_id,
             component_names=component_names,
             positions=positions,
@@ -973,10 +1142,10 @@ def build_spatial_roi_targets(
             image_size=image_size,
             grid_size=grid_size,
             point_tolerance_cells=point_tolerance_cells,
+            prepared=prepared,
         )
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        return dict(executor.map(build_one, ordered_tile_ids))
+        for tile_id in sorted(tile_ids)
+    )
 
 
 def spatial_roi_payload(
