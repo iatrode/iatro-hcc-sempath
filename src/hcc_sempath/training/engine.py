@@ -49,6 +49,7 @@ STEP_METRIC_PARTS = (
     "spatial_abundance_point",
     "spatial_brush_bag",
     "spatial_area_positive",
+    "spatial_measurement_positive",
     "spatial_explicit_negative",
     "spatial_implicit_negative",
     "spatial_point_supervised_pairs",
@@ -631,6 +632,7 @@ def _refresh_spatial_prototypes(
                 key: batch[key][spatial_sample_mask]
                 for key in (
                     "spatial_point_centers",
+                    "spatial_instance_exclusion_support",
                     "spatial_brush_bag_ids",
                     "spatial_area_positive",
                     "spatial_explicit_negative",
@@ -641,6 +643,9 @@ def _refresh_spatial_prototypes(
             observations = head.prototype_observation_sums(
                 outputs["spatial_features"],
                 point_centers=active["spatial_point_centers"],
+                instance_exclusion_support=active[
+                    "spatial_instance_exclusion_support"
+                ],
                 brush_bag_ids=active["spatial_brush_bag_ids"],
                 area_positive=active["spatial_area_positive"],
                 explicit_negative=active["spatial_explicit_negative"],
@@ -1096,6 +1101,7 @@ def _write_tensorboard_batch(
         "spatial_abundance_point",
         "spatial_brush_bag",
         "spatial_area_positive",
+        "spatial_measurement_positive",
         "spatial_explicit_negative",
         "spatial_implicit_negative",
     ):
@@ -1148,6 +1154,7 @@ def run_epoch(
         "spatial_abundance_point": 0.0,
         "spatial_brush_bag": 0.0,
         "spatial_area_positive": 0.0,
+        "spatial_measurement_positive": 0.0,
         "spatial_explicit_negative": 0.0,
         "spatial_implicit_negative": 0.0,
         "spatial_point_supervised_pairs": 0.0,
@@ -1569,6 +1576,7 @@ def run_epoch(
                                 "spatial_abundance_point",
                                 "spatial_brush_bag",
                                 "spatial_area_positive",
+                                "spatial_measurement_positive",
                                 "spatial_explicit_negative",
                                 "spatial_implicit_negative",
                                 "spatial_point_supervised_pairs",

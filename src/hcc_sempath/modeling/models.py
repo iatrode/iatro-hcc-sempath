@@ -427,14 +427,25 @@ class SpatialMorphometryHead(nn.Module):
         area_positive: torch.Tensor,
         explicit_negative: torch.Tensor,
         implicit_negative: torch.Tensor,
+        instance_exclusion_support: torch.Tensor | None = None,
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """Collect exact local-prototype sufficient statistics for one chunk."""
 
         countable = self.instance_valid.view(1, -1, 1, 1)
         density = self.density_valid.view(1, -1, 1, 1)
+        exclusion = (
+            torch.zeros_like(point_centers, dtype=torch.bool)
+            if instance_exclusion_support is None
+            else instance_exclusion_support.to(dtype=torch.bool)
+        )
         instance_positive = (point_centers > 0) & countable
+        measurement_point = (
+            (point_centers > 0)
+            & density
+            & ~exclusion
+        )
         measurement_positive = (
-            ((point_centers > 0) & density)
+            measurement_point
             | (brush_bag_ids > 0)
             | area_positive.to(dtype=torch.bool)
         )

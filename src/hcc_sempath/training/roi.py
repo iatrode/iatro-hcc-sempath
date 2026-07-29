@@ -954,6 +954,16 @@ def _build_spatial_tile_target(
                             grid_size=grid_size,
                             prepared=prepared,
                         )
+                        # A circle is both one resolved instance and the
+                        # annotated full extent of that object. Keep its centre
+                        # for the instance head and route its complete support
+                        # to the measurement head.
+                        _add_brush_bag(
+                            brush_bag_ids[idx],
+                            geometry,
+                            image_size=image_size,
+                            prepared=prepared,
+                        )
                     else:
                         _add_brush_bag(
                             brush_bag_ids[idx],

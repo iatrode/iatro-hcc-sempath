@@ -190,6 +190,76 @@ def _maximum_cardinality_score_matching(
     return matched
 
 
+def _point_center_pair_terms(
+    logits: torch.Tensor,
+    point_centers: torch.Tensor,
+    *,
+    tolerance_cells: int,
+    exclusive: bool = True,
+    exclusion_support: torch.Tensor | None = None,
+    point_centers_host: torch.Tensor | None = None,
+    exclusion_support_host: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fix every annotated centre as positive and suppress its local ring."""
+
+    if tolerance_cells < 0:
+        raise ValueError(
+            f"tolerance_cells must be non-negative, got {tolerance_cells}"
+        )
+    centers = point_centers.to(device=logits.device, dtype=torch.float32)
+    if centers.shape != logits.shape:
+        raise ValueError(
+            "point-centre shape mismatch: "
+            f"centers={tuple(centers.shape)} logits={tuple(logits.shape)}"
+        )
+    if exclusion_support is not None:
+        if exclusion_support.shape != logits.shape:
+            raise ValueError(
+                "point exclusion support shape mismatch: "
+                f"support={tuple(exclusion_support.shape)} "
+                f"logits={tuple(logits.shape)}"
+            )
+        exclusion_support = exclusion_support.to(
+            device=logits.device,
+            dtype=torch.bool,
+        )
+    point_count = centers.flatten(2).sum(dim=2)
+    supervised = point_count > 0
+    positive = centers > 0
+    positive_pair = (
+        (F.softplus(-logits) * centers).flatten(2).sum(dim=2)
+        / point_count.clamp_min(1)
+    )
+
+    if exclusive:
+        batch, component, height, width = logits.shape
+        if tolerance_cells > 0:
+            local_support = F.max_pool2d(
+                positive.reshape(batch * component, 1, height, width).float(),
+                kernel_size=2 * tolerance_cells + 1,
+                stride=1,
+                padding=tolerance_cells,
+            ).reshape_as(positive) > 0
+        else:
+            local_support = positive
+        if exclusion_support is not None:
+            local_support = local_support | exclusion_support
+        negative = local_support & ~positive
+        negative_count = negative.flatten(2).sum(dim=2)
+        negative_pair = (
+            (F.softplus(logits) * negative).flatten(2).sum(dim=2)
+            / negative_count.clamp_min(1)
+        )
+        pair_loss = positive_pair + torch.where(
+            negative_count > 0,
+            negative_pair,
+            torch.zeros_like(negative_pair),
+        )
+    else:
+        pair_loss = positive_pair
+    return pair_loss, supervised, point_count
+
+
 def _point_peak_loss(
     logits: torch.Tensor,
     point_centers: torch.Tensor,
@@ -428,19 +498,43 @@ def _routed_negative_loss(
     *,
     instance_pair_valid: torch.Tensor | None = None,
     measurement_pair_valid: torch.Tensor | None = None,
+    hard_tail_topk: int = 0,
+    hard_tail_weight: float = 0.5,
+    sum_heads: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Apply negatives to valid heads without halving area-only components."""
+    """Apply negatives to valid heads with optional hard-tail suppression."""
 
     mask = mask.to(device=instance_logits.device, dtype=torch.bool)
-    valid_count = mask.flatten(2).sum(dim=2)
-    instance_pair = (
-        (F.softplus(instance_logits) * mask).flatten(2).sum(dim=2)
-        / valid_count.clamp_min(1)
-    )
-    measurement_pair = (
-        (F.softplus(measurement_logits) * mask).flatten(2).sum(dim=2)
-        / valid_count.clamp_min(1)
-    )
+    flat_mask = mask.flatten(2)
+    valid_count = flat_mask.sum(dim=2)
+
+    def _negative_pair(logits: torch.Tensor) -> torch.Tensor:
+        losses = F.softplus(logits).flatten(2)
+        mean_loss = (
+            (losses * flat_mask).sum(dim=2)
+            / valid_count.clamp_min(1)
+        )
+        if hard_tail_topk <= 0:
+            return mean_loss
+        if not 0.0 <= float(hard_tail_weight) <= 1.0:
+            raise ValueError("hard_tail_weight must be in [0, 1]")
+        topk = min(int(hard_tail_topk), losses.shape[2])
+        masked_losses = losses.masked_fill(~flat_mask, float("-inf"))
+        tail_values = masked_losses.topk(topk, dim=2).values
+        tail_values = torch.where(
+            torch.isfinite(tail_values),
+            tail_values,
+            torch.zeros_like(tail_values),
+        )
+        tail_count = valid_count.clamp(max=topk)
+        tail_loss = tail_values.sum(dim=2) / tail_count.clamp_min(1)
+        return (
+            (1.0 - float(hard_tail_weight)) * mean_loss
+            + float(hard_tail_weight) * tail_loss
+        )
+
+    instance_pair = _negative_pair(instance_logits)
+    measurement_pair = _negative_pair(measurement_logits)
     supervised = valid_count > 0
     countable_pair = countable.reshape(1, -1)
     instance_supervised = supervised & countable_pair
@@ -455,30 +549,40 @@ def _routed_negative_loss(
             device=instance_logits.device,
             dtype=torch.bool,
         )
-    objective_count = (
-        instance_supervised.float() + measurement_supervised.float()
-    )
-    pair_loss = (
-        instance_pair * instance_supervised.float()
-        + measurement_pair * measurement_supervised.float()
-    ) / objective_count.clamp_min(1.0)
-    any_supervised = objective_count > 0
-    return (
-        _mean_supervised_pair(
+    if sum_heads:
+        loss = (
+            _mean_supervised_pair(
+                instance_pair,
+                instance_supervised,
+                instance_logits,
+            )
+            + _mean_supervised_pair(
+                measurement_pair,
+                measurement_supervised,
+                measurement_logits,
+            )
+        )
+    else:
+        objective_count = (
+            instance_supervised.float() + measurement_supervised.float()
+        )
+        pair_loss = (
+            instance_pair * instance_supervised.float()
+            + measurement_pair * measurement_supervised.float()
+        ) / objective_count.clamp_min(1.0)
+        loss = _mean_supervised_pair(
             pair_loss,
-            any_supervised,
+            objective_count > 0,
             instance_logits,
-        ),
-        instance_supervised,
-        measurement_supervised,
-    )
+        )
+    return loss, instance_supervised, measurement_supervised
 
 
-def _positive_area_loss(
+def _positive_area_pair_terms(
     logits: torch.Tensor,
     mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Positive occupancy support without inventing unmarked boundaries."""
+    """Return per tile-component full-support positive area losses."""
 
     mask = mask.to(device=logits.device, dtype=torch.bool)
     valid_count = mask.flatten(2).sum(dim=2)
@@ -487,21 +591,31 @@ def _positive_area_loss(
         / valid_count.clamp_min(1)
     )
     supervised = valid_count > 0
+    return pair_loss, supervised
+
+
+def _positive_area_loss(
+    logits: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Component-balanced wrapper around full-support area supervision."""
+
+    pair_loss, supervised = _positive_area_pair_terms(logits, mask)
     return _mean_supervised_pair(pair_loss, supervised, logits), supervised
 
 
-def _brush_bag_loss(
+def _brush_bag_pair_terms(
     logits: torch.Tensor,
     bag_ids: torch.Tensor,
     *,
     top_fraction: float,
     bag_ids_host: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, int, int]:
-    """Positive multiple-instance loss over dense-cell brush bags.
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Return per-pair positive losses over painted density supports.
 
-    Only the strongest configured fraction of cells contributes to a bag's
-    positive score. This requires distributed evidence without declaring every
-    covered cell positive or inventing instance centres.
+    ``top_fraction=1`` is the contour-faithful route: every selected cell
+    receives positive measurement supervision. Fractions below one retain the
+    legacy multiple-instance route only for controlled comparisons.
     """
 
     if not 0.0 < top_fraction <= 1.0:
@@ -542,44 +656,67 @@ def _brush_bag_loss(
     bag_count = len(flat_indices)
     pair_count = len(supervised_pairs)
     if bag_count == 0:
-        return logits.sum() * 0.0, 0, 0
+        return (
+            logits.new_zeros(logits.shape[:2]),
+            torch.zeros(
+                logits.shape[:2],
+                device=logits.device,
+                dtype=torch.bool,
+            ),
+            0,
+            0,
+        )
 
     device = logits.device
     indices = torch.cat(flat_indices).to(device=device)
     sizes = torch.tensor(bag_sizes, device=device, dtype=torch.long)
-    keep = torch.tensor(keep_counts, device=device, dtype=torch.long)
     pairs = torch.tensor(bag_pairs, device=device, dtype=torch.long)
     values = logits.flatten().index_select(0, indices)
     bag_index = torch.repeat_interleave(
         torch.arange(bag_count, device=device),
         sizes,
     )
-    # Stable value sort followed by stable bag sort is a lexicographic
-    # (bag ascending, score descending) ordering without one topk launch per
-    # brush bag.
-    score_order = torch.argsort(
-        values,
-        descending=True,
-        stable=True,
-    )
-    grouped_order = score_order[
-        torch.argsort(bag_index[score_order], stable=True)
-    ]
-    sorted_values = values[grouped_order]
-    offsets = torch.cumsum(sizes, dim=0) - sizes
-    rank = torch.arange(values.numel(), device=device) - torch.repeat_interleave(
-        offsets,
-        sizes,
-    )
-    selected = rank < torch.repeat_interleave(keep, sizes)
-    sorted_bag_index = bag_index[grouped_order]
-    bag_sums = logits.new_zeros((bag_count,)).scatter_add(
-        0,
-        sorted_bag_index,
-        torch.where(selected, sorted_values, torch.zeros_like(sorted_values)),
-    )
-    evidence = bag_sums / keep.to(dtype=logits.dtype)
-    bag_losses = F.softplus(-evidence)
+    if math.isclose(float(top_fraction), 1.0):
+        # A painted range is a complete positive support, not a bag from which
+        # the model may choose only its easiest cells.
+        bag_sums = logits.new_zeros((bag_count,)).scatter_add(
+            0,
+            bag_index,
+            F.softplus(-values),
+        )
+        bag_losses = bag_sums / sizes.to(dtype=logits.dtype)
+    else:
+        keep = torch.tensor(keep_counts, device=device, dtype=torch.long)
+        # Stable value sort followed by stable bag sort is a lexicographic
+        # (bag ascending, score descending) ordering without one topk launch
+        # per brush bag.
+        score_order = torch.argsort(
+            values,
+            descending=True,
+            stable=True,
+        )
+        grouped_order = score_order[
+            torch.argsort(bag_index[score_order], stable=True)
+        ]
+        sorted_values = values[grouped_order]
+        offsets = torch.cumsum(sizes, dim=0) - sizes
+        rank = (
+            torch.arange(values.numel(), device=device)
+            - torch.repeat_interleave(offsets, sizes)
+        )
+        selected = rank < torch.repeat_interleave(keep, sizes)
+        sorted_bag_index = bag_index[grouped_order]
+        bag_sums = logits.new_zeros((bag_count,)).scatter_add(
+            0,
+            sorted_bag_index,
+            torch.where(
+                selected,
+                sorted_values,
+                torch.zeros_like(sorted_values),
+            ),
+        )
+        evidence = bag_sums / keep.to(dtype=logits.dtype)
+        bag_losses = F.softplus(-evidence)
     flat_pair_loss = logits.new_zeros(
         (logits.shape[0] * component_count,)
     ).scatter_add(0, pairs, bag_losses)
@@ -594,6 +731,24 @@ def _brush_bag_loss(
         logits.shape[0],
         component_count,
     ) > 0
+    return pair_loss, supervised, bag_count, pair_count
+
+
+def _brush_bag_loss(
+    logits: torch.Tensor,
+    bag_ids: torch.Tensor,
+    *,
+    top_fraction: float,
+    bag_ids_host: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, int, int]:
+    """Component-balanced wrapper around painted-support supervision."""
+
+    pair_loss, supervised, bag_count, pair_count = _brush_bag_pair_terms(
+        logits,
+        bag_ids,
+        top_fraction=top_fraction,
+        bag_ids_host=bag_ids_host,
+    )
     return (
         _mean_supervised_pair(pair_loss, supervised, logits),
         bag_count,
@@ -790,7 +945,7 @@ def spatial_morphometry_loss(
         "instance exclusion support and explicit-negative targets overlap",
     )
 
-    instance_point, point_pairs, point_counts = _point_peak_loss(
+    instance_point_pair, point_pairs, point_counts = _point_center_pair_terms(
         instance_logits,
         point_centers,
         tolerance_cells=point_tolerance_cells,
@@ -810,27 +965,92 @@ def spatial_morphometry_loss(
             )
         ),
     )
-    abundance_point, _, _ = _point_peak_loss(
+    instance_point = _mean_supervised_pair(
+        instance_point_pair,
+        point_pairs,
+        instance_logits,
+    )
+    measurement_point_mask = density & ~exclusion_bool
+    measurement_point_mask_host = (
+        density_host
+        if resolved_exclusion_host is None
+        else density_host & ~resolved_exclusion_host
+    )
+    (
+        abundance_point_pair,
+        abundance_point_pairs,
+        _,
+    ) = _point_center_pair_terms(
         abundance_logits,
-        point_centers * density.to(dtype=point_centers.dtype),
+        point_centers
+        * measurement_point_mask.to(dtype=point_centers.dtype),
         tolerance_cells=point_tolerance_cells,
         exclusive=False,
         point_centers_host=(
             None
             if resolved_point_host is None
             else resolved_point_host
-            * density_host.to(dtype=resolved_point_host.dtype)
+            * measurement_point_mask_host.to(
+                dtype=resolved_point_host.dtype
+            )
         ),
     )
-    brush_bag, brush_bags, brush_pairs = _brush_bag_loss(
+    abundance_point = _mean_supervised_pair(
+        abundance_point_pair,
+        abundance_point_pairs,
+        abundance_logits,
+    )
+    (
+        brush_bag_pair,
+        brush_pair_mask,
+        brush_bags,
+        brush_pairs,
+    ) = _brush_bag_pair_terms(
         abundance_logits,
         brush_bag_ids,
         top_fraction=brush_top_fraction,
         bag_ids_host=brush_bag_ids_host,
     )
-    area_positive_loss, area_pairs = _positive_area_loss(
+    brush_bag = _mean_supervised_pair(
+        brush_bag_pair,
+        brush_pair_mask,
+        abundance_logits,
+    )
+    area_positive_pair, area_pairs = _positive_area_pair_terms(
         abundance_logits,
         area_bool,
+    )
+    area_positive_loss = _mean_supervised_pair(
+        area_positive_pair,
+        area_pairs,
+        abundance_logits,
+    )
+    measurement_numerator = torch.zeros_like(abundance_point_pair)
+    measurement_source_count = torch.zeros_like(abundance_point_pair)
+    if float(abundance_point_weight) > 0:
+        measurement_numerator += (
+            float(abundance_point_weight)
+            * abundance_point_pair
+            * abundance_point_pairs.float()
+        )
+        measurement_source_count += abundance_point_pairs.float()
+    if float(brush_weight) > 0:
+        measurement_numerator += (
+            float(brush_weight)
+            * brush_bag_pair
+            * brush_pair_mask.float()
+        )
+        measurement_source_count += brush_pair_mask.float()
+    measurement_numerator += area_positive_pair * area_pairs.float()
+    measurement_source_count += area_pairs.float()
+    measurement_pairs = measurement_source_count > 0
+    measurement_pair = (
+        measurement_numerator / measurement_source_count.clamp_min(1)
+    )
+    measurement_positive = _mean_supervised_pair(
+        measurement_pair,
+        measurement_pairs,
+        abundance_logits,
     )
     (
         explicit_loss,
@@ -841,6 +1061,9 @@ def spatial_morphometry_loss(
         abundance_logits,
         explicit_bool,
         countable,
+        hard_tail_topk=4,
+        hard_tail_weight=0.5,
+        sum_heads=True,
     )
     (
         implicit_loss,
@@ -869,9 +1092,7 @@ def spatial_morphometry_loss(
 
     total = (
         instance_point
-        + float(abundance_point_weight) * abundance_point
-        + float(brush_weight) * brush_bag
-        + area_positive_loss
+        + measurement_positive
         + float(explicit_negative_weight) * explicit_loss
         + float(implicit_negative_weight) * implicit_loss
     )
@@ -881,6 +1102,7 @@ def spatial_morphometry_loss(
         "spatial_abundance_point": abundance_point.detach(),
         "spatial_brush_bag": brush_bag.detach(),
         "spatial_area_positive": area_positive_loss.detach(),
+        "spatial_measurement_positive": measurement_positive.detach(),
         "spatial_explicit_negative": explicit_loss.detach(),
         "spatial_implicit_negative": implicit_loss.detach(),
         "spatial_point_supervised_pairs": point_pairs.sum().detach(),

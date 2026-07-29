@@ -2,6 +2,17 @@
 
 ## 0.2.0 — Unreleased
 
+- Fix point supervision to train the annotated centre instead of selecting
+  the model's current local maximum.
+- Train every selected range cell when full-range supervision is configured,
+  and combine point, range, and area evidence once per measurement component.
+- Penalize sparse complete-negative false-positive peaks with a balanced
+  global-mean and top-four hard-tail loss on both valid spatial heads.
+- Exclude range-derived instance support from measurement prototype refresh.
+- Add `spatial_measurement_positive` as a diagnostic metric. Existing
+  checkpoints and annotation files remain load-compatible; retraining is
+  required to obtain the corrected loss behaviour.
+
 - Define the first-release classification/spatial API and asset schema after
   removing unpublished development terminology.
 - Define classification prototype registries as one ordered class bank;

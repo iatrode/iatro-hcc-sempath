@@ -34,12 +34,29 @@ def _reference_brush_bag_loss(
             ids = bag_ids[batch_idx, component_idx]
             for bag_id in torch.unique(ids[ids > 0]).tolist():
                 values = logits[batch_idx, component_idx][ids == bag_id]
-                keep = max(
-                    1,
-                    int(torch.ceil(torch.tensor(values.numel() * top_fraction))),
-                )
-                evidence = torch.topk(values, keep, sorted=False).values.mean()
-                bag_losses.append(torch.nn.functional.softplus(-evidence))
+                if top_fraction == 1.0:
+                    bag_losses.append(
+                        torch.nn.functional.softplus(-values).mean()
+                    )
+                else:
+                    keep = max(
+                        1,
+                        int(
+                            torch.ceil(
+                                torch.tensor(
+                                    values.numel() * top_fraction
+                                )
+                            )
+                        ),
+                    )
+                    evidence = torch.topk(
+                        values,
+                        keep,
+                        sorted=False,
+                    ).values.mean()
+                    bag_losses.append(
+                        torch.nn.functional.softplus(-evidence)
+                    )
                 bag_count += 1
             if bag_losses:
                 pair_losses.append(torch.stack(bag_losses).mean())
@@ -582,7 +599,7 @@ def test_point_uses_local_tolerance_and_leaves_unmarked_cells_ignored(
     assert not target.explicit_negative.any()
 
 
-def test_circle_is_one_large_instance_and_not_a_brush_bag(
+def test_circle_is_one_large_instance_and_full_measurement_support(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "spatial.json"
@@ -616,7 +633,7 @@ def test_circle_is_one_large_instance_and_not_a_brush_bag(
 
     assert target.point_centers.sum().item() == 2
     assert target.instance_exclusion_support.any()
-    assert not target.brush_mask.any()
+    assert target.brush_mask.any()
     assert not target.area_positive.any()
     assert not target.explicit_negative.any()
 
@@ -1002,7 +1019,7 @@ def test_point_peak_host_targets_preserve_matching_and_gradients() -> None:
     )
 
 
-def test_implicit_background_direct_gradient_is_twenty_times_weaker() -> None:
+def test_implicit_background_direct_gradient_is_forty_times_weaker() -> None:
     def negative_gradient(*, explicit: bool) -> tuple[float, float]:
         instance = torch.zeros((1, 1, 3, 3), requires_grad=True)
         measurement = torch.zeros_like(instance, requires_grad=True)
@@ -1026,8 +1043,8 @@ def test_implicit_background_direct_gradient_is_twenty_times_weaker() -> None:
     explicit_loss, explicit_gradient = negative_gradient(explicit=True)
     implicit_loss, implicit_gradient = negative_gradient(explicit=False)
 
-    assert explicit_loss == pytest.approx(20.0 * implicit_loss)
-    assert explicit_gradient == pytest.approx(20.0 * implicit_gradient)
+    assert explicit_loss == pytest.approx(40.0 * implicit_loss)
+    assert explicit_gradient == pytest.approx(40.0 * implicit_gradient)
 
 
 def test_area_only_loss_does_not_train_instance_channel() -> None:
@@ -1126,18 +1143,19 @@ def test_structure_extent_penalizes_a_second_instance_peak() -> None:
     assert two_loss > one_loss
 
 
-def test_point_peak_accepts_response_within_tolerance() -> None:
-    instance_logits = torch.full((1, 1, 5, 5), -5.0)
-    instance_logits[0, 0, 2, 3] = 5.0
-    abundance_logits = instance_logits.clone()
-    point_centers = torch.zeros_like(instance_logits)
+def test_point_supervision_is_fixed_at_clicked_center() -> None:
+    centered_logits = torch.full((1, 1, 5, 5), -5.0)
+    centered_logits[0, 0, 2, 2] = 5.0
+    shifted_logits = torch.full((1, 1, 5, 5), -5.0)
+    shifted_logits[0, 0, 2, 3] = 5.0
+    point_centers = torch.zeros_like(centered_logits)
     point_centers[0, 0, 2, 2] = 1
-    zeros_long = torch.zeros_like(instance_logits, dtype=torch.long)
-    zeros_bool = torch.zeros_like(instance_logits, dtype=torch.bool)
+    zeros_long = torch.zeros_like(centered_logits, dtype=torch.long)
+    zeros_bool = torch.zeros_like(centered_logits, dtype=torch.bool)
 
-    tolerant, _ = spatial_morphometry_loss(
-        instance_logits=instance_logits,
-        abundance_logits=abundance_logits,
+    centered, _ = spatial_morphometry_loss(
+        instance_logits=centered_logits,
+        abundance_logits=centered_logits,
         point_centers=point_centers,
         brush_bag_ids=zeros_long,
         area_positive=zeros_bool,
@@ -1146,19 +1164,19 @@ def test_point_peak_accepts_response_within_tolerance() -> None:
         point_tolerance_cells=1,
         abundance_point_weight=0.0,
     )
-    exact, _ = spatial_morphometry_loss(
-        instance_logits=instance_logits,
-        abundance_logits=abundance_logits,
+    shifted, _ = spatial_morphometry_loss(
+        instance_logits=shifted_logits,
+        abundance_logits=shifted_logits,
         point_centers=point_centers,
         brush_bag_ids=zeros_long,
         area_positive=zeros_bool,
         explicit_negative=zeros_bool,
         implicit_negative=zeros_bool,
-        point_tolerance_cells=0,
+        point_tolerance_cells=1,
         abundance_point_weight=0.0,
     )
 
-    assert tolerant < exact
+    assert centered < shifted
 
 
 def test_adjacent_clicks_cannot_share_one_response_peak() -> None:
