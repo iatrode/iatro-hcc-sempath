@@ -63,6 +63,7 @@ SELECTION_COMPONENTS = (
     "classification",
     "spatial",
 )
+PRUNER_WARMUP_STEPS = 8
 RESULT_METRICS = (
     "selection_loss",
     *(
@@ -2158,7 +2159,7 @@ def main() -> None:
         "n_startup_trials": 6,
         "pruner": (
             "MedianPruner(n_startup_trials=6,"
-            "n_warmup_steps=5,interval_steps=1)"
+            f"n_warmup_steps={PRUNER_WARMUP_STEPS},interval_steps=1)"
         ),
         "baseline_params": BASELINE_PARAMS,
         "seeded_params": list(SEEDED_PARAMS),
@@ -2217,7 +2218,7 @@ def main() -> None:
     )
     pruner = optuna.pruners.MedianPruner(
         n_startup_trials=6,
-        n_warmup_steps=5,
+        n_warmup_steps=PRUNER_WARMUP_STEPS,
         interval_steps=1,
     )
     study = optuna.create_study(

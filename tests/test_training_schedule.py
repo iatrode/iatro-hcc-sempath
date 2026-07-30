@@ -13,6 +13,7 @@ from hcc_sempath.training.engine import (
     _complete_bank_spatial_metrics,
     _eligible_selection_epoch_count,
     _selection_early_stop_requested,
+    _selection_eligible_epochs_from_csv,
     _normalized_selection_metrics,
     _normalize_uint8_images_fp16,
     _selection_start_step,
@@ -245,6 +246,25 @@ def test_selection_early_stop_requires_eligibility_and_patience() -> None:
         bad_epochs=3,
         patience=4,
     )
+
+
+def test_selection_eligible_epochs_recover_from_truncated_metrics(
+    tmp_path,
+) -> None:
+    path = tmp_path / "metrics.csv"
+    path.write_text(
+        "epoch,global_step,selection_eligible\n"
+        "1,100,false\n"
+        "2,200,true\n"
+        "3,300,true\n"
+        "4,400,true\n",
+        encoding="utf-8",
+    )
+
+    assert _selection_eligible_epochs_from_csv(
+        path,
+        maximum_step=350,
+    ) == 2
 
 
 def test_complete_bank_spatial_reducer_is_batch_partition_invariant() -> None:

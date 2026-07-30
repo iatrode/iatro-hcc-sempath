@@ -2472,6 +2472,29 @@ def _selection_early_stop_requested(
     )
 
 
+def _selection_eligible_epochs_from_csv(
+    path: Path,
+    *,
+    maximum_step: int,
+) -> int:
+    """Recover completed eligible validation epochs from a metrics file."""
+
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                step = int(float(row.get("global_step", "") or "nan"))
+            except (TypeError, ValueError):
+                continue
+            if step > maximum_step:
+                continue
+            if str(row.get("selection_eligible", "")).lower() == "true":
+                count += 1
+    return count
+
+
 def _teacher_retention_metrics(
     embedding_metrics: dict[str, float],
     *,
@@ -2889,9 +2912,31 @@ def fit(
     selection_bad_epochs = int(
         (resume_state or {}).get("selection_bad_epochs", 0)
     )
-    selection_eligible_epochs = int(
-        (resume_state or {}).get("selection_eligible_epochs", 0)
+    restored_eligible_epochs = (resume_state or {}).get(
+        "selection_eligible_epochs"
     )
+    recovered_eligible_epochs = (
+        _selection_eligible_epochs_from_csv(
+            output_dir / "metrics.csv",
+            maximum_step=resume_global_step,
+        )
+        if resume_state is not None
+        else 0
+    )
+    if restored_eligible_epochs is None:
+        selection_eligible_epochs = recovered_eligible_epochs
+    else:
+        selection_eligible_epochs = int(restored_eligible_epochs)
+        if (
+            (output_dir / "metrics.csv").exists()
+            and selection_eligible_epochs != recovered_eligible_epochs
+        ):
+            raise ValueError(
+                "checkpoint selection_eligible_epochs disagrees with "
+                "metrics.csv after resume truncation: "
+                f"checkpoint={selection_eligible_epochs} "
+                f"metrics={recovered_eligible_epochs}"
+            )
     selection_baseline = {
         str(name): float(value)
         for name, value in (
@@ -3051,13 +3096,18 @@ def fit(
             selection_start_step=selection_early_stop_start_step,
             resume_batch_in_epoch=resume_batch_in_epoch,
         )
-        if eligible_epochs < selection_minimum_eligible_epochs:
+        total_eligible_epochs = (
+            selection_eligible_epochs + eligible_epochs
+        )
+        if total_eligible_epochs < selection_minimum_eligible_epochs:
             raise ValueError(
                 "training budget cannot reach enough eligible joint-selection "
                 "epochs after all active ramps: "
                 f"steps_per_epoch={steps_per_epoch} "
                 f"selection_start_step={selection_early_stop_start_step} "
-                f"eligible_epochs={eligible_epochs} "
+                f"completed_eligible_epochs={selection_eligible_epochs} "
+                f"remaining_eligible_epochs={eligible_epochs} "
+                f"total_eligible_epochs={total_eligible_epochs} "
                 f"required={selection_minimum_eligible_epochs}"
             )
     expert_eval_cfg = {

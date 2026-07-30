@@ -110,6 +110,7 @@ def test_trial_config_uses_matched_tenth_population_and_fixed_losses(
 def test_server_a0_config_uses_trajectory_derived_selection_contract() -> None:
     from hcc_sempath.training.config import load_config
 
+    module = _search_module()
     root = Path(__file__).resolve().parents[1]
     cfg = load_config(
         root / "configs" / "local" / "server" / "train_a0_optuna.yaml"
@@ -117,6 +118,7 @@ def test_server_a0_config_uses_trajectory_derived_selection_contract() -> None:
 
     assert cfg["train"]["selection_minimum_eligible_epochs"] == 8
     assert cfg["train"]["selection_early_stop_patience"] == 3
+    assert module.PRUNER_WARMUP_STEPS == 8
     assert cfg["train"]["selection_metric_weights"] == {
         "teacher": 0.26,
         "classification": 0.28,
