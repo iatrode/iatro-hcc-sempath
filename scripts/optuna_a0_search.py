@@ -1140,7 +1140,15 @@ def _formal_base_config(
     # view must already be bound when its schedule and study digest are built.
     cfg["data"]["train_tile_fraction"] = 0.10
     cfg["data"]["val_tile_fraction"] = 0.10
+    # Train and validation process pools coexist during validation. Keeping
+    # either pool persistent exceeded the formal host's 90 GiB memory cgroup.
+    cfg["data"]["persistent_workers"] = False
+    cfg["data"]["val_persistent_workers"] = False
     cfg["train"]["epochs"] = int(epochs)
+    # These diagnostics are useful in development runs but add an unrelated
+    # 20–30 second probe and retained-gradient pass to every formal trial.
+    cfg["train"]["development_probe_interval_steps"] = 0
+    cfg["train"]["gradient_diagnostic_interval_steps"] = 0
     return cfg
 
 
@@ -1195,7 +1203,10 @@ def trial_config(
         cfg["data"].get("prefetch_factor", 3)
     )
     cfg["data"]["persistent_workers"] = bool(
-        cfg["data"].get("persistent_workers", True)
+        cfg["data"].get("persistent_workers", False)
+    )
+    cfg["data"]["val_persistent_workers"] = bool(
+        cfg["data"].get("val_persistent_workers", False)
     )
     cfg["data"]["dynamic_package_sampling"] = bool(
         cfg["data"].get("dynamic_package_sampling", True)
@@ -1235,6 +1246,8 @@ def trial_config(
     )
     # The old intra-epoch population-loss stop is not a selection signal.
     cfg["train"]["development_early_stop"] = False
+    cfg["train"]["development_probe_interval_steps"] = 0
+    cfg["train"]["gradient_diagnostic_interval_steps"] = 0
     cfg["train"]["selection_early_stop"] = True
     cfg["train"].setdefault(
         "selection_metric_weights",

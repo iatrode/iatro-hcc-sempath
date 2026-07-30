@@ -12,6 +12,10 @@ data:
   spatial_train_splits: [train]
   spatial_val_splits: [val]
   require_complete_expert_validation: true
+  # The train and validation worker pools overlap during validation; retaining
+  # both pools exceeded the 90 GiB formal-host memory cgroup.
+  persistent_workers: false
+  val_persistent_workers: false
 
 train:
   # The first trial freezes T0/C0/S0 at the shared initialization. Every later
@@ -21,6 +25,8 @@ train:
   # analysis changes only this prespecified selection rule.
   epochs: 16
   development_early_stop: false
+  development_probe_interval_steps: 0
+  gradient_diagnostic_interval_steps: 0
   selection_early_stop: true
   selection_metric_weights:
     teacher: 0.26
