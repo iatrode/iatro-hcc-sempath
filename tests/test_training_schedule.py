@@ -9,7 +9,13 @@ from hcc_sempath.training.config import teacher_dims, teacher_names, validate_tr
 from hcc_sempath.training.engine import (
     _amp_enabled,
     _bucket_spatial_sample_mask,
+    _classification_eval_metrics,
+    _complete_bank_spatial_metrics,
+    _eligible_selection_epoch_count,
+    _normalized_selection_metrics,
     _normalize_uint8_images_fp16,
+    _selection_start_step,
+    _teacher_retention_metrics,
     _spatial_global_targets_from_spatial,
     _objective_gradient_diagnostics,
     _optimizer_step,
@@ -37,6 +43,203 @@ from hcc_sempath.training.train import (
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 import torch
+
+
+def test_classification_validation_metrics_are_class_balanced() -> None:
+    logits = torch.tensor(
+        [
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [0.0, 4.0, 0.0],
+            [4.0, 0.0, 0.0],
+        ]
+    )
+    metrics = _classification_eval_metrics(
+        {
+            "prototype_mask": torch.ones(6, dtype=torch.bool),
+            "prototype_classification": torch.tensor(
+                [0, 0, 0, 0, 1, 2]
+            ),
+            "classification_logits": logits,
+        }
+    )
+
+    assert metrics["classification_accuracy"] == pytest.approx(5 / 6)
+    assert metrics["classification_balanced_accuracy"] == pytest.approx(
+        2 / 3
+    )
+    assert metrics["classification_evaluated_classes"] == 3
+    assert metrics["classification_total_classes"] == 3
+    assert (
+        metrics["classification_balanced_cross_entropy"]
+        > metrics["classification_cross_entropy"]
+    )
+
+
+def test_joint_selection_metric_uses_fixed_normalized_components() -> None:
+    metrics = _normalized_selection_metrics(
+        {
+            "teacher": 0.4,
+            "classification": 0.6,
+            "spatial": 0.9,
+        },
+        {
+            "teacher": 0.8,
+            "classification": 1.2,
+            "spatial": 1.0,
+        },
+        {
+            "teacher": 0.50,
+            "classification": 0.25,
+            "spatial": 0.25,
+        },
+    )
+
+    assert metrics["selection_teacher_normalized"] == pytest.approx(0.5)
+    assert metrics["selection_classification_normalized"] == pytest.approx(
+        0.5
+    )
+    assert metrics["selection_spatial_normalized"] == pytest.approx(0.9)
+    assert metrics["selection_loss"] == pytest.approx(0.6)
+
+
+def test_configured_selection_baseline_is_positive_and_complete() -> None:
+    cfg = {
+        "data": {"teachers": ["teacher"]},
+        "model": {"teacher_dims": {"teacher": 8}},
+        "loss": {},
+        "train": {
+            "selection_metric_baseline": {
+                "teacher": 0.8,
+                "classification": 1.2,
+                "spatial": 1.0,
+            }
+        },
+    }
+
+    validate_training_config(cfg, ["teacher"])
+    cfg["train"]["selection_metric_baseline"]["spatial"] = 0.0
+    with pytest.raises(ValueError, match="finite and positive"):
+        validate_training_config(cfg, ["teacher"])
+
+
+def test_teacher_retention_does_not_use_dynamic_population_loss() -> None:
+    metrics = _teacher_retention_metrics(
+        {
+            "teacher_a_feature_cosine": 0.8,
+            "teacher_a_relation_mse": 0.2,
+            "teacher_b_feature_cosine": 0.6,
+            "teacher_b_relation_mse": 0.4,
+            "val_feature": 999.0,
+        },
+        relation_weight=0.05,
+    )
+
+    assert metrics["fixed_teacher_distance"] == pytest.approx(0.3)
+    assert metrics["fixed_teacher_relation"] == pytest.approx(0.3)
+    assert metrics["teacher_validation_loss"] == pytest.approx(0.315)
+
+
+def test_selection_start_waits_for_every_active_supervision_ramp() -> None:
+    assert _selection_start_step(
+        {
+            "loss": {
+                "expert_supervision_start_step": 1000,
+                "expert_supervision_ramp_steps": 1000,
+                "prototype_filter_weight": 0.5,
+                "prototype_filter_start_step": 1500,
+                "prototype_filter_ramp_steps": 1000,
+                "zhcc_response_weight": 0.15,
+                "zhcc_response_start_step": 2000,
+                "zhcc_response_ramp_steps": 750,
+            }
+        }
+    ) == 2750
+
+
+def test_selection_start_cannot_bypass_active_supervision_ramp() -> None:
+    cfg = {
+        "data": {"teachers": ["teacher"]},
+        "model": {"teacher_dims": {"teacher": 8}},
+        "loss": {
+            "expert_supervision_start_step": 1000,
+            "expert_supervision_ramp_steps": 1000,
+            "prototype_filter_weight": 0.5,
+            "prototype_filter_start_step": 1500,
+            "prototype_filter_ramp_steps": 1000,
+        },
+        "train": {"selection_early_stop_start_step": 1},
+    }
+
+    assert _selection_start_step(cfg) == 2500
+    with pytest.raises(ValueError, match="cannot precede"):
+        validate_training_config(cfg, ["teacher"])
+
+
+def test_selection_reachability_counts_post_ramp_epoch_ends() -> None:
+    assert _eligible_selection_epoch_count(
+        current_global_step=0,
+        steps_per_epoch=209,
+        start_epoch=1,
+        expected_epochs=16,
+        selection_start_step=2500,
+    ) == 5
+    assert _eligible_selection_epoch_count(
+        current_global_step=0,
+        steps_per_epoch=208,
+        start_epoch=1,
+        expected_epochs=16,
+        selection_start_step=2500,
+    ) == 4
+
+
+def test_selection_reachability_handles_mid_epoch_resume() -> None:
+    assert _eligible_selection_epoch_count(
+        current_global_step=250,
+        steps_per_epoch=100,
+        start_epoch=3,
+        expected_epochs=5,
+        selection_start_step=400,
+        resume_batch_in_epoch=50,
+    ) == 2
+
+
+def test_complete_bank_spatial_reducer_is_batch_partition_invariant() -> None:
+    complete = {
+        "_spatial_eval_instance_point_sum": torch.tensor([3.0, 4.0]),
+        "_spatial_eval_instance_point_count": torch.tensor([2.0, 4.0]),
+        "_spatial_eval_measurement_positive_sum": torch.tensor([2.0, 0.0]),
+        "_spatial_eval_measurement_positive_count": torch.tensor([4.0, 0.0]),
+        "_spatial_eval_explicit_instance_sum": torch.tensor([1.0, 6.0]),
+        "_spatial_eval_explicit_instance_count": torch.tensor([2.0, 3.0]),
+        "_spatial_eval_explicit_abundance_sum": torch.tensor([2.0, 2.0]),
+        "_spatial_eval_explicit_abundance_count": torch.tensor([4.0, 1.0]),
+        "_spatial_eval_implicit_sum": torch.tensor([5.0, 1.0]),
+        "_spatial_eval_implicit_count": torch.tensor([5.0, 2.0]),
+    }
+    first = {key: value * 0.25 for key, value in complete.items()}
+    second = {
+        key: complete[key] - first[key]
+        for key in complete
+    }
+    merged = {
+        key: first[key] + second[key]
+        for key in complete
+    }
+
+    expected = _complete_bank_spatial_metrics(
+        complete,
+        explicit_negative_weight=1.0,
+        implicit_negative_weight=0.05,
+    )
+    observed = _complete_bank_spatial_metrics(
+        merged,
+        explicit_negative_weight=1.0,
+        implicit_negative_weight=0.05,
+    )
+    assert observed == pytest.approx(expected)
 
 
 @pytest.mark.parametrize(
@@ -199,7 +402,7 @@ def test_scheduled_loss_config_warms_parallel_expert_terms_together() -> None:
     assert active["feature_loss_type"] == "cosine"
     assert active["spatial_point_tolerance_cells"] == 1
     assert active["spatial_abundance_point_weight"] == pytest.approx(0.5)
-    assert active["spatial_brush_top_fraction"] == pytest.approx(0.25)
+    assert active["spatial_brush_top_fraction"] == pytest.approx(1.0)
     assert active["spatial_implicit_negative_weight"] == pytest.approx(0.05)
     assert active["spatial_detach_backbone"] is False
 
@@ -810,6 +1013,37 @@ def test_training_config_rejects_negative_checkpoint_interval() -> None:
         validate_training_config(cfg, ["teacher"])
 
 
+@pytest.mark.parametrize(
+    "weights",
+    [
+        {
+            "teacher": 0.50,
+            "classification": 0.50,
+        },
+        {
+            "teacher": 0.50,
+            "classification": 0.25,
+            "spatial": 0.20,
+        },
+        {
+            "teacher": 0.75,
+            "classification": 0.25,
+            "spatial": 0.0,
+        },
+    ],
+)
+def test_training_config_rejects_invalid_selection_weights(weights) -> None:
+    cfg = {
+        "data": {"teachers": ["teacher"]},
+        "model": {"teacher_dims": {"teacher": 8}},
+        "loss": {},
+        "train": {"selection_metric_weights": weights},
+    }
+
+    with pytest.raises(ValueError, match="selection_metric_weights"):
+        validate_training_config(cfg, ["teacher"])
+
+
 def test_training_config_rejects_degenerate_pamtd_reliability() -> None:
     cfg = {
         "data": {
@@ -982,6 +1216,139 @@ def test_resume_terminal_epoch_comes_only_from_config() -> None:
 
     with pytest.raises(ValueError, match="checkpoint epoch"):
         _resolve_configured_epochs({"train": {"epochs": 3}}, extended)
+
+
+def test_fit_selects_checkpoint_from_independent_expert_validation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    train_loader = [object()]
+    population_val_loader = [object()]
+    classification_val_loader = [object()]
+    spatial_val_loader = [object()]
+    spatial_losses = iter([0.8, 0.8, 0.4, 0.7])
+
+    def fake_run_epoch(
+        model,
+        loader,
+        prototypes,
+        optimizer,
+        device,
+        cfg,
+        train,
+        **kwargs,
+    ):
+        del model, prototypes, optimizer, device, cfg, kwargs
+        if train:
+            epoch = fake_run_epoch.train_epoch
+            fake_run_epoch.train_epoch += 1
+            return {
+                "loss": 1.0,
+                "global_step_end": float(epoch),
+                "spatial_supervised_step_end": float(epoch),
+            }
+        if loader is population_val_loader:
+            embeddings = (
+                torch.zeros((1, 2)),
+                {"teacher": torch.zeros((1, 2))},
+                {"teacher": torch.zeros((1, 2))},
+                {
+                    "prototype_mask": torch.zeros(
+                        1,
+                        dtype=torch.bool,
+                    ),
+                    "prototype_classification": torch.full(
+                        (1,),
+                        -1,
+                    ),
+                    "classification_logits": torch.zeros((0, 0)),
+                },
+            )
+            return {"loss": 1.0, "feature": 0.1}, embeddings
+        if loader is classification_val_loader:
+            class_count = len(DEFAULT_CLASSIFICATION_CLASSES)
+            embeddings = (
+                torch.zeros((class_count, 2)),
+                {},
+                {},
+                {
+                    "prototype_mask": torch.ones(
+                        class_count,
+                        dtype=torch.bool,
+                    ),
+                    "prototype_classification": torch.arange(
+                        class_count
+                    ),
+                    "classification_logits": (
+                        torch.eye(class_count) * 5.0
+                    ),
+                },
+            )
+            return {}, embeddings
+        if loader is spatial_val_loader:
+            return {
+                "spatial": next(spatial_losses),
+                "spatial_explicit_negative_pairs": 7.0,
+            }
+        raise AssertionError("unexpected loader")
+
+    fake_run_epoch.train_epoch = 1
+    monkeypatch.setattr(
+        "hcc_sempath.training.engine.run_epoch",
+        fake_run_epoch,
+    )
+    monkeypatch.setattr(
+        "hcc_sempath.training.engine.evaluate_teacher_outputs",
+        lambda *args, **kwargs: {"teacher_feature_cosine": 0.5},
+    )
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    cfg = {
+        "runtime": {"output_dir": str(tmp_path), "seed": 13},
+        "data": {"spatial_manifest_path": "spatial.json"},
+        "model": {},
+        "loss": {
+            "relation_weight": 0.0,
+            "semantic_weight": 0.0,
+            "classification_weight": 1.0,
+            "spatial_weight": 1.0,
+        },
+        "train": {
+            "epochs": 3,
+            "amp": False,
+            "topk": 1,
+            "tensorboard": False,
+            "early_stop_teacher_alignment": False,
+            "selection_early_stop": False,
+        },
+    }
+
+    summary = fit(
+        model,
+        train_loader,
+        population_val_loader,
+        None,
+        optimizer,
+        torch.device("cpu"),
+        cfg,
+        expert_classification_val_loader=(
+            classification_val_loader
+        ),
+        expert_spatial_val_loader=spatial_val_loader,
+    )
+
+    assert summary["epoch"] == 2
+    assert summary["expert_val_spatial"] == pytest.approx(0.4)
+    checkpoint = torch.load(
+        tmp_path / "checkpoints" / "best.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert checkpoint["epoch"] == 2
+    assert checkpoint["best_selection_epoch"] == 2
+    assert checkpoint["run_complete"] is True
+    assert checkpoint["selection_finalized"] is True
+    assert checkpoint["run_terminal_epoch"] == 3
 
 
 def test_development_metrics_exclude_internal_continuation_state() -> None:

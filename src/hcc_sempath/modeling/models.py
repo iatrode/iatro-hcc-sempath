@@ -1244,6 +1244,9 @@ def validate_spatial_decoder_calibration(
     expected_research_contract_sha256: str | None = None,
     expected_optimizer_visible_contract_sha256: str | None = None,
     expected_supervision_assets_sha256: str | None = None,
+    expected_formal_asset_contract_sha256: str | None = None,
+    expected_source_tree_sha256: str | None = None,
+    expected_study_contract_sha256: str | None = None,
 ) -> dict:
     """Validate and normalize the frozen spatial-analysis decoder contract."""
 
@@ -1311,6 +1314,9 @@ def validate_spatial_decoder_calibration(
         "validation_cohort_sha256",
         "optimizer_visible_contract_sha256",
         "supervision_assets_sha256",
+        "formal_asset_contract_sha256",
+        "source_tree_sha256",
+        "study_contract_sha256",
     )
     normalized_provenance: dict[str, object] = {}
     for key in digest_fields:
@@ -1333,13 +1339,32 @@ def validate_spatial_decoder_calibration(
                 f"{key} must be positive"
             )
         normalized_provenance[key] = value
+    selected_epoch = int(
+        provenance.get(
+            "selected_epoch",
+            normalized_provenance["terminal_epoch"],
+        )
+    )
+    selection_finalized = bool(
+        provenance.get(
+            "selection_finalized",
+            normalized_provenance["terminal_epoch"]
+            == normalized_provenance["expected_epochs"],
+        )
+    )
     if (
-        normalized_provenance["terminal_epoch"]
-        != normalized_provenance["expected_epochs"]
+        not selection_finalized
+        or selected_epoch <= 0
+        or selected_epoch > normalized_provenance["terminal_epoch"]
+        or normalized_provenance["terminal_epoch"]
+        > normalized_provenance["expected_epochs"]
     ):
         raise ValueError(
-            "spatial decoder calibration provenance is not terminal"
+            "spatial decoder calibration provenance is not a finalized "
+            "selection from a completed schedule"
         )
+    normalized_provenance["selected_epoch"] = selected_epoch
+    normalized_provenance["selection_finalized"] = selection_finalized
     if (
         expected_model_state_sha256 is not None
         and normalized_provenance["checkpoint_model_sha256"]
@@ -1374,6 +1399,19 @@ def validate_spatial_decoder_calibration(
         raise ValueError(
             "spatial decoder calibration supervision-asset mismatch"
         )
+    for key, expected in (
+        (
+            "formal_asset_contract_sha256",
+            expected_formal_asset_contract_sha256,
+        ),
+        ("source_tree_sha256", expected_source_tree_sha256),
+        ("study_contract_sha256", expected_study_contract_sha256),
+    ):
+        if expected is not None and normalized_provenance[key] != expected:
+            raise ValueError(
+                "spatial decoder calibration formal provenance mismatch: "
+                f"{key}"
+            )
     return {
         "version": 1,
         "spatial_component_names": names,

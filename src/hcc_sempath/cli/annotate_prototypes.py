@@ -28,6 +28,9 @@ from urllib.parse import parse_qs, urlparse
 from PIL import Image, ImageDraw
 
 from hcc_sempath.cli._annotation_tiles import AnnotationTilePackageReader, IacRecord
+from hcc_sempath.training.prototype_labels import (
+    DEFAULT_CLASSIFICATION_CLASSES,
+)
 from iatro.iac import read_header
 from iatro.iac.adapters.tiles import decode_jxl
 
@@ -41,14 +44,7 @@ CONTEXT_MAX_RADIUS = 8
 CONTEXT_WORKERS = 8
 MAX_OPEN_IAC_VIEWERS = 8
 
-CLASSIFICATION_PROTOTYPES = [
-    "HCC-tumor-well-differentiated",
-    "HCC-tumor-moderately-differentiated",
-    "HCC-tumor-poorly-differentiated",
-    "Background-liver",
-    "Inflammatory-stromal",
-    "Degenerative-material",
-]
+CLASSIFICATION_PROTOTYPES = list(DEFAULT_CLASSIFICATION_CLASSES)
 
 SPATIAL_PROTOTYPES = [
     "hepatocellular-parenchyma",
@@ -635,7 +631,9 @@ def _find_free_port(host: str, preferred: int) -> int:
 
 
 def _auth_ok(provided: str, expected: str) -> bool:
-    return bool(provided) and hmac.compare_digest(provided, expected)
+    return not expected or (
+        bool(provided) and hmac.compare_digest(provided, expected)
+    )
 
 
 def _request_auth_token(query: dict[str, list[str]]) -> str:
@@ -2554,7 +2552,8 @@ async function api(path, opts){const r=await fetch(authed(scoped(path)), opts); 
 function setQueueOpen(open){document.getElementById('layout').classList.toggle('queue-collapsed',!open);}
 function isMobile(){return window.matchMedia('(max-width:760px)').matches;}
 function applyModeLayout(){const classificationMode=MODE==='classification';document.getElementById('roiClassBar').style.display=classificationMode?'none':'flex';document.getElementById('roiStatus').style.display=classificationMode?'none':'block';document.getElementById('roiPlan').style.display=classificationMode?'none':'flex';document.getElementById('roiCountDetails').style.display=classificationMode?'none':'block';document.getElementById('roiTools').style.display=classificationMode?'none':'flex';document.getElementById('roiCanvas').style.display=classificationMode?'none':'block';document.getElementById('prototypeLabels').style.display=classificationMode?'block':'none';document.getElementById('classificationSection').style.display=classificationMode?'block':'none';document.getElementById('spatialSection').style.display='none';document.getElementById('tileViewport').style.cursor=classificationMode?'default':'crosshair';}
-async function ensureAuth(){setAuthToken(tokenFromUrl()||localStorage.getItem('hcc_sempath_annotation_token')||''); if(!AUTH_TOKEN){document.getElementById('authGate').style.display='flex'; throw new Error('');}}
+const AUTH_REQUIRED=%AUTH_REQUIRED_JSON%;
+async function ensureAuth(){if(!AUTH_REQUIRED){document.getElementById('authGate').style.display='none';return}setAuthToken(tokenFromUrl()||localStorage.getItem('hcc_sempath_annotation_token')||''); if(!AUTH_TOKEN){document.getElementById('authGate').style.display='flex'; throw new Error('');}}
 async function submitAuth(){setAuthToken(document.getElementById('authInput').value.trim()); try{await api('/api/scan-status'); document.getElementById('authGate').style.display='none'; refreshPackage().catch(e=>document.getElementById('status').textContent=e.message||String(e));}catch(e){document.getElementById('authStatus').textContent='Invalid token.';}}
 function setupPanZoom(el,onClick,options={}){
     let scale=1,tx=0,ty=0,drag=false,sx=0,sy=0,stx=0,sty=0,moved=0,minTx=0,minTy=0,frame=0,trackpadWheel=false;
@@ -3041,6 +3040,7 @@ def make_handler(
                         .replace("%MODES_JSON%", json.dumps(list(archives)))
                         .replace("%VERSION_JSON%", json.dumps(version))
                         .replace("%REVIEW_MODE_JSON%", json.dumps(review_mode))
+                        .replace("%AUTH_REQUIRED_JSON%", json.dumps(bool(auth_token)))
                         .replace("%VERSIONS_JSON%", json.dumps(archives[mode].versions_json()["versions"]))
                     )
                     body = html.encode("utf-8")
@@ -3347,6 +3347,11 @@ def _annotation_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8765, help="Use 0 to pick a free port.")
     parser.add_argument("--token", default="", help="Annotation UI auth token; overrides the persisted state .auth-token when set.")
     parser.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="Disable authentication for a temporary trusted-network session.",
+    )
+    parser.add_argument(
         "--min-tissue-fraction",
         type=float,
         default=0.30,
@@ -3354,8 +3359,11 @@ def _annotation_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--priority-manifest",
-        required=True,
-        help="Shared mutable tile-priority manifest used by both expert tasks.",
+        default="",
+        help=(
+            "Optional shared mutable tile-priority manifest. Omit it for "
+            "ordinary random annotation."
+        ),
     )
     parser.add_argument(
         "--classification-review-manifest",
@@ -3422,11 +3430,15 @@ def _annotation_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    logging.basicConfig(task=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _annotation_parser().parse_args()
     from hcc_sempath.modeling.roi_plan import RoiPlanGenerator
 
-    priority_queue = SharedPriorityQueue(args.priority_manifest)
+    priority_queue = (
+        SharedPriorityQueue(args.priority_manifest)
+        if args.priority_manifest
+        else None
+    )
     classification_review_queue = (
         StrictReviewQueue(args.classification_review_manifest)
         if args.classification_review_manifest
@@ -3490,17 +3502,24 @@ def main() -> None:
             min_tissue_fraction=args.min_tissue_fraction,
         ),
     }
-    auth_token = _load_or_create_auth_token(args.classification_state, args.token)
+    auth_token = (
+        ""
+        if args.no_auth
+        else _load_or_create_auth_token(
+            args.classification_state,
+            args.token,
+        )
+    )
     roi_plan_generator = RoiPlanGenerator()
     port = _find_free_port(args.host, args.port)
     server = ThreadingHTTPServer(
         (args.host, port), make_handler(datasets, auth_token, roi_plan_generator)
     )
     base_url = f"http://{args.host}:{port}/"
-    query = f"token={auth_token}"
+    query = f"token={auth_token}" if auth_token else ""
     if args.review_existing:
         query += "&mode=spatial&review=1"
-    url = f"{base_url}?{query}"
+    url = f"{base_url}?{query}" if query else base_url
     states = ",".join(f"{mode}:{item.data().state.state_path}" for mode, item in datasets.items())
     LOG.info("server_start url=%s states=%s", base_url, states)
     print(f"annotation_ui url={url} states={states}", flush=True)

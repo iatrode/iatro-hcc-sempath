@@ -27,6 +27,7 @@ from hcc_sempath.modeling.models import (  # noqa: E402
     STUDENT_PATCH_SIZE,
     canonical_payload_sha256,
     model_state_sha256,
+    validate_spatial_decoder_calibration,
 )
 from hcc_sempath.training.config import (  # noqa: E402
     _package_record_count,
@@ -59,18 +60,43 @@ from hcc_sempath.training.train import (  # noqa: E402
 )
 
 
-def _terminal_checkpoint(payload: dict) -> dict:
+def _finalized_checkpoint(payload: dict) -> dict:
     cfg = payload.get("config")
     if not isinstance(cfg, dict):
         raise ValueError("checkpoint has no resolved training config")
     expected = int(cfg.get("train", {}).get("epochs", -1))
-    if (
-        not bool(payload.get("training_complete", False))
-        or int(payload.get("epoch", -1)) != expected
-        or int(payload.get("expected_epochs", -1)) != expected
-    ):
+    checkpoint_epoch = int(payload.get("epoch", -1))
+    expected_matches = (
+        int(payload.get("expected_epochs", -1)) == expected
+    )
+    legacy_terminal = bool(
+        payload.get("training_complete", False)
+        and checkpoint_epoch == expected
+        and expected_matches
+    )
+    finalized_selection = bool(
+        payload.get("run_complete", False)
+        and payload.get("selection_finalized", False)
+        and checkpoint_epoch
+        == int(payload.get("best_selection_epoch", -1))
+        and expected_matches
+    )
+    joint_selection_run = bool(
+        cfg.get("train", {}).get("selection_early_stop", False)
+        or cfg.get("data", {}).get(
+            "require_complete_expert_validation",
+            False,
+        )
+    )
+    accepted = (
+        finalized_selection
+        if joint_selection_run
+        else (legacy_terminal or finalized_selection)
+    )
+    if not accepted:
         raise ValueError(
-            "spatial calibration requires the terminal training checkpoint"
+            "spatial calibration requires a finalized joint-selection "
+            "checkpoint from a completed run"
         )
     return cfg
 
@@ -164,7 +190,7 @@ def main() -> None:
         raise ValueError("--batch-size must be positive")
 
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg = _terminal_checkpoint(payload)
+    cfg = _finalized_checkpoint(payload)
     device = torch.device(cfg["runtime"]["device"])
     names = spatial_component_names(args.annotation)
     frozen_names = [
@@ -318,7 +344,7 @@ def main() -> None:
             )
         ),
         "brush_top_fraction": float(
-            cfg["loss"].get("spatial_brush_top_fraction", 0.25)
+            cfg["loss"].get("spatial_brush_top_fraction", 1.0)
         ),
         "completeness_contract": (
             "explicit_count_and_measurement_complete_v1"
@@ -351,20 +377,44 @@ def main() -> None:
                 "sizes": cfg["data"][
                     "optimizer_visible_tile_package_sizes"
                 ],
+                "sha256": cfg["data"][
+                    "optimizer_visible_tile_package_sha256"
+                ],
+                "expert_split_exclusion_sha256": cfg["data"].get(
+                    "expert_split_exclusion_sha256"
+                ),
             }
         ),
         "supervision_assets_sha256": canonical_payload_sha256(
-            {
-                "prototype_supervision_manifest_path": cfg["data"].get(
-                    "prototype_supervision_manifest_path"
-                ),
-                "spatial_manifest_path": cfg["data"].get(
-                    "spatial_manifest_path"
-                ),
-            }
+            cfg["data"].get("supervision_asset_sha256", {})
         ),
-        "terminal_epoch": int(payload["epoch"]),
+        "formal_asset_contract_sha256": str(
+            cfg["data"].get("formal_asset_contract_sha256", "")
+        ),
+        "source_tree_sha256": str(
+            cfg["data"].get("formal_source", {}).get(
+                "source_tree_sha256",
+                "",
+            )
+        ),
+        "study_contract_sha256": str(
+            cfg["data"].get(
+                "formal_study_contract_sha256",
+                "",
+            )
+        ),
+        "selected_epoch": int(payload["epoch"]),
+        "terminal_epoch": int(
+            payload.get("run_terminal_epoch", payload["epoch"])
+        ),
         "expected_epochs": int(payload["expected_epochs"]),
+        "selection_finalized": bool(
+            payload.get(
+                "selection_finalized",
+                int(payload["epoch"])
+                == int(payload["expected_epochs"]),
+            )
+        ),
     }
     calibration, report = calibrate_spatial_decoder(
         instance_probability=torch.cat(instance_batches),
@@ -404,8 +454,38 @@ def main() -> None:
             cfg["loss"].get("spatial_implicit_negative_weight", 0.05)
         ),
         brush_top_fraction=float(
-            cfg["loss"].get("spatial_brush_top_fraction", 0.25)
+            cfg["loss"].get("spatial_brush_top_fraction", 1.0)
         ),
+    )
+    calibration = validate_spatial_decoder_calibration(
+        calibration,
+        names,
+        expected_output_stride=stride,
+        expected_model_state_sha256=calibration_provenance[
+            "checkpoint_model_sha256"
+        ],
+        expected_research_contract_sha256=calibration_provenance[
+            "research_contract_sha256"
+        ],
+        expected_optimizer_visible_contract_sha256=(
+            calibration_provenance[
+                "optimizer_visible_contract_sha256"
+            ]
+        ),
+        expected_supervision_assets_sha256=calibration_provenance[
+            "supervision_assets_sha256"
+        ],
+        expected_formal_asset_contract_sha256=(
+            calibration_provenance[
+                "formal_asset_contract_sha256"
+            ]
+        ),
+        expected_source_tree_sha256=calibration_provenance[
+            "source_tree_sha256"
+        ],
+        expected_study_contract_sha256=calibration_provenance[
+            "study_contract_sha256"
+        ],
     )
     report["protocol"].update(
         {

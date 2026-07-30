@@ -1,11 +1,10 @@
 inherits: matched_tenth.yaml
 
-# A12: A0 with every cell in a dense-cell brush bag trained as positive. A0
-# uses top-quarter MIL pooling, which permits unmarked inter-cell space inside
-# the brush support.
+# A12: replace A0's contour-faithful full cell brush/circle range support with
+# legacy top-quarter MIL pooling.
 
 runtime:
   output_dir: outputs/experiments/ablation/a12_dense_brush_target
 
 loss:
-  spatial_brush_top_fraction: 1.0
+  spatial_brush_top_fraction: 0.25

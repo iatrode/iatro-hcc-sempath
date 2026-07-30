@@ -219,7 +219,7 @@ def calibrate_spatial_decoder(
     threshold_grid: Sequence[float] | None = None,
     nms_kernels: Sequence[int] = (3, 5, 7),
     implicit_negative_weight: float = 0.05,
-    brush_top_fraction: float = 0.25,
+    brush_top_fraction: float = 1.0,
     focus_minimum_grid: Sequence[int] = tuple(range(1, 10)),
 ) -> tuple[dict, dict]:
     """Freeze decoder values from explicitly complete independent labels.

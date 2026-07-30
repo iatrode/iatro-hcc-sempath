@@ -1,0 +1,35 @@
+inherits: train_tenth.example.yaml
+
+runtime:
+  output_dir: runtime/optuna_runs/manual_trial
+
+data:
+  # Replace these paths with the finalized, immutable train+val assets.
+  prototype_supervision_manifest_path: /path/to/a0/hcc_prototype_supervision_manifest.csv
+  prototype_supervision_train_splits: [train]
+  prototype_supervision_val_splits: [val]
+  spatial_manifest_path: /path/to/a0/hcc_spatial_annotations.json
+  spatial_train_splits: [train]
+  spatial_val_splits: [val]
+  require_complete_expert_validation: true
+
+train:
+  # The first trial freezes T0/C0/S0 at the shared initialization. Every later
+  # trial recomputes and verifies that baseline before reusing the exact stored
+  # values. The weights are explicit so the planned three-cell sensitivity
+  # analysis changes only this prespecified selection rule.
+  epochs: 16
+  development_early_stop: false
+  selection_early_stop: true
+  selection_metric_weights:
+    teacher: 0.50
+    classification: 0.25
+    spatial: 0.25
+  # Start is derived from the last configured supervision-ramp end.
+  selection_early_stop_patience: 4
+  selection_early_stop_relative_delta: 0.005
+  # Guarantees enough post-ramp epochs to observe a real plateau.
+  selection_minimum_eligible_epochs: 5
+  early_stop_teacher_alignment: false
+  max_val_batches: 256
+  max_eval_batches: 128

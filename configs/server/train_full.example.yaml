@@ -17,6 +17,7 @@ data:
   # Spatial JSON/JSONL supports point, brush, circle, and polygon geometries.
   spatial_manifest_path: /path/to/prototypes/hcc_spatial_annotations.json
   spatial_train_splits: [train]
+  spatial_val_splits: [val]
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
   num_workers: 8
@@ -42,7 +43,8 @@ model:
   classification_class_names:
     [HCC-tumor-well-differentiated, HCC-tumor-moderately-differentiated,
      HCC-tumor-poorly-differentiated, Background-liver,
-     Inflammatory-stromal, Degenerative-material]
+     Inflammatory-stromal, Hemorrhage-necrosis,
+     Artifact-contamination]
   spatial_dim: 256
   spatial_output_stride: 7
 
@@ -79,7 +81,9 @@ loss:
   spatial_point_tolerance_cells: 1
   spatial_abundance_point_weight: 0.5
   spatial_brush_weight: 1.0
-  spatial_brush_top_fraction: 0.25
+  # Brush/circle contours denote positive occupied support, so every selected
+  # grid cell is supervised. Values below 1.0 are legacy MIL comparisons only.
+  spatial_brush_top_fraction: 1.0
   spatial_explicit_negative_weight: 1.0
   spatial_implicit_negative_weight: 0.05
   # Default training always feeds both expert objectives back into zhcc.

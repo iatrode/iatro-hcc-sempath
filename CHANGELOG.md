@@ -2,6 +2,30 @@
 
 ## 0.2.0 — Unreleased
 
+- Replace the unpublished six-class classification contract with the final
+  seven-class contract, splitting hemorrhage/necrosis from
+  artifact/contamination and fixing the training bank at 400 tiles per class.
+- Add independent full-bank L1 and L2 validation streams for A0 search and
+  checkpoint selection. The frozen A0 selection loss combines epoch-0-
+  normalized component-balanced spatial loss, class-balanced classification
+  cross entropy, and direct fixed-teacher feature/relation retention with
+  explicit configurable weights.
+- Exclude exact finalized expert-validation rows from population training and
+  exact expert-training rows from population validation when historical IAC
+  package splits and the finalized annotation split differ.
+- Replace the training-loss Optuna proxy with a contract-hashed, resumable A0
+  search over learning rate, weight decay, and global spatial-task weight.
+  Search artifacts bind the trial, best epoch, checkpoint, configuration, and
+  supervision digests.
+- Make formal A1–A12 runs inherit the selected A0 maximum budget and normalized
+  teacher/L1/L2 checkpoint rule, removing the obsolete three-/six-epoch
+  population-loss stopping path. Classification-removal conditions retain the
+  complete L1 validation bank while zeroing classification training loss.
+  Freeze the A0 ramp boundary, bind each condition's active source/asset
+  subset, and reject continuation from a checkpoint created under a shorter
+  epoch plan. Bind `best_config.yaml` to the completed study's winning trial
+  and checkpoint, and revalidate each full resolved ablation config at train
+  startup.
 - Fix point supervision to train the annotated centre instead of selecting
   the model's current local maximum.
 - Train every selected range cell when full-range supervision is configured,

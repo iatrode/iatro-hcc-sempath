@@ -22,8 +22,13 @@ def _provenance() -> dict:
         "validation_cohort_sha256": "4" * 64,
         "optimizer_visible_contract_sha256": "5" * 64,
         "supervision_assets_sha256": "6" * 64,
+        "formal_asset_contract_sha256": "7" * 64,
+        "source_tree_sha256": "8" * 64,
+        "study_contract_sha256": "9" * 64,
+        "selected_epoch": 1,
         "terminal_epoch": 1,
         "expected_epochs": 1,
+        "selection_finalized": True,
     }
 
 
@@ -220,7 +225,7 @@ def test_completeness_only_measurement_negative_is_strong() -> None:
     )
 
 
-def test_dense_brush_is_one_mil_positive_not_dense_pixel_truth() -> None:
+def test_dense_brush_requires_full_contour_support() -> None:
     case = _complete_validation_case()
     for key in (
         "instance_probability",
@@ -265,13 +270,19 @@ def test_dense_brush_is_one_mil_positive_not_dense_pixel_truth() -> None:
 
     _, report = calibrate_spatial_decoder(**case)
 
-    # One point pair plus one brush bag: the 16 brush cells are not promoted
-    # to 16 exact positives.
+    # Only the first quarter of the painted support is predicted. Under the
+    # contour-faithful formal contract, that brush remains a false negative.
     assert (
         report["components"]["hepatocellular-parenchyma"][
             "measurement_tp"
         ]
-        == 2.0
+        == 1.0
+    )
+    assert (
+        report["components"]["hepatocellular-parenchyma"][
+            "measurement_fn"
+        ]
+        == 1.0
     )
 
 

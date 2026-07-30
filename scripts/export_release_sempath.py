@@ -90,6 +90,47 @@ def _release_contract(cfg: dict) -> dict:
     }
 
 
+def _require_finalized_checkpoint(payload: dict) -> dict:
+    cfg = payload.get("config")
+    if not isinstance(cfg, dict):
+        raise ValueError("checkpoint has no resolved training config")
+    expected = int(cfg.get("train", {}).get("epochs", -1))
+    checkpoint_epoch = int(payload.get("epoch", -1))
+    expected_matches = (
+        int(payload.get("expected_epochs", -1)) == expected
+    )
+    legacy_terminal = bool(
+        payload.get("training_complete", False)
+        and checkpoint_epoch == expected
+        and expected_matches
+    )
+    finalized_selection = bool(
+        payload.get("run_complete", False)
+        and payload.get("selection_finalized", False)
+        and checkpoint_epoch
+        == int(payload.get("best_selection_epoch", -1))
+        and expected_matches
+    )
+    joint_selection_run = bool(
+        cfg.get("train", {}).get("selection_early_stop", False)
+        or cfg.get("data", {}).get(
+            "require_complete_expert_validation",
+            False,
+        )
+    )
+    accepted = (
+        finalized_selection
+        if joint_selection_run
+        else (legacy_terminal or finalized_selection)
+    )
+    if not accepted:
+        raise ValueError(
+            "spatial release requires a finalized joint-selection "
+            "checkpoint from a completed run"
+        )
+    return cfg
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Export the classification + spatial HCC-SemPath release."
@@ -108,19 +149,8 @@ def main() -> None:
         map_location="cpu",
         weights_only=False,
     )
-    cfg = payload.get("config")
-    if not isinstance(cfg, dict):
-        raise ValueError("checkpoint has no resolved training config")
+    cfg = _require_finalized_checkpoint(payload)
     expected_epochs = int(cfg.get("train", {}).get("epochs", -1))
-    if (
-        not bool(payload.get("training_complete", False))
-        or int(payload.get("epoch", -1)) != expected_epochs
-        or int(payload.get("expected_epochs", -1)) != expected_epochs
-    ):
-        raise ValueError(
-            "spatial release requires the terminal checkpoint from the "
-            "prescribed training schedule"
-        )
     if args.config:
         requested_cfg = load_config(Path(args.config))
         if _release_contract(requested_cfg) != _release_contract(cfg):
@@ -166,21 +196,64 @@ def main() -> None:
                             "optimizer_visible_tile_package_sizes",
                             [],
                         ),
+                        "sha256": cfg["data"].get(
+                            "optimizer_visible_tile_package_sha256",
+                            [],
+                        ),
+                        "expert_split_exclusion_sha256": cfg["data"].get(
+                            "expert_split_exclusion_sha256"
+                        ),
                     }
                 )
             ),
             expected_supervision_assets_sha256=(
                 canonical_payload_sha256(
-                    {
-                        "prototype_supervision_manifest_path": cfg[
-                            "data"
-                        ].get("prototype_supervision_manifest_path"),
-                        "spatial_manifest_path": cfg["data"].get(
-                            "spatial_manifest_path"
-                        ),
-                    }
+                    cfg["data"].get(
+                        "supervision_asset_sha256",
+                        {},
+                    )
                 )
             ),
+            expected_formal_asset_contract_sha256=str(
+                cfg["data"].get(
+                    "formal_asset_contract_sha256",
+                    "",
+                )
+            ),
+            expected_source_tree_sha256=str(
+                cfg["data"].get("formal_source", {}).get(
+                    "source_tree_sha256",
+                    "",
+                )
+            ),
+            expected_study_contract_sha256=str(
+                cfg["data"].get(
+                    "formal_study_contract_sha256",
+                    "",
+                )
+            ),
+        )
+    calibration_provenance = calibration["provenance"]
+    expected_epoch_provenance = {
+        "selected_epoch": int(payload["epoch"]),
+        "terminal_epoch": int(
+            payload.get("run_terminal_epoch", payload["epoch"])
+        ),
+        "expected_epochs": int(payload["expected_epochs"]),
+    }
+    for key, expected_value in expected_epoch_provenance.items():
+        if int(calibration_provenance.get(key, -1)) != expected_value:
+            raise ValueError(
+                "spatial calibration checkpoint epoch provenance mismatch: "
+                f"{key} expected={expected_value} "
+                f"got={calibration_provenance.get(key)}"
+            )
+    if not bool(
+        calibration_provenance.get("selection_finalized", False)
+    ):
+        raise ValueError(
+            "spatial calibration was not produced from a finalized "
+            "selection checkpoint"
         )
 
     training_model = HCCSemPathModel(
@@ -268,9 +341,26 @@ def main() -> None:
         "spatial_component_contracts": spatial_component_metadata(spatial_names),
         "spatial_decoder_calibration": calibration,
         "training_provenance": {
-            "terminal_epoch": int(payload["epoch"]),
+            "selected_epoch": int(payload["epoch"]),
+            "terminal_epoch": int(
+                payload.get("run_terminal_epoch", payload["epoch"])
+            ),
             "expected_epochs": expected_epochs,
-            "training_complete": True,
+            "selection_finalized": bool(
+                payload.get(
+                    "selection_finalized",
+                    int(payload["epoch"]) == int(expected_epochs),
+                )
+            ),
+            "formal_asset_contract_sha256": calibration_provenance[
+                "formal_asset_contract_sha256"
+            ],
+            "source_tree_sha256": calibration_provenance[
+                "source_tree_sha256"
+            ],
+            "study_contract_sha256": calibration_provenance[
+                "study_contract_sha256"
+            ],
             "training_model_sha256": calibration["provenance"][
                 "checkpoint_model_sha256"
             ],

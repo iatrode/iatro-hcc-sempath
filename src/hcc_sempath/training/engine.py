@@ -73,6 +73,76 @@ STEP_METRIC_FIELDS = (
     *STEP_METRIC_PARTS,
 )
 
+SPATIAL_EVAL_STAT_PREFIX = "_spatial_eval_"
+SPATIAL_EVAL_OBJECTIVES = (
+    "instance_point",
+    "measurement_positive",
+    "explicit_instance",
+    "explicit_abundance",
+    "implicit",
+)
+
+
+def _component_balanced_mean_from_statistics(
+    numerator: torch.Tensor,
+    count: torch.Tensor,
+) -> float:
+    """Reduce one complete-bank objective once across active components."""
+
+    numerator = numerator.to(dtype=torch.float64, device="cpu")
+    count = count.to(dtype=torch.float64, device="cpu")
+    if numerator.ndim != 1 or count.shape != numerator.shape:
+        raise ValueError(
+            "spatial evaluation statistics must be component vectors: "
+            f"numerator={tuple(numerator.shape)} count={tuple(count.shape)}"
+        )
+    active = count > 0
+    if not bool(active.any()):
+        return 0.0
+    return float((numerator[active] / count[active]).mean())
+
+
+def _complete_bank_spatial_metrics(
+    statistics: dict[str, torch.Tensor],
+    *,
+    explicit_negative_weight: float,
+    implicit_negative_weight: float,
+) -> dict[str, float]:
+    """Compute the batch/permutation-invariant spatial validation objective."""
+
+    reduced: dict[str, float] = {}
+    for objective in SPATIAL_EVAL_OBJECTIVES:
+        sum_key = f"{SPATIAL_EVAL_STAT_PREFIX}{objective}_sum"
+        count_key = f"{SPATIAL_EVAL_STAT_PREFIX}{objective}_count"
+        if sum_key not in statistics or count_key not in statistics:
+            raise ValueError(
+                "incomplete spatial evaluation statistics: "
+                f"missing={sum_key if sum_key not in statistics else count_key}"
+            )
+        reduced[objective] = _component_balanced_mean_from_statistics(
+            statistics[sum_key],
+            statistics[count_key],
+        )
+    explicit = (
+        reduced["explicit_instance"]
+        + reduced["explicit_abundance"]
+    )
+    total = (
+        reduced["instance_point"]
+        + reduced["measurement_positive"]
+        + float(explicit_negative_weight) * explicit
+        + float(implicit_negative_weight) * reduced["implicit"]
+    )
+    return {
+        "spatial": total,
+        "spatial_instance_point": reduced["instance_point"],
+        "spatial_measurement_positive": reduced[
+            "measurement_positive"
+        ],
+        "spatial_explicit_negative": explicit,
+        "spatial_implicit_negative": reduced["implicit"],
+    }
+
 
 class StepMetricsWriter:
     """Buffer per-step scalars and transfer them to one append-only CSV in groups."""
@@ -889,7 +959,7 @@ def scheduled_loss_config(
             loss_cfg.get("spatial_brush_weight", 1.0)
         ),
         "spatial_brush_top_fraction": float(
-            loss_cfg.get("spatial_brush_top_fraction", 0.25)
+            loss_cfg.get("spatial_brush_top_fraction", 1.0)
         ),
         "spatial_explicit_negative_weight": float(
             loss_cfg.get("spatial_explicit_negative_weight", 1.0)
@@ -1170,6 +1240,7 @@ def run_epoch(
         **default_totals,
         **dict((resumed or {}).get("totals", {})),
     }
+    spatial_eval_statistics: dict[str, torch.Tensor] = {}
     gradient_totals = dict((resumed or {}).get("gradient_totals", {}))
     gradient_count = int((resumed or {}).get("gradient_count", 0))
     last_gradient_step = int(
@@ -1662,6 +1733,20 @@ def run_epoch(
                 "pamtd_response": response_loss.detach(),
                 "teacher_alpha_mean": alpha_mean.detach(),
             }
+            if not train:
+                for key, value in parts.items():
+                    if not key.startswith(SPATIAL_EVAL_STAT_PREFIX):
+                        continue
+                    current = value.detach().to(
+                        device="cpu",
+                        dtype=torch.float64,
+                    )
+                    if key in spatial_eval_statistics:
+                        spatial_eval_statistics[key] = (
+                            spatial_eval_statistics[key] + current
+                        )
+                    else:
+                        spatial_eval_statistics[key] = current.clone()
             totals["loss"] = totals["loss"] + loss.detach()
             for key, value in parts.items():
                 if key.endswith("_feature_cosine") and key not in totals:
@@ -1831,6 +1916,22 @@ def run_epoch(
             if isinstance(mean_value, torch.Tensor)
             else float(mean_value)
         )
+    if spatial_eval_statistics:
+        result.update(
+            _complete_bank_spatial_metrics(
+                spatial_eval_statistics,
+                explicit_negative_weight=float(
+                    last_loss_cfg[
+                        "spatial_explicit_negative_weight"
+                    ]
+                ),
+                implicit_negative_weight=float(
+                    last_loss_cfg[
+                        "spatial_implicit_negative_weight"
+                    ]
+                ),
+            )
+        )
     for key, value in gradient_totals.items():
         result[key] = value / max(1, gradient_count)
     result["gradient_diagnostic_count"] = float(gradient_count)
@@ -1959,12 +2060,478 @@ def _classification_eval_metrics(supervised: dict[str, torch.Tensor]) -> dict[st
     mask = supervised["prototype_mask"].bool()
     logits = supervised["classification_logits"]
     if logits.numel() == 0 or not bool(mask.any()):
-        return {"classification_accuracy": 0.0, "classification_evaluated_tiles": 0.0}
+        return {
+            "classification_accuracy": 0.0,
+            "classification_balanced_accuracy": 0.0,
+            "classification_macro_f1": 0.0,
+            "classification_cross_entropy": float("inf"),
+            "classification_balanced_cross_entropy": float("inf"),
+            "classification_evaluated_tiles": 0.0,
+            "classification_evaluated_classes": 0.0,
+            "classification_total_classes": float(
+                logits.shape[1]
+                if logits.ndim == 2
+                else 0
+            ),
+        }
     target = supervised["prototype_classification"][mask]
-    prediction = logits[mask].argmax(dim=1)
+    selected_logits = logits[mask].float()
+    prediction = selected_logits.argmax(dim=1)
+    class_count = int(selected_logits.shape[1])
+    recalls: list[float] = []
+    f1_values: list[float] = []
+    per_sample_cross_entropy = F.cross_entropy(
+        selected_logits,
+        target,
+        reduction="none",
+    )
+    class_cross_entropies: list[float] = []
+    for class_index in range(class_count):
+        target_positive = target == class_index
+        if not bool(target_positive.any()):
+            continue
+        predicted_positive = prediction == class_index
+        true_positive = int(
+            (target_positive & predicted_positive).sum()
+        )
+        false_positive = int(
+            ((~target_positive) & predicted_positive).sum()
+        )
+        false_negative = int(
+            (target_positive & (~predicted_positive)).sum()
+        )
+        recalls.append(
+            true_positive / max(1, true_positive + false_negative)
+        )
+        f1_values.append(
+            (2 * true_positive)
+            / max(
+                1,
+                2 * true_positive + false_positive + false_negative,
+            )
+        )
+        class_cross_entropies.append(
+            float(per_sample_cross_entropy[target_positive].mean())
+        )
     return {
         "classification_accuracy": float((prediction == target).float().mean()),
+        "classification_balanced_accuracy": float(np.mean(recalls)),
+        "classification_macro_f1": float(np.mean(f1_values)),
+        "classification_cross_entropy": float(
+            per_sample_cross_entropy.mean().detach()
+        ),
+        "classification_balanced_cross_entropy": float(
+            np.mean(class_cross_entropies)
+        ),
         "classification_evaluated_tiles": float(mask.sum()),
+        "classification_evaluated_classes": float(len(recalls)),
+        "classification_total_classes": float(class_count),
+    }
+
+
+SELECTION_COMPONENTS = (
+    "teacher",
+    "classification",
+    "spatial",
+)
+DEFAULT_SELECTION_WEIGHTS = {
+    "teacher": 0.50,
+    "classification": 0.25,
+    "spatial": 0.25,
+}
+
+
+def _selection_weights(cfg: dict) -> dict[str, float]:
+    configured = cfg.get("train", {}).get(
+        "selection_metric_weights",
+        DEFAULT_SELECTION_WEIGHTS,
+    )
+    if not isinstance(configured, dict):
+        raise ValueError("train.selection_metric_weights must be a mapping")
+    unknown = sorted(set(configured).difference(SELECTION_COMPONENTS))
+    missing = sorted(set(SELECTION_COMPONENTS).difference(configured))
+    if unknown or missing:
+        raise ValueError(
+            "train.selection_metric_weights must contain exactly "
+            f"{list(SELECTION_COMPONENTS)}: missing={missing} "
+            f"unknown={unknown}"
+        )
+    weights = {
+        name: float(configured[name])
+        for name in SELECTION_COMPONENTS
+    }
+    if any(
+        not math.isfinite(value) or value <= 0.0
+        for value in weights.values()
+    ):
+        raise ValueError(
+            "all train.selection_metric_weights must be finite and positive"
+        )
+    total = sum(weights.values())
+    if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-8):
+        raise ValueError(
+            "train.selection_metric_weights must sum to 1.0: "
+            f"observed={total}"
+        )
+    return weights
+
+
+def _configured_selection_baseline(
+    cfg: dict,
+) -> dict[str, float] | None:
+    configured = cfg.get("train", {}).get(
+        "selection_metric_baseline"
+    )
+    if configured is None:
+        return None
+    if not isinstance(configured, dict) or set(configured) != set(
+        SELECTION_COMPONENTS
+    ):
+        raise ValueError(
+            "train.selection_metric_baseline must contain exactly "
+            f"{list(SELECTION_COMPONENTS)}"
+        )
+    baseline = {
+        name: float(configured[name])
+        for name in SELECTION_COMPONENTS
+    }
+    _normalized_selection_metrics(
+        baseline,
+        baseline,
+        DEFAULT_SELECTION_WEIGHTS,
+    )
+    return baseline
+
+
+def _assert_selection_baseline_matches(
+    observed: dict[str, float],
+    expected: dict[str, float],
+) -> None:
+    for name in SELECTION_COMPONENTS:
+        if not math.isclose(
+            float(observed[name]),
+            float(expected[name]),
+            rel_tol=1e-6,
+            abs_tol=1e-8,
+        ):
+            raise ValueError(
+                "shared initialization baseline mismatch: "
+                f"component={name} observed={float(observed[name]):.9g} "
+                f"expected={float(expected[name]):.9g}"
+            )
+
+
+def _selection_start_step(cfg: dict) -> int:
+    loss_cfg = cfg.get("loss", {})
+    endpoints = [
+        int(loss_cfg.get("expert_supervision_start_step", 0))
+        + int(loss_cfg.get("expert_supervision_ramp_steps", 0)),
+    ]
+    if float(loss_cfg.get("prototype_filter_weight", 0.0)) > 0.0:
+        endpoints.append(
+            int(loss_cfg.get("prototype_filter_start_step", 0))
+            + int(loss_cfg.get("prototype_filter_ramp_steps", 0))
+        )
+    if float(loss_cfg.get("zhcc_response_weight", 0.0)) > 0.0:
+        endpoints.append(
+            int(loss_cfg.get("zhcc_response_start_step", 0))
+            + int(loss_cfg.get("zhcc_response_ramp_steps", 0))
+        )
+    required = max(endpoints)
+    configured = cfg.get("train", {}).get(
+        "selection_early_stop_start_step"
+    )
+    if configured is None:
+        return required
+    return max(int(configured), required)
+
+
+def _eligible_selection_epoch_count(
+    *,
+    current_global_step: int,
+    steps_per_epoch: int,
+    start_epoch: int,
+    expected_epochs: int,
+    selection_start_step: int,
+    resume_batch_in_epoch: int = 0,
+) -> int:
+    """Count remaining epoch ends at which joint selection is valid."""
+
+    if steps_per_epoch <= 0:
+        raise ValueError("steps_per_epoch must be positive")
+    if resume_batch_in_epoch < 0 or resume_batch_in_epoch > steps_per_epoch:
+        raise ValueError(
+            "resume_batch_in_epoch must be within the current epoch"
+        )
+    if expected_epochs < start_epoch:
+        return 0
+    step = int(current_global_step)
+    eligible = 0
+    for epoch in range(start_epoch, expected_epochs + 1):
+        completed_batches = (
+            resume_batch_in_epoch if epoch == start_epoch else 0
+        )
+        step += steps_per_epoch - completed_batches
+        if step >= selection_start_step:
+            eligible += 1
+    return eligible
+
+
+def _teacher_retention_metrics(
+    embedding_metrics: dict[str, float],
+    *,
+    relation_weight: float,
+) -> dict[str, float]:
+    feature_by_teacher = {
+        key[: -len("_feature_cosine")]: float(value)
+        for key, value in embedding_metrics.items()
+        if key.endswith("_feature_cosine")
+    }
+    relation_by_teacher = {
+        key[: -len("_relation_mse")]: float(value)
+        for key, value in embedding_metrics.items()
+        if key.endswith("_relation_mse")
+    }
+    if not feature_by_teacher:
+        raise ValueError(
+            "teacher validation requires at least one feature cosine metric"
+        )
+    if (
+        relation_by_teacher
+        and relation_by_teacher.keys() != feature_by_teacher.keys()
+    ) or (relation_weight > 0.0 and not relation_by_teacher):
+        raise ValueError(
+            "teacher validation requires paired feature cosine and relation "
+            "metrics for every teacher"
+        )
+    feature_cosines = list(feature_by_teacher.values())
+    relation_losses = (
+        list(relation_by_teacher.values())
+        if relation_by_teacher
+        else [0.0] * len(feature_cosines)
+    )
+    if not all(
+        math.isfinite(value)
+        for value in (*feature_cosines, *relation_losses)
+    ):
+        raise FloatingPointError("non-finite fixed teacher validation metric")
+    feature_distance = float(
+        sum(1.0 - value for value in feature_cosines)
+        / len(feature_cosines)
+    )
+    relation = float(sum(relation_losses) / len(relation_losses))
+    total = feature_distance + float(relation_weight) * relation
+    return {
+        "teacher_alignment_score": float(
+            sum(feature_cosines) / len(feature_cosines)
+        ),
+        "fixed_teacher_distance": feature_distance,
+        "fixed_teacher_relation": relation,
+        "teacher_validation_loss": total,
+    }
+
+
+def _normalized_selection_metrics(
+    raw: dict[str, float],
+    baseline: dict[str, float],
+    weights: dict[str, float],
+) -> dict[str, float]:
+    normalized: dict[str, float] = {}
+    for name in SELECTION_COMPONENTS:
+        value = float(raw[name])
+        reference = float(baseline[name])
+        if (
+            not math.isfinite(value)
+            or not math.isfinite(reference)
+            or value < 0.0
+            or reference <= 0.0
+        ):
+            raise FloatingPointError(
+                "selection metrics and baselines must be finite with a "
+                f"positive baseline: component={name} value={value} "
+                f"baseline={reference}"
+            )
+        normalized[name] = value / reference
+    selection_loss = sum(
+        weights[name] * normalized[name]
+        for name in SELECTION_COMPONENTS
+    )
+    return {
+        **{
+            f"selection_{name}_raw": float(raw[name])
+            for name in SELECTION_COMPONENTS
+        },
+        **{
+            f"selection_{name}_baseline": float(baseline[name])
+            for name in SELECTION_COMPONENTS
+        },
+        **{
+            f"selection_{name}_normalized": normalized[name]
+            for name in SELECTION_COMPONENTS
+        },
+        **{
+            f"selection_{name}_weight": weights[name]
+            for name in SELECTION_COMPONENTS
+        },
+        "selection_loss": float(selection_loss),
+    }
+
+
+def _selection_raw_metrics(
+    validation: dict[str, dict[str, float]],
+    cfg: dict,
+) -> tuple[dict[str, float], dict[str, float]]:
+    teacher = _teacher_retention_metrics(
+        validation["embedding"],
+        relation_weight=float(
+            cfg.get("loss", {}).get("relation_weight", 0.0)
+        ),
+    )
+    classification = validation["expert_classification"]
+    spatial = validation["expert_spatial"]
+    raw = {
+        "teacher": teacher["teacher_validation_loss"],
+        "classification": float(
+            classification["classification_balanced_cross_entropy"]
+        ),
+        "spatial": float(spatial["spatial"]),
+    }
+    return raw, teacher
+
+
+def _run_validation_streams(
+    *,
+    model,
+    val_loader,
+    expert_classification_val_loader,
+    expert_spatial_val_loader,
+    prototypes,
+    optimizer,
+    device,
+    cfg: dict,
+    expert_eval_cfg: dict,
+    epoch: int,
+    global_step: int,
+    spatial_supervised_step: int,
+    summary_writer=None,
+) -> dict[str, dict[str, float]]:
+    # A capped population validation view must contain the same deterministic
+    # tiles in every epoch; sample order must not become a hidden moving target.
+    _set_loader_epoch(val_loader, 0)
+    val_iterator = iter(val_loader)
+    try:
+        val_metrics, val_embeddings = run_epoch(
+            model,
+            val_loader,
+            prototypes,
+            optimizer,
+            device,
+            cfg,
+            train=False,
+            max_batches=cfg["train"].get("max_val_batches"),
+            epoch=epoch,
+            global_step=global_step,
+            spatial_supervised_step=spatial_supervised_step,
+            summary_writer=summary_writer,
+            collect_embeddings=True,
+            max_eval_batches=cfg["train"].get(
+                "max_eval_batches",
+                cfg["train"].get("max_val_batches"),
+            ),
+            prefetched_iterator=val_iterator,
+        )
+        val_iterator = None
+    finally:
+        close_val_iterator = getattr(val_iterator, "close", None)
+        if callable(close_val_iterator):
+            close_val_iterator()
+    _, student_by_teacher, teacher_by_name, supervised = val_embeddings
+    cpu_prototypes = (
+        {
+            name: registry.to("cpu")
+            for name, registry in prototypes.items()
+        }
+        if prototypes
+        else None
+    )
+    embedding_metrics = evaluate_teacher_outputs(
+        student_by_teacher,
+        teacher_by_name,
+        cpu_prototypes,
+        int(cfg["train"]["topk"]),
+        max_pairwise_samples=int(
+            cfg["train"].get("eval_pairwise_max_samples", 4096)
+        ),
+    )
+    population_classification_metrics = _classification_eval_metrics(
+        supervised
+    )
+    del val_embeddings, student_by_teacher, teacher_by_name, supervised
+    _release_host_memory()
+
+    expert_classification_metrics: dict[str, float] = {}
+    expert_spatial_metrics: dict[str, float] = {}
+    if expert_classification_val_loader is not None:
+        _set_loader_epoch(expert_classification_val_loader, 0)
+        classification_eval_cfg = {
+            **expert_eval_cfg,
+            "loss": {
+                **expert_eval_cfg["loss"],
+                "classification_weight": 1.0,
+                "spatial_weight": 0.0,
+            },
+        }
+        _, expert_classification_embeddings = run_epoch(
+            model,
+            expert_classification_val_loader,
+            prototypes,
+            optimizer,
+            device,
+            classification_eval_cfg,
+            train=False,
+            max_batches=None,
+            epoch=epoch,
+            global_step=global_step,
+            spatial_supervised_step=spatial_supervised_step,
+            collect_embeddings=True,
+            max_eval_batches=None,
+        )
+        expert_supervised = expert_classification_embeddings[3]
+        expert_classification_metrics = _classification_eval_metrics(
+            expert_supervised
+        )
+        del expert_classification_embeddings, expert_supervised
+        _release_host_memory()
+    if expert_spatial_val_loader is not None:
+        _set_loader_epoch(expert_spatial_val_loader, 0)
+        spatial_eval_cfg = {
+            **expert_eval_cfg,
+            "loss": {
+                **expert_eval_cfg["loss"],
+                "classification_weight": 0.0,
+                "spatial_weight": 1.0,
+            },
+        }
+        expert_spatial_metrics = run_epoch(
+            model,
+            expert_spatial_val_loader,
+            prototypes,
+            optimizer,
+            device,
+            spatial_eval_cfg,
+            train=False,
+            max_batches=None,
+            epoch=epoch,
+            global_step=global_step,
+            spatial_supervised_step=spatial_supervised_step,
+        )
+        _release_host_memory()
+    return {
+        "population": val_metrics,
+        "embedding": embedding_metrics,
+        "population_classification": population_classification_metrics,
+        "expert_classification": expert_classification_metrics,
+        "expert_spatial": expert_spatial_metrics,
     }
 
 
@@ -2073,6 +2640,8 @@ def fit(
     resume_state: dict | None = None,
     prototype_refresh_loader=None,
     spatial_prototype_refresh_loader=None,
+    expert_classification_val_loader=None,
+    expert_spatial_val_loader=None,
 ) -> dict:
     output_dir = ensure_dir(cfg["runtime"]["output_dir"])
     checkpoints = ensure_dir(output_dir / "checkpoints")
@@ -2095,6 +2664,27 @@ def fit(
     best_classification_accuracy = float(
         (resume_state or {}).get("best_classification_accuracy", float("-inf"))
     )
+    best_selection_loss = float(
+        (resume_state or {}).get("best_selection_loss", float("inf"))
+    )
+    best_significant_selection_loss = float(
+        (resume_state or {}).get(
+            "best_significant_selection_loss",
+            float("inf"),
+        )
+    )
+    best_selection_epoch = int(
+        (resume_state or {}).get("best_selection_epoch", 0)
+    )
+    selection_bad_epochs = int(
+        (resume_state or {}).get("selection_bad_epochs", 0)
+    )
+    selection_baseline = {
+        str(name): float(value)
+        for name, value in (
+            (resume_state or {}).get("selection_baseline", {})
+        ).items()
+    }
     best_metrics = dict((resume_state or {}).get("best_metrics", {}))
     last_metrics = dict(
         (resume_state or {}).get(
@@ -2206,6 +2796,68 @@ def fit(
             cfg["train"].get("development_probe_batches", 64)
         ),
     }
+    expert_selection_enabled = bool(
+        expert_classification_val_loader is not None
+        and expert_spatial_val_loader is not None
+    )
+    selection_early_stop_enabled = bool(
+        expert_selection_enabled
+        and cfg["train"].get("selection_early_stop", False)
+    )
+    selection_metric_weights = _selection_weights(cfg)
+    configured_selection_baseline = _configured_selection_baseline(cfg)
+    selection_early_stop_start_step = _selection_start_step(cfg)
+    selection_early_stop_patience = int(
+        cfg["train"].get("selection_early_stop_patience", 4)
+    )
+    selection_early_stop_relative_delta = float(
+        cfg["train"].get(
+            "selection_early_stop_relative_delta",
+            0.005,
+        )
+    )
+    selection_minimum_eligible_epochs = int(
+        cfg["train"].get("selection_minimum_eligible_epochs", 1)
+    )
+    if expert_selection_enabled:
+        configured_max_batches = cfg["train"].get("max_train_batches")
+        steps_per_epoch = len(train_loader)
+        if configured_max_batches is not None:
+            steps_per_epoch = min(
+                steps_per_epoch,
+                int(configured_max_batches),
+            )
+        eligible_epochs = _eligible_selection_epoch_count(
+            current_global_step=global_step,
+            steps_per_epoch=steps_per_epoch,
+            start_epoch=start_epoch,
+            expected_epochs=expected_epochs,
+            selection_start_step=selection_early_stop_start_step,
+            resume_batch_in_epoch=resume_batch_in_epoch,
+        )
+        if eligible_epochs < selection_minimum_eligible_epochs:
+            raise ValueError(
+                "training budget cannot reach enough eligible joint-selection "
+                "epochs after all active ramps: "
+                f"steps_per_epoch={steps_per_epoch} "
+                f"selection_start_step={selection_early_stop_start_step} "
+                f"eligible_epochs={eligible_epochs} "
+                f"required={selection_minimum_eligible_epochs}"
+            )
+    expert_eval_cfg = {
+        **cfg,
+        "train": {
+            **cfg["train"],
+            "progress": False,
+            "log_interval": 0,
+            "tensorboard_batch_interval": 0,
+        },
+        "loss": {
+            **cfg["loss"],
+            "expert_supervision_start_step": 0,
+            "expert_supervision_ramp_steps": 0,
+        },
+    }
     saved_early_stop_state = (resume_state or {}).get(
         "development_early_stop_state"
     )
@@ -2230,6 +2882,7 @@ def fit(
         development_early_stop_enabled
         and early_stop_state.get("triggered", False)
     )
+    selection_stop_requested = False
     development_stop_summary: dict[str, float | int | bool] = {}
 
     def checkpoint_payload(
@@ -2274,6 +2927,19 @@ def fit(
             "best_teacher_alignment": best_teacher_alignment,
             "best_classification_accuracy": (
                 best_classification_accuracy
+            ),
+            "best_selection_loss": best_selection_loss,
+            "best_significant_selection_loss": (
+                best_significant_selection_loss
+            ),
+            "best_selection_epoch": best_selection_epoch,
+            "selection_bad_epochs": selection_bad_epochs,
+            "selection_baseline": dict(selection_baseline),
+            "selection_metric_weights": dict(
+                selection_metric_weights
+            ),
+            "selection_early_stop_start_step": (
+                selection_early_stop_start_step
             ),
             "best_metrics": best_metrics,
             "last_metrics": last_metrics,
@@ -2426,6 +3092,92 @@ def fit(
             )
         return development_stop_requested
 
+    if expert_selection_enabled:
+        if (
+            not selection_baseline
+            and resume_state is not None
+            and global_step > 0
+        ):
+            raise ValueError(
+                "cannot reconstruct the shared-initialization selection "
+                "baseline from a progressed checkpoint"
+            )
+        if selection_baseline:
+            _normalized_selection_metrics(
+                selection_baseline,
+                selection_baseline,
+                selection_metric_weights,
+            )
+            if configured_selection_baseline is not None:
+                _assert_selection_baseline_matches(
+                    selection_baseline,
+                    configured_selection_baseline,
+                )
+        else:
+            was_training = bool(model.training)
+            try:
+                if prototype_refresh_state is not None:
+                    _maybe_refresh_prototypes(
+                        model=model,
+                        cfg=cfg,
+                        device=device,
+                        state=prototype_refresh_state,
+                        global_step=global_step,
+                    )
+                initial_validation = _run_validation_streams(
+                    model=model,
+                    val_loader=val_loader,
+                    expert_classification_val_loader=(
+                        expert_classification_val_loader
+                    ),
+                    expert_spatial_val_loader=expert_spatial_val_loader,
+                    prototypes=prototypes,
+                    optimizer=optimizer,
+                    device=device,
+                    cfg=cfg,
+                    expert_eval_cfg=expert_eval_cfg,
+                    epoch=0,
+                    global_step=global_step,
+                    spatial_supervised_step=spatial_supervised_step,
+                )
+                observed_selection_baseline, initial_teacher_metrics = (
+                    _selection_raw_metrics(initial_validation, cfg)
+                )
+                if configured_selection_baseline is not None:
+                    _assert_selection_baseline_matches(
+                        observed_selection_baseline,
+                        configured_selection_baseline,
+                    )
+                    selection_baseline = dict(
+                        configured_selection_baseline
+                    )
+                else:
+                    selection_baseline = observed_selection_baseline
+                _normalized_selection_metrics(
+                    selection_baseline,
+                    selection_baseline,
+                    selection_metric_weights,
+                )
+            finally:
+                model.train(was_training)
+            write_json(
+                output_dir / "selection_baseline.json",
+                {
+                    "global_step": global_step,
+                    "metrics": selection_baseline,
+                    "observed_metrics": observed_selection_baseline,
+                    "weights": selection_metric_weights,
+                    "teacher_diagnostics": initial_teacher_metrics,
+                },
+            )
+            _log(
+                "selection_baseline "
+                + " ".join(
+                    f"{name}={selection_baseline[name]:.6f}"
+                    for name in SELECTION_COMPONENTS
+                )
+            )
+
     try:
         for epoch in range(start_epoch, expected_epochs + 1):
             _set_loader_epoch(train_loader, epoch - 1)
@@ -2484,66 +3236,62 @@ def fit(
                     checkpoints / "last.pt",
                 )
                 break
-            val_iterator = iter(val_loader)
-            try:
-                val_metrics, val_embeddings = run_epoch(
-                    model,
-                    val_loader,
-                    prototypes,
-                    optimizer,
-                    device,
-                    cfg,
-                    train=False,
-                    max_batches=cfg["train"].get("max_val_batches"),
-                    epoch=epoch,
-                    global_step=global_step,
-                    spatial_supervised_step=spatial_supervised_step,
-                    summary_writer=writer,
-                    collect_embeddings=True,
-                    max_eval_batches=cfg["train"].get(
-                        "max_eval_batches",
-                        cfg["train"].get("max_val_batches"),
-                    ),
-                    prefetched_iterator=val_iterator,
-                )
-                val_iterator = None
-            finally:
-                close_val_iterator = getattr(val_iterator, "close", None)
-                if callable(close_val_iterator):
-                    close_val_iterator()
-            _, student_by_teacher, teacher_by_name, supervised = val_embeddings
-            cpu_prototypes = (
-                {name: registry.to("cpu") for name, registry in prototypes.items()}
-                if prototypes
-                else None
+            validation = _run_validation_streams(
+                model=model,
+                val_loader=val_loader,
+                expert_classification_val_loader=(
+                    expert_classification_val_loader
+                ),
+                expert_spatial_val_loader=expert_spatial_val_loader,
+                prototypes=prototypes,
+                optimizer=optimizer,
+                device=device,
+                cfg=cfg,
+                expert_eval_cfg=expert_eval_cfg,
+                epoch=epoch,
+                global_step=global_step,
+                spatial_supervised_step=spatial_supervised_step,
+                summary_writer=writer,
             )
-            embedding_metrics = evaluate_teacher_outputs(
-                student_by_teacher,
-                teacher_by_name,
-                cpu_prototypes,
-                int(cfg["train"]["topk"]),
-                max_pairwise_samples=int(
-                    cfg["train"].get("eval_pairwise_max_samples", 4096)
+            val_metrics = validation["population"]
+            embedding_metrics = validation["embedding"]
+            population_classification_metrics = validation[
+                "population_classification"
+            ]
+            expert_classification_metrics = validation[
+                "expert_classification"
+            ]
+            expert_spatial_metrics = validation["expert_spatial"]
+            teacher_metrics = _teacher_retention_metrics(
+                embedding_metrics,
+                relation_weight=float(
+                    cfg["loss"].get("relation_weight", 0.0)
                 ),
             )
-            classification_metrics = _classification_eval_metrics(supervised)
-            del val_embeddings, student_by_teacher, teacher_by_name, supervised
-            _release_host_memory()
-
-            teacher_alignment_values = [
-                float(value)
-                for key, value in embedding_metrics.items()
-                if key.endswith("_feature_cosine")
+            teacher_alignment = teacher_metrics[
+                "teacher_alignment_score"
             ]
-            teacher_alignment = (
-                float(sum(teacher_alignment_values) / len(teacher_alignment_values))
-                if teacher_alignment_values
-                else float("-inf")
-            )
+            selection_loss = float("nan")
+            selection_metrics: dict[str, float] = {}
+            if expert_selection_enabled:
+                raw_selection_metrics, teacher_metrics = (
+                    _selection_raw_metrics(validation, cfg)
+                )
+                selection_metrics = _normalized_selection_metrics(
+                    raw_selection_metrics,
+                    selection_baseline,
+                    selection_metric_weights,
+                )
+                selection_loss = selection_metrics["selection_loss"]
             loss_cfg = scheduled_loss_config(
                 cfg,
                 epoch=epoch,
                 global_step=global_step,
+            )
+            classification_metrics = (
+                expert_classification_metrics
+                if expert_classification_metrics
+                else population_classification_metrics
             )
             row = {
                 "epoch": epoch,
@@ -2569,8 +3317,34 @@ def fit(
                 "teacher_alignment_score": (
                     0.0 if not math.isfinite(teacher_alignment) else teacher_alignment
                 ),
+                **teacher_metrics,
+                **selection_metrics,
+                "selection_loss": selection_loss,
+                "selection_start_step": (
+                    selection_early_stop_start_step
+                ),
+                "selection_eligible": (
+                    global_step >= selection_early_stop_start_step
+                ),
                 **embedding_metrics,
                 **classification_metrics,
+                **{
+                    f"population_{key}": value
+                    for key, value in (
+                        population_classification_metrics.items()
+                    )
+                },
+                **{
+                    f"expert_val_{key}": value
+                    for key, value in (
+                        expert_classification_metrics.items()
+                    )
+                },
+                **{
+                    f"expert_val_{key}": value
+                    for key, value in expert_spatial_metrics.items()
+                    if key.startswith("spatial")
+                },
             }
             alignment_history.append(
                 {
@@ -2587,28 +3361,83 @@ def fit(
             _write_tensorboard_scalars(writer, row, epoch)
             last_metrics = row
             improved_loss = val_metrics["loss"] < best_loss
+            selection_eligible = bool(
+                expert_selection_enabled
+                and global_step >= selection_early_stop_start_step
+            )
+            improved_selection = bool(
+                selection_eligible
+                and selection_loss < best_selection_loss
+            )
+            significant_selection_improvement = bool(
+                selection_eligible
+                and (
+                    not math.isfinite(
+                        best_significant_selection_loss
+                    )
+                    or selection_loss
+                    < best_significant_selection_loss
+                    * (1.0 - selection_early_stop_relative_delta)
+                )
+            )
             improved_alignment = teacher_alignment > best_teacher_alignment
+            classification_selection_metric = float(
+                classification_metrics.get(
+                    "classification_macro_f1",
+                    classification_metrics["classification_accuracy"],
+                )
+            )
             improved_classification = (
                 classification_metrics["classification_evaluated_tiles"] > 0
-                and classification_metrics["classification_accuracy"] > best_classification_accuracy
+                and classification_selection_metric
+                > best_classification_accuracy
             )
             if improved_loss:
                 best_loss = val_metrics["loss"]
+                if not expert_selection_enabled:
+                    best_metrics = row
+            if improved_selection:
+                best_selection_loss = selection_loss
+                best_selection_epoch = epoch
                 best_metrics = row
+            if selection_eligible:
+                if significant_selection_improvement:
+                    best_significant_selection_loss = selection_loss
+                    selection_bad_epochs = 0
+                else:
+                    selection_bad_epochs += 1
             if improved_alignment:
                 best_teacher_alignment = teacher_alignment
             if improved_classification:
-                best_classification_accuracy = classification_metrics["classification_accuracy"]
+                best_classification_accuracy = (
+                    classification_selection_metric
+                )
 
+            selection_stop_requested = bool(
+                selection_early_stop_enabled
+                and selection_eligible
+                and selection_bad_epochs
+                >= selection_early_stop_patience
+            )
             checkpoint = checkpoint_payload(
                 epoch=epoch,
                 batch_in_epoch=0,
                 epoch_accumulator=None,
-                training_complete=epoch >= expected_epochs,
+                training_complete=(
+                    epoch >= expected_epochs
+                    or selection_stop_requested
+                ),
             )
             _atomic_torch_save(checkpoint, checkpoints / "last.pt")
-            if improved_loss:
+            if improved_selection or (
+                improved_loss and not expert_selection_enabled
+            ):
                 _atomic_torch_save(checkpoint, checkpoints / "best.pt")
+            if improved_loss:
+                _atomic_torch_save(
+                    checkpoint,
+                    checkpoints / "best_population_loss.pt",
+                )
             if improved_alignment:
                 _atomic_torch_save(
                     checkpoint,
@@ -2619,6 +3448,16 @@ def fit(
                     checkpoint,
                     checkpoints / "best_classification_accuracy.pt",
                 )
+            if selection_stop_requested:
+                _log(
+                    "selection_early_stop "
+                    f"epoch={epoch} "
+                    f"global_step={global_step} "
+                    f"best_epoch={best_selection_epoch} "
+                    f"best_loss={best_selection_loss:.6f} "
+                    f"patience={selection_early_stop_patience}"
+                )
+                break
             if bool(
                 cfg["train"].get(
                     "early_stop_teacher_alignment",
@@ -2636,8 +3475,58 @@ def fit(
         step_metrics_writer.flush()
         if writer is not None:
             writer.close()
+    if expert_selection_enabled and not math.isfinite(best_selection_loss):
+        raise RuntimeError(
+            "training ended before the joint selection metric became "
+            "eligible: "
+            f"global_step={global_step} "
+            f"selection_start_step={selection_early_stop_start_step}"
+        )
+    if expert_selection_enabled:
+        best_checkpoint_path = checkpoints / "best.pt"
+        best_checkpoint = torch.load(
+            best_checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        if (
+            int(best_checkpoint.get("epoch", -1))
+            != best_selection_epoch
+            or not math.isclose(
+                float(
+                    best_checkpoint.get(
+                        "best_selection_loss",
+                        float("nan"),
+                    )
+                ),
+                best_selection_loss,
+                rel_tol=1e-7,
+                abs_tol=1e-9,
+            )
+        ):
+            raise RuntimeError(
+                "best selection checkpoint disagrees with the completed run"
+            )
+        best_checkpoint.update(
+            {
+                "run_complete": True,
+                "selection_finalized": True,
+                "run_terminal_epoch": int(
+                    last_metrics.get("epoch", best_selection_epoch)
+                ),
+                "run_terminal_global_step": int(global_step),
+                "selection_stop_triggered": bool(
+                    selection_stop_requested
+                ),
+            }
+        )
+        _atomic_torch_save(best_checkpoint, best_checkpoint_path)
     spatial_route = bool(cfg["data"].get("spatial_manifest_path"))
-    summary_metrics = last_metrics if spatial_route else best_metrics
+    summary_metrics = (
+        best_metrics
+        if expert_selection_enabled
+        else (last_metrics if spatial_route else best_metrics)
+    )
     if not summary_metrics:
         raise RuntimeError("training produced no summary metrics")
     write_json(output_dir / "summary.json", summary_metrics)

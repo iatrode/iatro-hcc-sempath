@@ -159,6 +159,8 @@ def test_auth_token_requires_exact_nonempty_match() -> None:
     assert not _auth_ok("", "secret")
     assert not _auth_ok("secret ", "secret")
     assert not _auth_ok("other", "secret")
+    assert _auth_ok("", "")
+    assert _auth_ok("ignored", "")
 
 
 def test_annotation_cli_always_requires_classification_and_spatial_roi_workspaces() -> None:
@@ -188,6 +190,24 @@ def test_annotation_cli_always_requires_classification_and_spatial_roi_workspace
     assert args.roi_priority_attributes == "small-vessel,ductular-portal"
     assert args.review_existing is True
     assert not any("--roi-plan-config" in action.option_strings for action in parser._actions)
+
+
+def test_annotation_cli_allows_random_mode_without_priority_manifest() -> None:
+    parser = _annotation_parser()
+    args = parser.parse_args(
+        [
+            "--input",
+            "tiles",
+            "--classification-state",
+            "classification.json",
+            "--spatial-state",
+            "spatial.json",
+            "--no-auth",
+        ]
+    )
+
+    assert args.priority_manifest == ""
+    assert args.no_auth is True
     assert not any("--roi-plan-checkpoint" in action.option_strings for action in parser._actions)
     assert not any("--roi-plan-device" in action.option_strings for action in parser._actions)
     with pytest.raises(SystemExit):

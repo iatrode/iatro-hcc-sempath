@@ -507,7 +507,7 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
     point_tolerance = int(loss_cfg.get("spatial_point_tolerance_cells", 1))
     if point_tolerance < 0:
         raise ValueError("loss.spatial_point_tolerance_cells must be non-negative")
-    brush_fraction = float(loss_cfg.get("spatial_brush_top_fraction", 0.25))
+    brush_fraction = float(loss_cfg.get("spatial_brush_top_fraction", 1.0))
     if not math.isfinite(brush_fraction) or not (
         0.0 < brush_fraction <= 1.0
     ):
@@ -606,6 +606,155 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
         raise ValueError(
             "train.development_early_stop_patience must be positive"
         )
+    selection_early_stop = cfg.get("train", {}).get(
+        "selection_early_stop",
+        False,
+    )
+    if not isinstance(selection_early_stop, bool):
+        raise ValueError("train.selection_early_stop must be boolean")
+    selection_start_step = cfg.get("train", {}).get(
+        "selection_early_stop_start_step"
+    )
+    if (
+        selection_start_step is not None
+        and int(selection_start_step) < 0
+    ):
+        raise ValueError(
+            "train.selection_early_stop_start_step must be non-negative"
+        )
+    loss_cfg_for_selection = cfg.get("loss", {})
+    required_selection_start = (
+        int(
+            loss_cfg_for_selection.get(
+                "expert_supervision_start_step",
+                0,
+            )
+        )
+        + int(
+            loss_cfg_for_selection.get(
+                "expert_supervision_ramp_steps",
+                0,
+            )
+        )
+    )
+    for weight_key, start_key, ramp_key in (
+        (
+            "prototype_filter_weight",
+            "prototype_filter_start_step",
+            "prototype_filter_ramp_steps",
+        ),
+        (
+            "zhcc_response_weight",
+            "zhcc_response_start_step",
+            "zhcc_response_ramp_steps",
+        ),
+    ):
+        if float(loss_cfg_for_selection.get(weight_key, 0.0)) > 0.0:
+            required_selection_start = max(
+                required_selection_start,
+                int(loss_cfg_for_selection.get(start_key, 0))
+                + int(loss_cfg_for_selection.get(ramp_key, 0)),
+            )
+    if (
+        selection_start_step is not None
+        and int(selection_start_step) < required_selection_start
+    ):
+        raise ValueError(
+            "train.selection_early_stop_start_step cannot precede the "
+            "last active supervision ramp: "
+            f"configured={int(selection_start_step)} "
+            f"required={required_selection_start}"
+        )
+    if int(
+        cfg.get("train", {}).get(
+            "selection_early_stop_patience",
+            4,
+        )
+    ) <= 0:
+        raise ValueError(
+            "train.selection_early_stop_patience must be positive"
+        )
+    if int(
+        cfg.get("train", {}).get(
+            "selection_minimum_eligible_epochs",
+            1,
+        )
+    ) <= 0:
+        raise ValueError(
+            "train.selection_minimum_eligible_epochs must be positive"
+        )
+    selection_relative_delta = float(
+        cfg.get("train", {}).get(
+            "selection_early_stop_relative_delta",
+            0.005,
+        )
+    )
+    if not 0.0 < selection_relative_delta < 1.0:
+        raise ValueError(
+            "train.selection_early_stop_relative_delta must be in (0, 1)"
+        )
+    selection_weights = cfg.get("train", {}).get(
+        "selection_metric_weights",
+        {
+            "teacher": 0.50,
+            "classification": 0.25,
+            "spatial": 0.25,
+        },
+    )
+    expected_selection_weights = {
+        "teacher",
+        "classification",
+        "spatial",
+    }
+    if (
+        not isinstance(selection_weights, dict)
+        or set(selection_weights) != expected_selection_weights
+    ):
+        raise ValueError(
+            "train.selection_metric_weights must contain exactly "
+            "teacher, classification, and spatial"
+        )
+    resolved_selection_weights = [
+        float(selection_weights[name])
+        for name in sorted(expected_selection_weights)
+    ]
+    if any(
+        not math.isfinite(value) or value <= 0.0
+        for value in resolved_selection_weights
+    ):
+        raise ValueError(
+            "all train.selection_metric_weights must be finite and positive"
+        )
+    if not math.isclose(
+        sum(resolved_selection_weights),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-8,
+    ):
+        raise ValueError(
+            "train.selection_metric_weights must sum to 1.0"
+        )
+    selection_baseline = cfg.get("train", {}).get(
+        "selection_metric_baseline"
+    )
+    if selection_baseline is not None:
+        if (
+            not isinstance(selection_baseline, dict)
+            or set(selection_baseline) != expected_selection_weights
+        ):
+            raise ValueError(
+                "train.selection_metric_baseline must contain exactly "
+                "teacher, classification, and spatial"
+            )
+        if any(
+            not math.isfinite(float(selection_baseline[name]))
+            or float(selection_baseline[name]) <= 0.0
+            for name in expected_selection_weights
+        ):
+            raise ValueError(
+                "all train.selection_metric_baseline values must be "
+                "finite and positive"
+            )
     if int(cfg.get("train", {}).get("lr_warmup_steps", 0)) < 0:
         raise ValueError("train.lr_warmup_steps must be non-negative")
     if (

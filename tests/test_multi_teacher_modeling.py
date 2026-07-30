@@ -763,8 +763,13 @@ def _decoder_calibration(
             "validation_cohort_sha256": "4" * 64,
             "optimizer_visible_contract_sha256": "5" * 64,
             "supervision_assets_sha256": "6" * 64,
+            "formal_asset_contract_sha256": "7" * 64,
+            "source_tree_sha256": "8" * 64,
+            "study_contract_sha256": "9" * 64,
+            "selected_epoch": 1,
             "terminal_epoch": 1,
             "expected_epochs": 1,
+            "selection_finalized": True,
         },
     }
 
@@ -801,6 +806,12 @@ def test_spatial_decoder_calibration_contract_is_exact() -> None:
             calibration,
             DEFAULT_SPATIAL_COMPONENTS,
             expected_supervision_assets_sha256="f" * 64,
+        )
+    with pytest.raises(ValueError, match="formal provenance"):
+        validate_spatial_decoder_calibration(
+            calibration,
+            DEFAULT_SPATIAL_COMPONENTS,
+            expected_source_tree_sha256="f" * 64,
         )
 
 

@@ -8,7 +8,7 @@ implementation, validation, and release contract.
 HCC-SemPath learns two complementary pathology representations from one fixed
 DINOv2-S/14 tile encoder:
 
-1. a six-class, mutually exclusive classification task
+1. a seven-class, mutually exclusive classification task
    \(\mathcal{T}_{\mathrm{cls}}\);
 2. weakly supervised spatial morphometry task
    \(\mathcal{T}_{\mathrm{spatial}}\) for eleven HCC components,
@@ -56,9 +56,10 @@ The global classification classes, in fixed order, are:
 3. `HCC-tumor-poorly-differentiated`
 4. `Background-liver`
 5. `Inflammatory-stromal`
-6. `Degenerative-material`
+6. `Hemorrhage-necrosis`
+7. `Artifact-contamination`
 
-The output is one six-way softmax.
+The output is one seven-way softmax.
 
 ### Spatial task
 
@@ -116,9 +117,9 @@ The student architecture and initialization remain fixed to pretrained
 DINOv2-S/14 at native 224-pixel input.
 All existing teacher feature caches remain usable. The four teachers shape the
 shared representation through feature and relation distillation. The stable
-classification annotations define teacher-specific six-class prototypes and periodically
+classification annotations define teacher-specific seven-class prototypes and periodically
 recomputed student-space class centroids. Every student refresh re-encodes the
-complete fixed 2,400-tile bank with the current encoder; a compute mini-batch
+complete fixed 2,800-tile bank with the current encoder; a compute mini-batch
 is only a memory chunk and never defines the prototype pool. Their responses provide both HCC semantic
 supervision and per-tile PAMT-D teacher reliability, while direct classification
 cross-entropy supervises the human boundary.
@@ -132,7 +133,7 @@ targets.
 
 ### Classification head
 
-The normalized global embedding is read against six no-gradient,
+The normalized global embedding is read against seven no-gradient,
 expert-updated student-space centroids:
 
 ```text
@@ -143,7 +144,7 @@ classification_logits[k] = cosine(z, centroid_classification[k]) / temperature
 Human classification labels define the complete centroid bank and use cross entropy on the
 resulting response. Centroids are no-gradient coordinates recomputed from the
 current student between optimizer steps; gradients from the response update
-`z_hcc`. Semantic distillation and PAMT-D use the six class-conditioned
+`z_hcc`. Semantic distillation and PAMT-D use the seven class-conditioned
 teacher prototypes.
 
 ### Dense local branch
@@ -174,10 +175,11 @@ For each of eleven components the head emits:
 These maps are positive-versus-negative local prototype responses over the
 fused spatial features. One supervised tile/component contributes one centroid
 observation, so a large brush cannot dominate merely by covering more grid
-cells. Point/circle centres update instance prototypes. Cell points and dense
-cell brushes update density prototypes; circle/brush extent updates discrete
-structure area prototypes; continuous and pigment extent updates burden/area
-prototypes. A structure point never supplies an inferred extent.
+cells. Point/circle centres update instance prototypes. Cell points, dense
+cell brushes, and cell-circle extent update density prototypes;
+circle/brush extent updates discrete-structure area prototypes; continuous
+and pigment extent updates burden/area prototypes. A structure point never
+supplies an inferred extent.
 
 A component prototype is a semantic readout coordinate after the trainable
 local, semantic, fusion, and nonlinear context transformations. Morphological
@@ -204,21 +206,17 @@ undefined component/measurement pairs as invalid.
 
 ## 6. Targets and losses
 
-Countable instance centres use a tolerant one-to-one peak objective: adjacent
-clicks cannot be satisfied by the same response cell. Matching maximizes
-cardinality before response score, and non-matched cells within the union of
-click-tolerance regions are negative for the instance objective, so one click
-cannot train two decoded peaks. Dense-cell brushes use an aggregate
-positive-bag objective. Area-capable components use positive occupied-area
-support. Explicit negatives supervise confirmed absence; all other unmarked
-cells remain outside the loss.
-
-The point tolerance represents click/grid uncertainty, not nucleus diameter.
-A point never supplies an inferred object area or an exact sub-grid centre.
-A circle additionally supplies instance-exclusion support so one large object
-cannot produce multiple centres, without becoming a cell-area target. Mixed
-point/brush cell annotations supervise resolved instances and unresolved
-abundance separately.
+Countable point marks supervise the grid cell containing the annotated centre.
+The configured neighbourhood is exclusion support: nearby non-centre cells are
+negative for the instance objective, so one click cannot train multiple decoded
+peaks. A point never supplies inferred object area. Dense-cell brushes and
+circle/brush contours supervise every selected grid cell as positive occupied
+support; top-fraction MIL pooling is retained only as a legacy mechanism
+comparison. A circle additionally supplies instance-exclusion support so one
+large object cannot produce multiple centres. Mixed point/brush cell
+annotations supervise resolved instances and unresolved abundance separately.
+Explicit negatives supervise confirmed absence; all other unmarked cells remain
+outside the loss.
 
 PAMT-D combines teacher base weights and per-tile reliability as
 `w_m * alpha_mi`. Feature and classification-semantic losses are normalized jointly over
@@ -292,7 +290,7 @@ decision boundary when available.
 
 ## 8. Data organization
 
-- The classification task uses the frozen 2,400-tile expert asset, with 400 tiles
+- The classification task uses the frozen 2,800-tile expert asset, with 400 tiles
   per class.
 - The spatial task uses the current eleven-component annotation manifest.
 - Both assets are intentionally small expert interventions on the
@@ -300,10 +298,26 @@ decision boundary when available.
   the full corpus.
 - The union of their training tiles is replayed throughout population
   distillation; newly annotated tiles enter the same union automatically.
-- Formal mechanism ablations use one fixed 10% population subset and the
-  complete fixed classification/spatial expert union for three epochs. The selected Optuna trial
-  is A0; every other condition inherits its seed, hyperparameters, schedule,
-  and subset without retuning.
+- A0 Optuna search uses one deterministic 10% population subset, the complete
+  training expert union, and independent complete L1/L2 validation banks. It
+  searches learning rate, weight decay, and the global spatial-task weight for
+  at most 16 epochs. The fixed 10% population is the compute-matched study
+  population for A0 and every formal ablation; it is not a checkpoint-selection
+  device. Every formal mechanism ablation inherits the A0 seed,
+  hyperparameters, maximum budget, checkpoint-selection rule, schedule, and
+  subset without retuning. Because an intervention can change the
+  initialization-scale of a validation term, each ablation freezes its own
+  epoch-0 \(T_0,C_0,S_0\) denominators while retaining the A0 weights, ramp
+  boundary, patience, and relative-improvement rule. The A0 ramp boundary is
+  explicit, so disabling a late-ramped mechanism cannot create earlier
+  checkpoint opportunities. Conditions that remove classification training
+  still retain the complete L1 validation bank. Each condition receives an
+  exact source/asset contract over its active teacher/prototype subset, and a
+  checkpoint from an obsolete shorter epoch plan cannot be extended into the
+  formal run. The ablation base is accepted only when the completed Optuna
+  study export binds it to the winning trial's hyperparameters, raw config,
+  selected epoch, and checkpoint digest; training revalidates the complete
+  resolved condition digest at startup.
 - The shared priority list serves the stable 3,000 tiles first and expands
   outside that boundary only when still-growing component curves require more
   examples.
@@ -332,10 +346,36 @@ decision boundary when available.
 
 ## 9. Validation
 
-Training records validation loss, classification accuracy when validation labels exist,
-and retained teacher alignment. The terminal checkpoint after the prescribed
-schedule enters independent spatial validation on a slide-separated expert
-asset.
+Training keeps ordinary teacher validation, seven-class expert validation, and
+eleven-component spatial expert validation as separate streams. A0 checkpoint
+selection uses three fixed validation terms:
+
+- \(T_e\): direct four-teacher retention on the deterministic population
+  validation view, computed from mean cosine distance plus the configured
+  relation-MSE weight. Dynamic PAMT-D targets and student prototypes do not
+  enter this term.
+- \(C_e\): class-balanced cross entropy over the complete seven-class expert
+  validation bank.
+- \(S_e\): one complete-bank, component-balanced reduction of the
+  eleven-component spatial objective, including explicit negatives.
+
+The first trial evaluates the shared initialization before optimization to
+freeze \(T_0,C_0,S_0\). Every later trial recomputes and must reproduce those
+values before using the stored denominators. Epoch \(e\) minimizes
+\[
+J_e=w_TT_e/T_0+w_CC_e/C_0+w_SS_e/S_0,
+\]
+with default \((w_T,w_C,w_S)=(0.50,0.25,0.25)\). The weights must be positive,
+sum to one, and are configuration-bound for the prespecified three-cell
+sensitivity analysis. Selection and patience begin only after every active
+expert/PAMT-D supervision ramp has completed. Macro-F1, balanced accuracy,
+ordinary population loss, and individual teacher cosines remain diagnostics.
+No validation expert tile enters replay or any optimizer-visible bank; when
+historical IAC package splits differ from finalized annotation splits, the
+exact validation rows are removed from population training.
+The formal search uses one coordinator and one strict global trial budget.
+Optuna pruning steps count only post-ramp joint-validation observations, so a
+late ramp cannot silently consume the pruning warm-up.
 
 After checkpoint freezing, spatial validation is performed on an independent,
 slide-separated expert sample:
@@ -353,22 +393,24 @@ slide-separated expert sample:
 `scripts/calibrate_spatial_decoder.py` implements this gate. Exact point/count
 pairs require explicit per-component `roi_count_complete`; measurement pairs
 likewise require `roi_measurement_complete`. These flags are validation-only
-claims and are never inferred from ordinary weak training marks. Dense-cell
-brushes are evaluated as top-fraction MIL bags, not exact positive pixels.
+claims and are never inferred from ordinary weak training marks. Brush and
+circle contours use their full selected support under the formal contract.
 Threshold scoring excludes incomplete tile/component pairs, retains explicit
 and includes complete-negative tiles when selecting bile minimum-focus size.
 
 Validation tile IDs must resolve inside the requested manifest `val`/`exval`
 partition, which must be patient/slide-disjoint from the entire
-optimizer-visible population plus the classification/spatial expert replay cohort. The terminal
-checkpoint freezes the exact optimizer-visible package list, an aggregate
+optimizer-visible population plus the classification/spatial expert replay
+cohort. The finalized joint-selection checkpoint records both its selected
+epoch and the completed run's terminal epoch, and freezes the exact
+optimizer-visible package list, an aggregate
 package/cohort digest, and SHA-256 digests of mutable classification/spatial/prototype
 supervision assets. Resume, independent evaluation, and calibration never
 reconstruct that contract from a later directory scan. The aggregate
 report contains component/mode, point/circle/brush/mixed strata, slide-macro
 metrics, and independent-slide counts. The versioned decoder asset binds the
 ordered thresholds, NMS kernels, bile minimum-focus size, and output stride to
-the exact terminal model-state digest, research contract, annotation,
+the exact selected model-state digest, research contract, annotation,
 protocol, and validation cohort. The release exporter rejects a calibration
 from any other checkpoint.
 
@@ -392,7 +434,7 @@ separate research objects with independent evidence boundaries.
 HCC-SemPath contributes one HCC-specific representation with:
 
 - retained multi-teacher foundation features;
-- stable six-class global tissue state;
+- stable seven-class global tissue state;
 - eleven-component, geometry-aware spatial output;
 - native support for class-routed point/circle/brush annotations;
 - cell-scale localization plus multi-grid structural context;
@@ -406,8 +448,9 @@ HCC-SemPath contributes one HCC-specific representation with:
 - `spatial_schema.py`: fixed eleven-class measurement capabilities.
 - `training/roi.py`: instance centres, instance-exclusion support, density
   bags, positive area, explicit negatives, and ignored unmarked regions.
-- `training/spatial_losses.py`: tolerant instance peaks, abundance point peaks,
-  dense-cell brush bags, positive-area loss, and capability-routed negatives.
+- `training/spatial_losses.py`: exact-centre instance peaks, abundance point
+  peaks, contour-faithful brush support, positive-area loss, and
+  capability-routed negatives.
 - `training/pamtd.py`: per-tile four-teacher adjudication and shared semantic
   response target.
 - `training/engine.py`: active objective, exact full-bank dynamic prototype
@@ -422,7 +465,7 @@ HCC-SemPath contributes one HCC-specific representation with:
   exclusion.
 - `scripts/roi_information_curve.py`: executable four-teacher,
   component-wise annotation sufficiency/QC curve.
-- `scripts/calibrate_spatial_decoder.py`: terminal-checkpoint decoder freeze.
+- `scripts/calibrate_spatial_decoder.py`: finalized-selection decoder freeze.
 - `scripts/export_release_sempath.py`: provenance-bound release package.
 
 Implementation conformance requires:
@@ -439,4 +482,5 @@ Implementation conformance requires:
    plateaus, not a preset tile quota;
 7. formal ablations retain the same fixed 10% population subset and complete
    expert union, and differ only by the named mechanism;
-8. only an independently calibrated terminal checkpoint can become a release.
+8. only an independently calibrated, finalized joint-selection checkpoint can
+   become a release.

@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import json
+import os
+import re
+import subprocess
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -996,59 +1001,86 @@ def _target_rows_by_package(
             "expert supervision references tiles outside the training split: "
             f"count={len(missing)} sample={', '.join(missing[:3])}"
         )
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
     rows: dict[int, np.ndarray] = {}
-    unresolved: list[str] = []
     for package_index, targets in targets_by_package.items():
         _, _, record_table = read_tables(package_paths[package_index])
         tile_ids = record_table.column("tile_id")
-        resolved: dict[str, int] = {}
+        resolved_rows: list[int] = []
         for tile_id, declared_row in targets.items():
-            if (
-                declared_row < len(tile_ids)
-                and str(tile_ids[declared_row].as_py()) == tile_id
-            ):
-                resolved[tile_id] = declared_row
-        remaining = set(targets).difference(resolved)
-        if remaining:
-            value_set = pa.array(sorted(remaining), type=tile_ids.type)
-            matched = pc.indices_nonzero(
-                pc.is_in(tile_ids, value_set=value_set)
-            ).to_numpy(zero_copy_only=False)
-            for row in matched.tolist():
-                tile_id = str(tile_ids[int(row)].as_py())
-                if tile_id in resolved:
-                    raise ValueError(
-                        "duplicate expert tile_id within package: "
-                        f"tile={tile_id} package={package_paths[package_index]}"
-                    )
-                resolved[tile_id] = int(row)
-        unresolved.extend(sorted(set(targets).difference(resolved)))
+            observed = (
+                str(tile_ids[declared_row].as_py())
+                if declared_row < len(tile_ids)
+                else "<row-out-of-range>"
+            )
+            if observed != tile_id:
+                raise ValueError(
+                    "stale expert package/row provenance: "
+                    f"package={package_paths[package_index]} "
+                    f"row={declared_row} expected={tile_id} "
+                    f"observed={observed}"
+                )
+            resolved_rows.append(declared_row)
         rows[package_index] = np.asarray(
-            sorted(resolved.values()),
+            sorted(resolved_rows),
             dtype=np.int64,
-        )
-    if unresolved and require_all:
-        raise ValueError(
-            "expert tile_id is absent from its declared training package: "
-            f"count={len(unresolved)} sample={', '.join(unresolved[:3])}"
         )
     return rows
 
 
+def _expert_package_subset(
+    tile_packages: list[str],
+    teacher_packages: dict[str, list[str]],
+    target_locations: dict[str, tuple[str, int]],
+) -> tuple[
+    list[str],
+    dict[str, list[str]],
+    dict[int, np.ndarray],
+    set[str],
+]:
+    """Select complete packages/rows needed by one fixed expert split."""
+
+    resolved_rows = _target_rows_by_package(
+        tile_packages,
+        target_locations,
+    )
+    selected_indices = sorted(resolved_rows)
+    selected_tiles = [
+        tile_packages[index]
+        for index in selected_indices
+    ]
+    selected_teachers = {
+        name: [
+            paths[index]
+            for index in selected_indices
+        ]
+        for name, paths in teacher_packages.items()
+    }
+    remapped_rows = {
+        new_index: resolved_rows[old_index]
+        for new_index, old_index in enumerate(selected_indices)
+    }
+    return (
+        selected_tiles,
+        selected_teachers,
+        remapped_rows,
+        set(selected_tiles),
+    )
+
+
 def _validation_package_keep_indices(
     validation_packages: list[str],
-    expert_packages: list[str],
+    optimizer_visible_packages: list[str],
 ) -> list[int]:
-    """Exclude exact expert packages from the validation package list."""
+    """Keep evaluation packages outside the frozen optimizer-visible set."""
 
-    expert_paths = {str(Path(path).resolve()) for path in expert_packages}
+    visible_paths = {
+        str(Path(path).resolve())
+        for path in optimizer_visible_packages
+    }
     return [
         index
         for index, package_path in enumerate(validation_packages)
-        if str(Path(package_path).resolve()) not in expert_paths
+        if str(Path(package_path).resolve()) not in visible_paths
     ]
 
 
@@ -1133,6 +1165,22 @@ def _teacher_paths_from_data(cfg: dict, key: str) -> dict[str, list[str]]:
     return result
 
 
+def _active_teacher_paths(
+    cfg: dict,
+    paths: dict[str, list[str]],
+    *,
+    key: str,
+) -> dict[str, list[str]]:
+    active = teacher_names(cfg)
+    missing = sorted(set(active) - set(paths))
+    if missing:
+        raise ValueError(f"data.{key} is missing active teachers: {missing}")
+    return {
+        teacher: list(paths[teacher])
+        for teacher in active
+    }
+
+
 def _resume_contract(cfg: dict) -> dict:
     """Freeze every numerical/data semantic while allowing host-only changes."""
 
@@ -1147,7 +1195,6 @@ def _resume_contract(cfg: dict) -> dict:
         "optimizer_visible_tile_packages",
         "optimizer_visible_tile_package_sizes",
         "optimizer_visible_contract_sha256",
-        "supervision_asset_sha256",
     ):
         contract.get("data", {}).pop(key, None)
     for key in (
@@ -1171,6 +1218,350 @@ def _resume_contract(cfg: dict) -> dict:
     return contract
 
 
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _canonical_sha256(payload: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _verify_formal_ablation_contract(cfg: dict) -> None:
+    expected = cfg.get("data", {}).get(
+        "formal_ablation_contract_sha256"
+    )
+    if expected is None:
+        return
+    if (
+        not isinstance(expected, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected) is None
+    ):
+        raise ValueError("formal ablation contract digest is invalid")
+    payload = copy.deepcopy(cfg)
+    payload["data"].pop("formal_ablation_contract_sha256", None)
+    observed = _canonical_sha256(payload)
+    if observed != expected:
+        raise ValueError(
+            "resolved formal ablation config changed after contract freeze: "
+            f"expected={expected} observed={observed}"
+        )
+
+
+def _source_tree_sha256(repo: Path) -> str:
+    roots = (
+        repo / "pyproject.toml",
+        repo / "README.md",
+        repo / "CHANGELOG.md",
+        repo / "configs",
+        repo / "docs",
+        repo / "experiments" / "ablation",
+        repo / "scripts",
+        repo / "src",
+        repo / "tests",
+    )
+    files: list[Path] = []
+    for root in roots:
+        if root.is_file():
+            files.append(root)
+        elif root.is_dir():
+            files.extend(
+                path
+                for path in root.rglob("*")
+                if path.is_file()
+                and "__pycache__" not in path.parts
+                and path.suffix not in {".pyc", ".pyo"}
+            )
+    digest = hashlib.sha256()
+    for path in sorted(set(files)):
+        relative = path.relative_to(repo).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(_file_sha256(path)))
+    return digest.hexdigest()
+
+
+def _verify_formal_source_contract(
+    cfg: dict,
+    *,
+    repo: Path | None = None,
+) -> None:
+    expected = cfg.get("data", {}).get("formal_source")
+    if expected is None:
+        return
+    if not isinstance(expected, dict):
+        raise ValueError("data.formal_source must be a mapping")
+    commit = str(expected.get("commit", "")).lower()
+    mode = str(expected.get("source_mode", ""))
+    tree_digest = str(expected.get("source_tree_sha256", "")).lower()
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", commit) is None
+        or re.fullmatch(r"[0-9a-f]{64}", tree_digest) is None
+        or mode not in {"clean_git_commit", "declared_archive"}
+    ):
+        raise ValueError("formal source contract is incomplete")
+    repo = (
+        Path(__file__).resolve().parents[3]
+        if repo is None
+        else Path(repo).resolve()
+    )
+    observed_tree = _source_tree_sha256(repo)
+    if observed_tree != tree_digest:
+        raise ValueError(
+            "formal executable source tree content changed: "
+            f"expected={tree_digest} observed={observed_tree}"
+        )
+    if mode == "clean_git_commit":
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if (
+            head.returncode != 0
+            or head.stdout.strip().lower() != commit
+            or status.returncode != 0
+            or status.stdout.strip()
+        ):
+            raise ValueError(
+                "formal training requires the exact clean committed source"
+            )
+    else:
+        declared_commit = os.environ.get(
+            "HCC_SEMPATH_SOURCE_COMMIT",
+            "",
+        ).strip().lower()
+        if declared_commit != commit:
+            raise ValueError(
+                "formal source archive commit declaration changed"
+            )
+    cfg["data"]["formal_source_contract_sha256"] = (
+        _canonical_sha256(expected)
+    )
+
+
+def _formal_static_asset_paths(cfg: dict) -> dict[str, Path]:
+    data = cfg["data"]
+    result: dict[str, Path] = {}
+    prototype_paths = data.get("prototype_paths")
+    if isinstance(prototype_paths, dict):
+        for teacher, path in prototype_paths.items():
+            result[f"prototype_{teacher}"] = Path(str(path)).resolve()
+    for key in (
+        "prototype_supervision_manifest_path",
+        "spatial_manifest_path",
+        "train_manifest_path",
+    ):
+        value = data.get(key)
+        if value:
+            result[key] = Path(str(value)).resolve()
+    return result
+
+
+def _verify_formal_asset_contract(
+    cfg: dict,
+    *,
+    complete_tile_packages: list[str],
+    complete_teacher_packages: dict[str, list[str]],
+) -> None:
+    """Re-resolve and re-hash the complete formal input contract per trial."""
+
+    formal = cfg.get("data", {}).get("formal_asset_sha256")
+    if formal is None:
+        return
+    if not isinstance(formal, dict):
+        raise ValueError("data.formal_asset_sha256 must be a mapping")
+    static_expected = formal.get("static_files")
+    iac_expected = formal.get("iac_packages")
+    student_expected = formal.get("student_pretrained")
+    if (
+        not isinstance(static_expected, dict)
+        or not isinstance(iac_expected, dict)
+        or not isinstance(student_expected, dict)
+    ):
+        raise ValueError("formal asset SHA-256 contract is incomplete")
+    static_paths = _formal_static_asset_paths(cfg)
+    if set(static_paths) != set(static_expected):
+        raise ValueError(
+            "formal static asset keys differ from the resolved config: "
+            f"expected={sorted(static_expected)} "
+            f"resolved={sorted(static_paths)}"
+        )
+    for name, path in static_paths.items():
+        if not path.is_file() or _file_sha256(path) != str(
+            static_expected[name]
+        ):
+            raise ValueError(
+                f"formal static asset content changed: {name}={path}"
+            )
+    resolved_iac_paths = {
+        str(Path(path).resolve())
+        for path in complete_tile_packages
+    }
+    resolved_iac_paths.update(
+        str(Path(path).resolve())
+        for teacher_paths in complete_teacher_packages.values()
+        for path in teacher_paths
+    )
+    expected_iac_paths = {
+        str(Path(str(path)).resolve())
+        for path in iac_expected
+    }
+    if resolved_iac_paths != expected_iac_paths:
+        added = sorted(resolved_iac_paths - expected_iac_paths)
+        removed = sorted(expected_iac_paths - resolved_iac_paths)
+        raise ValueError(
+            "formal tile/teacher IAC package set changed: "
+            f"added={added[:10]} removed={removed[:10]}"
+        )
+    for raw_path in sorted(expected_iac_paths):
+        path = Path(raw_path)
+        expected_digest = iac_expected.get(raw_path)
+        if expected_digest is None:
+            raise ValueError(
+                "formal tile/teacher IAC path is not canonical: "
+                f"{raw_path}"
+            )
+        if not path.is_file() or _file_sha256(path) != str(
+            expected_digest
+        ):
+            raise ValueError(
+                f"formal tile/teacher IAC content changed: {path}"
+            )
+    student_path = Path(
+        str(student_expected.get("path", ""))
+    ).resolve()
+    if (
+        student_path != STUDENT_PRETRAINED_PATH.resolve()
+        or not student_path.is_file()
+        or _file_sha256(student_path)
+        != str(student_expected.get("sha256", ""))
+    ):
+        raise ValueError(
+            "formal DINOv2 initialization content changed"
+        )
+    cfg["data"]["formal_asset_contract_sha256"] = _canonical_sha256(
+        formal
+    )
+
+
+def _freeze_supervision_asset_contract(cfg: dict) -> None:
+    """Bind every mutable human/prototype supervision file by content."""
+
+    data = cfg["data"]
+    paths: dict[str, Path] = {}
+    for key in (
+        "prototype_supervision_manifest_path",
+        "expert_replay_prototype_manifest_path",
+        "spatial_manifest_path",
+    ):
+        value = data.get(key)
+        if value:
+            paths[key] = Path(str(value)).resolve()
+    prototype_paths = data.get("prototype_paths")
+    if isinstance(prototype_paths, dict):
+        for name, value in prototype_paths.items():
+            paths[f"prototype_paths.{name}"] = Path(str(value)).resolve()
+    missing = [
+        f"{name}={path}"
+        for name, path in paths.items()
+        if not path.is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "supervision assets are missing: " + ", ".join(missing)
+        )
+    frozen = {
+        name: {
+            "path": str(path),
+            "sha256": _file_sha256(path),
+        }
+        for name, path in sorted(paths.items())
+    }
+    formal_static = (
+        data.get("formal_asset_sha256", {}).get(
+            "static_files",
+            {},
+        )
+    )
+    if formal_static:
+        expected_digests = {
+            str(value) for value in formal_static.values()
+        }
+        unmatched = [
+            name
+            for name, value in frozen.items()
+            if value["sha256"] not in expected_digests
+        ]
+        if unmatched:
+            raise ValueError(
+                "supervision asset content differs from the formal A0 "
+                f"contract: {unmatched}"
+            )
+    data["supervision_asset_sha256"] = frozen
+
+
+def _excluded_rows_contract(
+    package_paths: list[str],
+    rows_by_package: dict[int, np.ndarray],
+) -> dict[str, list[int]]:
+    return {
+        str(Path(package_paths[index]).resolve()): [
+            int(value)
+            for value in np.asarray(rows, dtype=np.int64).tolist()
+        ]
+        for index, rows in sorted(rows_by_package.items())
+        if len(rows) > 0
+    }
+
+
+def _freeze_expert_split_exclusion_contract(
+    cfg: dict,
+    *,
+    train_packages: list[str],
+    train_excluded_rows: dict[int, np.ndarray],
+    val_packages: list[str],
+    val_excluded_rows: dict[int, np.ndarray],
+) -> None:
+    contract = {
+        "population_train_excludes_expert_val": (
+            _excluded_rows_contract(
+                train_packages,
+                train_excluded_rows,
+            )
+        ),
+        "population_val_excludes_expert_train": (
+            _excluded_rows_contract(
+                val_packages,
+                val_excluded_rows,
+            )
+        ),
+    }
+    cfg["data"]["expert_split_exclusion_contract"] = contract
+    cfg["data"]["expert_split_exclusion_sha256"] = _canonical_sha256(
+        contract
+    )
+
+
 def _freeze_optimizer_visible_contract(
     cfg: dict,
     *,
@@ -1178,7 +1569,7 @@ def _freeze_optimizer_visible_contract(
     expert_packages: list[str],
     expert_replay_enabled: bool,
 ) -> None:
-    """Record a cheap package-list/byte-size resume guard."""
+    """Freeze optimizer-visible package identity and content."""
 
     visible = list(population_packages)
     if expert_replay_enabled:
@@ -1190,24 +1581,63 @@ def _freeze_optimizer_visible_contract(
     cfg["data"]["optimizer_visible_tile_package_sizes"] = [
         Path(path).stat().st_size for path in frozen_packages
     ]
+    formal_iac = (
+        cfg["data"].get("formal_asset_sha256", {}).get(
+            "iac_packages",
+            {},
+        )
+    )
+    if formal_iac and not isinstance(formal_iac, dict):
+        raise ValueError("data.formal_asset_sha256.iac_packages is invalid")
+    digests: list[str] = []
+    for path in frozen_packages:
+        digest = formal_iac.get(path) if formal_iac else None
+        if formal_iac and digest is None:
+            raise ValueError(
+                "optimizer-visible package is absent from the formal "
+                f"A0 asset contract: {path}"
+            )
+        if not formal_iac:
+            digest = _file_sha256(path)
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(
+                f"invalid optimizer-visible package SHA-256: {path}"
+            )
+        digests.append(digest)
+    cfg["data"]["optimizer_visible_tile_package_sha256"] = digests
 
 
 def _verify_optimizer_visible_packages(cfg: dict) -> None:
     packages = cfg["data"].get("optimizer_visible_tile_packages")
     sizes = cfg["data"].get("optimizer_visible_tile_package_sizes")
-    if not isinstance(packages, list) or not isinstance(sizes, list):
+    digests = cfg["data"].get(
+        "optimizer_visible_tile_package_sha256"
+    )
+    if (
+        not isinstance(packages, list)
+        or not isinstance(sizes, list)
+        or not isinstance(digests, list)
+    ):
         raise ValueError("checkpoint has no optimizer-visible package list")
-    if len(packages) != len(sizes):
+    if len(packages) != len(sizes) or len(packages) != len(digests):
         raise ValueError("optimizer-visible package count changed")
     current = [Path(path).stat().st_size for path in packages]
     if current != [int(size) for size in sizes]:
         raise ValueError("optimizer-visible package size changed")
+    current_digests = [_file_sha256(path) for path in packages]
+    if current_digests != [str(value) for value in digests]:
+        raise ValueError("optimizer-visible package content changed")
 
 
 def _validate_resume_contract(cfg: dict, resume_state: dict) -> None:
     saved_cfg = resume_state.get("config")
     if not isinstance(saved_cfg, dict):
         raise ValueError("resume checkpoint has no resolved training config")
+    _verify_optimizer_visible_packages(saved_cfg)
     if _resume_contract(saved_cfg) != _resume_contract(cfg):
         raise ValueError(
             "resume config changes the model, loss, data, or optimization "
@@ -1414,6 +1844,7 @@ def main() -> None:
     _probe.timeline_event("startup.begin", force=True)
     cfg = load_config(args.config)
     _probe.timeline_event("startup.config_loaded", force=True)
+    _verify_formal_ablation_contract(cfg)
     cfg["research_contract"] = {
         "student_backbone": STUDENT_BACKBONE_NAME,
         "student_pretrained": True,
@@ -1422,6 +1853,7 @@ def main() -> None:
         "student_pretrained_file": STUDENT_PRETRAINED_PATH.name,
         "student_pretrained_sha256": STUDENT_PRETRAINED_SHA256,
     }
+    _verify_formal_source_contract(cfg)
     _cap_compute_threads(int(cfg["data"].get("num_workers", 0)))
     seed_everything(int(cfg["runtime"]["seed"]))
     device = torch.device(cfg["runtime"]["device"])
@@ -1434,13 +1866,50 @@ def main() -> None:
     if explicit_split_packages:
         train_tile_packages = _paths_from_data(cfg, "train_image_tile_package_paths")
         val_tile_packages = _paths_from_data(cfg, "val_image_tile_package_paths")
-        train_teacher_packages = _teacher_paths_from_data(cfg, "train_teacher_feature_package_paths")
-        val_teacher_packages = _teacher_paths_from_data(cfg, "val_teacher_feature_package_paths")
-        names = list(train_teacher_packages)
-        expert_tile_packages = train_tile_packages + val_tile_packages
-        expert_teacher_packages = {
-            name: train_teacher_packages[name] + val_teacher_packages[name]
+        train_teacher_packages = _active_teacher_paths(
+            cfg,
+            _teacher_paths_from_data(
+                cfg,
+                "train_teacher_feature_package_paths",
+            ),
+            key="train_teacher_feature_package_paths",
+        )
+        val_teacher_packages = _active_teacher_paths(
+            cfg,
+            _teacher_paths_from_data(
+                cfg,
+                "val_teacher_feature_package_paths",
+            ),
+            key="val_teacher_feature_package_paths",
+        )
+        names = teacher_names(cfg)
+        complete_expert_tile_packages = (
+            list(train_tile_packages) + list(val_tile_packages)
+        )
+        complete_expert_teacher_packages = {
+            name: (
+                list(train_teacher_packages[name])
+                + list(val_teacher_packages[name])
+            )
             for name in names
+        }
+        complete_train_tile_packages = list(
+            complete_expert_tile_packages
+        )
+        complete_val_tile_packages = list(
+            complete_expert_tile_packages
+        )
+        complete_train_teacher_packages = {
+            name: list(paths)
+            for name, paths in (
+                complete_expert_teacher_packages.items()
+            )
+        }
+        complete_val_teacher_packages = {
+            name: list(paths)
+            for name, paths in (
+                complete_expert_teacher_packages.items()
+            )
         }
     elif manifest_path:
         manifest = load_training_manifest(manifest_path)
@@ -1460,30 +1929,68 @@ def main() -> None:
             manifest,
             "val",
         )
-        expert_tile_packages = expert_train_tiles + expert_val_tiles
-        expert_teacher_packages = {
-            name: expert_train_teachers[name] + expert_val_teachers[name]
+        complete_expert_tile_packages = (
+            expert_train_tiles + expert_val_tiles
+        )
+        complete_expert_teacher_packages = {
+            name: (
+                expert_train_teachers[name]
+                + expert_val_teachers[name]
+            )
             for name in names
+        }
+        complete_train_tile_packages = list(
+            complete_expert_tile_packages
+        )
+        complete_val_tile_packages = list(
+            complete_expert_tile_packages
+        )
+        complete_train_teacher_packages = {
+            name: list(paths)
+            for name, paths in (
+                complete_expert_teacher_packages.items()
+            )
+        }
+        complete_val_teacher_packages = {
+            name: list(paths)
+            for name, paths in (
+                complete_expert_teacher_packages.items()
+            )
         }
     else:
         tile_packages = image_tile_package_paths(cfg)
-        teacher_packages = teacher_feature_package_paths(cfg)
+        teacher_packages = _active_teacher_paths(
+            cfg,
+            teacher_feature_package_paths(cfg),
+            key="teacher_feature_package_paths",
+        )
         train_tile_packages = tile_packages
         val_tile_packages = tile_packages
         train_teacher_packages = teacher_packages
         val_teacher_packages = teacher_packages
-        names = list(teacher_packages)
-        expert_tile_packages = list(train_tile_packages)
-        expert_teacher_packages = {
+        names = teacher_names(cfg)
+        complete_train_tile_packages = list(train_tile_packages)
+        complete_val_tile_packages = list(val_tile_packages)
+        complete_train_teacher_packages = {
             name: list(paths)
             for name, paths in train_teacher_packages.items()
         }
+        complete_val_teacher_packages = {
+            name: list(paths)
+            for name, paths in val_teacher_packages.items()
+        }
+    _verify_formal_asset_contract(
+        cfg,
+        complete_tile_packages=complete_train_tile_packages,
+        complete_teacher_packages=complete_train_teacher_packages,
+    )
     _probe.timeline_event(
         "startup.package_paths_resolved",
         force=True,
         train_packages=len(train_tile_packages),
         validation_packages=len(val_tile_packages),
-        expert_packages=len(expert_tile_packages),
+        expert_train_packages=len(complete_train_tile_packages),
+        expert_validation_packages=len(complete_val_tile_packages),
     )
     if manifest_path or explicit_split_packages:
         _assert_disjoint_package_paths(
@@ -1571,18 +2078,66 @@ def main() -> None:
             cfg["loss"].get("spatial_point_tolerance_cells", 1)
         ),
     )
-    # Spatial supervision is a training-side expert asset. Validation batches
-    # intentionally carry no spatial targets; localization is evaluated externally
-    # only after the training run is frozen.
-    val_spatial_targets = {}
+    spatial_val_splits = set(
+        cfg["data"].get("spatial_val_splits", ["val"])
+    )
+    val_spatial_targets = build_spatial_roi_targets(
+        spatial_manifest_path,
+        component_names=component_names,
+        image_size=image_size,
+        grid_size=spatial_grid_size,
+        allowed_splits=spatial_val_splits,
+        point_tolerance_cells=int(
+            cfg["loss"].get("spatial_point_tolerance_cells", 1)
+        ),
+    )
     _probe.timeline_event(
         "startup.spatial_assets_loaded",
         force=True,
-        spatial_tiles=len(train_spatial_targets),
+        train_spatial_tiles=len(train_spatial_targets),
+        validation_spatial_tiles=len(val_spatial_targets),
     )
     expert_tile_ids = set(replay_prototype_labels).union(
         train_spatial_targets
     )
+    validation_expert_tile_ids = set(val_prototype_labels).union(
+        val_spatial_targets
+    )
+    supervision_overlap = expert_tile_ids & validation_expert_tile_ids
+    if supervision_overlap:
+        raise ValueError(
+            "train/validation expert tile overlap: "
+            f"count={len(supervision_overlap)} "
+            f"sample={next(iter(sorted(supervision_overlap)))}"
+        )
+    if bool(cfg["data"].get("require_complete_expert_validation", False)):
+        missing_classes = [
+            classification_class_names[index]
+            for index in range(len(classification_class_names))
+            if not any(
+                label.classification == index
+                for label in val_prototype_labels.values()
+            )
+        ]
+        if missing_classes:
+            raise ValueError(
+                "expert validation has no classification labels for: "
+                + ", ".join(missing_classes)
+            )
+        missing_components = [
+            component
+            for index, component in enumerate(component_names)
+            if not any(
+                bool(target.supervised[index])
+                for target in val_spatial_targets.values()
+            )
+        ]
+        if missing_components:
+            raise ValueError(
+                "expert validation has no spatial supervision for: "
+                + ", ".join(missing_components)
+            )
+
     expert_locations: dict[str, tuple[str, int]] = {}
     for tile_id, label in replay_prototype_labels.items():
         if label.package_path is not None and label.row is not None:
@@ -1605,54 +2160,98 @@ def main() -> None:
             f"count={len(missing_locations)} "
             f"sample={', '.join(missing_locations[:3])}"
         )
+    validation_expert_locations: dict[str, tuple[str, int]] = {}
+    for tile_id, label in val_prototype_labels.items():
+        if label.package_path is not None and label.row is not None:
+            validation_expert_locations[tile_id] = (
+                label.package_path,
+                label.row,
+            )
+    for tile_id, location in load_spatial_tile_locations(
+        spatial_manifest_path,
+        allowed_splits=spatial_val_splits,
+    ).items():
+        previous = validation_expert_locations.get(tile_id)
+        if previous is not None and previous != location:
+            raise ValueError(
+                "validation classification/spatial provenance mismatch: "
+                f"tile={tile_id} classification={previous} spatial={location}"
+            )
+        validation_expert_locations[tile_id] = location
+    missing_validation_locations = sorted(
+        validation_expert_tile_ids.difference(
+            validation_expert_locations
+        )
+    )
+    if missing_validation_locations:
+        raise ValueError(
+            "validation expert annotation is missing fixed IAC "
+            "package/row provenance: "
+            f"count={len(missing_validation_locations)} "
+            f"sample={', '.join(missing_validation_locations[:3])}"
+        )
+
     expert_rows_by_package: dict[int, np.ndarray] = {}
+    expert_tile_packages: list[str] = []
+    expert_teacher_packages: dict[str, list[str]] = {
+        name: []
+        for name in names
+    }
     if expert_tile_ids:
-        resolved_rows = _target_rows_by_package(
+        (
             expert_tile_packages,
+            expert_teacher_packages,
+            expert_rows_by_package,
+            _,
+        ) = _expert_package_subset(
+            complete_train_tile_packages,
+            complete_train_teacher_packages,
             expert_locations,
         )
-        selected_indices = sorted(resolved_rows)
-        selected_paths = {
-            expert_tile_packages[index]
-            for index in selected_indices
-        }
-        expert_tile_packages = [
-            expert_tile_packages[index]
-            for index in selected_indices
-        ]
-        expert_teacher_packages = {
-            name: [
-                paths[index]
-                for index in selected_indices
-            ]
-            for name, paths in expert_teacher_packages.items()
-        }
-        expert_rows_by_package = {
-            new_index: resolved_rows[old_index]
-            for new_index, old_index in enumerate(selected_indices)
-        }
-
-        # Expert-supervised packages are never part of the internal
-        # teacher-alignment validation stream. This keeps the package-level
-        # split disjoint even when an older manifest auto-split ignored the
-        # annotation asset's explicit train designation.
-        val_keep = _validation_package_keep_indices(
-            val_tile_packages,
-            list(selected_paths),
+    validation_expert_rows_by_package: dict[int, np.ndarray] = {}
+    validation_expert_tile_packages: list[str] = []
+    validation_expert_teacher_packages: dict[str, list[str]] = {
+        name: []
+        for name in names
+    }
+    if validation_expert_tile_ids:
+        (
+            validation_expert_tile_packages,
+            validation_expert_teacher_packages,
+            validation_expert_rows_by_package,
+            _,
+        ) = _expert_package_subset(
+            complete_val_tile_packages,
+            complete_val_teacher_packages,
+            validation_expert_locations,
         )
-        val_tile_packages = [
-            val_tile_packages[index]
-            for index in val_keep
-        ]
-        val_teacher_packages = {
-            name: [paths[index] for index in val_keep]
-            for name, paths in val_teacher_packages.items()
-        }
-        if not val_tile_packages:
-            raise ValueError(
-                "expert-supervised package exclusion left an empty "
-                "validation split"
-            )
+    # The finalized expert split is authoritative even when its source IACs
+    # came from an older train/val package partition. Exact expert-validation
+    # rows must never enter the optimizer through population distillation, and
+    # exact expert-training rows must not leak into population validation.
+    population_train_excluded_rows = _target_rows_by_package(
+        train_tile_packages,
+        validation_expert_locations,
+        require_all=False,
+    )
+    population_val_excluded_rows = _target_rows_by_package(
+        val_tile_packages,
+        expert_locations,
+        require_all=False,
+    )
+    cfg["data"]["population_train_excluded_expert_val_tiles"] = int(
+        sum(len(rows) for rows in population_train_excluded_rows.values())
+    )
+    cfg["data"]["population_val_excluded_expert_train_tiles"] = int(
+        sum(len(rows) for rows in population_val_excluded_rows.values())
+    )
+    _freeze_expert_split_exclusion_contract(
+        cfg,
+        train_packages=train_tile_packages,
+        train_excluded_rows=population_train_excluded_rows,
+        val_packages=val_tile_packages,
+        val_excluded_rows=population_val_excluded_rows,
+    )
     spatial_dataset_kwargs = {
         "spatial_component_count": len(component_names) if spatial_manifest_path else 0,
         "spatial_grid_size": spatial_grid_size,
@@ -1675,6 +2274,7 @@ def main() -> None:
             expected_dims=dims,
             prototype_labels=train_prototype_labels,
             spatial_targets=train_spatial_targets,
+            excluded_rows_by_package=population_train_excluded_rows,
             **spatial_dataset_kwargs,
         )
         val_ds = PackageSampledDistillationDataset(
@@ -1684,13 +2284,24 @@ def main() -> None:
             max_records=int(cfg["data"].get("max_val_records", 0)),
             seed=int(cfg["runtime"]["seed"]) + 1,
             expected_dims=dims,
-            prototype_labels=val_prototype_labels,
-            spatial_targets=val_spatial_targets,
+            prototype_labels={},
+            spatial_targets={},
+            excluded_rows_by_package=population_val_excluded_rows,
             **spatial_dataset_kwargs,
         )
     elif manifest_path or explicit_split_packages:
         train_records = read_packaged_tile_records(train_tile_packages)
         val_records = read_packaged_tile_records(val_tile_packages)
+        train_records = [
+            item
+            for item in train_records
+            if item.record.tile_id not in validation_expert_tile_ids
+        ]
+        val_records = [
+            item
+            for item in val_records
+            if item.record.tile_id not in expert_tile_ids
+        ]
         if not train_records or not val_records:
             raise ValueError("manifest must contain non-empty train and val splits")
         train_records = _limit_records(train_records, int(cfg["data"].get("max_train_records", 0)), int(cfg["runtime"]["seed"]))
@@ -1725,8 +2336,8 @@ def main() -> None:
             val_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=val_teacher_packages,
-            prototype_labels=val_prototype_labels,
-            spatial_targets=val_spatial_targets,
+            prototype_labels={},
+            spatial_targets={},
             **spatial_dataset_kwargs,
         )
     else:
@@ -1738,6 +2349,16 @@ def main() -> None:
         )
         train_records = [item for item in records if item.record.split == "train"]
         val_records = [item for item in records if item.record.split == "val"]
+        train_records = [
+            item
+            for item in train_records
+            if item.record.tile_id not in validation_expert_tile_ids
+        ]
+        val_records = [
+            item
+            for item in val_records
+            if item.record.tile_id not in expert_tile_ids
+        ]
         if not train_records or not val_records:
             raise ValueError("manifest must contain non-empty train and val splits")
         train_records = _limit_records(train_records, int(cfg["data"].get("max_train_records", 0)), int(cfg["runtime"]["seed"]))
@@ -1772,8 +2393,8 @@ def main() -> None:
             val_records,
             **common_dataset_kwargs,
             teacher_cache_package_paths=val_teacher_packages,
-            prototype_labels=val_prototype_labels,
-            spatial_targets=val_spatial_targets,
+            prototype_labels={},
+            spatial_targets={},
             **spatial_dataset_kwargs,
         )
     _probe.timeline_event(
@@ -1867,6 +2488,21 @@ def main() -> None:
     )
     prototype_refresh_loader = None
     spatial_prototype_refresh_loader = None
+    expert_classification_val_loader = None
+    expert_spatial_val_loader = None
+    expert_batch_size = int(
+        cfg["data"].get(
+            "expert_batch_size",
+            min(64, int(cfg["train"]["batch_size"])),
+        )
+    )
+    cfg["data"]["expert_batch_size"] = expert_batch_size
+    prototype_batch_size = int(
+        cfg["train"].get(
+            "dynamic_prototype_batch_size",
+            cfg["train"]["batch_size"],
+        )
+    )
     if expert_tile_ids:
         expert_ds = PackageSampledDistillationDataset(
             expert_tile_packages,
@@ -1886,19 +2522,6 @@ def main() -> None:
             ),
             spatial_targets=train_spatial_targets,
             **spatial_dataset_kwargs,
-        )
-        expert_batch_size = int(
-            cfg["data"].get(
-                "expert_batch_size",
-                min(64, int(cfg["train"]["batch_size"])),
-            )
-        )
-        cfg["data"]["expert_batch_size"] = expert_batch_size
-        prototype_batch_size = int(
-            cfg["train"].get(
-                "dynamic_prototype_batch_size",
-                cfg["train"]["batch_size"],
-            )
         )
         expert_bank = _materialize_expert_bank(
             expert_ds,
@@ -1950,6 +2573,63 @@ def main() -> None:
                 replay_interval
             )
             cfg["data"]["expert_replay_tiles"] = len(expert_tile_ids)
+    if validation_expert_tile_ids:
+        validation_expert_ds = PackageSampledDistillationDataset(
+            validation_expert_tile_packages,
+            validation_expert_teacher_packages,
+            image_size=image_size,
+            max_records=0,
+            seed=int(cfg["runtime"]["seed"]) + 1,
+            mean=cfg["data"].get("mean"),
+            std=cfg["data"].get("std"),
+            expected_dims=dims,
+            prototype_labels=val_prototype_labels,
+            tensor_collate=bool(
+                cfg["data"].get(
+                    "tensor_collate",
+                    device.type == "cuda",
+                )
+            ),
+            spatial_targets=val_spatial_targets,
+            **spatial_dataset_kwargs,
+        )
+        validation_bank = _materialize_expert_bank(
+            validation_expert_ds,
+            validation_expert_rows_by_package,
+            batch_size=prototype_batch_size,
+            num_workers=num_workers,
+            prefetch_factor=int(
+                cfg["data"].get("prefetch_factor", 2)
+            ),
+        )
+        if val_prototype_labels:
+            classification_indices = [
+                validation_bank.index_by_tile_id[tile_id]
+                for tile_id in sorted(val_prototype_labels)
+            ]
+            expert_classification_val_loader = (
+                _InMemoryExpertBatchLoader(
+                    validation_bank,
+                    indices=classification_indices,
+                    batch_size=expert_batch_size,
+                    seed=int(cfg["runtime"]["seed"]) + 400_009,
+                )
+            )
+        if val_spatial_targets:
+            spatial_validation_indices = [
+                validation_bank.index_by_tile_id[tile_id]
+                for tile_id in sorted(val_spatial_targets)
+            ]
+            expert_spatial_val_loader = _InMemoryExpertBatchLoader(
+                validation_bank,
+                indices=spatial_validation_indices,
+                batch_size=expert_batch_size,
+                seed=int(cfg["runtime"]["seed"]) + 500_009,
+            )
+        cfg["data"]["expert_validation_tiles"] = len(
+            validation_expert_tile_ids
+        )
+    _freeze_supervision_asset_contract(cfg)
     _freeze_optimizer_visible_contract(
         cfg,
         population_packages=train_tile_packages,
@@ -2038,6 +2718,10 @@ def main() -> None:
         spatial_prototype_refresh_loader=(
             spatial_prototype_refresh_loader
         ),
+        expert_classification_val_loader=(
+            expert_classification_val_loader
+        ),
+        expert_spatial_val_loader=expert_spatial_val_loader,
     )
     _probe.timeline_event("startup.fit_returned", force=True)
     print("train_ok " + " ".join(f"{k}={v}" for k, v in metrics.items()))

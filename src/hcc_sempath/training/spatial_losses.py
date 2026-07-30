@@ -501,7 +501,8 @@ def _routed_negative_loss(
     hard_tail_topk: int = 0,
     hard_tail_weight: float = 0.5,
     sum_heads: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_pair_terms: bool = False,
+) -> tuple[torch.Tensor, ...]:
     """Apply negatives to valid heads with optional hard-tail suppression."""
 
     mask = mask.to(device=instance_logits.device, dtype=torch.bool)
@@ -575,7 +576,18 @@ def _routed_negative_loss(
             objective_count > 0,
             instance_logits,
         )
-    return loss, instance_supervised, measurement_supervised
+    result = (
+        loss,
+        instance_supervised,
+        measurement_supervised,
+    )
+    if return_pair_terms:
+        return (
+            *result,
+            instance_pair,
+            measurement_pair,
+        )
+    return result
 
 
 def _positive_area_pair_terms(
@@ -774,7 +786,7 @@ def spatial_morphometry_loss(
     point_tolerance_cells: int = 1,
     abundance_point_weight: float = 0.5,
     brush_weight: float = 1.0,
-    brush_top_fraction: float = 0.25,
+    brush_top_fraction: float = 1.0,
     explicit_negative_weight: float = 1.0,
     implicit_negative_weight: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -1056,6 +1068,8 @@ def spatial_morphometry_loss(
         explicit_loss,
         explicit_pairs_instance,
         explicit_pairs_abundance,
+        explicit_pair_instance,
+        explicit_pair_abundance,
     ) = _routed_negative_loss(
         instance_logits,
         abundance_logits,
@@ -1064,11 +1078,14 @@ def spatial_morphometry_loss(
         hard_tail_topk=4,
         hard_tail_weight=0.5,
         sum_heads=True,
+        return_pair_terms=True,
     )
     (
         implicit_loss,
         implicit_pairs_instance,
         implicit_pairs_abundance,
+        implicit_pair_instance,
+        implicit_pair_abundance,
     ) = _routed_negative_loss(
         instance_logits,
         abundance_logits,
@@ -1088,6 +1105,53 @@ def spatial_morphometry_loss(
             .any(dim=2)
             | implicit_bool.flatten(2).all(dim=2)
         ),
+        return_pair_terms=True,
+    )
+    implicit_objective_count = (
+        implicit_pairs_instance.float()
+        + implicit_pairs_abundance.float()
+    )
+    implicit_pair = (
+        implicit_pair_instance
+        * implicit_pairs_instance.float()
+        + implicit_pair_abundance
+        * implicit_pairs_abundance.float()
+    ) / implicit_objective_count.clamp_min(1.0)
+    implicit_pair_mask = implicit_objective_count > 0
+
+    def _component_statistics(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = mask.to(device=values.device, dtype=values.dtype)
+        return (
+            (values * weight).sum(dim=0).detach(),
+            weight.sum(dim=0).detach(),
+        )
+
+    instance_point_sum, instance_point_count = _component_statistics(
+        instance_point_pair,
+        point_pairs,
+    )
+    measurement_sum, measurement_count = _component_statistics(
+        measurement_pair,
+        measurement_pairs,
+    )
+    explicit_instance_sum, explicit_instance_count = (
+        _component_statistics(
+            explicit_pair_instance,
+            explicit_pairs_instance,
+        )
+    )
+    explicit_abundance_sum, explicit_abundance_count = (
+        _component_statistics(
+            explicit_pair_abundance,
+            explicit_pairs_abundance,
+        )
+    )
+    implicit_sum, implicit_count = _component_statistics(
+        implicit_pair,
+        implicit_pair_mask,
     )
 
     total = (
@@ -1124,4 +1188,14 @@ def spatial_morphometry_loss(
             implicit_pairs_instance.sum(),
             implicit_pairs_abundance.sum(),
         ).detach(),
+        "_spatial_eval_instance_point_sum": instance_point_sum,
+        "_spatial_eval_instance_point_count": instance_point_count,
+        "_spatial_eval_measurement_positive_sum": measurement_sum,
+        "_spatial_eval_measurement_positive_count": measurement_count,
+        "_spatial_eval_explicit_instance_sum": explicit_instance_sum,
+        "_spatial_eval_explicit_instance_count": explicit_instance_count,
+        "_spatial_eval_explicit_abundance_sum": explicit_abundance_sum,
+        "_spatial_eval_explicit_abundance_count": explicit_abundance_count,
+        "_spatial_eval_implicit_sum": implicit_sum,
+        "_spatial_eval_implicit_count": implicit_count,
     }

@@ -21,6 +21,8 @@ from hcc_sempath.training.feature_pack_merge import (
 
 TILE_SUFFIX = ".tiles.iac"
 TEACHERS = ("gigapath", "h_optimus_1", "uni2_h", "virchow2")
+TARGET_PER_CLASS = 400
+SEPARATION_WEIGHT = 32.0
 
 
 def _strip_suffix(name: str, suffix: str) -> str:
@@ -63,7 +65,14 @@ def _load_annotations(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]
     annotations = payload.get("annotations")
     if not isinstance(annotations, dict):
         raise ValueError(f"annotation JSON missing annotations object: {path}")
-    rows = [item for item in annotations.values() if item.get("tile_id") and item.get("classification")]
+    rows = sorted(
+        (
+            item
+            for item in annotations.values()
+            if item.get("tile_id") and item.get("classification")
+        ),
+        key=lambda item: str(item["tile_id"]),
+    )
     if not rows:
         raise ValueError(f"annotation JSON has no usable annotations: {path}")
     return payload, rows
@@ -107,15 +116,9 @@ def _read_features(
             merged_reader.close()
     reader = FeatureCacheReader(path)
     try:
-        return np.stack(
-            [
-                reader.read_feature_at(int(row))
-                .astype(np.float32, copy=False)
-                .reshape(-1)
-                for row in rows
-            ],
-            axis=0,
-        )
+        return reader.read_features_at(
+            [int(row) for row in rows]
+        ).astype(np.float32, copy=False)
     finally:
         reader.close()
 
@@ -141,7 +144,10 @@ def _write_registry(
     )
 
 
-def _write_supervision_csv(path: Path, rows: list[dict[str, Any]], source_split: str) -> None:
+def _write_supervision_csv(
+    path: Path,
+    split_rows: list[tuple[str, list[dict[str, Any]]]],
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     seen: set[str] = set()
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -160,25 +166,42 @@ def _write_supervision_csv(path: Path, rows: list[dict[str, Any]], source_split:
             ],
         )
         writer.writeheader()
-        for item in rows:
-            tile_id = str(item["tile_id"]).strip()
-            if tile_id in seen:
-                raise ValueError(f"duplicate annotated tile_id: {tile_id}")
-            seen.add(tile_id)
-            slide_id = str(item.get("slide") or item.get("slide_id") or tile_id).strip()
-            writer.writerow(
-                {
-                    "tile_id": tile_id,
-                    "slide_id": slide_id,
-                    "patient_id": str(item.get("patient_id") or slide_id).strip(),
-                    "classification_label": str(item["classification"]).strip(),
-                    "source_split": source_split,
-                    "adjudicated": "true",
-                    "dataset": str(item.get("dataset") or Path(str(item.get("iac") or "")).parent.name).strip(),
-                    "iac": str(item.get("iac") or "").strip(),
-                    "row": str(item.get("row")),
-                }
-            )
+        for source_split, rows in split_rows:
+            for item in rows:
+                tile_id = str(item["tile_id"]).strip()
+                if tile_id in seen:
+                    raise ValueError(
+                        "train/validation annotation overlap or duplicate: "
+                        f"{tile_id}"
+                    )
+                seen.add(tile_id)
+                slide_id = str(
+                    item.get("slide")
+                    or item.get("slide_id")
+                    or tile_id
+                ).strip()
+                writer.writerow(
+                    {
+                        "tile_id": tile_id,
+                        "slide_id": slide_id,
+                        "patient_id": str(
+                            item.get("patient_id") or slide_id
+                        ).strip(),
+                        "classification_label": str(
+                            item["classification"]
+                        ).strip(),
+                        "source_split": source_split,
+                        "adjudicated": "true",
+                        "dataset": str(
+                            item.get("dataset")
+                            or Path(
+                                str(item.get("iac") or "")
+                            ).parent.name
+                        ).strip(),
+                        "iac": str(item.get("iac") or "").strip(),
+                        "row": str(item.get("row")),
+                    }
+                )
 
 
 def _collect_teacher_features(
@@ -236,11 +259,133 @@ def _build_label_prototypes(
     return prototypes, counts
 
 
+def _facility_order(
+    similarity: np.ndarray,
+    count: int,
+    *,
+    margin_rank: np.ndarray,
+) -> list[int]:
+    sample_count = int(similarity.shape[0])
+    covered = np.zeros(sample_count, dtype=np.float32)
+    selected = np.zeros(sample_count, dtype=bool)
+    order: list[int] = []
+    for _ in range(min(count, sample_count)):
+        gain = np.maximum(
+            similarity - covered[:, None],
+            0.0,
+        ).sum(axis=0, dtype=np.float64)
+        score = gain * (
+            1.0 + SEPARATION_WEIGHT * margin_rank
+        )
+        score[selected] = -np.inf
+        chosen = int(np.argmax(score))
+        order.append(chosen)
+        selected[chosen] = True
+        covered = np.maximum(covered, similarity[:, chosen])
+    return order
+
+
+def _global_class_margins(
+    rows: list[dict[str, Any]],
+    features: dict[str, np.ndarray],
+    labels: list[str],
+) -> np.ndarray:
+    row_labels = np.asarray(
+        [str(row["classification"]) for row in rows]
+    )
+    margin = np.zeros(len(rows), dtype=np.float32)
+    for teacher in TEACHERS:
+        centroids: list[np.ndarray] = []
+        for label in labels:
+            centroid = features[teacher][row_labels == label].mean(
+                axis=0
+            )
+            centroid /= max(float(np.linalg.norm(centroid)), 1e-12)
+            centroids.append(centroid)
+        scores = features[teacher] @ np.stack(centroids).T
+        for label_index, label in enumerate(labels):
+            mask = row_labels == label
+            competitor = np.max(
+                np.delete(scores[mask], label_index, axis=1),
+                axis=1,
+            )
+            margin[mask] += (
+                scores[mask, label_index] - competitor
+            ) / len(TEACHERS)
+    return margin
+
+
+def _rank_margin(
+    indices: list[int],
+    margin: np.ndarray,
+) -> np.ndarray:
+    values = margin[np.asarray(indices)]
+    order = np.argsort(values, kind="stable")
+    ranks = np.empty(len(indices), dtype=np.float32)
+    ranks[order] = np.linspace(
+        0.0,
+        1.0,
+        len(indices),
+        dtype=np.float32,
+    )
+    return ranks
+
+
+def _select_fixed_training_bank(
+    rows: list[dict[str, Any]],
+    features: dict[str, np.ndarray],
+    classification_names: list[str],
+) -> list[int]:
+    normalized_features = {
+        teacher: _normalize_rows(features[teacher])
+        for teacher in TEACHERS
+    }
+    global_margin = _global_class_margins(
+        rows,
+        normalized_features,
+        classification_names,
+    )
+    selected_indices: list[int] = []
+    for label in classification_names:
+        indices = [
+            index
+            for index, row in enumerate(rows)
+            if str(row["classification"]) == label
+        ]
+        if len(indices) < TARGET_PER_CLASS:
+            raise ValueError(
+                f"{label} has {len(indices)} accepted tiles; "
+                f"{TARGET_PER_CLASS} are required"
+            )
+        combined = np.zeros(
+            (len(indices), len(indices)),
+            dtype=np.float32,
+        )
+        for teacher in TEACHERS:
+            matrix = normalized_features[teacher][indices]
+            combined += np.clip(
+                (matrix @ matrix.T + 1.0) * 0.5,
+                0.0,
+                1.0,
+            ) / len(TEACHERS)
+        local_order = _facility_order(
+            combined,
+            TARGET_PER_CLASS,
+            margin_rank=_rank_margin(indices, global_margin),
+        )
+        selected_indices.extend(
+            indices[index]
+            for index in local_order
+        )
+    return sorted(selected_indices)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build training prototype assets from final annotation JSON.")
     parser.add_argument("--annotation-json", required=True)
     parser.add_argument("--training-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--validation-annotation-json", default="")
     parser.add_argument("--embedding-dim", type=int, default=1536)
     parser.add_argument("--source-split", default="train")
     args = parser.parse_args()
@@ -259,10 +404,32 @@ def main() -> None:
     names = list(classification_names)
 
     teacher_dims: dict[str, int] = {}
+    teacher_features: dict[str, np.ndarray] = {}
     for teacher in TEACHERS:
         features, dim = _collect_teacher_features(manifest, rows, teacher)
         teacher_dims[teacher] = dim
-        prototypes, counts = _build_label_prototypes(rows, features, classification_names, spatial_names)
+        teacher_features[teacher] = np.stack(
+            features,
+            axis=0,
+        ).astype(np.float32)
+
+    selected_indices = _select_fixed_training_bank(
+        rows,
+        teacher_features,
+        classification_names,
+    )
+    selected_rows = [rows[index] for index in selected_indices]
+    for teacher in TEACHERS:
+        selected_features = [
+            teacher_features[teacher][index]
+            for index in selected_indices
+        ]
+        prototypes, counts = _build_label_prototypes(
+            selected_rows,
+            selected_features,
+            classification_names,
+            spatial_names,
+        )
         _write_registry(
             output_dir / f"{teacher}_hcc_semantic_prototypes.pt",
             prototypes=prototypes,
@@ -273,16 +440,52 @@ def main() -> None:
                 "training_manifest": str(manifest_path),
                 "teacher": teacher,
                 "builder": "build_prototype_assets_from_annotations.py",
+                "selection": (
+                    "four-teacher fixed greedy facility coverage"
+                ),
+                "target_per_class": TARGET_PER_CLASS,
             },
         )
 
+    validation_rows: list[dict[str, Any]] = []
+    validation_path: Path | None = None
+    if str(args.validation_annotation_json).strip():
+        validation_path = Path(args.validation_annotation_json)
+        validation_payload, validation_rows = _load_annotations(
+            validation_path
+        )
+        validation_names = [
+            str(name)
+            for name in validation_payload.get(
+                "classification_prototypes",
+                [],
+            )
+        ]
+        if validation_names != classification_names:
+            raise ValueError(
+                "training/validation classification schemas differ"
+            )
     supervision_path = output_dir / "hcc_prototype_supervision_manifest.csv"
-    _write_supervision_csv(supervision_path, rows, source_split=str(args.source_split))
+    _write_supervision_csv(
+        supervision_path,
+        [
+            (str(args.source_split), selected_rows),
+            ("val", validation_rows),
+        ],
+    )
     summary = {
         "annotation_json": str(annotation_path),
+        "validation_annotation_json": (
+            None
+            if validation_path is None
+            else str(validation_path)
+        ),
         "training_manifest": str(manifest_path),
         "output_dir": str(output_dir),
-        "annotations": len(rows),
+        "accepted_training_annotations": len(rows),
+        "selected_training_annotations": len(selected_rows),
+        "validation_annotations": len(validation_rows),
+        "target_per_class": TARGET_PER_CLASS,
         "classification_prototypes": classification_names,
         "teacher_dims": teacher_dims,
         "supervision_manifest": str(supervision_path),
@@ -290,7 +493,8 @@ def main() -> None:
     (output_dir / "prototype_assets_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(
         "prototype_assets_ok "
-        f"annotations={len(rows)} output_dir={output_dir} "
+        f"train_selected={len(selected_rows)} "
+        f"validation={len(validation_rows)} output_dir={output_dir} "
         f"classification_classes={len(classification_names)}"
     )
 

@@ -48,7 +48,7 @@ if [ "${#conditions[@]}" -eq 0 ]; then
   conditions=(a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12)
 fi
 if [ -z "${HCC_SEMPATH_ABLATION_BASE_CONFIG:-}" ]; then
-  echo "HCC_SEMPATH_ABLATION_BASE_CONFIG must point to the selected Optuna A0 trial config" >&2
+  echo "HCC_SEMPATH_ABLATION_BASE_CONFIG must point to the completed study's exported best_config.yaml" >&2
   exit 2
 fi
 
@@ -84,6 +84,9 @@ for condition in "${conditions[@]}"; do
   checkpoint="$output_dir/checkpoints/last.pt"
   train_args=(-m hcc_sempath.cli.main train --config "$run_config")
   if [ -f "$checkpoint" ]; then
+    "${PYTHON_CMD[@]}" -c \
+      'import sys; from experiments.ablation.scripts.resolve_ablation_config import validate_ablation_resume_checkpoint; validate_ablation_resume_checkpoint(sys.argv[1], sys.argv[2])' \
+      "$run_config" "$checkpoint"
     train_args+=(--resume "$checkpoint")
   fi
   "${PYTHON_CMD[@]}" "${train_args[@]}"

@@ -12,18 +12,19 @@ inherits: matched_tenth.yaml
 # together; four-teacher feature/relation distillation and spatial
 # supervision, including its local prototype readout, remain active.
 #
-# Active prototype paths and the classification target manifest are explicitly nulled. The
-# resolver retains the separate replay-selection manifest solely for matched
-# tile sampling.
+# Prototype coordinates are explicitly nulled and the classification training
+# loss is zeroed. The classification manifest remains available both to retain
+# the matched replay images and to evaluate the unchanged complete L1
+# validation term used for checkpoint selection.
 
 runtime:
   output_dir: outputs/experiments/ablation/a1_no_prototype
 
 data:
   prototype_paths: null
-  prototype_supervision_manifest_path: null
 
 loss:
+  classification_weight: 0.0
   semantic_weight: 0.0
   zhcc_response_weight: 0.0
   prototype_filter_weight: 0.0

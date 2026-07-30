@@ -26,14 +26,14 @@ def _registry() -> PrototypeRegistry:
 
 
 def test_pamtd_returns_per_tile_teacher_weights_and_classification_target() -> None:
+    basis = torch.eye(CLASSIFICATION_COUNT)
     teacher_by_name = {
-        "a": torch.tensor(
-            [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-             [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]]
-        ),
-        "b": torch.tensor(
-            [[0.9, 0.1, 0.0, 0.0, 0.0, 0.0],
-             [0.0, 0.8, 0.2, 0.0, 0.0, 0.0]]
+        "a": basis[:2],
+        "b": torch.stack(
+            [
+                0.9 * basis[0] + 0.1 * basis[1],
+                0.8 * basis[1] + 0.2 * basis[2],
+            ]
         ),
     }
     result = prototype_adjudicated_teacher_target(
@@ -65,10 +65,7 @@ def test_pamtd_returns_per_tile_teacher_weights_and_classification_target() -> N
 
 
 def test_spatial_component_response_only_adjudicates_teacher_reliability() -> None:
-    teacher = torch.tensor(
-        [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-         [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]]
-    )
+    teacher = torch.eye(CLASSIFICATION_COUNT)[:2]
     spatial_prototypes = torch.stack(
         [
             torch.roll(
@@ -120,10 +117,7 @@ def test_spatial_component_response_only_adjudicates_teacher_reliability() -> No
 
 
 def test_uninitialized_spatial_prototypes_are_exactly_classification_only() -> None:
-    teacher = torch.tensor(
-        [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-         [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]]
-    )
+    teacher = torch.eye(CLASSIFICATION_COUNT)[:2]
     common = {
         "teacher_by_name": {"a": teacher},
         "prototypes_by_teacher": {"a": _registry()},
@@ -284,20 +278,15 @@ def test_teacher_alpha_jointly_normalizes_relation_pairs() -> None:
 
 
 def test_teacher_alpha_jointly_normalizes_semantic_kl() -> None:
+    basis = torch.eye(CLASSIFICATION_COUNT)
     common = {
         "student_by_teacher": {
-            "bad": torch.tensor(
-                [[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]],
-                requires_grad=True,
-            ),
-            "good": torch.tensor(
-                [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
-                requires_grad=True,
-            ),
+            "bad": basis[1].unsqueeze(0).requires_grad_(),
+            "good": basis[0].unsqueeze(0).requires_grad_(),
         },
         "teacher_by_name": {
-            "bad": torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]]),
-            "good": torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]]),
+            "bad": basis[0].unsqueeze(0),
+            "good": basis[0].unsqueeze(0),
         },
         "prototypes_by_teacher": {
             "bad": _registry(),

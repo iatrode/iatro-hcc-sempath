@@ -1,19 +1,7 @@
-# Shared formal ablation budget. The supplied base must be the selected Optuna
-# A0 trial; these values restate its fixed comparison population and give
-# development-loss early stopping enough room to determine the duration.
+# Shared formal ablation population. The supplied base is the selected Optuna
+# A0 trial and remains authoritative for the maximum epoch budget, schedules,
+# and joint T/C/S checkpoint-selection rule.
 
 data:
   train_tile_fraction: 0.10
   val_tile_fraction: 0.10
-
-train:
-  epochs: 6
-  max_val_batches: 1
-  max_eval_batches: 1
-  checkpoint_interval_steps: 1000
-  development_probe_interval_steps: 1000
-  development_probe_batches: 64
-  development_early_stop: true
-  development_early_stop_min_step: 4000
-  development_early_stop_relative_delta: 0.005
-  development_early_stop_patience: 2

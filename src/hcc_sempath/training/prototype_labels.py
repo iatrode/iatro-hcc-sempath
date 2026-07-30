@@ -13,7 +13,8 @@ DEFAULT_CLASSIFICATION_CLASSES = (
     "HCC-tumor-poorly-differentiated",
     "Background-liver",
     "Inflammatory-stromal",
-    "Degenerative-material",
+    "Hemorrhage-necrosis",
+    "Artifact-contamination",
 )
 
 

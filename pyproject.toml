@@ -50,7 +50,7 @@ dev = [
   "pytest",
 ]
 search = [
-  "optuna",
+  "optuna==4.9.0",
 ]
 
 [project.scripts]

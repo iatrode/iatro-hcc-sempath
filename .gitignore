@@ -9,6 +9,7 @@ dist/
 configs/local/
 artifacts/
 outputs/
+runtime/
 annotations/
 smoke_data/
 data/

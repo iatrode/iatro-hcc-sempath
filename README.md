@@ -4,7 +4,7 @@ HCC-SemPath learns an HCC-specific pathology representation from four cached
 pathology teachers and a small, fixed expert-supervision stream. The model
 combines:
 
-- six-class global classification prototype supervision;
+- seven-class global classification prototype supervision;
 - eleven-component spatial prototype supervision from class-routed point, circle, and
   brush annotations.
 
@@ -38,7 +38,7 @@ hcc-sempath --help
 ```text
 HCC image-tile IAC packages + four teacher-feature IAC streams
   -> shared DINOv2-S/14 HCC representation
-  -> six-class classification prototype readout
+  -> seven-class classification prototype readout
   -> eleven-component spatial prototype and measurement maps
   -> independently calibrated count/density/area outputs
 ```
@@ -86,26 +86,62 @@ hcc-sempath evaluate \
   --split val
 ```
 
-The terminal checkpoint is the spatial candidate. Its decoder is frozen only
-on an independent slide-separated asset whose tile/component records explicitly
+Run the A0 search only after the fixed train/validation expert assets pass its
+preflight:
+
+```bash
+python scripts/optuna_a0_search.py \
+  --base-config configs/server/train_a0_optuna.example.yaml \
+  --n-trials 0
+```
+
+Run the formal study with one coordinator; rerunning the same command resumes
+the contract-bound study with the same trial-seeded TPE trajectory and without
+exceeding its 20-trial global budget:
+
+```bash
+python scripts/optuna_a0_search.py \
+  --base-config configs/server/train_a0_optuna.example.yaml \
+  --n-trials 20 \
+  --study-trials 20
+```
+
+The A0 checkpoint minimizes a prespecified normalized joint score. Direct
+fixed-teacher feature/relation retention receives weight `0.50`; complete-bank
+seven-class balanced cross entropy and eleven-component spatial loss receive
+`0.25` each. Every term is divided by the first trial's shared-initialization
+epoch-0 value; later trials must reproduce that baseline before optimization.
+Selection and pruning start only after every active supervision ramp. The
+study contract hashes source, all resolved tile and four-teacher IAC packages,
+model initialization, supervision manifests, and prototype registries.
+An interrupted `RUNNING` or failed trial invalidates that formal study instead
+of being silently counted as a completed search configuration.
+After all 20 records are complete or pruned, `best_config.yaml` binds the
+selected trial number and hyperparameters, raw trial-config digest, selected
+epoch, and `best.pt` digest. Formal ablations reject a provisional config from
+an incomplete study or any config that is not that exported winner.
+
+The finalized `checkpoints/best.pt` selected by that score is the spatial
+candidate. Its decoder is frozen only on an independent slide-separated asset
+whose tile/component records explicitly
 declare `roi_count_complete` and `roi_measurement_complete`:
 
 ```bash
 python scripts/calibrate_spatial_decoder.py \
-  --checkpoint outputs/hcc_sempath_v2/checkpoints/last.pt \
+  --checkpoint outputs/hcc_sempath_v2/checkpoints/best.pt \
   --annotation /path/to/hcc_spatial_validation.json \
   --validation-split val \
   --output-calibration outputs/hcc_sempath_v2/spatial_calibration.json \
   --output-report outputs/hcc_sempath_v2/spatial_validation_report.json
 
 python scripts/export_release_sempath.py \
-  --checkpoint outputs/hcc_sempath_v2/checkpoints/last.pt \
+  --checkpoint outputs/hcc_sempath_v2/checkpoints/best.pt \
   --spatial-calibration outputs/hcc_sempath_v2/spatial_calibration.json \
   --output-dir artifacts/release/hcc_sempath_v2
 ```
 
 Calibration and release verify the frozen optimizer-visible cohort,
-supervision-asset digests, terminal model state, research contract, validation
+supervision-asset digests, finalized selected model state, research contract, validation
 annotation, protocol, and cohort. Ordinary weak training marks never imply
 exhaustive validation truth.
 

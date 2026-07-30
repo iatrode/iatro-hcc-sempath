@@ -524,6 +524,7 @@ class PackageSampledDistillationDataset(Dataset):
         spatial_targets: dict[str, SpatialRoiTarget] | None = None,
         spatial_component_count: int = 0,
         spatial_grid_size: tuple[int, int] = (0, 0),
+        excluded_rows_by_package: dict[int, np.ndarray] | None = None,
     ) -> None:
         self.tile_paths = [Path(path) for path in image_tile_package_paths]
         self.teacher_package_paths = {
@@ -548,13 +549,56 @@ class PackageSampledDistillationDataset(Dataset):
             package_headers=package_headers,
         )
         self.package_counts = counts
+        excluded_rows_by_package = excluded_rows_by_package or {}
+        unknown_exclusion_packages = sorted(
+            set(excluded_rows_by_package).difference(
+                range(len(self.package_counts))
+            )
+        )
+        if unknown_exclusion_packages:
+            raise ValueError(
+                "excluded rows reference unknown package indices: "
+                f"{unknown_exclusion_packages}"
+            )
+        self.excluded_rows_by_package: list[np.ndarray] = []
+        self.available_package_counts: list[int] = []
+        for package_idx, package_count in enumerate(self.package_counts):
+            excluded = np.unique(
+                np.asarray(
+                    excluded_rows_by_package.get(
+                        package_idx,
+                        np.empty((0,), dtype=np.int64),
+                    ),
+                    dtype=np.int64,
+                )
+            )
+            if (
+                len(excluded)
+                and (
+                    int(excluded[0]) < 0
+                    or int(excluded[-1]) >= package_count
+                )
+            ):
+                raise ValueError(
+                    "excluded row is outside its package: "
+                    f"package={package_idx} rows={excluded.tolist()} "
+                    f"count={package_count}"
+                )
+            available = package_count - len(excluded)
+            if available <= 0:
+                raise ValueError(
+                    "row exclusions remove an entire population package: "
+                    f"package={package_idx} count={package_count}"
+                )
+            self.excluded_rows_by_package.append(excluded)
+            self.available_package_counts.append(available)
         self.sequential_iac_rows = all(
             int(package_headers[path].get("row_order_seed", 0) or 0) > 0
             for path in self.tile_paths
         )
         self.cumulative_counts: list[int] = []
         running_total = 0
-        for count in counts:
+        for count in self.available_package_counts:
             running_total += count
             self.cumulative_counts.append(running_total)
         self.total_records = running_total
@@ -594,12 +638,12 @@ class PackageSampledDistillationDataset(Dataset):
 
     def _package_sample_counts(self, sample_count: int, rng: np.random.Generator) -> list[int]:
         if sample_count >= self.total_records:
-            return list(self.package_counts)
-        expected = np.asarray(self.package_counts, dtype=np.float64) * (sample_count / self.total_records)
+            return list(self.available_package_counts)
+        expected = np.asarray(self.available_package_counts, dtype=np.float64) * (sample_count / self.total_records)
         counts = np.floor(expected).astype(np.int64)
         if sample_count >= len(counts):
             counts = np.maximum(counts, 1)
-        counts = np.minimum(counts, np.asarray(self.package_counts, dtype=np.int64))
+        counts = np.minimum(counts, np.asarray(self.available_package_counts, dtype=np.int64))
         overflow = int(counts.sum() - sample_count)
         if overflow > 0:
             candidates = np.flatnonzero(counts > 0)
@@ -608,7 +652,7 @@ class PackageSampledDistillationDataset(Dataset):
         remainder = int(sample_count - counts.sum())
         if remainder > 0:
             fractions = expected - np.floor(expected)
-            capacity = np.asarray(self.package_counts, dtype=np.int64) - counts
+            capacity = np.asarray(self.available_package_counts, dtype=np.int64) - counts
             candidates = np.flatnonzero(capacity > 0)
             if len(candidates) < remainder:
                 raise ValueError(f"could not distribute sample budget: remainder={remainder}")
@@ -622,27 +666,62 @@ class PackageSampledDistillationDataset(Dataset):
 
     def _ordered_rows_for_package(
         self,
-        package_count: int,
+        package_idx: int,
         take: int,
         rng: np.random.Generator,
     ) -> np.ndarray | None:
+        package_count = self.package_counts[package_idx]
+        excluded = self.excluded_rows_by_package[package_idx]
+        available_count = self.available_package_counts[package_idx]
         if take <= 0:
             return np.empty((0,), dtype=np.int64)
-        if take >= package_count:
+        if take > available_count:
+            raise ValueError(
+                "package sample count exceeds rows remaining after exclusions: "
+                f"package={package_idx} take={take} "
+                f"available={available_count}"
+            )
+        if take == package_count and not len(excluded):
             return None
+        available_rows = np.setdiff1d(
+            np.arange(package_count, dtype=np.int64),
+            excluded,
+            assume_unique=True,
+        )
+        if take == available_count:
+            return available_rows
         if self.sequential_iac_rows:
-            return np.arange(take, dtype=np.int64)
-        stride = package_count / take
+            return available_rows[:take]
+        stride = available_count / take
         offset = float(rng.random()) * stride
-        rows = np.floor(offset + np.arange(take, dtype=np.float64) * stride).astype(np.int64)
-        rows = np.minimum(rows, package_count - 1)
-        rows = np.unique(rows)
-        while len(rows) < take:
-            missing = take - len(rows)
-            extra = rng.choice(package_count, size=missing, replace=False)
-            rows = np.unique(np.concatenate([rows, extra.astype(np.int64, copy=False)]))
+        positions = np.floor(
+            offset + np.arange(take, dtype=np.float64) * stride
+        ).astype(np.int64)
+        positions = np.minimum(positions, available_count - 1)
+        positions = np.unique(positions)
+        while len(positions) < take:
+            missing = take - len(positions)
+            candidates = np.setdiff1d(
+                np.arange(available_count, dtype=np.int64),
+                positions,
+                assume_unique=True,
+            )
+            extra = rng.choice(
+                candidates,
+                size=missing,
+                replace=False,
+            )
+            positions = np.unique(
+                np.concatenate(
+                    [
+                        positions,
+                        extra.astype(np.int64, copy=False),
+                    ]
+                )
+            )
+        rows = available_rows[positions[:take]]
         rows.sort()
-        return rows[:take]
+        return rows
 
     def _build_package_ordered_plan(
         self,
@@ -653,7 +732,7 @@ class PackageSampledDistillationDataset(Dataset):
         package_rows: list[np.ndarray | None] = [np.empty((0,), dtype=np.int64) for _ in self.package_counts]
         for package_idx, take in enumerate(self._package_sample_counts(sample_count, rng)):
             rows = self._ordered_rows_for_package(
-                self.package_counts[package_idx],
+                package_idx,
                 take,
                 rng,
             )

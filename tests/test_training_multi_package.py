@@ -34,13 +34,19 @@ from hcc_sempath.training.engine import _prepare_images
 from hcc_sempath.training.train import (
     BatchSlot,
     _PackageShuffleBatchLoader,
+    _active_teacher_paths,
     _assert_disjoint_package_cohorts,
     _assert_disjoint_package_paths,
+    _canonical_sha256,
+    _freeze_expert_split_exclusion_contract,
     _freeze_optimizer_visible_contract,
+    _file_sha256,
+    _verify_formal_asset_contract,
+    _verify_formal_ablation_contract,
+    _verify_formal_source_contract,
     _verify_optimizer_visible_packages,
     _alloc_batch_buffer,
     _target_rows_by_package,
-    _validation_package_keep_indices,
 )
 from hcc_sempath.training.prototype_labels import PrototypeLabel
 from hcc_sempath.training.roi import SpatialRoiTarget
@@ -185,7 +191,7 @@ def test_offline_cohort_check_rejects_same_patient_across_packages(
         )
 
 
-def test_optimizer_visible_contract_records_package_sizes(
+def test_optimizer_visible_contract_records_package_content(
     tmp_path: Path,
 ) -> None:
     population, _ = _write_package(
@@ -214,7 +220,211 @@ def test_optimizer_visible_contract_records_package_sizes(
         population.stat().st_size,
         replay.stat().st_size,
     ]
+    assert len(
+        cfg["data"]["optimizer_visible_tile_package_sha256"]
+    ) == 2
     _verify_optimizer_visible_packages(cfg)
+
+    with replay.open("r+b") as handle:
+        handle.seek(-1, 2)
+        original = handle.read(1)
+        handle.seek(-1, 2)
+        handle.write(bytes([original[0] ^ 1]))
+    with pytest.raises(ValueError, match="content changed"):
+        _verify_optimizer_visible_packages(cfg)
+
+
+def test_active_teacher_paths_filter_inactive_explicit_mappings() -> None:
+    cfg = {
+        "data": {"teachers": ["virchow2"]},
+        "model": {"teacher_dims": {"virchow2": 2560}},
+    }
+    selected = _active_teacher_paths(
+        cfg,
+        {
+            "gigapath": ["gigapath.iac"],
+            "virchow2": ["virchow2.iac"],
+        },
+        key="teacher_feature_package_paths",
+    )
+    assert selected == {"virchow2": ["virchow2.iac"]}
+
+
+def test_expert_split_exclusion_contract_binds_exact_rows(
+    tmp_path: Path,
+) -> None:
+    cfg = {"data": {}}
+    train = str((tmp_path / "train.tiles.iac").resolve())
+    val = str((tmp_path / "val.tiles.iac").resolve())
+
+    _freeze_expert_split_exclusion_contract(
+        cfg,
+        train_packages=[train],
+        train_excluded_rows={0: np.asarray([2, 7])},
+        val_packages=[val],
+        val_excluded_rows={0: np.asarray([3])},
+    )
+
+    assert cfg["data"]["expert_split_exclusion_contract"] == {
+        "population_train_excludes_expert_val": {
+            train: [2, 7],
+        },
+        "population_val_excludes_expert_train": {
+            val: [3],
+        },
+    }
+    first = cfg["data"]["expert_split_exclusion_sha256"]
+    _freeze_expert_split_exclusion_contract(
+        cfg,
+        train_packages=[train],
+        train_excluded_rows={0: np.asarray([2, 8])},
+        val_packages=[val],
+        val_excluded_rows={0: np.asarray([3])},
+    )
+    assert cfg["data"]["expert_split_exclusion_sha256"] != first
+
+
+def test_formal_asset_contract_rehashes_every_iac(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import hcc_sempath.training.train as train_module
+
+    prototype = tmp_path / "prototype.pt"
+    population = tmp_path / "population.iac"
+    student = tmp_path / "student.pth"
+    prototype.write_bytes(b"prototype")
+    population.write_bytes(b"population")
+    student.write_bytes(b"student")
+    monkeypatch.setattr(
+        train_module,
+        "STUDENT_PRETRAINED_PATH",
+        student,
+    )
+    formal = {
+        "static_files": {
+            "prototype_teacher": _file_sha256(prototype),
+        },
+        "iac_packages": {
+            str(population.resolve()): _file_sha256(population),
+        },
+        "student_pretrained": {
+            "path": str(student.resolve()),
+            "sha256": _file_sha256(student),
+        },
+    }
+    cfg = {
+        "data": {
+            "prototype_paths": {"teacher": str(prototype)},
+            "formal_asset_sha256": formal,
+        }
+    }
+
+    _verify_formal_asset_contract(
+        cfg,
+        complete_tile_packages=[str(population)],
+        complete_teacher_packages={},
+    )
+    assert len(cfg["data"]["formal_asset_contract_sha256"]) == 64
+
+    population.write_bytes(b"populatioN")
+    with pytest.raises(ValueError, match="IAC content changed"):
+        _verify_formal_asset_contract(
+            cfg,
+            complete_tile_packages=[str(population)],
+            complete_teacher_packages={},
+        )
+
+
+def test_formal_source_contract_rejects_tree_drift(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import hcc_sempath.training.train as train_module
+
+    monkeypatch.setattr(
+        train_module,
+        "_source_tree_sha256",
+        lambda repo: "b" * 64,
+    )
+    cfg = {
+        "data": {
+            "formal_source": {
+                "commit": "a" * 40,
+                "source_mode": "clean_git_commit",
+                "source_tree_sha256": "c" * 64,
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="source tree content changed"):
+        _verify_formal_source_contract(cfg, repo=tmp_path)
+
+
+def test_formal_ablation_contract_rejects_config_drift() -> None:
+    cfg = {
+        "runtime": {"seed": 13},
+        "data": {},
+        "train": {"lr": 1.5e-4},
+        "loss": {"spatial_weight": 0.2},
+    }
+    train_module_digest = _canonical_sha256(cfg)
+    cfg["data"]["formal_ablation_contract_sha256"] = train_module_digest
+    assert len(train_module_digest) == 64
+    _verify_formal_ablation_contract(cfg)
+
+    cfg["train"]["lr"] = 9.9e-4
+    with pytest.raises(ValueError, match="config changed"):
+        _verify_formal_ablation_contract(cfg)
+
+
+def test_formal_asset_contract_rejects_iac_package_set_drift(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import hcc_sempath.training.train as train_module
+
+    prototype = tmp_path / "prototype.pt"
+    population = tmp_path / "population.iac"
+    added_teacher = tmp_path / "added_teacher.iac"
+    student = tmp_path / "student.pth"
+    for path, payload in (
+        (prototype, b"prototype"),
+        (population, b"population"),
+        (added_teacher, b"teacher"),
+        (student, b"student"),
+    ):
+        path.write_bytes(payload)
+    monkeypatch.setattr(
+        train_module,
+        "STUDENT_PRETRAINED_PATH",
+        student,
+    )
+    cfg = {
+        "data": {
+            "prototype_paths": {"teacher": str(prototype)},
+            "formal_asset_sha256": {
+                "static_files": {
+                    "prototype_teacher": _file_sha256(prototype),
+                },
+                "iac_packages": {
+                    str(population.resolve()): _file_sha256(population),
+                },
+                "student_pretrained": {
+                    "path": str(student.resolve()),
+                    "sha256": _file_sha256(student),
+                },
+            },
+        }
+    }
+
+    with pytest.raises(ValueError, match="IAC package set changed"):
+        _verify_formal_asset_contract(
+            cfg,
+            complete_tile_packages=[str(population)],
+            complete_teacher_packages={
+                "teacher": [str(added_teacher)],
+            },
+        )
 
 
 def test_dataset_adds_dynamic_prototype_supervision_fields(tmp_path: Path) -> None:
@@ -259,17 +469,16 @@ def test_expert_row_resolution_reads_only_requested_tile_ids(
     assert rows[1].tolist() == [0]
 
 
-def test_expert_row_resolution_recovers_from_reordered_iac_rows(
+def test_expert_row_resolution_rejects_stale_declared_row(
     tmp_path: Path,
 ) -> None:
     tile_a, _ = _write_package(tmp_path, "slide_a", 10, count=3)
 
-    rows = _target_rows_by_package(
-        [str(tile_a)],
-        {"slide_a_0000002": (tile_a.name, 0)},
-    )
-
-    assert rows[0].tolist() == [2]
+    with pytest.raises(ValueError, match="stale expert package/row"):
+        _target_rows_by_package(
+            [str(tile_a)],
+            {"slide_a_0000002": (tile_a.name, 0)},
+        )
 
 
 def test_expert_row_resolution_rejects_tile_outside_train_packages(
@@ -302,30 +511,6 @@ def test_expert_row_resolution_can_find_subset_without_missing_error(
     )
 
     assert rows[0].tolist() == [0]
-
-
-def test_validation_exclusion_removes_exact_expert_package(
-    tmp_path: Path,
-) -> None:
-    expert, _ = _write_package(
-        tmp_path,
-        "slide_expert",
-        10,
-        patient_id="shared",
-    )
-    independent, _ = _write_package(
-        tmp_path,
-        "slide_independent",
-        30,
-        patient_id="other",
-    )
-
-    keep = _validation_package_keep_indices(
-        [str(expert), str(independent)],
-        [str(expert)],
-    )
-
-    assert keep == [1]
 
 
 def test_dataset_collates_spatial_targets_and_preserves_ignore_mask(tmp_path: Path) -> None:
@@ -744,6 +929,39 @@ def test_package_sampled_dataset_uses_every_selected_package_with_spread_rows(tm
         assert rows is not None
         assert len(rows) == 2
         assert int(rows[1] - rows[0]) >= 2
+
+
+def test_package_sampled_dataset_excludes_fixed_validation_rows(
+    tmp_path: Path,
+) -> None:
+    tile_path, feature_path = _write_package(
+        tmp_path,
+        "slide_exclusion",
+        10,
+        count=8,
+    )
+    dataset = PackageSampledDistillationDataset(
+        [tile_path],
+        {"toy": [feature_path]},
+        image_size=(32, 32),
+        seed=13,
+        expected_dims={"toy": 4},
+        excluded_rows_by_package={
+            0: np.asarray([1, 4, 7], dtype=np.int64),
+        },
+    )
+
+    assert len(dataset) == 5
+    assert dataset.package_sample_rows[0] is not None
+    assert dataset.package_sample_rows[0].tolist() == [0, 2, 3, 5, 6]
+    sampled_tile_ids = {
+        dataset[index]["tile_id"]
+        for index in range(len(dataset))
+    }
+    assert sampled_tile_ids == {
+        f"slide_exclusion_{index:07d}"
+        for index in (0, 2, 3, 5, 6)
+    }
 
 
 def test_package_shuffle_loader_mixes_packages_single_thread(tmp_path: Path) -> None:
