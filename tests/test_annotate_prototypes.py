@@ -269,6 +269,15 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert ".roiClassBar{display:flex;flex-wrap:wrap" in HTML
     assert ".roiClassBar{flex-wrap:nowrap;max-width:min(100%,760px);overflow-x:auto" in HTML
     assert 'id="tileZoom"' in HTML
+    assert "let tileScale=2,tileZoomUserSet=false" in HTML
+    assert "function applyDefaultTileZoom()" in HTML
+    assert "Math.min(viewport.clientWidth,viewport.clientHeight)" in HTML
+    assert "function resetTileViewportForRecord()" in HTML
+    assert "workspace.scrollTop=0;workspace.scrollLeft=0" in HTML
+    assert "viewport.scrollTop=0;viewport.scrollLeft=0" in HTML
+    assert "tileZoomUserSet=true;setTileZoom(" in HTML
+    assert "requestAnimationFrame(applyDefaultTileZoom)" in HTML
+    assert "tile.src=authed(scoped(`/api/tile?package=${pkg}&row=${rec.row}`)); resetTileViewportForRecord();" in HTML
     assert 'id="overviewBtn" type="button">Overview' in HTML
     assert 'id="overviewOverlay" class="contextOverlay hidden"' in HTML
     assert 'class="imageControlRow overviewControlRow"' not in HTML
