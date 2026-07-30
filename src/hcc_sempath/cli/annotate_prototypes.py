@@ -761,7 +761,13 @@ def _is_counted_annotation(item: dict) -> bool:
     review_decision = str(item.get("review_decision") or "").strip().lower()
     if decision in skip_values or review_decision in skip_values:
         return False
-    return bool(str(item.get("classification") or item.get("classification_label") or "").strip())
+    return bool(
+        str(
+            item.get("classification")
+            or item.get("classification_label")
+            or ""
+        ).strip()
+    ) or bool(item.get("roi_reviewed"))
 
 
 def _ordered_unique(values) -> list[str]:
@@ -1512,14 +1518,23 @@ class AnnotationData:
         for key, item in self.state.annotations.items():
             if key in self.state.skipped or not _is_counted_annotation(item):
                 continue
-            classification_counts[item["classification"]] = classification_counts.get(item["classification"], 0) + 1
-            for label in item["spatial"]:
+            classification = str(item.get("classification") or "")
+            if classification:
+                classification_counts[classification] = (
+                    classification_counts.get(classification, 0) + 1
+                )
+            for label in item.get("spatial", []):
                 spatial_counts[label] = spatial_counts.get(label, 0) + 1
         package_classification_counts = {name: 0 for name in self.state.classification_prototypes}
         package_spatial_counts = {name: 0 for name in self.state.spatial_prototypes}
         for item in self.state.counted_annotations_for_package(package):
-            package_classification_counts[item["classification"]] = package_classification_counts.get(item["classification"], 0) + 1
-            for label in item["spatial"]:
+            classification = str(item.get("classification") or "")
+            if classification:
+                package_classification_counts[classification] = (
+                    package_classification_counts.get(classification, 0)
+                    + 1
+                )
+            for label in item.get("spatial", []):
                 package_spatial_counts[label] = package_spatial_counts.get(label, 0) + 1
         LOG.info(
             "progress_read iac=%s annotated=%d total=%d remaining=%d overall_annotated=%d overall_total=%d",
