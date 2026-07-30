@@ -271,7 +271,9 @@ def test_roi_ui_complete_review_is_dynamic_and_only_required_in_roi_mode() -> No
     assert 'id="tileZoom"' in HTML
     assert "let tileScale=2,tileZoomUserSet=false" in HTML
     assert "function applyDefaultTileZoom()" in HTML
-    assert "Math.min(viewport.clientWidth,viewport.clientHeight)" in HTML
+    assert ".tileViewport{height:auto;aspect-ratio:1 / 1}" in HTML
+    assert ".tileViewport{height:360px}" not in HTML
+    assert "const available=viewport.clientWidth" in HTML
     assert "function resetTileViewportForRecord()" in HTML
     assert "workspace.scrollTop=0;workspace.scrollLeft=0" in HTML
     assert "viewport.scrollTop=0;viewport.scrollLeft=0" in HTML
