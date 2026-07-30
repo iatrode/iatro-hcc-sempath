@@ -63,6 +63,10 @@ def _local_base(tmp_path: Path) -> Path:
                     "train_tile_fraction": 0.1,
                     "val_tile_fraction": 0.1,
                     "require_complete_expert_validation": True,
+                    "dynamic_package_sampling": True,
+                    "package_multiprocessing": True,
+                    "package_chunk_size": 64,
+                    "package_buffer_batches": 4,
                     "teachers": teachers,
                     "train_image_tile_package_paths": [train_tile],
                     "val_image_tile_package_paths": [val_tile],
@@ -132,12 +136,14 @@ def _local_base(tmp_path: Path) -> Path:
                     "zhcc_response_ramp_steps": 1000,
                 },
                 "train": {
+                    "batch_size": 512,
                     "epochs": 16,
                     "lr": 0.00018,
                     "weight_decay": 0.005,
                     "lr_warmup_steps": 1000,
                     "max_val_batches": 1,
                     "max_eval_batches": 1,
+                    "eval_pairwise_max_samples": 512,
                     "dynamic_prototype_refresh_steps": 500,
                     "dynamic_spatial_prototype_refresh_steps": 500,
                     "development_early_stop": False,
@@ -226,6 +232,10 @@ def test_all_conditions_reuse_the_selected_a0_budget_and_schedule(
             "spatial": 0.25,
         }
         assert resolved["train"]["selection_early_stop_patience"] == 4
+        assert resolved["train"]["batch_size"] == 512
+        assert resolved["train"]["max_val_batches"] == 1
+        assert resolved["train"]["max_eval_batches"] == 1
+        assert resolved["train"]["eval_pairwise_max_samples"] == 512
         assert resolved["train"][
             "selection_early_stop_start_step"
         ] == 3000
@@ -350,6 +360,34 @@ def test_resolver_rejects_a_nonmatching_a0_base(
         resolve_ablation_config(
             invalid,
             CONFIG_ROOT / "a2_no_adjudication.yaml",
+        )
+
+
+def test_ablation_cannot_change_the_teacher_probe_contract(
+    tmp_path: Path,
+) -> None:
+    condition = tmp_path / "changed_probe.yaml"
+    condition.write_text(
+        yaml.safe_dump(
+            {
+                "inherits": str(
+                    (CONFIG_ROOT / "matched_tenth.yaml").resolve()
+                ),
+                "runtime": {"output_dir": "outputs/changed_probe"},
+                "train": {"max_eval_batches": 2},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="joint checkpoint-selection rule",
+    ):
+        resolve_ablation_config(
+            _local_base(tmp_path),
+            condition,
         )
 
 

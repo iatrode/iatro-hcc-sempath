@@ -1464,6 +1464,88 @@ def _verify_formal_asset_contract(
     )
 
 
+def _verify_population_validation_contract(
+    cfg: dict,
+    *,
+    selected_val_tile_packages: list[str],
+) -> None:
+    """Recompute the fixed teacher-probe definition from resolved inputs."""
+
+    data = cfg.get("data", {})
+    declared = data.get("formal_population_validation")
+    if declared is None:
+        return
+    if not isinstance(declared, dict):
+        raise ValueError(
+            "data.formal_population_validation must be a mapping"
+        )
+    formal_assets = data.get("formal_asset_sha256", {})
+    iac_sha256 = formal_assets.get("iac_packages", {})
+    static_sha256 = formal_assets.get("static_files", {})
+    if not isinstance(iac_sha256, dict) or not isinstance(
+        static_sha256,
+        dict,
+    ):
+        raise ValueError(
+            "fixed population validation requires the formal asset contract"
+        )
+    selected_packages: dict[str, str] = {}
+    for raw_path in selected_val_tile_packages:
+        path = str(Path(raw_path).resolve())
+        digest = iac_sha256.get(path)
+        if not isinstance(digest, str):
+            raise ValueError(
+                "population-validation package is absent from the formal "
+                f"asset contract: {path}"
+            )
+        selected_packages[path] = digest
+    train = cfg["train"]
+    definition = {
+        "selected_val_tile_packages": selected_packages,
+        "expert_exclusion_assets": {
+            key: str(static_sha256[key])
+            for key in (
+                "prototype_supervision_manifest_path",
+                "spatial_manifest_path",
+            )
+        },
+        "runtime_seed": int(cfg["runtime"]["seed"]),
+        "val_tile_fraction": float(data["val_tile_fraction"]),
+        "dynamic_package_sampling": bool(
+            data.get("dynamic_package_sampling", True)
+        ),
+        "package_multiprocessing": bool(
+            data.get("package_multiprocessing", False)
+        ),
+        "package_chunk_size": int(
+            data.get("package_chunk_size", 64)
+        ),
+        "package_buffer_batches": int(
+            data.get("package_buffer_batches", 4)
+        ),
+        "batch_size": int(train["batch_size"]),
+        "max_val_batches": int(train["max_val_batches"]),
+        "max_eval_batches": int(train["max_eval_batches"]),
+        "eval_pairwise_max_samples": int(
+            train.get("eval_pairwise_max_samples", 4096)
+        ),
+    }
+    observed = _canonical_sha256(definition)
+    expected = str(declared.get("probe_definition_sha256", ""))
+    if observed != expected:
+        raise ValueError(
+            "fixed population-validation probe definition changed: "
+            f"expected={expected} observed={observed}"
+        )
+    if int(declared.get("selected_val_packages", -1)) != len(
+        selected_packages
+    ):
+        raise ValueError(
+            "fixed population-validation package count changed"
+        )
+    cfg["data"]["population_validation_contract_sha256"] = observed
+
+
 def _freeze_supervision_asset_contract(cfg: dict) -> None:
     """Bind every mutable human/prototype supervision file by content."""
 
@@ -1549,7 +1631,7 @@ def _freeze_expert_split_exclusion_contract(
                 train_excluded_rows,
             )
         ),
-        "population_val_excludes_expert_train": (
+        "population_val_excludes_all_expert": (
             _excluded_rows_contract(
                 val_packages,
                 val_excluded_rows,
@@ -1984,6 +2066,10 @@ def main() -> None:
         complete_tile_packages=complete_train_tile_packages,
         complete_teacher_packages=complete_train_teacher_packages,
     )
+    _verify_population_validation_contract(
+        cfg,
+        selected_val_tile_packages=val_tile_packages,
+    )
     _probe.timeline_event(
         "startup.package_paths_resolved",
         force=True,
@@ -2227,22 +2313,27 @@ def main() -> None:
         )
     # The finalized expert split is authoritative even when its source IACs
     # came from an older train/val package partition. Exact expert-validation
-    # rows must never enter the optimizer through population distillation, and
-    # exact expert-training rows must not leak into population validation.
+    # rows must never enter the optimizer through population distillation.
+    # Population validation is the label-blind teacher-retention stream, so it
+    # excludes the complete train+validation expert union.
     population_train_excluded_rows = _target_rows_by_package(
         train_tile_packages,
         validation_expert_locations,
         require_all=False,
     )
+    all_expert_locations = {
+        **expert_locations,
+        **validation_expert_locations,
+    }
     population_val_excluded_rows = _target_rows_by_package(
         val_tile_packages,
-        expert_locations,
+        all_expert_locations,
         require_all=False,
     )
     cfg["data"]["population_train_excluded_expert_val_tiles"] = int(
         sum(len(rows) for rows in population_train_excluded_rows.values())
     )
-    cfg["data"]["population_val_excluded_expert_train_tiles"] = int(
+    cfg["data"]["population_val_excluded_expert_tiles"] = int(
         sum(len(rows) for rows in population_val_excluded_rows.values())
     )
     _freeze_expert_split_exclusion_contract(

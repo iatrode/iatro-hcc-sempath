@@ -350,10 +350,14 @@ Training keeps ordinary teacher validation, seven-class expert validation, and
 eleven-component spatial expert validation as separate streams. A0 checkpoint
 selection uses three fixed validation terms:
 
-- \(T_e\): direct four-teacher retention on the deterministic population
-  validation view, computed from mean cosine distance plus the configured
-  relation-MSE weight. Dynamic PAMT-D targets and student prototypes do not
-  enter this term.
+- \(T_e\): direct four-teacher retention on a deterministic 65,536-tile probe
+  (the unchanged first 128 batches at batch size 512) drawn from the fixed 10%
+  population-validation packages. It is computed from mean cosine distance
+  on the full probe plus relation MSE on its deterministic evenly spaced
+  4,096-tile subset, using the configured relation weight. Dynamic PAMT-D
+  targets and student prototypes do not enter this term. Every L1/L2 expert
+  train and validation tile is excluded from this label-blind probe; ordinary
+  population-validation diagnostics are accumulated on the same 128 batches.
 - \(C_e\): class-balanced cross entropy over the complete seven-class expert
   validation bank.
 - \(S_e\): one complete-bank, component-balanced reduction of the

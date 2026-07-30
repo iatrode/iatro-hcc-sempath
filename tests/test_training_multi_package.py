@@ -43,6 +43,7 @@ from hcc_sempath.training.train import (
     _file_sha256,
     _verify_formal_asset_contract,
     _verify_formal_ablation_contract,
+    _verify_population_validation_contract,
     _verify_formal_source_contract,
     _verify_optimizer_visible_packages,
     _alloc_batch_buffer,
@@ -269,7 +270,7 @@ def test_expert_split_exclusion_contract_binds_exact_rows(
         "population_train_excludes_expert_val": {
             train: [2, 7],
         },
-        "population_val_excludes_expert_train": {
+        "population_val_excludes_all_expert": {
             val: [3],
         },
     }
@@ -282,6 +283,73 @@ def test_expert_split_exclusion_contract_binds_exact_rows(
         val_excluded_rows={0: np.asarray([3])},
     )
     assert cfg["data"]["expert_split_exclusion_sha256"] != first
+
+
+def test_population_validation_contract_rejects_a_changed_probe(
+    tmp_path: Path,
+) -> None:
+    val = str((tmp_path / "val.tiles.iac").resolve())
+    definition = {
+        "selected_val_tile_packages": {val: "a" * 64},
+        "expert_exclusion_assets": {
+            "prototype_supervision_manifest_path": "b" * 64,
+            "spatial_manifest_path": "c" * 64,
+        },
+        "runtime_seed": 13,
+        "val_tile_fraction": 0.1,
+        "dynamic_package_sampling": True,
+        "package_multiprocessing": True,
+        "package_chunk_size": 64,
+        "package_buffer_batches": 4,
+        "batch_size": 512,
+        "max_val_batches": 128,
+        "max_eval_batches": 128,
+        "eval_pairwise_max_samples": 4096,
+    }
+    cfg = {
+        "runtime": {"seed": 13},
+        "data": {
+            "val_tile_fraction": 0.1,
+            "dynamic_package_sampling": True,
+            "package_multiprocessing": True,
+            "package_chunk_size": 64,
+            "package_buffer_batches": 4,
+            "formal_asset_sha256": {
+                "iac_packages": {val: "a" * 64},
+                "static_files": {
+                    "prototype_supervision_manifest_path": "b" * 64,
+                    "spatial_manifest_path": "c" * 64,
+                },
+            },
+            "formal_population_validation": {
+                "selected_val_packages": 1,
+                "probe_definition_sha256": _canonical_sha256(
+                    definition
+                ),
+            },
+        },
+        "train": {
+            "batch_size": 512,
+            "max_val_batches": 128,
+            "max_eval_batches": 128,
+            "eval_pairwise_max_samples": 4096,
+        },
+    }
+
+    _verify_population_validation_contract(
+        cfg,
+        selected_val_tile_packages=[val],
+    )
+    assert cfg["data"][
+        "population_validation_contract_sha256"
+    ] == _canonical_sha256(definition)
+
+    cfg["train"]["max_eval_batches"] = 64
+    with pytest.raises(ValueError, match="probe definition changed"):
+        _verify_population_validation_contract(
+            cfg,
+            selected_val_tile_packages=[val],
+        )
 
 
 def test_formal_asset_contract_rehashes_every_iac(

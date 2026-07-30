@@ -31,6 +31,8 @@ def _raw_config(path: Path) -> dict:
 
 def _selection_contract(config: dict) -> dict:
     train = config["train"]
+    data = config["data"]
+    runtime = config["runtime"]
     weights = {
         str(name): float(value)
         for name, value in train.get(
@@ -74,6 +76,25 @@ def _selection_contract(config: dict) -> dict:
         "early_stop_teacher_alignment": bool(
             train.get("early_stop_teacher_alignment", False)
         ),
+        "teacher_retention_probe": {
+            "runtime_seed": int(runtime["seed"]),
+            "batch_size": int(train["batch_size"]),
+            "max_val_batches": int(train["max_val_batches"]),
+            "max_eval_batches": int(train["max_eval_batches"]),
+            "eval_pairwise_max_samples": int(
+                train["eval_pairwise_max_samples"]
+            ),
+            "dynamic_package_sampling": bool(
+                data["dynamic_package_sampling"]
+            ),
+            "package_multiprocessing": bool(
+                data.get("package_multiprocessing", False)
+            ),
+            "package_chunk_size": int(data["package_chunk_size"]),
+            "package_buffer_batches": int(
+                data.get("package_buffer_batches", 4)
+            ),
+        },
     }
 
 

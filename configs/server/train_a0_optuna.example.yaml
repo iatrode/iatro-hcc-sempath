@@ -31,5 +31,12 @@ train:
   # Guarantees enough post-ramp epochs to observe a real plateau.
   selection_minimum_eligible_epochs: 5
   early_stop_teacher_alignment: false
-  max_val_batches: 256
+  # The selected package-level 10% validation view is the source population.
+  # Joint selection uses one unchanged 128-batch, label-blind population
+  # validation probe (65,536 tiles at batch 512). This fixed large probe avoids
+  # materializing all four teacher outputs for the complete 10% sampling frame
+  # at every epoch. Relation MSE uses the deterministic evenly spaced 4,096-tile
+  # subset configured below.
+  max_val_batches: 128
   max_eval_batches: 128
+  eval_pairwise_max_samples: 4096

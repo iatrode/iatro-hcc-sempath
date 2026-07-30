@@ -65,6 +65,10 @@ def test_trial_config_uses_matched_tenth_population_and_fixed_losses(
             "source_tree_sha256": "c" * 64,
         },
         formal_study_contract_sha256="d" * 64,
+        formal_population_validation={
+            "selected_val_packages": 29,
+            "probe_definition_sha256": "e" * 64,
+        },
     )
 
     assert cfg["data"]["train_tile_fraction"] == pytest.approx(0.1)
@@ -92,11 +96,148 @@ def test_trial_config_uses_matched_tenth_population_and_fixed_losses(
     }
     assert cfg["data"]["formal_source"]["source_tree_sha256"] == "c" * 64
     assert cfg["data"]["formal_study_contract_sha256"] == "d" * 64
+    assert cfg["data"]["formal_population_validation"] == {
+        "selected_val_packages": 29,
+        "probe_definition_sha256": "e" * 64,
+    }
     assert set(trial.params) == {
         "lr",
         "weight_decay",
         "spatial_weight",
     }
+
+
+def test_server_a0_config_requires_five_post_ramp_selection_epochs() -> None:
+    from hcc_sempath.training.config import load_config
+
+    root = Path(__file__).resolve().parents[1]
+    cfg = load_config(
+        root / "configs" / "local" / "server" / "train_a0_optuna.yaml"
+    )
+
+    assert cfg["train"]["selection_minimum_eligible_epochs"] == 5
+    assert cfg["train"]["selection_metric_weights"] == {
+        "teacher": 0.50,
+        "classification": 0.25,
+        "spatial": 0.25,
+    }
+    assert "selection_early_stop_min_epochs" not in cfg["train"]
+
+
+def test_formal_preflight_binds_the_same_tenth_view_as_trials() -> None:
+    module = _search_module()
+
+    cfg = module._formal_base_config(
+        {
+            "runtime": {"seed": 13},
+            "data": {
+                "train_tile_fraction": 1.0,
+                "val_tile_fraction": 1.0,
+            },
+            "train": {"epochs": 10},
+        },
+        epochs=16,
+    )
+
+    assert cfg["data"]["train_tile_fraction"] == pytest.approx(0.10)
+    assert cfg["data"]["val_tile_fraction"] == pytest.approx(0.10)
+    assert cfg["train"]["epochs"] == 16
+
+
+def test_population_validation_contract_binds_fixed_teacher_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _search_module()
+    package = tmp_path / "val.tiles.iac"
+    package.touch()
+    monkeypatch.setattr(
+        "iatro.iac.read_header",
+        lambda path: {"num_records": 200_000},
+    )
+
+    contract = module._population_validation_contract(
+        {
+            "data": {},
+            "train": {
+                "batch_size": 512,
+                "max_val_batches": 256,
+                "max_eval_batches": 128,
+            },
+        },
+        [package],
+        expert_tiles=3_095,
+    )
+
+    assert contract["selected_val_records"] == 200_000
+    assert contract["population_val_records_lower_bound"] == 196_905
+    assert contract["ordinary_validation_batches"] == 256
+    assert contract["ordinary_validation_tiles"] == 131_072
+    assert contract["teacher_retention_batches"] == 128
+    assert contract["teacher_retention_tiles"] == 65_536
+    assert contract["teacher_relation_tiles"] == 4_096
+
+
+def test_population_validation_contract_rejects_hidden_probe_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _search_module()
+    package = tmp_path / "val.tiles.iac"
+    package.touch()
+    monkeypatch.setattr(
+        "iatro.iac.read_header",
+        lambda path: {"num_records": 200_000},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="max_eval_batches cannot exceed max_val_batches",
+    ):
+        module._population_validation_contract(
+            {
+                "data": {},
+                "train": {
+                    "batch_size": 512,
+                    "max_val_batches": 64,
+                    "max_eval_batches": 128,
+                },
+            },
+            [package],
+            expert_tiles=0,
+        )
+
+
+def test_preflight_rejects_cross_modality_train_val_overlap(
+    tmp_path: Path,
+) -> None:
+    module = _search_module()
+    classification = tmp_path / "classification.csv"
+    classification.write_text(
+        "tile_id,source_split,adjudicated\n"
+        "shared,train,true\n",
+        encoding="utf-8",
+    )
+    spatial = tmp_path / "spatial.json"
+    spatial.write_text(
+        json.dumps(
+            {
+                "annotations": {
+                    "shared": {
+                        "tile_id": "shared",
+                        "split": "val",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="expert tile overlap across L1/L2",
+    ):
+        module._expert_split_tile_counts(classification, spatial)
 
 
 def test_preflight_explicit_packages_take_precedence_over_manifest(
@@ -135,6 +276,19 @@ def test_preflight_explicit_packages_take_precedence_over_manifest(
         (tmp_path / "val.tiles.iac").resolve(),
     ]
     assert all(len(feature_paths[teacher]) == 2 for teacher in teachers)
+
+    train_tiles, train_feature_paths = (
+        module._resolved_training_iac_paths(
+            cfg,
+            complete=True,
+            splits=("train",),
+        )
+    )
+    assert train_tiles == [(tmp_path / "train.tiles.iac").resolve()]
+    assert all(
+        paths == [(tmp_path / f"train.{teacher}.iac").resolve()]
+        for teacher, paths in train_feature_paths.items()
+    )
 
 
 def test_selection_loss_objective_is_strict_and_directionally_correct() -> None:
@@ -206,6 +360,23 @@ def test_selection_loss_objective_is_strict_and_directionally_correct() -> None:
                 "spatial": 2.0,
             },
         )
+
+
+def test_metric_polling_ignores_a_concurrent_partial_csv_row(
+    tmp_path: Path,
+) -> None:
+    module = _search_module()
+    metrics = tmp_path / "metrics.csv"
+    metrics.write_text(
+        "epoch,selection_loss\n"
+        "1,0.9\n"
+        "2,0.",
+        encoding="utf-8",
+    )
+
+    assert module.read_metric_rows(metrics) == [
+        {"epoch": "1", "selection_loss": "0.9"}
+    ]
 
 
 def test_training_exit_drains_final_eligible_metric(

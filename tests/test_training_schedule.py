@@ -1227,6 +1227,17 @@ def test_fit_selects_checkpoint_from_independent_expert_validation(
     classification_val_loader = [object()]
     spatial_val_loader = [object()]
     spatial_losses = iter([0.8, 0.8, 0.4, 0.7])
+    raw_model = torch.nn.Linear(2, 2)
+
+    class CompiledLikeModel(torch.nn.Module):
+        def __init__(self, raw):
+            super().__init__()
+            self._orig_mod = raw
+
+        def forward(self, inputs):
+            return self._orig_mod(inputs)
+
+    compiled_like_model = CompiledLikeModel(raw_model)
 
     def fake_run_epoch(
         model,
@@ -1238,8 +1249,9 @@ def test_fit_selects_checkpoint_from_independent_expert_validation(
         train,
         **kwargs,
     ):
-        del model, prototypes, optimizer, device, cfg, kwargs
+        del prototypes, optimizer, device, cfg, kwargs
         if train:
+            assert model is compiled_like_model
             epoch = fake_run_epoch.train_epoch
             fake_run_epoch.train_epoch += 1
             return {
@@ -1247,6 +1259,7 @@ def test_fit_selects_checkpoint_from_independent_expert_validation(
                 "global_step_end": float(epoch),
                 "spatial_supervised_step_end": float(epoch),
             }
+        assert model is raw_model
         if loader is population_val_loader:
             embeddings = (
                 torch.zeros((1, 2)),
@@ -1301,8 +1314,8 @@ def test_fit_selects_checkpoint_from_independent_expert_validation(
         "hcc_sempath.training.engine.evaluate_teacher_outputs",
         lambda *args, **kwargs: {"teacher_feature_cosine": 0.5},
     )
-    model = torch.nn.Linear(2, 2)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    model = compiled_like_model
+    optimizer = torch.optim.SGD(raw_model.parameters(), lr=0.1)
     cfg = {
         "runtime": {"output_dir": str(tmp_path), "seed": 13},
         "data": {"spatial_manifest_path": "spatial.json"},

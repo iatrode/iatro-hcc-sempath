@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -378,9 +379,12 @@ def _resolved_training_iac_paths(
     cfg: dict[str, Any],
     *,
     complete: bool,
+    splits: tuple[str, ...] = ("train", "val"),
 ) -> tuple[list[Path], dict[str, list[Path]]]:
     """Resolve the exact tile/teacher packages behind the training manifest."""
 
+    if not splits or any(split not in {"train", "val"} for split in splits):
+        raise ValueError("splits must be a non-empty subset of train/val")
     from hcc_sempath.training.config import (
         image_tile_package_paths,
         manifest_data_paths,
@@ -402,10 +406,8 @@ def _resolved_training_iac_paths(
             for value in data.get("teachers", TEACHERS)
         ]
         tile_paths = []
-        for key in (
-            "train_image_tile_package_paths",
-            "val_image_tile_package_paths",
-        ):
+        for split in splits:
+            key = f"{split}_image_tile_package_paths"
             values = data.get(key)
             if values is None:
                 raise ValueError(f"data.{key} is required")
@@ -419,10 +421,8 @@ def _resolved_training_iac_paths(
             teacher: []
             for teacher in TEACHERS
         }
-        for key in (
-            "train_teacher_feature_package_paths",
-            "val_teacher_feature_package_paths",
-        ):
+        for split in splits:
+            key = f"{split}_teacher_feature_package_paths"
             mapping = data.get(key)
             if not isinstance(mapping, dict):
                 raise ValueError(
@@ -448,7 +448,7 @@ def _resolved_training_iac_paths(
         teacher_paths: dict[str, list[str]] = {
             teacher: [] for teacher in TEACHERS
         }
-        for split in ("train", "val"):
+        for split in splits:
             split_tiles, split_teachers = manifest_data_paths(
                 resolved_cfg,
                 manifest,
@@ -460,6 +460,11 @@ def _resolved_training_iac_paths(
                     split_teachers[teacher]
                 )
     else:
+        if set(splits) != {"train", "val"}:
+            raise ValueError(
+                "split-specific A0 path resolution requires a manifest or "
+                "explicit train/val package lists"
+            )
         tile_paths = image_tile_package_paths(resolved_cfg)
         teacher_paths = teacher_feature_package_paths(resolved_cfg)
     return (
@@ -578,6 +583,128 @@ def _population_schedule_contract(
         "selection_start_step": selection_start_step,
         "eligible_epochs_lower_bound": eligible_epochs,
         "required_eligible_epochs": required,
+    }
+
+
+def _population_validation_contract(
+    cfg: dict[str, Any],
+    selected_val_tiles: list[Path],
+    *,
+    expert_tiles: int,
+    iac_sha256: dict[str, str] | None = None,
+    expert_asset_sha256: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Bind the deterministic population-validation and teacher probe sizes."""
+
+    from iatro.iac import read_header
+
+    records = sum(
+        int(read_header(path)["num_records"])
+        for path in selected_val_tiles
+    )
+    max_records = int(cfg.get("data", {}).get("max_val_records", 0))
+    if max_records > 0:
+        records = min(records, max_records)
+    # The teacher-retention probe excludes the complete L1/L2 train+validation
+    # expert union. Subtracting that full union is conservative because many of
+    # its rows may live outside the selected validation packages.
+    lower_bound = max(0, records - int(expert_tiles))
+    batch_size = int(cfg.get("train", {}).get("batch_size", 0))
+    max_val_batches = int(
+        cfg.get("train", {}).get("max_val_batches", 0)
+    )
+    max_eval_batches = int(
+        cfg.get("train", {}).get("max_eval_batches", 0)
+    )
+    pairwise_samples = int(
+        cfg.get("train", {}).get(
+            "eval_pairwise_max_samples",
+            4096,
+        )
+    )
+    if batch_size <= 0:
+        raise ValueError(
+            "A0 population validation requires a positive batch size"
+        )
+    if max_val_batches <= 0 or max_eval_batches <= 0:
+        raise ValueError(
+            "A0 requires positive max_val_batches and max_eval_batches"
+        )
+    if max_eval_batches > max_val_batches:
+        raise ValueError(
+            "A0 max_eval_batches cannot exceed max_val_batches"
+        )
+    teacher_tiles = max_eval_batches * batch_size
+    if pairwise_samples <= 0 or pairwise_samples > teacher_tiles:
+        raise ValueError(
+            "A0 eval_pairwise_max_samples must be positive and cannot "
+            "exceed the fixed teacher-retention probe"
+        )
+    batches_lower_bound = (
+        lower_bound + batch_size - 1
+    ) // batch_size
+    if batches_lower_bound < max_val_batches:
+        raise ValueError(
+            "selected population-validation view is too small for the "
+            "prespecified fixed validation probe: "
+            f"batches_lower_bound={batches_lower_bound} "
+            f"required={max_val_batches}"
+        )
+    selected_package_contract = {
+        str(path.resolve()): (
+            str(iac_sha256[str(path.resolve())])
+            if iac_sha256 is not None
+            else file_sha256(path)
+        )
+        for path in selected_val_tiles
+    }
+    probe_definition = {
+        "selected_val_tile_packages": selected_package_contract,
+        "expert_exclusion_assets": dict(
+            sorted((expert_asset_sha256 or {}).items())
+        ),
+        "runtime_seed": int(
+            cfg.get("runtime", {}).get("seed", 13)
+        ),
+        "val_tile_fraction": float(
+            cfg.get("data", {}).get("val_tile_fraction", 1.0)
+        ),
+        "dynamic_package_sampling": bool(
+            cfg.get("data", {}).get(
+                "dynamic_package_sampling",
+                True,
+            )
+        ),
+        "package_multiprocessing": bool(
+            cfg.get("data", {}).get(
+                "package_multiprocessing",
+                False,
+            )
+        ),
+        "package_chunk_size": int(
+            cfg.get("data", {}).get("package_chunk_size", 64)
+        ),
+        "package_buffer_batches": int(
+            cfg.get("data", {}).get("package_buffer_batches", 4)
+        ),
+        "batch_size": batch_size,
+        "max_val_batches": max_val_batches,
+        "max_eval_batches": max_eval_batches,
+        "eval_pairwise_max_samples": pairwise_samples,
+    }
+    return {
+        "selected_val_records": records,
+        "selected_val_packages": len(selected_val_tiles),
+        "population_val_records_lower_bound": lower_bound,
+        "population_val_batches_lower_bound": batches_lower_bound,
+        "ordinary_validation_batches": max_val_batches,
+        "ordinary_validation_tiles": max_val_batches * batch_size,
+        "teacher_retention_batches": max_eval_batches,
+        "teacher_retention_tiles": teacher_tiles,
+        "teacher_relation_tiles": pairwise_samples,
+        "probe_definition_sha256": _canonical_digest(
+            probe_definition
+        ),
     }
 
 
@@ -741,6 +868,32 @@ def _spatial_split_counts(
 
 
 def _spatial_split_tile_counts(path: Path) -> dict[str, int]:
+    return {
+        split: len(tile_ids)
+        for split, tile_ids in _spatial_split_tile_ids(path).items()
+    }
+
+
+def _classification_split_tile_ids(
+    path: Path,
+) -> dict[str, set[str]]:
+    result: dict[str, set[str]] = {"train": set(), "val": set()}
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            split = str(row.get("source_split", "")).strip()
+            tile_id = str(row.get("tile_id", "")).strip()
+            adjudicated = str(row.get("adjudicated", "")).strip().lower()
+            if (
+                split in result
+                and tile_id
+                and adjudicated
+                in {"1", "true", "yes", "y", "adjudicated"}
+            ):
+                result[split].add(tile_id)
+    return result
+
+
+def _spatial_split_tile_ids(path: Path) -> dict[str, set[str]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     annotations = payload.get("annotations", {})
     result: dict[str, set[str]] = {"train": set(), "val": set()}
@@ -752,9 +905,29 @@ def _spatial_split_tile_counts(path: Path) -> dict[str, int]:
         )
         if split in result:
             result[split].add(str(raw["tile_id"]))
+    return result
+
+
+def _expert_split_tile_counts(
+    classification_path: Path,
+    spatial_path: Path,
+) -> dict[str, int]:
+    classification = _classification_split_tile_ids(
+        classification_path
+    )
+    spatial = _spatial_split_tile_ids(spatial_path)
+    train = classification["train"] | spatial["train"]
+    val = classification["val"] | spatial["val"]
+    overlap = train & val
+    if overlap:
+        raise ValueError(
+            "train/validation expert tile overlap across L1/L2: "
+            f"count={len(overlap)} sample={next(iter(sorted(overlap)))}"
+        )
     return {
-        split: len(tile_ids)
-        for split, tile_ids in result.items()
+        "train": len(train),
+        "val": len(val),
+        "overlap": 0,
     }
 
 
@@ -808,6 +981,10 @@ def preflight_assets(
     spatial_tile_counts = _spatial_split_tile_counts(
         paths["spatial_manifest_path"],
     )
+    expert_tile_counts = _expert_split_tile_counts(
+        paths["prototype_supervision_manifest_path"],
+        paths["spatial_manifest_path"],
+    )
     if set(
         str(value)
         for value in cfg["data"].get(
@@ -848,9 +1025,15 @@ def preflight_assets(
         cfg,
         complete=True,
     )
-    selected_tiles, _ = _resolved_training_iac_paths(
+    selected_train_tiles, _ = _resolved_training_iac_paths(
         cfg,
         complete=False,
+        splits=("train",),
+    )
+    selected_val_tiles, _ = _resolved_training_iac_paths(
+        cfg,
+        complete=False,
+        splits=("val",),
     )
     iac_paths = sorted(
         {
@@ -898,9 +1081,25 @@ def preflight_assets(
     }
     schedule = _population_schedule_contract(
         cfg,
-        selected_tiles,
+        selected_train_tiles,
         classification_val_tiles=sum(counts["val"].values()),
         spatial_val_tiles=spatial_tile_counts["val"],
+    )
+    validation = _population_validation_contract(
+        cfg,
+        selected_val_tiles,
+        expert_tiles=(
+            expert_tile_counts["train"]
+            + expert_tile_counts["val"]
+        ),
+        iac_sha256=iac_sha256,
+        expert_asset_sha256={
+            key: static_sha256[key]
+            for key in (
+                "prototype_supervision_manifest_path",
+                "spatial_manifest_path",
+            )
+        },
     )
     return {
         "paths": {
@@ -916,8 +1115,32 @@ def preflight_assets(
         "classification_counts": counts,
         "spatial_counts": spatial_counts,
         "spatial_tile_counts": spatial_tile_counts,
+        "expert_tile_counts": expert_tile_counts,
         "population_schedule": schedule,
+        "population_validation": validation,
     }
+
+
+def _formal_base_config(
+    base_cfg: dict[str, Any],
+    *,
+    epochs: int,
+) -> dict[str, Any]:
+    """Freeze study-wide settings before preflight and contract hashing."""
+
+    cfg = deep_merge({}, base_cfg)
+    cfg.setdefault("runtime", {})
+    cfg.setdefault("data", {})
+    cfg.setdefault("train", {})
+    if int(cfg["runtime"].get("seed", 13)) != 13:
+        raise ValueError("formal A0 search requires runtime.seed=13")
+    cfg["runtime"]["seed"] = 13
+    # Trial configs repeat these values defensively, but the formal population
+    # view must already be bound when its schedule and study digest are built.
+    cfg["data"]["train_tile_fraction"] = 0.10
+    cfg["data"]["val_tile_fraction"] = 0.10
+    cfg["train"]["epochs"] = int(epochs)
+    return cfg
 
 
 def trial_config(
@@ -930,6 +1153,7 @@ def trial_config(
     formal_asset_sha256: dict[str, Any] | None = None,
     formal_source: dict[str, str] | None = None,
     formal_study_contract_sha256: str | None = None,
+    formal_population_validation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cfg = deep_merge({}, base_cfg)
     cfg.setdefault("runtime", {})
@@ -957,6 +1181,11 @@ def trial_config(
     if formal_study_contract_sha256 is not None:
         cfg["data"]["formal_study_contract_sha256"] = str(
             formal_study_contract_sha256
+        )
+    if formal_population_validation is not None:
+        cfg["data"]["formal_population_validation"] = deep_merge(
+            {},
+            formal_population_validation,
         )
     cfg["data"]["num_workers"] = int(
         cfg["data"].get("num_workers", 16)
@@ -1210,12 +1439,15 @@ def read_metric_rows(
 ) -> list[dict[str, str]]:
     if not metrics_path.exists():
         return []
-    with metrics_path.open(
-        "r",
-        newline="",
-        encoding="utf-8",
-    ) as handle:
-        return list(csv.DictReader(handle))
+    payload = metrics_path.read_text(encoding="utf-8")
+    # Training and the Optuna coordinator are separate processes. Ignore a
+    # final row until its terminating newline is visible, so polling cannot
+    # mistake a concurrent partial append for a malformed scientific metric.
+    if payload and not payload.endswith(("\n", "\r")):
+        payload = payload.rsplit("\n", 1)[0] + "\n"
+    if not payload.strip():
+        return []
+    return list(csv.DictReader(io.StringIO(payload)))
 
 
 def _selection_row_eligible(row: dict[str, str]) -> bool:
@@ -1478,6 +1710,7 @@ def _study_contract(
     selection_weights: dict[str, float],
     sampler_seed: int,
     total_trial_budget: int,
+    population_validation: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "source": source,
@@ -1493,6 +1726,7 @@ def _study_contract(
         "direction": "minimize",
         "epochs_per_trial": int(epochs),
         "population_fraction": 0.10,
+        "population_validation": dict(population_validation),
         "search_space": SEARCH_SPACE,
         "sampler": {
             "name": "trial_seeded_tpe_v1",
@@ -1833,13 +2067,10 @@ def main() -> None:
     if not base_config_path.is_absolute():
         base_config_path = repo / base_config_path
     base_config_path = base_config_path.resolve()
-    base_cfg = load_yaml(base_config_path)
-    base_cfg.setdefault("runtime", {})
-    base_cfg.setdefault("train", {})
-    if int(base_cfg["runtime"].get("seed", 13)) != 13:
-        raise ValueError("formal A0 search requires runtime.seed=13")
-    base_cfg["runtime"]["seed"] = 13
-    base_cfg["train"]["epochs"] = int(args.epochs)
+    base_cfg = _formal_base_config(
+        load_yaml(base_config_path),
+        epochs=int(args.epochs),
+    )
     source = source_state(repo)
     assets = preflight_assets(base_cfg)
     selection_weights = {
@@ -1872,6 +2103,7 @@ def main() -> None:
         selection_weights=selection_weights,
         sampler_seed=int(args.sampler_seed),
         total_trial_budget=int(args.study_trials),
+        population_validation=assets["population_validation"],
     )
     contract_digest = _canonical_digest(contract)
 
@@ -2030,6 +2262,9 @@ def main() -> None:
             formal_asset_sha256=assets["formal_asset_sha256"],
             formal_source=source,
             formal_study_contract_sha256=contract_digest,
+            formal_population_validation=assets[
+                "population_validation"
+            ],
         )
         cfg_path = trial_dir / "config.yaml"
         write_yaml(cfg_path, cfg)

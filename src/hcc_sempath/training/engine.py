@@ -1087,6 +1087,12 @@ def _cuda_memory_mb(device: torch.device) -> float:
     return float(torch.cuda.memory_allocated(device) / (1024 * 1024))
 
 
+def _cuda_reserved_memory_mb(device: torch.device) -> float:
+    if device.type != "cuda":
+        return 0.0
+    return float(torch.cuda.memory_reserved(device) / (1024 * 1024))
+
+
 def _release_host_memory() -> None:
     gc.collect()
     try:
@@ -1866,11 +1872,16 @@ def run_epoch(
                     now - last_progress_detail
                     >= progress_detail_interval
                 ):
-                    progress_bar.set_postfix(
-                        loss=f"{float(loss.detach().cpu()):.4f}",
-                        tiles_s=f"{n_tiles / elapsed:.0f}",
-                        refresh=False,
-                    )
+                    detail = {
+                        "loss": f"{float(loss.detach().cpu()):.4f}",
+                        "tiles_s": f"{n_tiles / elapsed:.0f}",
+                    }
+                    if device.type == "cuda":
+                        detail["cuda_alloc/resv_mb"] = (
+                            f"{_cuda_memory_mb(device):.0f}/"
+                            f"{_cuda_reserved_memory_mb(device):.0f}"
+                        )
+                    progress_bar.set_postfix(detail, refresh=False)
                     last_progress_detail = now
                 progress_bar.update(1)
             if will_log:
@@ -1887,7 +1898,9 @@ def run_epoch(
                     f"last_image_prepare_sec={image_prepare:.3f} "
                     f"last_batch_sec={batch_elapsed:.3f} "
                     f"loss={float(loss.detach().cpu()):.6f} "
-                    f"cuda_mem_mb={_cuda_memory_mb(device):.1f}"
+                    f"cuda_mem_mb={_cuda_memory_mb(device):.1f} "
+                    "cuda_reserved_mb="
+                    f"{_cuda_reserved_memory_mb(device):.1f}"
                 )
                 interval_start = now
                 interval_tiles = 0
@@ -1939,6 +1952,8 @@ def run_epoch(
     result["tiles_per_sec"] = n_tiles / elapsed
     result["tiles"] = float(n_tiles)
     result["seconds"] = elapsed
+    result["cuda_memory_allocated_mb"] = _cuda_memory_mb(device)
+    result["cuda_memory_reserved_mb"] = _cuda_reserved_memory_mb(device)
     result["global_step_end"] = float(global_step)
     result["spatial_supervised_step_end"] = float(spatial_supervised_step)
     result["batch_in_epoch_end"] = float(n_batches)
@@ -2415,13 +2430,18 @@ def _run_validation_streams(
     spatial_supervised_step: int,
     summary_writer=None,
 ) -> dict[str, dict[str, float]]:
+    # Compilation is an optimizer-only concern. Validation contains small
+    # fixed expert banks and unavoidable tail batches; sending those shapes
+    # through the compiled wrapper creates one-off graphs/CUDA allocations
+    # without changing the selected checkpoint.
+    evaluation_model = getattr(model, "_orig_mod", model)
     # A capped population validation view must contain the same deterministic
     # tiles in every epoch; sample order must not become a hidden moving target.
     _set_loader_epoch(val_loader, 0)
     val_iterator = iter(val_loader)
     try:
         val_metrics, val_embeddings = run_epoch(
-            model,
+            evaluation_model,
             val_loader,
             prototypes,
             optimizer,
@@ -2482,7 +2502,7 @@ def _run_validation_streams(
             },
         }
         _, expert_classification_embeddings = run_epoch(
-            model,
+            evaluation_model,
             expert_classification_val_loader,
             prototypes,
             optimizer,
@@ -2513,7 +2533,7 @@ def _run_validation_streams(
             },
         }
         expert_spatial_metrics = run_epoch(
-            model,
+            evaluation_model,
             expert_spatial_val_loader,
             prototypes,
             optimizer,
