@@ -12,9 +12,11 @@ from hcc_sempath.training.engine import (
     _classification_eval_metrics,
     _complete_bank_spatial_metrics,
     _eligible_selection_epoch_count,
+    _selection_early_stop_requested,
     _normalized_selection_metrics,
     _normalize_uint8_images_fp16,
     _selection_start_step,
+    _spatial_bucket_sizes,
     _teacher_retention_metrics,
     _spatial_global_targets_from_spatial,
     _objective_gradient_diagnostics,
@@ -36,6 +38,7 @@ from hcc_sempath.training.spatial_losses import _mean_supervised_pair
 from hcc_sempath.spatial_schema import DEFAULT_SPATIAL_COMPONENTS
 from hcc_sempath.training.train import (
     _build_optimizer,
+    _configure_default_compile_cache,
     _configure_compiled_training_for_gradient_diagnostics,
     _resume_contract,
     _resolve_configured_epochs,
@@ -206,6 +209,44 @@ def test_selection_reachability_handles_mid_epoch_resume() -> None:
     ) == 2
 
 
+def test_selection_early_stop_waits_for_minimum_eligible_epochs() -> None:
+    assert not _selection_early_stop_requested(
+        enabled=True,
+        eligible=True,
+        eligible_epochs=4,
+        minimum_eligible_epochs=5,
+        bad_epochs=4,
+        patience=4,
+    )
+    assert _selection_early_stop_requested(
+        enabled=True,
+        eligible=True,
+        eligible_epochs=5,
+        minimum_eligible_epochs=5,
+        bad_epochs=4,
+        patience=4,
+    )
+
+
+def test_selection_early_stop_requires_eligibility_and_patience() -> None:
+    assert not _selection_early_stop_requested(
+        enabled=True,
+        eligible=False,
+        eligible_epochs=8,
+        minimum_eligible_epochs=5,
+        bad_epochs=8,
+        patience=4,
+    )
+    assert not _selection_early_stop_requested(
+        enabled=True,
+        eligible=True,
+        eligible_epochs=8,
+        minimum_eligible_epochs=5,
+        bad_epochs=3,
+        patience=4,
+    )
+
+
 def test_complete_bank_spatial_reducer_is_batch_partition_invariant() -> None:
     complete = {
         "_spatial_eval_instance_point_sum": torch.tensor([3.0, 4.0]),
@@ -258,6 +299,42 @@ def test_spatial_compute_mask_uses_power_of_two_buckets(mask, expected) -> None:
     actual = _bucket_spatial_sample_mask(torch.tensor(mask, dtype=torch.bool))
 
     assert actual.tolist() == expected
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "expected"),
+    [
+        (1, (1,)),
+        (8, (1, 2, 4, 8)),
+        (23, (1, 2, 4, 8, 16, 23)),
+        (64, (1, 2, 4, 8, 16, 32, 64)),
+    ],
+)
+def test_spatial_warmup_enumerates_every_reachable_bucket(
+    batch_size,
+    expected,
+) -> None:
+    assert _spatial_bucket_sizes(batch_size) == expected
+
+
+def test_cuda_compile_uses_a_shared_default_cache(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    cfg = {
+        "runtime": {"output_dir": str(tmp_path / "trial")},
+        "train": {"compile": True},
+    }
+
+    cache_dir = _configure_default_compile_cache(
+        cfg,
+        torch.device("cuda"),
+    )
+
+    assert cache_dir == tmp_path / "torchinductor-cache"
+    assert cfg["runtime"]["compile_cache_dir"] == str(cache_dir)
+    assert cache_dir.is_dir()
 
 
 def test_cuda_amp_precision_is_shared_by_training_and_evaluation() -> None:

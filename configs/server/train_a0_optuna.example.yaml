@@ -16,20 +16,21 @@ data:
 train:
   # The first trial freezes T0/C0/S0 at the shared initialization. Every later
   # trial recomputes and verifies that baseline before reusing the exact stored
-  # values. The weights are explicit so the planned three-cell sensitivity
+  # values. These weights are the stable center of the epoch-7 selection
+  # region from the fixed 10% A0 trajectory; a later three-cell sensitivity
   # analysis changes only this prespecified selection rule.
   epochs: 16
   development_early_stop: false
   selection_early_stop: true
   selection_metric_weights:
-    teacher: 0.50
-    classification: 0.25
-    spatial: 0.25
+    teacher: 0.26
+    classification: 0.28
+    spatial: 0.46
   # Start is derived from the last configured supervision-ramp end.
-  selection_early_stop_patience: 4
+  selection_early_stop_patience: 3
   selection_early_stop_relative_delta: 0.005
   # Guarantees enough post-ramp epochs to observe a real plateau.
-  selection_minimum_eligible_epochs: 5
+  selection_minimum_eligible_epochs: 8
   early_stop_teacher_alignment: false
   # The selected package-level 10% validation view is the source population.
   # Joint selection uses one unchanged 128-batch, label-blind population

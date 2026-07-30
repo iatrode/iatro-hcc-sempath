@@ -8,6 +8,7 @@ import math
 from numbers import Number
 from pathlib import Path
 import random
+import shutil
 import time
 from typing import Callable
 
@@ -539,6 +540,158 @@ def _bucket_spatial_sample_mask(
     padding_indices = (~sample_mask).nonzero(as_tuple=False).flatten()
     compute_mask[padding_indices[: bucket_size - active_count]] = True
     return compute_mask
+
+
+def _spatial_bucket_sizes(batch_size: int) -> tuple[int, ...]:
+    """Return every ROI shape reachable by the power-of-two bucketer."""
+
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError("spatial bucket batch size must be positive")
+    sizes: list[int] = []
+    bucket = 1
+    while bucket < batch_size:
+        sizes.append(bucket)
+        bucket *= 2
+    sizes.append(batch_size)
+    return tuple(sizes)
+
+
+def _warmup_compiled_spatial_buckets(
+    model,
+    batch: dict,
+    cfg: dict,
+    device: torch.device,
+    *,
+    batch_sizes: tuple[int, ...],
+) -> dict[str, int | float | list[int]]:
+    """Compile every reachable spatial-head forward/backward ROI shape."""
+
+    raw_model = getattr(model, "_orig_mod", model)
+    normalized_batch_sizes = tuple(
+        sorted({int(value) for value in batch_sizes})
+    )
+    if (
+        getattr(raw_model, "spatial_head", None) is None
+        or not normalized_batch_sizes
+    ):
+        return {
+            "graphs": 0,
+            "seconds": 0.0,
+            "batch_sizes": [],
+            "roi_sizes": [],
+            "peak_allocated_mb": 0.0,
+            "peak_reserved_mb": 0.0,
+        }
+    if normalized_batch_sizes[0] <= 0:
+        raise ValueError("spatial warmup requires positive batch sizes")
+    available = int(batch["images"].shape[0])
+    if normalized_batch_sizes[-1] > available:
+        raise ValueError(
+            "spatial warmup batch is too small: "
+            f"available={available} required={normalized_batch_sizes[-1]}"
+        )
+
+    cpu_rng_state = torch.random.get_rng_state()
+    cuda_rng_state = (
+        torch.cuda.get_rng_state(device)
+        if device.type == "cuda"
+        else None
+    )
+    was_training = bool(raw_model.training)
+    raw_model.train()
+    raw_model.zero_grad(set_to_none=True)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    started = time.perf_counter()
+    graph_count = 0
+    roi_sizes: set[int] = set()
+    peak_allocated = 0.0
+    peak_reserved = 0.0
+    try:
+        prepared = _prepare_images(
+            batch,
+            cfg,
+            device,
+            normalization=_image_normalization(cfg, device),
+            amp_input=_amp_enabled(device, cfg),
+        )
+        for batch_size in normalized_batch_sizes:
+            images = prepared[:batch_size]
+            for roi_size in _spatial_bucket_sizes(batch_size):
+                spatial_sample_mask = torch.zeros(
+                    batch_size,
+                    dtype=torch.bool,
+                )
+                spatial_sample_mask[:roi_size] = True
+                with torch.autocast(
+                    device_type=device.type,
+                    enabled=_amp_enabled(device, cfg),
+                ):
+                    outputs = model(
+                        images,
+                        spatial_detach_backbone=bool(
+                            cfg["loss"].get(
+                                "spatial_detach_backbone",
+                                False,
+                            )
+                        ),
+                        return_spatial_features=True,
+                        run_spatial=True,
+                        spatial_sample_mask=spatial_sample_mask,
+                    )
+                    differentiable = [
+                        outputs["embedding_norm"],
+                        outputs["classification_logits"],
+                        outputs["spatial_instance_logits"],
+                        outputs["spatial_abundance_logits"],
+                        *outputs["teacher_outputs"].values(),
+                    ]
+                    surrogate = sum(
+                        value.float().square().mean()
+                        for value in differentiable
+                    )
+                surrogate.backward()
+                raw_model.zero_grad(set_to_none=True)
+                graph_count += 1
+                roi_sizes.add(roi_size)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            peak_allocated = float(
+                torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+            )
+            peak_reserved = float(
+                torch.cuda.max_memory_reserved(device) / (1024 * 1024)
+            )
+    finally:
+        raw_model.zero_grad(set_to_none=True)
+        raw_model.train(was_training)
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state, device)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+    result: dict[str, int | float | list[int]] = {
+        "graphs": graph_count,
+        "seconds": time.perf_counter() - started,
+        "batch_sizes": list(normalized_batch_sizes),
+        "roi_sizes": sorted(roi_sizes),
+        "peak_allocated_mb": peak_allocated,
+        "peak_reserved_mb": peak_reserved,
+    }
+    print(
+        "compiled_spatial_bucket_warmup "
+        f"graphs={result['graphs']} "
+        f"batch_sizes={result['batch_sizes']} "
+        f"roi_sizes={result['roi_sizes']} "
+        f"seconds={result['seconds']:.2f} "
+        f"cuda_peak_alloc/resv_mb="
+        f"{result['peak_allocated_mb']:.0f}/"
+        f"{result['peak_reserved_mb']:.0f}",
+        flush=True,
+    )
+    return result
 
 
 @torch.inference_mode()
@@ -1249,10 +1402,17 @@ def run_epoch(
     spatial_eval_statistics: dict[str, torch.Tensor] = {}
     gradient_totals = dict((resumed or {}).get("gradient_totals", {}))
     gradient_count = int((resumed or {}).get("gradient_count", 0))
+    gradient_diagnostic_interval = int(
+        cfg["train"].get(
+            "gradient_diagnostic_interval_steps",
+            GRADIENT_DIAGNOSTIC_INTERVAL_STEPS,
+        )
+        or 0
+    )
     last_gradient_step = int(
         (resumed or {}).get(
             "last_gradient_step",
-            global_step - GRADIENT_DIAGNOSTIC_INTERVAL_STEPS,
+            global_step - max(1, gradient_diagnostic_interval),
         )
     )
     n_batches = int((resumed or {}).get("batches", 0))
@@ -1689,11 +1849,12 @@ def run_epoch(
 
                 if (
                     train
+                    and gradient_diagnostic_interval > 0
                     and spatial_is_active
                     and float(loss_cfg["spatial_weight"]) > 0
                     and not bool(loss_cfg["spatial_detach_backbone"])
                     and global_step - last_gradient_step
-                    >= GRADIENT_DIAGNOSTIC_INTERVAL_STEPS
+                    >= gradient_diagnostic_interval
                 ):
                     shared_parameters = tuple(
                         raw_model.encoder.backbone.blocks[-1].parameters()
@@ -2292,6 +2453,25 @@ def _eligible_selection_epoch_count(
     return eligible
 
 
+def _selection_early_stop_requested(
+    *,
+    enabled: bool,
+    eligible: bool,
+    eligible_epochs: int,
+    minimum_eligible_epochs: int,
+    bad_epochs: int,
+    patience: int,
+) -> bool:
+    """Gate joint-validation stopping by both evidence and patience."""
+
+    return bool(
+        enabled
+        and eligible
+        and eligible_epochs >= minimum_eligible_epochs
+        and bad_epochs >= patience
+    )
+
+
 def _teacher_retention_metrics(
     embedding_metrics: dict[str, float],
     *,
@@ -2665,6 +2845,16 @@ def fit(
 ) -> dict:
     output_dir = ensure_dir(cfg["runtime"]["output_dir"])
     checkpoints = ensure_dir(output_dir / "checkpoints")
+    trajectory_snapshots_dir = (
+        ensure_dir(output_dir / "trajectory_snapshots")
+        if bool(
+            cfg["train"].get(
+                "retain_trajectory_snapshots",
+                False,
+            )
+        )
+        else None
+    )
     resume_global_step = int((resume_state or {}).get("global_step", 0))
     if resume_state is not None:
         for metric_name in (
@@ -2699,12 +2889,18 @@ def fit(
     selection_bad_epochs = int(
         (resume_state or {}).get("selection_bad_epochs", 0)
     )
+    selection_eligible_epochs = int(
+        (resume_state or {}).get("selection_eligible_epochs", 0)
+    )
     selection_baseline = {
         str(name): float(value)
         for name, value in (
             (resume_state or {}).get("selection_baseline", {})
         ).items()
     }
+    trajectory_snapshots = list(
+        (resume_state or {}).get("trajectory_snapshots", [])
+    )
     best_metrics = dict((resume_state or {}).get("best_metrics", {}))
     last_metrics = dict(
         (resume_state or {}).get(
@@ -2954,7 +3150,9 @@ def fit(
             ),
             "best_selection_epoch": best_selection_epoch,
             "selection_bad_epochs": selection_bad_epochs,
+            "selection_eligible_epochs": selection_eligible_epochs,
             "selection_baseline": dict(selection_baseline),
+            "trajectory_snapshots": list(trajectory_snapshots),
             "selection_metric_weights": dict(
                 selection_metric_weights
             ),
@@ -2975,6 +3173,88 @@ def fit(
             ),
         }
 
+    def archive_trajectory_snapshot(
+        *,
+        current_epoch: int,
+        step: int,
+        spatial_step: int,
+        metrics: dict | None,
+    ) -> None:
+        nonlocal trajectory_snapshots
+        if (
+            trajectory_snapshots_dir is None
+            or current_epoch <= 1
+            or step < selection_early_stop_start_step
+            or any(
+                int(item["global_step"]) == int(step)
+                for item in trajectory_snapshots
+            )
+        ):
+            return
+        reserve_gb = float(
+            cfg["train"].get(
+                "trajectory_snapshot_reserve_gb",
+                10.0,
+            )
+        )
+        free_bytes = shutil.disk_usage(output_dir).free
+        if free_bytes < int(reserve_gb * (1024**3)) + 1024**3:
+            _log(
+                "trajectory_snapshot_skipped_disk_reserve "
+                f"epoch={current_epoch} global_step={step} "
+                f"free_gb={free_bytes / (1024**3):.2f} "
+                f"reserve_gb={reserve_gb:.2f}"
+            )
+            return
+        filename = f"step_{step:08d}.pt"
+        raw_model = getattr(model, "_orig_mod", model)
+        _atomic_torch_save(
+            {
+                "format": "hcc-sempath-trajectory-snapshot-v1",
+                "model": raw_model.state_dict(),
+                "epoch": int(current_epoch),
+                "global_step": int(step),
+                "spatial_supervised_step": int(spatial_step),
+                "metrics": (
+                    _scalar_epoch_metrics(metrics)
+                    if metrics is not None
+                    else {}
+                ),
+                "selection_baseline": dict(selection_baseline),
+                "config": cfg,
+            },
+            trajectory_snapshots_dir / filename,
+        )
+        entry = {
+            "epoch": int(current_epoch),
+            "global_step": int(step),
+            "spatial_supervised_step": int(spatial_step),
+            "checkpoint": filename,
+            "has_complete_validation": metrics is not None,
+        }
+        if metrics is not None and expert_selection_enabled:
+            entry["raw"] = {
+                name: float(metrics[f"selection_{name}_raw"])
+                for name in SELECTION_COMPONENTS
+            }
+            entry["normalized"] = {
+                name: float(
+                    metrics[f"selection_{name}_normalized"]
+                )
+                for name in SELECTION_COMPONENTS
+            }
+        trajectory_snapshots.append(entry)
+        trajectory_snapshots.sort(
+            key=lambda item: int(item["global_step"])
+        )
+        write_json(
+            trajectory_snapshots_dir / "index.json",
+            {
+                "reserve_gb": reserve_gb,
+                "snapshots": trajectory_snapshots,
+            },
+        )
+
     def save_step_checkpoint(
         step: int,
         spatial_step: int,
@@ -2993,6 +3273,12 @@ def fit(
         spatial_supervised_step = int(spatial_step)
         step_metrics_writer.flush()
         started = time.perf_counter()
+        archive_trajectory_snapshot(
+            current_epoch=current_epoch,
+            step=step,
+            spatial_step=spatial_step,
+            metrics=None,
+        )
         _atomic_torch_save(
             checkpoint_payload(
                 epoch=current_epoch,
@@ -3421,6 +3707,7 @@ def fit(
                 best_selection_epoch = epoch
                 best_metrics = row
             if selection_eligible:
+                selection_eligible_epochs += 1
                 if significant_selection_improvement:
                     best_significant_selection_loss = selection_loss
                     selection_bad_epochs = 0
@@ -3433,11 +3720,21 @@ def fit(
                     classification_selection_metric
                 )
 
-            selection_stop_requested = bool(
-                selection_early_stop_enabled
-                and selection_eligible
-                and selection_bad_epochs
-                >= selection_early_stop_patience
+            selection_stop_requested = _selection_early_stop_requested(
+                enabled=selection_early_stop_enabled,
+                eligible=selection_eligible,
+                eligible_epochs=selection_eligible_epochs,
+                minimum_eligible_epochs=(
+                    selection_minimum_eligible_epochs
+                ),
+                bad_epochs=selection_bad_epochs,
+                patience=selection_early_stop_patience,
+            )
+            archive_trajectory_snapshot(
+                current_epoch=epoch,
+                step=global_step,
+                spatial_step=spatial_supervised_step,
+                metrics=row,
             )
             checkpoint = checkpoint_payload(
                 epoch=epoch,

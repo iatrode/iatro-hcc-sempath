@@ -1224,7 +1224,7 @@ def trial_config(
     )
     cfg["train"]["max_grad_norm"] = 1.0
     cfg["train"]["max_val_batches"] = int(
-        cfg["train"].get("max_val_batches", 256)
+        cfg["train"].get("max_val_batches", 128)
     )
     cfg["train"]["max_eval_batches"] = int(
         cfg["train"].get("max_eval_batches", 128)
@@ -1238,10 +1238,13 @@ def trial_config(
     cfg["train"].setdefault(
         "selection_metric_weights",
         {
-            "teacher": 0.50,
-            "classification": 0.25,
-            "spatial": 0.25,
+            "teacher": 0.26,
+            "classification": 0.28,
+            "spatial": 0.46,
         },
+    )
+    cfg["train"]["selection_minimum_eligible_epochs"] = int(
+        cfg["train"].get("selection_minimum_eligible_epochs", 8)
     )
     if selection_baseline is not None:
         cfg["train"]["selection_metric_baseline"] = {
@@ -1249,7 +1252,7 @@ def trial_config(
             for name in SELECTION_COMPONENTS
         }
     cfg["train"]["selection_early_stop_patience"] = int(
-        cfg["train"].get("selection_early_stop_patience", 4)
+        cfg["train"].get("selection_early_stop_patience", 3)
     )
     cfg["train"]["selection_early_stop_relative_delta"] = float(
         cfg["train"].get(
@@ -2078,9 +2081,9 @@ def main() -> None:
             base_cfg.get("train", {}).get(
                 "selection_metric_weights",
                 {
-                    "teacher": 0.50,
-                    "classification": 0.25,
-                    "spatial": 0.25,
+                    "teacher": 0.26,
+                    "classification": 0.28,
+                    "spatial": 0.46,
                 },
             )[name]
         )

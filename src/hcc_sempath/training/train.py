@@ -49,7 +49,12 @@ from .datasets import (
     read_packaged_tile_records,
     validate_teacher_cache,
 )
-from .engine import _scheduler_contract, build_lr_scheduler, fit
+from .engine import (
+    _scheduler_contract,
+    _warmup_compiled_spatial_buckets,
+    build_lr_scheduler,
+    fit,
+)
 from .manifest import load_training_manifest
 from .prototype_labels import DEFAULT_CLASSIFICATION_CLASSES, load_prototype_labels
 from .roi import (
@@ -1910,12 +1915,45 @@ def _build_optimizer(
 def _configure_compiled_training_for_gradient_diagnostics() -> None:
     """Allow diagnostic autograd passes before the optimizing backward pass."""
 
+    import torch._dynamo
     from torch._functorch import config as functorch_config
 
     # AOTAutograd buffer donation requires one non-retained backward. The
     # scientific diagnostic intentionally takes two retained gradients from
     # the same forward graph before the optimizing backward.
     functorch_config.donated_buffer = False
+    torch._dynamo.config.cache_size_limit = max(
+        int(torch._dynamo.config.cache_size_limit),
+        32,
+    )
+
+
+def _configure_default_compile_cache(
+    cfg: dict,
+    device: torch.device,
+) -> Path | None:
+    """Use one persistent Inductor cache across CUDA training runs."""
+
+    if not bool(
+        device.type == "cuda"
+        and cfg["train"].get("compile", False)
+    ):
+        return None
+    configured = os.environ.get("TORCHINDUCTOR_CACHE_DIR", "").strip()
+    if configured:
+        cache_dir = Path(configured).expanduser().resolve()
+    else:
+        cache_dir = (
+            Path(cfg["runtime"]["output_dir"])
+            .expanduser()
+            .resolve()
+            .parent
+            / "torchinductor-cache"
+        )
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cfg["runtime"]["compile_cache_dir"] = str(cache_dir)
+    return cache_dir
 
 
 def main() -> None:
@@ -1939,6 +1977,13 @@ def main() -> None:
     _cap_compute_threads(int(cfg["data"].get("num_workers", 0)))
     seed_everything(int(cfg["runtime"]["seed"]))
     device = torch.device(cfg["runtime"]["device"])
+    compile_cache_dir = _configure_default_compile_cache(cfg, device)
+    if compile_cache_dir is not None:
+        _probe.timeline_event(
+            "startup.compile_cache_configured",
+            force=True,
+            path=str(compile_cache_dir),
+        )
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -2495,17 +2540,53 @@ def main() -> None:
         validation_tiles=len(val_ds),
     )
     num_workers = int(cfg["data"]["num_workers"])
-    loader_kwargs = {
-        "batch_size": cfg["train"]["batch_size"],
+    val_num_workers = int(
+        cfg["data"].get("val_num_workers", num_workers)
+    )
+    if val_num_workers < 0:
+        raise ValueError("data.val_num_workers must be non-negative")
+    train_batch_size = int(cfg["train"]["batch_size"])
+    val_batch_size = int(
+        cfg["train"].get("val_batch_size", train_batch_size)
+    )
+    if val_batch_size <= 0:
+        raise ValueError("train.val_batch_size must be positive")
+    train_loader_kwargs = {
+        "batch_size": train_batch_size,
         "num_workers": num_workers,
         "pin_memory": device.type == "cuda",
     }
+    val_loader_kwargs = {
+        **train_loader_kwargs,
+        "batch_size": val_batch_size,
+        "num_workers": val_num_workers,
+    }
+    prefetch_factor = int(cfg["data"].get("prefetch_factor", 2))
+    val_prefetch_factor = int(
+        cfg["data"].get("val_prefetch_factor", prefetch_factor)
+    )
+    if val_num_workers > 0 and val_prefetch_factor <= 0:
+        raise ValueError(
+            "data.val_prefetch_factor must be positive when "
+            "data.val_num_workers is positive"
+        )
     if num_workers > 0:
-        loader_kwargs["prefetch_factor"] = int(cfg["data"].get("prefetch_factor", 2))
-        loader_kwargs["persistent_workers"] = bool(cfg["data"].get("persistent_workers", True))
+        persistent_workers = bool(
+            cfg["data"].get("persistent_workers", True)
+        )
+        train_loader_kwargs["prefetch_factor"] = prefetch_factor
+        train_loader_kwargs["persistent_workers"] = persistent_workers
+    if val_num_workers > 0:
+        val_loader_kwargs["prefetch_factor"] = val_prefetch_factor
+        val_loader_kwargs["persistent_workers"] = bool(
+            cfg["data"].get("val_persistent_workers", True)
+        )
     if dynamic_package_sampling:
         prefetch_batches = int(cfg["data"].get("prefetch_factor", 2))
-        default_chunk_size = max(1, int(cfg["train"]["batch_size"]) // max(1, num_workers))
+        default_chunk_size = max(
+            1,
+            train_batch_size // max(1, num_workers),
+        )
         package_chunk_size = int(cfg["data"].get("package_chunk_size", default_chunk_size))
         package_buffer_batches = int(cfg["data"].get("package_buffer_batches", 4))
         use_mp = bool(cfg["data"].get("package_multiprocessing", False)) and num_workers > 0
@@ -2516,29 +2597,39 @@ def main() -> None:
             # of the ~800% CPU ceiling and 7.3ms/tile vs 2ms in-bench decode).
             # Reproduces the thread loader's exact tile order via the chunk-plan
             # batch sampler, and reuses the dataset's __getitems__ + collate.
-            bs = int(cfg["train"]["batch_size"])
+            bs = train_batch_size
             train_sampler = _ChunkPlanBatchSampler(
                 train_ds, batch_size=bs, chunk_size=package_chunk_size,
                 seed=int(cfg["runtime"]["seed"]), reshuffle_each_epoch=True,
             )
             val_sampler = _ChunkPlanBatchSampler(
-                val_ds, batch_size=bs, chunk_size=package_chunk_size,
+                val_ds,
+                batch_size=val_batch_size,
+                chunk_size=package_chunk_size,
                 seed=int(cfg["runtime"]["seed"]) + 1, reshuffle_each_epoch=False,
             )
-            mp_kwargs = dict(
+            train_mp_kwargs = dict(
                 num_workers=num_workers,
                 pin_memory=device.type == "cuda",
-                prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
+                prefetch_factor=prefetch_factor,
                 persistent_workers=bool(cfg["data"].get("persistent_workers", True)),
             )
+            val_mp_kwargs = dict(
+                num_workers=val_num_workers,
+                pin_memory=device.type == "cuda",
+                prefetch_factor=val_prefetch_factor,
+                persistent_workers=bool(
+                    cfg["data"].get("val_persistent_workers", True)
+                ),
+            )
             train_loader = DataLoader(train_ds, batch_sampler=train_sampler,
-                                      collate_fn=train_ds.collate, **mp_kwargs)
+                                      collate_fn=train_ds.collate, **train_mp_kwargs)
             val_loader = DataLoader(val_ds, batch_sampler=val_sampler,
-                                    collate_fn=val_ds.collate, **mp_kwargs)
+                                    collate_fn=val_ds.collate, **val_mp_kwargs)
         else:
             train_loader = _PackageShuffleBatchLoader(
                 train_ds,
-                batch_size=int(cfg["train"]["batch_size"]),
+                batch_size=train_batch_size,
                 num_workers=num_workers,
                 prefetch_batches=prefetch_batches,
                 collate_fn=train_ds.collate,
@@ -2550,9 +2641,9 @@ def main() -> None:
             )
             val_loader = _PackageShuffleBatchLoader(
                 val_ds,
-                batch_size=int(cfg["train"]["batch_size"]),
-                num_workers=num_workers,
-                prefetch_batches=prefetch_batches,
+                batch_size=val_batch_size,
+                num_workers=val_num_workers,
+                prefetch_batches=val_prefetch_factor,
                 collate_fn=val_ds.collate,
                 seed=int(cfg["runtime"]["seed"]) + 1,
                 chunk_size=package_chunk_size,
@@ -2565,13 +2656,13 @@ def main() -> None:
             train_ds,
             shuffle=True,
             collate_fn=collate_distillation,
-            **loader_kwargs,
+            **train_loader_kwargs,
         )
         val_loader = DataLoader(
             val_ds,
             shuffle=False,
             collate_fn=collate_distillation,
-            **loader_kwargs,
+            **val_loader_kwargs,
         )
     _probe.timeline_event("startup.population_loaders_built", force=True)
     replay_interval = int(
@@ -2579,6 +2670,7 @@ def main() -> None:
     )
     prototype_refresh_loader = None
     spatial_prototype_refresh_loader = None
+    expert_loader = None
     expert_classification_val_loader = None
     expert_spatial_val_loader = None
     expert_batch_size = int(
@@ -2778,6 +2870,43 @@ def main() -> None:
         _configure_compiled_training_for_gradient_diagnostics()
         model = torch.compile(model)
     _probe.timeline_event("startup.model_compile_wrapped", force=True)
+    if bool(
+        cfg["train"].get(
+            "compile_spatial_bucket_warmup",
+            device.type == "cuda",
+        )
+        and bool(cfg["train"].get("compile", False))
+        and device.type == "cuda"
+        and expert_loader is not None
+        and spatial_prototype_refresh_loader is not None
+    ):
+        expert_count = int(expert_loader.indices.size)
+        replay_batch_sizes = {
+            min(expert_count, expert_loader.batch_size)
+        }
+        tail_size = expert_count % expert_loader.batch_size
+        if tail_size:
+            replay_batch_sizes.add(tail_size)
+        warmup_indices = torch.from_numpy(
+            spatial_prototype_refresh_loader.indices[
+                : max(replay_batch_sizes)
+            ].copy()
+        ).long()
+        warmup_batch = spatial_prototype_refresh_loader.bank.batch(
+            warmup_indices
+        )
+        _warmup_compiled_spatial_buckets(
+            model,
+            warmup_batch,
+            cfg,
+            device,
+            batch_sizes=tuple(sorted(replay_batch_sizes)),
+        )
+        _probe.timeline_event(
+            "startup.compiled_spatial_buckets_warmed",
+            force=True,
+            batch_sizes=sorted(replay_batch_sizes),
+        )
     optimizer = _build_optimizer(model, cfg, device)
     _probe.timeline_event("startup.optimizer_built", force=True)
     if resume_state and "optimizer" in resume_state:
