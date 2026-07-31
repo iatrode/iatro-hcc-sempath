@@ -11,6 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import signal
 import subprocess
@@ -102,19 +103,22 @@ class TrialSeededTPESampler(optuna.samplers.BaseSampler):
         self.seed = int(seed)
         self.n_startup_trials = int(n_startup_trials)
         self._delegates: dict[int, optuna.samplers.TPESampler] = {}
+        self._delegates_lock = threading.Lock()
 
     def _delegate(
         self,
         trial: optuna.trial.FrozenTrial,
     ) -> optuna.samplers.TPESampler:
-        if trial.number not in self._delegates:
-            self._delegates[trial.number] = optuna.samplers.TPESampler(
-                seed=self.seed + int(trial.number),
-                n_startup_trials=self.n_startup_trials,
-                multivariate=True,
-                group=True,
-            )
-        return self._delegates[trial.number]
+        with self._delegates_lock:
+            if trial.number not in self._delegates:
+                self._delegates[trial.number] = optuna.samplers.TPESampler(
+                    seed=self.seed + int(trial.number),
+                    n_startup_trials=self.n_startup_trials,
+                    multivariate=True,
+                    group=True,
+                    constant_liar=True,
+                )
+            return self._delegates[trial.number]
 
     def before_trial(
         self,
@@ -169,7 +173,8 @@ class TrialSeededTPESampler(optuna.samplers.BaseSampler):
         state: optuna.trial.TrialState,
         values: list[float] | None,
     ) -> None:
-        delegate = self._delegates.pop(trial.number, None)
+        with self._delegates_lock:
+            delegate = self._delegates.pop(trial.number, None)
         if delegate is not None:
             delegate.after_trial(study, trial, state, values)
 
@@ -1507,6 +1512,35 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=30)
 
 
+def parse_cuda_devices(
+    raw_devices: str,
+    *,
+    parallel_trials: int,
+) -> tuple[str | None, ...]:
+    if int(parallel_trials) <= 0:
+        raise ValueError("--parallel-trials must be positive")
+    devices = tuple(
+        device.strip()
+        for device in str(raw_devices).split(",")
+        if device.strip()
+    )
+    if not devices:
+        if int(parallel_trials) != 1:
+            raise ValueError(
+                "--devices is required when --parallel-trials is greater "
+                "than one"
+            )
+        return (None,)
+    if len(set(devices)) != len(devices):
+        raise ValueError("--devices must not contain duplicates")
+    if len(devices) < int(parallel_trials):
+        raise ValueError(
+            "--devices must provide at least one distinct GPU per "
+            "parallel trial"
+        )
+    return devices
+
+
 def train_with_pruning(
     *,
     trial: optuna.Trial,
@@ -1518,12 +1552,15 @@ def train_with_pruning(
     expected_weights: dict[str, float],
     expected_baseline: dict[str, float] | None,
     expected_start_step: int,
+    cuda_visible_device: str | None = None,
     objective: str = "selection_loss",
 ) -> float:
     log_path = output_dir / "trial.log"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(repo / "src")
     env["PYTHONNOUSERSITE"] = "1"
+    if cuda_visible_device is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_device)
     command = [
         python_bin,
         "-m",
@@ -1751,6 +1788,7 @@ def _study_contract(
             "n_startup_trials": 6,
             "multivariate": True,
             "group": True,
+            "constant_liar": True,
         },
         "pruner": {
             "name": "MedianPruner",
@@ -2070,6 +2108,24 @@ def main() -> None:
     parser.add_argument("--timeout-hours", type=float, default=0.0)
     parser.add_argument("--poll-sec", type=float, default=20.0)
     parser.add_argument("--sampler-seed", type=int, default=13)
+    parser.add_argument(
+        "--parallel-trials",
+        type=int,
+        default=1,
+        help=(
+            "Number of independent single-GPU trials run concurrently "
+            "by this coordinator. A free GPU immediately receives the "
+            "next trial."
+        ),
+    )
+    parser.add_argument(
+        "--devices",
+        default="",
+        help=(
+            "Comma-separated physical CUDA device identifiers. Required "
+            "for parallel trials, for example: 0,1,2,3."
+        ),
+    )
     args = parser.parse_args()
 
     if int(args.epochs) < 6:
@@ -2078,6 +2134,10 @@ def main() -> None:
         raise ValueError("--n-trials must be non-negative")
     if int(args.study_trials) <= 0:
         raise ValueError("--study-trials must be positive")
+    cuda_devices = parse_cuda_devices(
+        str(args.devices),
+        parallel_trials=int(args.parallel_trials),
+    )
 
     repo = Path(__file__).resolve().parents[1]
     base_config_path = Path(args.base_config)
@@ -2167,6 +2227,16 @@ def main() -> None:
         "complete_spatial_expert_bank": True,
         "n_trials_requested": int(args.study_trials),
         "timeout_hours": float(args.timeout_hours),
+        "execution": {
+            "parallel_trials": int(args.parallel_trials),
+            "cuda_devices": [
+                device
+                for device in cuda_devices
+                if device is not None
+            ],
+            "trial_gpu_mode": "one_independent_trial_per_device",
+            "scheduling": "asynchronous_device_reuse",
+        },
         "sampler": "TrialSeededTPESampler",
         "sampler_seed": int(args.sampler_seed),
         "n_startup_trials": 6,
@@ -2255,98 +2325,115 @@ def main() -> None:
         output_root=output_root,
         manifest=manifest,
     )
+    available_devices: queue.Queue[str | None] = queue.Queue()
+    for cuda_device in cuda_devices:
+        available_devices.put(cuda_device)
+    baseline_lock = threading.Lock()
+    export_lock = threading.Lock()
 
     def objective(trial: optuna.Trial) -> float:
-        current_source = source_state(repo)
-        if current_source != source:
-            raise RuntimeError(
-                "formal source changed after study preflight"
-            )
-        trial_dir = output_root / f"trial_{trial.number:04d}"
-        if trial_dir.exists() and any(trial_dir.iterdir()):
-            raise RuntimeError(
-                "refusing to overwrite an existing trial directory: "
-                f"{trial_dir}"
-            )
-        trial_dir.mkdir(parents=True, exist_ok=True)
-        shared_baseline = _study_selection_baseline(study)
-        cfg = trial_config(
-            base_cfg,
-            trial,
-            trial_dir,
-            epochs=int(args.epochs),
-            selection_baseline=shared_baseline,
-            formal_asset_sha256=assets["formal_asset_sha256"],
-            formal_source=source,
-            formal_study_contract_sha256=contract_digest,
-            formal_population_validation=assets[
-                "population_validation"
-            ],
-        )
-        cfg_path = trial_dir / "config.yaml"
-        write_yaml(cfg_path, cfg)
-        print(
-            f"trial_start number={trial.number} "
-            f"lr={trial.params['lr']:.8g} "
-            f"weight_decay={trial.params['weight_decay']:.8g} "
-            f"spatial_weight={trial.params['spatial_weight']:.8g}",
-            flush=True,
-        )
-        trial.set_user_attr(
-            "study_contract_sha256",
-            contract_digest,
-        )
-        trial.set_user_attr(
-            "config_sha256",
-            config_digest(cfg),
-        )
+        cuda_device = available_devices.get()
         try:
-            result = train_with_pruning(
-                trial=trial,
-                cfg_path=cfg_path,
-                output_dir=trial_dir,
-                python_bin=str(args.python),
-                repo=repo,
-                poll_sec=float(args.poll_sec),
-                expected_weights=selection_weights,
-                expected_baseline=shared_baseline,
-                expected_start_step=(
-                    _selection_start_step_from_config(cfg)
-                ),
+            current_source = source_state(repo)
+            if current_source != source:
+                raise RuntimeError(
+                    "formal source changed after study preflight"
+                )
+            trial_dir = output_root / f"trial_{trial.number:04d}"
+            if trial_dir.exists() and any(trial_dir.iterdir()):
+                raise RuntimeError(
+                    "refusing to overwrite an existing trial directory: "
+                    f"{trial_dir}"
+                )
+            trial_dir.mkdir(parents=True, exist_ok=True)
+            with baseline_lock:
+                shared_baseline = _study_selection_baseline(study)
+            cfg = trial_config(
+                base_cfg,
+                trial,
+                trial_dir,
+                epochs=int(args.epochs),
+                selection_baseline=shared_baseline,
+                formal_asset_sha256=assets["formal_asset_sha256"],
+                formal_source=source,
+                formal_study_contract_sha256=contract_digest,
+                formal_population_validation=assets[
+                    "population_validation"
+                ],
             )
-            return result
-        except optuna.TrialPruned:
-            raise
-        except Exception as exc:
+            cfg_path = trial_dir / "config.yaml"
+            write_yaml(cfg_path, cfg)
+            print(
+                f"trial_start number={trial.number} "
+                f"device={cuda_device if cuda_device is not None else 'env'} "
+                f"lr={trial.params['lr']:.8g} "
+                f"weight_decay={trial.params['weight_decay']:.8g} "
+                f"spatial_weight={trial.params['spatial_weight']:.8g}",
+                flush=True,
+            )
             trial.set_user_attr(
-                "failure_reason",
-                f"{type(exc).__name__}: {exc}",
+                "study_contract_sha256",
+                contract_digest,
             )
-            raise
-        finally:
-            trial_baseline = _selection_baseline_from_path(
-                trial_dir / "selection_baseline.json"
+            trial.set_user_attr(
+                "config_sha256",
+                config_digest(cfg),
             )
-            if trial_baseline is not None:
-                baseline_digest = _bind_study_selection_baseline(
-                    study,
-                    trial_baseline,
+            trial.set_user_attr(
+                "cuda_visible_device",
+                cuda_device if cuda_device is not None else "inherited",
+            )
+            try:
+                return train_with_pruning(
+                    trial=trial,
+                    cfg_path=cfg_path,
+                    output_dir=trial_dir,
+                    python_bin=str(args.python),
+                    repo=repo,
+                    poll_sec=float(args.poll_sec),
+                    expected_weights=selection_weights,
+                    expected_baseline=shared_baseline,
+                    expected_start_step=(
+                        _selection_start_step_from_config(cfg)
+                    ),
+                    cuda_visible_device=cuda_device,
                 )
+            except optuna.TrialPruned:
+                raise
+            except Exception as exc:
                 trial.set_user_attr(
-                    "selection_metric_baseline_sha256",
-                    baseline_digest,
+                    "failure_reason",
+                    f"{type(exc).__name__}: {exc}",
                 )
+                raise
+            finally:
+                trial_baseline = _selection_baseline_from_path(
+                    trial_dir / "selection_baseline.json"
+                )
+                if trial_baseline is not None:
+                    with baseline_lock:
+                        baseline_digest = _bind_study_selection_baseline(
+                            study,
+                            trial_baseline,
+                        )
+                    trial.set_user_attr(
+                        "selection_metric_baseline_sha256",
+                        baseline_digest,
+                    )
+        finally:
+            available_devices.put(cuda_device)
 
     def export_callback(
         callback_study: optuna.Study,
         trial: optuna.trial.FrozenTrial,
     ) -> None:
         del trial
-        export_study_artifacts(
-            callback_study,
-            output_root=output_root,
-            manifest=manifest,
-        )
+        with export_lock:
+            export_study_artifacts(
+                callback_study,
+                output_root=output_root,
+                manifest=manifest,
+            )
 
     timeout = (
         None
@@ -2377,6 +2464,7 @@ def main() -> None:
         objective,
         n_trials=invocation_trials,
         timeout=timeout,
+        n_jobs=int(args.parallel_trials),
         gc_after_trial=True,
         callbacks=[export_callback],
     )

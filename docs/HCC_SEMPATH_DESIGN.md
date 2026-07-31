@@ -301,7 +301,11 @@ decision boundary when available.
 - A0 Optuna search uses one deterministic 10% population subset, the complete
   training expert union, and independent complete L1/L2 validation banks. It
   searches learning rate, weight decay, and the global spatial-task weight for
-  at most 16 epochs. The fixed 10% population is the compute-matched study
+  at most 16 epochs. Multi-GPU execution assigns one independent trial to each
+  GPU under one coordinator. Asynchronous device reuse prevents paid GPU
+  idling after early stopping; constant-liar TPE includes in-flight
+  configurations when proposing the next trial. The fixed 10% population is
+  the compute-matched study
   population for A0 and every formal ablation; it is not a checkpoint-selection
   device. Every formal mechanism ablation inherits the A0 seed,
   hyperparameters, maximum budget, checkpoint-selection rule, schedule, and

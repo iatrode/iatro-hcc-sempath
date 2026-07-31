@@ -106,11 +106,26 @@ python scripts/optuna_a0_search.py \
   --study-trials 20
 ```
 
+On a multi-GPU host, keep one coordinator and bind one independent trial to
+each GPU. Scheduling is asynchronous: a GPU that finishes early immediately
+receives the next trial, while constant-liar TPE accounts for configurations
+that remain in flight:
+
+```bash
+python scripts/optuna_a0_search.py \
+  --base-config configs/server/train_a0_optuna.example.yaml \
+  --n-trials 20 \
+  --study-trials 20 \
+  --parallel-trials 4 \
+  --devices 0,1,2,3
+```
+
 The A0 checkpoint minimizes a prespecified normalized joint score. Direct
-fixed-teacher feature/relation retention receives weight `0.50`; complete-bank
-seven-class balanced cross entropy and eleven-component spatial loss receive
-`0.25` each. Every term is divided by the first trial's shared-initialization
-epoch-0 value; later trials must reproduce that baseline before optimization.
+fixed-teacher feature/relation retention receives weight `0.26`; complete-bank
+seven-class balanced cross entropy receives `0.28`; and eleven-component
+spatial loss receives `0.46`. Every term is divided by the first trial's
+shared-initialization epoch-0 value; later trials must reproduce that baseline
+before optimization.
 Selection and pruning start only after every active supervision ramp. The
 study contract hashes source, all resolved tile and four-teacher IAC packages,
 model initialization, supervision manifests, and prototype registries.

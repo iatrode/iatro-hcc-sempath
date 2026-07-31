@@ -22,6 +22,34 @@ def _search_module():
     return module
 
 
+def _valid_selection_row() -> dict[str, str]:
+    return {
+        "epoch": "12",
+        "selection_eligible": "true",
+        "global_step": "2500",
+        "selection_start_step": "2500",
+        "selection_loss": "0.5",
+        "selection_teacher_raw": "0.4",
+        "selection_teacher_baseline": "0.8",
+        "selection_teacher_normalized": "0.5",
+        "selection_teacher_weight": "0.5",
+        "selection_classification_raw": "0.6",
+        "selection_classification_baseline": "1.2",
+        "selection_classification_normalized": "0.5",
+        "selection_classification_weight": "0.25",
+        "selection_spatial_raw": "0.5",
+        "selection_spatial_baseline": "1.0",
+        "selection_spatial_normalized": "0.5",
+        "selection_spatial_weight": "0.25",
+        "teacher_validation_loss": "0.4",
+        "expert_val_spatial": "0.5",
+        "expert_val_classification_balanced_cross_entropy": "0.6",
+        "expert_val_classification_evaluated_classes": "7",
+        "expert_val_classification_total_classes": "7",
+        "expert_val_spatial_explicit_negative_pairs": "4",
+    }
+
+
 def test_trial_config_uses_matched_tenth_population_and_fixed_losses(
     tmp_path: Path,
 ) -> None:
@@ -397,31 +425,7 @@ def test_training_exit_drains_final_eligible_metric(
     module = _search_module()
     output = tmp_path / "trial"
     (output / "checkpoints").mkdir(parents=True)
-    row = {
-        "epoch": "12",
-        "selection_eligible": "true",
-        "global_step": "2500",
-        "selection_start_step": "2500",
-        "selection_loss": "0.5",
-        "selection_teacher_raw": "0.4",
-        "selection_teacher_baseline": "0.8",
-        "selection_teacher_normalized": "0.5",
-        "selection_teacher_weight": "0.5",
-        "selection_classification_raw": "0.6",
-        "selection_classification_baseline": "1.2",
-        "selection_classification_normalized": "0.5",
-        "selection_classification_weight": "0.25",
-        "selection_spatial_raw": "0.5",
-        "selection_spatial_baseline": "1.0",
-        "selection_spatial_normalized": "0.5",
-        "selection_spatial_weight": "0.25",
-        "teacher_validation_loss": "0.4",
-        "expert_val_spatial": "0.5",
-        "expert_val_classification_balanced_cross_entropy": "0.6",
-        "expert_val_classification_evaluated_classes": "7",
-        "expert_val_classification_total_classes": "7",
-        "expert_val_spatial_explicit_negative_pairs": "4",
-    }
+    row = _valid_selection_row()
     with (output / "metrics.csv").open(
         "w",
         newline="",
@@ -491,6 +495,90 @@ def test_atomic_yaml_write_leaves_no_worker_temporary_file(
 
     assert module.load_yaml(output) == {"n_trials_requested": 5}
     assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_parallel_trial_devices_require_one_distinct_gpu_per_worker() -> None:
+    module = _search_module()
+
+    assert module.parse_cuda_devices(
+        "0, 1,2,3",
+        parallel_trials=4,
+    ) == ("0", "1", "2", "3")
+    assert module.parse_cuda_devices(
+        "",
+        parallel_trials=1,
+    ) == (None,)
+    with pytest.raises(ValueError, match="required"):
+        module.parse_cuda_devices("", parallel_trials=4)
+    with pytest.raises(ValueError, match="duplicates"):
+        module.parse_cuda_devices("0,1,1,2", parallel_trials=4)
+    with pytest.raises(ValueError, match="at least one"):
+        module.parse_cuda_devices("0,1", parallel_trials=4)
+
+
+def test_training_process_is_bound_to_requested_cuda_device(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _search_module()
+    output = tmp_path / "trial"
+    (output / "checkpoints").mkdir(parents=True)
+    metrics = output / "metrics.csv"
+    row = _valid_selection_row()
+    row["epoch"] = "12"
+    with metrics.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+    torch.save(
+        {
+            "epoch": 12,
+            "run_complete": True,
+            "selection_finalized": True,
+            "best_selection_loss": 0.5,
+        },
+        output / "checkpoints" / "best.pt",
+    )
+
+    captured_env = {}
+
+    class FinishedProcess:
+        returncode = 0
+        stdout = io.StringIO("")
+
+        def poll(self):
+            return 0
+
+    def fake_popen(*args, **kwargs):
+        del args
+        captured_env.update(kwargs["env"])
+        return FinishedProcess()
+
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    module.train_with_pruning(
+        trial=trial,
+        cfg_path=tmp_path / "config.yaml",
+        output_dir=output,
+        python_bin="python",
+        repo=tmp_path,
+        poll_sec=20.0,
+        expected_weights={
+            "teacher": 0.5,
+            "classification": 0.25,
+            "spatial": 0.25,
+        },
+        expected_baseline={
+            "teacher": 0.8,
+            "classification": 1.2,
+            "spatial": 1.0,
+        },
+        expected_start_step=2500,
+        cuda_visible_device="3",
+    )
+
+    assert captured_env["CUDA_VISIBLE_DEVICES"] == "3"
 
 
 def test_declared_archive_requires_a_real_commit_shape(
