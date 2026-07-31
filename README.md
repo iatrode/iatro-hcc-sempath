@@ -120,6 +120,12 @@ python scripts/optuna_a0_search.py \
   --devices 0,1,2,3
 ```
 
+After one complete preflight, later processes on the same unchanged host can
+reuse its frozen-asset result with `--verified-preflight-manifest`. The
+coordinator writes a stat-guarded receipt for the training workers; unchanged
+IAC packages are not read and hashed again, while any path, size, timestamp,
+device, or inode change falls back to full SHA-256 verification.
+
 The A0 checkpoint minimizes a prespecified normalized joint score. Direct
 fixed-teacher feature/relation retention receives weight `0.26`; complete-bank
 seven-class balanced cross entropy receives `0.28`; and eleven-component

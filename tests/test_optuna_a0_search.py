@@ -516,6 +516,75 @@ def test_parallel_trial_devices_require_one_distinct_gpu_per_worker() -> None:
         module.parse_cuda_devices("0,1", parallel_trials=4)
 
 
+def test_verified_preflight_reuses_only_matching_frozen_assets(
+    tmp_path: Path,
+) -> None:
+    module = _search_module()
+    source = {
+        "commit": "a" * 40,
+        "source_mode": "declared_archive",
+        "source_tree_sha256": "b" * 64,
+    }
+    assets = {
+        "formal_asset_sha256": {"static_files": {}},
+        "population_schedule": {"selection_start_step": 2500},
+        "population_validation": {"selected_val_packages": 3},
+    }
+    manifest = tmp_path / "preflight.yaml"
+    module.write_yaml(
+        manifest,
+        {
+            "source": source,
+            "base_config_sha256": "c" * 64,
+            "assets": assets,
+        },
+    )
+
+    assert module.load_verified_preflight_assets(
+        manifest,
+        source=source,
+        base_config_sha256="c" * 64,
+    ) == assets
+    with pytest.raises(RuntimeError, match="source differs"):
+        module.load_verified_preflight_assets(
+            manifest,
+            source={**source, "commit": "d" * 40},
+            base_config_sha256="c" * 64,
+        )
+    with pytest.raises(RuntimeError, match="base config differs"):
+        module.load_verified_preflight_assets(
+            manifest,
+            source=source,
+            base_config_sha256="e" * 64,
+        )
+
+
+def test_verified_iac_receipt_records_stat_guard(
+    tmp_path: Path,
+) -> None:
+    module = _search_module()
+    package = tmp_path / "population.iac"
+    package.write_bytes(b"frozen")
+    receipt_path = module.write_verified_iac_receipt(
+        tmp_path / "receipt.json",
+        {
+            "iac_packages": {
+                str(package.resolve()): "a" * 64,
+            }
+        },
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    entry = receipt["files"][str(package.resolve())]
+    stat = package.stat()
+    assert entry == {
+        "sha256": "a" * 64,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+    }
+
+
 def test_training_process_is_bound_to_requested_cuda_device(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1224,11 +1224,55 @@ def _resume_contract(cfg: dict) -> dict:
 
 
 def _file_sha256(path: str | Path) -> str:
+    receipt_path = os.environ.get(
+        "HCC_SEMPATH_VERIFIED_ASSET_RECEIPT",
+        "",
+    ).strip()
+    if receipt_path:
+        receipt = _load_verified_asset_receipt(receipt_path)
+        resolved = Path(path).resolve()
+        entry = receipt.get(str(resolved))
+        if entry is not None:
+            stat = resolved.stat()
+            observed = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "device": stat.st_dev,
+                "inode": stat.st_ino,
+            }
+            expected = {
+                key: int(entry[key])
+                for key in ("size", "mtime_ns", "device", "inode")
+            }
+            if observed == expected:
+                return str(entry["sha256"])
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+_VERIFIED_ASSET_RECEIPTS: dict[str, dict[str, dict[str, object]]] = {}
+
+
+def _load_verified_asset_receipt(
+    raw_path: str,
+) -> dict[str, dict[str, object]]:
+    receipt_path = str(Path(raw_path).resolve())
+    cached = _VERIFIED_ASSET_RECEIPTS.get(receipt_path)
+    if cached is not None:
+        return cached
+    payload = json.loads(
+        Path(receipt_path).read_text(encoding="utf-8")
+    )
+    files = payload.get("files")
+    if not isinstance(files, dict):
+        raise ValueError(
+            "verified asset receipt must contain a files mapping"
+        )
+    _VERIFIED_ASSET_RECEIPTS[receipt_path] = files
+    return files
 
 
 def _canonical_sha256(payload: object) -> str:

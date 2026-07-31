@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -402,6 +404,45 @@ def test_formal_asset_contract_rehashes_every_iac(
             complete_tile_packages=[str(population)],
             complete_teacher_packages={},
         )
+
+
+def test_verified_asset_receipt_skips_only_unchanged_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import hcc_sempath.training.train as train_module
+
+    package = tmp_path / "population.iac"
+    package.write_bytes(b"frozen")
+    stat = package.stat()
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "files": {
+                    str(package.resolve()): {
+                        "sha256": "a" * 64,
+                        "size": stat.st_size,
+                        "mtime_ns": stat.st_mtime_ns,
+                        "device": stat.st_dev,
+                        "inode": stat.st_ino,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    train_module._VERIFIED_ASSET_RECEIPTS.clear()
+    monkeypatch.setenv(
+        "HCC_SEMPATH_VERIFIED_ASSET_RECEIPT",
+        str(receipt),
+    )
+    assert train_module._file_sha256(package) == "a" * 64
+
+    package.write_bytes(b"changed")
+    assert train_module._file_sha256(package) == hashlib.sha256(
+        b"changed"
+    ).hexdigest()
 
 
 def test_formal_source_contract_rejects_tree_drift(

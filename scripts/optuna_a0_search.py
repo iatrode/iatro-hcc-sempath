@@ -99,9 +99,11 @@ class TrialSeededTPESampler(optuna.samplers.BaseSampler):
         *,
         seed: int,
         n_startup_trials: int,
+        constant_liar: bool = False,
     ) -> None:
         self.seed = int(seed)
         self.n_startup_trials = int(n_startup_trials)
+        self.constant_liar = bool(constant_liar)
         self._delegates: dict[int, optuna.samplers.TPESampler] = {}
         self._delegates_lock = threading.Lock()
 
@@ -116,7 +118,7 @@ class TrialSeededTPESampler(optuna.samplers.BaseSampler):
                     n_startup_trials=self.n_startup_trials,
                     multivariate=True,
                     group=True,
-                    constant_liar=True,
+                    constant_liar=self.constant_liar,
                 )
             return self._delegates[trial.number]
 
@@ -1541,6 +1543,76 @@ def parse_cuda_devices(
     return devices
 
 
+def load_verified_preflight_assets(
+    manifest_path: Path,
+    *,
+    source: dict[str, str],
+    base_config_sha256: str,
+) -> dict[str, Any]:
+    manifest = load_yaml(manifest_path)
+    if manifest.get("source") != source:
+        raise RuntimeError(
+            "verified preflight source differs from the executable "
+            "scientific source"
+        )
+    if manifest.get("base_config_sha256") != base_config_sha256:
+        raise RuntimeError(
+            "verified preflight base config differs from the resolved "
+            "formal config"
+        )
+    assets = manifest.get("assets")
+    if not isinstance(assets, dict):
+        raise RuntimeError("verified preflight manifest has no assets")
+    for key in (
+        "formal_asset_sha256",
+        "population_schedule",
+        "population_validation",
+    ):
+        if key not in assets:
+            raise RuntimeError(
+                f"verified preflight assets are missing {key}"
+            )
+    return assets
+
+
+def write_verified_iac_receipt(
+    path: Path,
+    formal_asset_sha256: dict[str, Any],
+) -> Path:
+    iac_packages = formal_asset_sha256.get("iac_packages")
+    if not isinstance(iac_packages, dict):
+        raise RuntimeError(
+            "formal asset contract has no IAC package mapping"
+        )
+    files: dict[str, dict[str, int | str]] = {}
+    for raw_path, raw_digest in sorted(iac_packages.items()):
+        resolved = Path(str(raw_path)).resolve()
+        stat = resolved.stat()
+        files[str(resolved)] = {
+            "sha256": str(raw_digest),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+        }
+    payload = {
+        "schema": "hcc-sempath-verified-asset-receipt-v1",
+        "files": files,
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.parent.mkdir(parents=True, exist_ok=True)
+    temporary.write_text(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return path
+
+
 def train_with_pruning(
     *,
     trial: optuna.Trial,
@@ -1553,6 +1625,7 @@ def train_with_pruning(
     expected_baseline: dict[str, float] | None,
     expected_start_step: int,
     cuda_visible_device: str | None = None,
+    verified_asset_receipt: Path | None = None,
     objective: str = "selection_loss",
 ) -> float:
     log_path = output_dir / "trial.log"
@@ -1561,6 +1634,10 @@ def train_with_pruning(
     env["PYTHONNOUSERSITE"] = "1"
     if cuda_visible_device is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_device)
+    if verified_asset_receipt is not None:
+        env["HCC_SEMPATH_VERIFIED_ASSET_RECEIPT"] = str(
+            verified_asset_receipt
+        )
     command = [
         python_bin,
         "-m",
@@ -1763,9 +1840,19 @@ def _study_contract(
     epochs: int,
     selection_weights: dict[str, float],
     sampler_seed: int,
+    sampler_constant_liar: bool,
     total_trial_budget: int,
     population_validation: dict[str, Any],
 ) -> dict[str, Any]:
+    sampler = {
+        "name": "trial_seeded_tpe_v1",
+        "optuna_version": optuna.__version__,
+        "n_startup_trials": 6,
+        "multivariate": True,
+        "group": True,
+    }
+    if sampler_constant_liar:
+        sampler["constant_liar"] = True
     return {
         "source": source,
         "base_config_sha256": base_config_sha256,
@@ -1782,14 +1869,7 @@ def _study_contract(
         "population_fraction": 0.10,
         "population_validation": dict(population_validation),
         "search_space": SEARCH_SPACE,
-        "sampler": {
-            "name": "trial_seeded_tpe_v1",
-            "optuna_version": optuna.__version__,
-            "n_startup_trials": 6,
-            "multivariate": True,
-            "group": True,
-            "constant_liar": True,
-        },
+        "sampler": sampler,
         "pruner": {
             "name": "MedianPruner",
             "n_startup_trials": 6,
@@ -2109,6 +2189,24 @@ def main() -> None:
     parser.add_argument("--poll-sec", type=float, default=20.0)
     parser.add_argument("--sampler-seed", type=int, default=13)
     parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=None,
+        help=(
+            "Scientific training source root. Defaults to the repository "
+            "containing this coordinator."
+        ),
+    )
+    parser.add_argument(
+        "--verified-preflight-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Reuse a previously verified frozen-asset manifest instead "
+            "of rehashing unchanged IAC, teacher, and tile assets."
+        ),
+    )
+    parser.add_argument(
         "--parallel-trials",
         type=int,
         default=1,
@@ -2126,6 +2224,16 @@ def main() -> None:
             "for parallel trials, for example: 0,1,2,3."
         ),
     )
+    parser.add_argument(
+        "--parallel-constant-liar",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Include in-flight configurations in parallel TPE proposals. "
+            "Disable only when resuming a legacy sequential study whose "
+            "contract predates this execution option."
+        ),
+    )
     args = parser.parse_args()
 
     if int(args.epochs) < 6:
@@ -2139,7 +2247,12 @@ def main() -> None:
         parallel_trials=int(args.parallel_trials),
     )
 
-    repo = Path(__file__).resolve().parents[1]
+    coordinator_repo = Path(__file__).resolve().parents[1]
+    repo = (
+        coordinator_repo
+        if args.source_root is None
+        else args.source_root.resolve()
+    )
     base_config_path = Path(args.base_config)
     if not base_config_path.is_absolute():
         base_config_path = repo / base_config_path
@@ -2149,7 +2262,16 @@ def main() -> None:
         epochs=int(args.epochs),
     )
     source = source_state(repo)
-    assets = preflight_assets(base_cfg)
+    resolved_base_config_sha256 = config_digest(base_cfg)
+    assets = (
+        preflight_assets(base_cfg)
+        if args.verified_preflight_manifest is None
+        else load_verified_preflight_assets(
+            args.verified_preflight_manifest.resolve(),
+            source=source,
+            base_config_sha256=resolved_base_config_sha256,
+        )
+    )
     selection_weights = {
         name: float(
             base_cfg.get("train", {}).get(
@@ -2171,14 +2293,23 @@ def main() -> None:
     )
     output_root = output_root.resolve() / args.study_name
     output_root.mkdir(parents=True, exist_ok=True)
+    verified_asset_receipt = (
+        None
+        if args.verified_preflight_manifest is None
+        else write_verified_iac_receipt(
+            output_root / "verified_asset_receipt.json",
+            assets["formal_asset_sha256"],
+        )
+    )
 
     contract = _study_contract(
         source=source,
-        base_config_sha256=config_digest(base_cfg),
+        base_config_sha256=resolved_base_config_sha256,
         asset_sha256=assets["formal_asset_sha256"],
         epochs=int(args.epochs),
         selection_weights=selection_weights,
         sampler_seed=int(args.sampler_seed),
+        sampler_constant_liar=bool(args.parallel_constant_liar),
         total_trial_budget=int(args.study_trials),
         population_validation=assets["population_validation"],
     )
@@ -2190,7 +2321,7 @@ def main() -> None:
         "study_contract_sha256": contract_digest,
         "source": source,
         "base_config": str(base_config_path),
-        "base_config_sha256": config_digest(base_cfg),
+        "base_config_sha256": resolved_base_config_sha256,
         "assets": assets,
         "objective": "selection_loss",
         "direction": "minimize",
@@ -2236,6 +2367,8 @@ def main() -> None:
             ],
             "trial_gpu_mode": "one_independent_trial_per_device",
             "scheduling": "asynchronous_device_reuse",
+            "constant_liar": bool(args.parallel_constant_liar),
+            "coordinator_source_root": str(coordinator_repo),
         },
         "sampler": "TrialSeededTPESampler",
         "sampler_seed": int(args.sampler_seed),
@@ -2298,6 +2431,7 @@ def main() -> None:
     sampler = TrialSeededTPESampler(
         seed=int(args.sampler_seed),
         n_startup_trials=6,
+        constant_liar=bool(args.parallel_constant_liar),
     )
     pruner = optuna.pruners.MedianPruner(
         n_startup_trials=6,
@@ -2397,6 +2531,7 @@ def main() -> None:
                         _selection_start_step_from_config(cfg)
                     ),
                     cuda_visible_device=cuda_device,
+                    verified_asset_receipt=verified_asset_receipt,
                 )
             except optuna.TrialPruned:
                 raise
