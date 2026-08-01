@@ -48,6 +48,15 @@ OUTPUT_DIR="$(
     'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["runtime"]["output_dir"])' \
     "${CONFIG_PATH}"
 )"
+STUDENT_PRETRAINED_PATH="$(
+  "${PYTHON_BIN}" -c \
+    'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["data"]["formal_asset_sha256"]["student_pretrained"]["path"])' \
+    "${CONFIG_PATH}"
+)"
+if [[ ! -f "${STUDENT_PRETRAINED_PATH}" ]]; then
+  echo "student pretrained weight is missing: ${STUDENT_PRETRAINED_PATH}" >&2
+  exit 2
+fi
 CHECKPOINT="${OUTPUT_DIR}/checkpoints/last.pt"
 TRAIN_ARGS=(-m hcc_sempath.cli.main train --config "${CONFIG_PATH}")
 if [[ -f "${CHECKPOINT}" ]]; then
@@ -60,6 +69,7 @@ printf -v COMMAND '%q ' env \
   "HCC_SEMPATH_SOURCE_COMMIT=${HCC_SEMPATH_SOURCE_COMMIT:?set HCC_SEMPATH_SOURCE_COMMIT}" \
   "HCC_SEMPATH_VERIFIED_ASSET_RECEIPT=${VERIFIED_ASSET_RECEIPT}" \
   "HCC_SEMPATH_ASSET_VERIFY_WORKERS=${HCC_SEMPATH_ASSET_VERIFY_WORKERS:-16}" \
+  "HCC_SEMPATH_STUDENT_PRETRAINED_PATH=${STUDENT_PRETRAINED_PATH}" \
   "OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}" \
   "MKL_NUM_THREADS=${MKL_NUM_THREADS:-2}" \
   "OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}" \

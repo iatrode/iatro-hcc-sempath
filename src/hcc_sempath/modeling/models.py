@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -48,6 +49,23 @@ STUDENT_PRETRAINED_ARTIFACTS = (
 def _resolve_fixed_student_pretraining(
     artifacts: Sequence[tuple[Path, str]] = STUDENT_PRETRAINED_ARTIFACTS,
 ) -> tuple[Path, str]:
+    configured = os.environ.get(
+        "HCC_SEMPATH_STUDENT_PRETRAINED_PATH",
+        "",
+    ).strip()
+    if configured:
+        path = Path(configured).expanduser().resolve()
+        digest_by_suffix = {
+            ".safetensors": artifacts[0][1],
+            ".pth": artifacts[1][1],
+        }
+        digest = digest_by_suffix.get(path.suffix.lower())
+        if digest is None:
+            raise ValueError(
+                "HCC_SEMPATH_STUDENT_PRETRAINED_PATH must be a "
+                ".safetensors or .pth file"
+            )
+        return path, digest
     for path, digest in artifacts:
         if path.is_file():
             return path, digest
