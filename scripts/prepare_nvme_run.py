@@ -23,11 +23,16 @@ from scripts.optuna_a0_search import (
 
 
 PATH_REPLACEMENTS = (
+    ("/autodl-fs/data/features/merged", "features"),
+    ("/root/autodl-fs/features/merged", "features"),
+    ("/root/data/features/merged", "features"),
     ("/autodl-fs/data/features", "features"),
     ("/root/autodl-fs/features", "features"),
     ("/root/autodl-tmp/tiles", "tiles"),
-    ("/root/autodl-tmp/hcc-sempath-assets", "hcc-sempath-assets"),
-    ("/root/autodl-tmp/hcc-sempath-pretrained", "hcc-sempath-pretrained"),
+    ("/root/autodl-tmp/hcc-sempath-assets", "assets"),
+    ("/root/autodl-tmp/hcc-sempath-pretrained", "pretrained"),
+    ("/root/data/hcc-sempath-assets", "assets"),
+    ("/root/data/hcc-sempath-pretrained", "pretrained"),
 )
 
 

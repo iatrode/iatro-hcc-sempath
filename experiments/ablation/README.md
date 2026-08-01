@@ -87,6 +87,16 @@ only storage locations, re-freeze path-sensitive contracts, reject any residual
 network-volume path, and launch in tmux without redirecting the training
 console:
 
+```text
+/root/data/
+  assets/
+  configs/
+  features/
+  outputs/
+  pretrained/
+  tiles/
+```
+
 ```bash
 export HCC_SEMPATH_SOURCE_COMMIT=<40-character-source-commit>
 bash scripts/run_a12_nvme.sh
