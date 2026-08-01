@@ -811,7 +811,16 @@ def test_final_export_binds_selected_trial_config_and_checkpoint(
     }
     module.write_yaml(trial_dir / "config.yaml", config)
     checkpoint = trial_dir / "best.pt"
-    torch.save({"epoch": 7}, checkpoint)
+    torch.save(
+        {
+            "epoch": 7,
+            "scheduler_contract": {
+                "name": "cosine",
+                "planned_total_steps": 20_576,
+            },
+        },
+        checkpoint,
+    )
     trial.set_user_attr("output_dir", str(trial_dir))
     trial.set_user_attr("best_checkpoint", str(checkpoint))
     trial.set_user_attr("best_epoch", 7)
@@ -847,3 +856,4 @@ def test_final_export_binds_selected_trial_config_and_checkpoint(
     assert selected["best_checkpoint_sha256"] == module.file_sha256(
         checkpoint
     )
+    assert selected["scheduler_contract"]["planned_total_steps"] == 20_576

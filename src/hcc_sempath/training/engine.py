@@ -1167,7 +1167,16 @@ def build_lr_scheduler(
 ):
     if str(cfg["train"].get("scheduler", "none")).lower() != "cosine":
         return None
-    total_steps = max(1, int(cfg["train"]["epochs"]) * max(1, int(steps_per_epoch)))
+    total_steps = max(
+        1,
+        int(
+            cfg["train"].get(
+                "lr_total_steps",
+                int(cfg["train"]["epochs"])
+                * max(1, int(steps_per_epoch)),
+            )
+        ),
+    )
     warmup_steps = max(0, int(cfg["train"].get("lr_warmup_steps", 0)))
     base_lr = float(cfg["train"]["lr"])
     min_factor = float(cfg["train"].get("min_lr", 0.0)) / base_lr if base_lr > 0 else 0.0
@@ -1206,6 +1215,12 @@ def _scheduler_contract(cfg: dict, steps_per_epoch: int) -> dict:
 
     scheduler = str(cfg["train"].get("scheduler", "none")).lower()
     planned_epochs = int(cfg["train"]["epochs"])
+    planned_total_steps = int(
+        cfg["train"].get(
+            "lr_total_steps",
+            planned_epochs * int(steps_per_epoch),
+        )
+    )
     return {
         "name": scheduler,
         "base_lr": float(cfg["train"].get("lr", 0.0)),
@@ -1213,7 +1228,12 @@ def _scheduler_contract(cfg: dict, steps_per_epoch: int) -> dict:
         "warmup_steps": int(cfg["train"].get("lr_warmup_steps", 0)),
         "steps_per_epoch": int(steps_per_epoch),
         "planned_epochs": planned_epochs,
-        "planned_total_steps": planned_epochs * int(steps_per_epoch),
+        "planned_total_steps": planned_total_steps,
+        "total_steps_source": (
+            "explicit_global_step"
+            if "lr_total_steps" in cfg["train"]
+            else "epochs_times_steps_per_epoch"
+        ),
         "terminal_behavior": (
             "clamp_at_min_lr" if scheduler == "cosine" else "unchanged"
         ),
@@ -2501,6 +2521,35 @@ def _eligible_selection_epoch_count(
     return eligible
 
 
+def _eligible_selection_probe_count(
+    *,
+    current_global_step: int,
+    maximum_global_step: int,
+    interval_steps: int,
+    selection_start_step: int,
+) -> int:
+    """Count fixed-step joint-selection probes remaining in a run."""
+
+    if interval_steps <= 0:
+        raise ValueError("interval_steps must be positive")
+    if maximum_global_step < current_global_step:
+        return 0
+    first = (
+        (current_global_step // interval_steps) + 1
+    ) * interval_steps
+    first = max(
+        first,
+        (
+            (selection_start_step + interval_steps - 1)
+            // interval_steps
+        )
+        * interval_steps,
+    )
+    if first > maximum_global_step:
+        return 0
+    return 1 + (maximum_global_step - first) // interval_steps
+
+
 def _selection_early_stop_requested(
     *,
     enabled: bool,
@@ -2539,6 +2588,27 @@ def _selection_eligible_epochs_from_csv(
             if step > maximum_step:
                 continue
             if str(row.get("selection_eligible", "")).lower() == "true":
+                count += 1
+    return count
+
+
+def _selection_eligible_probes_from_csv(
+    path: Path,
+    *,
+    maximum_step: int,
+) -> int:
+    """Recover completed eligible fixed-step selection probes."""
+
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                step = int(float(row.get("global_step", "") or "nan"))
+            except (TypeError, ValueError):
+                continue
+            if step <= maximum_step:
                 count += 1
     return count
 
@@ -2930,6 +3000,7 @@ def fit(
         for metric_name in (
             "step_metrics.csv",
             "development_metrics.csv",
+            "selection_metrics.csv",
             "metrics.csv",
         ):
             _truncate_csv_after_step(
@@ -2955,6 +3026,9 @@ def fit(
     )
     best_selection_epoch = int(
         (resume_state or {}).get("best_selection_epoch", 0)
+    )
+    best_selection_step = int(
+        (resume_state or {}).get("best_selection_step", 0)
     )
     selection_bad_epochs = int(
         (resume_state or {}).get("selection_bad_epochs", 0)
@@ -3127,6 +3201,44 @@ def fit(
     selection_minimum_eligible_epochs = int(
         cfg["train"].get("selection_minimum_eligible_epochs", 1)
     )
+    selection_probe_interval_steps = int(
+        cfg["train"].get("selection_probe_interval_steps", 0) or 0
+    )
+    step_selection_enabled = bool(
+        expert_selection_enabled and selection_probe_interval_steps > 0
+    )
+    selection_minimum_eligible_probes = int(
+        cfg["train"].get("selection_minimum_eligible_probes", 1)
+    )
+    selection_bad_probes = int(
+        (resume_state or {}).get("selection_bad_probes", 0)
+    )
+    restored_eligible_probes = (resume_state or {}).get(
+        "selection_eligible_probes"
+    )
+    recovered_eligible_probes = (
+        _selection_eligible_probes_from_csv(
+            output_dir / "selection_metrics.csv",
+            maximum_step=resume_global_step,
+        )
+        if resume_state is not None and step_selection_enabled
+        else 0
+    )
+    if restored_eligible_probes is None:
+        selection_eligible_probes = recovered_eligible_probes
+    else:
+        selection_eligible_probes = int(restored_eligible_probes)
+        if (
+            step_selection_enabled
+            and (output_dir / "selection_metrics.csv").exists()
+            and selection_eligible_probes != recovered_eligible_probes
+        ):
+            raise ValueError(
+                "checkpoint selection_eligible_probes disagrees with "
+                "selection_metrics.csv after resume truncation: "
+                f"checkpoint={selection_eligible_probes} "
+                f"metrics={recovered_eligible_probes}"
+            )
     if expert_selection_enabled:
         configured_max_batches = cfg["train"].get("max_train_batches")
         steps_per_epoch = len(train_loader)
@@ -3135,28 +3247,53 @@ def fit(
                 steps_per_epoch,
                 int(configured_max_batches),
             )
-        eligible_epochs = _eligible_selection_epoch_count(
-            current_global_step=global_step,
-            steps_per_epoch=steps_per_epoch,
-            start_epoch=start_epoch,
-            expected_epochs=expected_epochs,
-            selection_start_step=selection_early_stop_start_step,
-            resume_batch_in_epoch=resume_batch_in_epoch,
-        )
-        total_eligible_epochs = (
-            selection_eligible_epochs + eligible_epochs
-        )
-        if total_eligible_epochs < selection_minimum_eligible_epochs:
-            raise ValueError(
-                "training budget cannot reach enough eligible joint-selection "
-                "epochs after all active ramps: "
-                f"steps_per_epoch={steps_per_epoch} "
-                f"selection_start_step={selection_early_stop_start_step} "
-                f"completed_eligible_epochs={selection_eligible_epochs} "
-                f"remaining_eligible_epochs={eligible_epochs} "
-                f"total_eligible_epochs={total_eligible_epochs} "
-                f"required={selection_minimum_eligible_epochs}"
+        if step_selection_enabled:
+            remaining_steps = (
+                steps_per_epoch - resume_batch_in_epoch
+                + max(0, expected_epochs - start_epoch) * steps_per_epoch
             )
+            eligible_probes = _eligible_selection_probe_count(
+                current_global_step=global_step,
+                maximum_global_step=global_step + remaining_steps,
+                interval_steps=selection_probe_interval_steps,
+                selection_start_step=selection_early_stop_start_step,
+            )
+            total_eligible_probes = (
+                selection_eligible_probes + eligible_probes
+            )
+            if total_eligible_probes < selection_minimum_eligible_probes:
+                raise ValueError(
+                    "training budget cannot reach enough eligible "
+                    "joint-selection probes after all active ramps: "
+                    f"selection_start_step={selection_early_stop_start_step} "
+                    f"probe_interval_steps={selection_probe_interval_steps} "
+                    f"completed_eligible_probes={selection_eligible_probes} "
+                    f"remaining_eligible_probes={eligible_probes} "
+                    f"required={selection_minimum_eligible_probes}"
+                )
+        else:
+            eligible_epochs = _eligible_selection_epoch_count(
+                current_global_step=global_step,
+                steps_per_epoch=steps_per_epoch,
+                start_epoch=start_epoch,
+                expected_epochs=expected_epochs,
+                selection_start_step=selection_early_stop_start_step,
+                resume_batch_in_epoch=resume_batch_in_epoch,
+            )
+            total_eligible_epochs = (
+                selection_eligible_epochs + eligible_epochs
+            )
+            if total_eligible_epochs < selection_minimum_eligible_epochs:
+                raise ValueError(
+                    "training budget cannot reach enough eligible "
+                    "joint-selection epochs after all active ramps: "
+                    f"steps_per_epoch={steps_per_epoch} "
+                    f"selection_start_step={selection_early_stop_start_step} "
+                    f"completed_eligible_epochs={selection_eligible_epochs} "
+                    f"remaining_eligible_epochs={eligible_epochs} "
+                    f"total_eligible_epochs={total_eligible_epochs} "
+                    f"required={selection_minimum_eligible_epochs}"
+                )
     expert_eval_cfg = {
         **cfg,
         "train": {
@@ -3197,6 +3334,8 @@ def fit(
     )
     selection_stop_requested = False
     development_stop_summary: dict[str, float | int | bool] = {}
+    selection_probe_summary: dict[str, float | int | bool] = {}
+    pending_selection_checkpoint: dict | None = None
 
     def checkpoint_payload(
         *,
@@ -3246,8 +3385,11 @@ def fit(
                 best_significant_selection_loss
             ),
             "best_selection_epoch": best_selection_epoch,
+            "best_selection_step": best_selection_step,
             "selection_bad_epochs": selection_bad_epochs,
             "selection_eligible_epochs": selection_eligible_epochs,
+            "selection_bad_probes": selection_bad_probes,
+            "selection_eligible_probes": selection_eligible_probes,
             "selection_baseline": dict(selection_baseline),
             "trajectory_snapshots": list(trajectory_snapshots),
             "selection_metric_weights": dict(
@@ -3280,7 +3422,6 @@ def fit(
         nonlocal trajectory_snapshots
         if (
             trajectory_snapshots_dir is None
-            or current_epoch <= 1
             or step < selection_early_stop_start_step
             or any(
                 int(item["global_step"]) == int(step)
@@ -3360,6 +3501,7 @@ def fit(
         epoch_accumulator: dict,
     ) -> None:
         nonlocal global_step, spatial_supervised_step
+        nonlocal pending_selection_checkpoint
         if not _step_checkpoint_due(
             step=step,
             batch_in_epoch=batch_in_epoch,
@@ -3371,21 +3513,36 @@ def fit(
         spatial_supervised_step = int(spatial_step)
         step_metrics_writer.flush()
         started = time.perf_counter()
+        probe_at_step = (
+            pending_selection_checkpoint
+            if pending_selection_checkpoint is not None
+            and int(pending_selection_checkpoint["global_step"]) == step
+            else None
+        )
         archive_trajectory_snapshot(
             current_epoch=current_epoch,
             step=step,
             spatial_step=spatial_step,
-            metrics=None,
-        )
-        _atomic_torch_save(
-            checkpoint_payload(
-                epoch=current_epoch,
-                batch_in_epoch=batch_in_epoch,
-                epoch_accumulator=epoch_accumulator,
-                training_complete=False,
+            metrics=(
+                probe_at_step["metrics"]
+                if probe_at_step is not None
+                else None
             ),
-            checkpoints / "last.pt",
         )
+        checkpoint = checkpoint_payload(
+            epoch=current_epoch,
+            batch_in_epoch=batch_in_epoch,
+            epoch_accumulator=epoch_accumulator,
+            training_complete=bool(selection_stop_requested),
+        )
+        checkpoint_paths = [checkpoints / "last.pt"]
+        if probe_at_step is not None and bool(
+            probe_at_step["improved"]
+        ):
+            checkpoint_paths.append(checkpoints / "best.pt")
+        _atomic_torch_save_aliases(checkpoint, checkpoint_paths)
+        if probe_at_step is not None:
+            pending_selection_checkpoint = None
         _log(
             "step_checkpoint "
             f"epoch={current_epoch} batch={batch_in_epoch} "
@@ -3495,6 +3652,138 @@ def fit(
                 f"patience={development_early_stop_patience}"
             )
         return development_stop_requested
+
+    def run_selection_probe(
+        step: int,
+        spatial_step: int,
+        current_epoch: int,
+    ) -> bool:
+        nonlocal best_selection_loss, best_significant_selection_loss
+        nonlocal best_selection_epoch, best_selection_step, best_metrics
+        nonlocal last_metrics, selection_bad_probes
+        nonlocal selection_eligible_probes, selection_stop_requested
+        nonlocal selection_probe_summary, pending_selection_checkpoint
+        if (
+            not step_selection_enabled
+            or step < selection_early_stop_start_step
+            or step % selection_probe_interval_steps != 0
+        ):
+            return False
+        was_training = bool(model.training)
+        try:
+            validation = _run_validation_streams(
+                model=model,
+                val_loader=val_loader,
+                expert_classification_val_loader=(
+                    expert_classification_val_loader
+                ),
+                expert_spatial_val_loader=expert_spatial_val_loader,
+                prototypes=prototypes,
+                optimizer=optimizer,
+                device=device,
+                cfg=cfg,
+                expert_eval_cfg=expert_eval_cfg,
+                epoch=current_epoch,
+                global_step=step,
+                spatial_supervised_step=spatial_step,
+                summary_writer=None,
+            )
+        finally:
+            model.train(was_training)
+        raw_selection_metrics, teacher_metrics = _selection_raw_metrics(
+            validation,
+            cfg,
+        )
+        selection_metrics = _normalized_selection_metrics(
+            raw_selection_metrics,
+            selection_baseline,
+            selection_metric_weights,
+        )
+        classification_metrics = validation["expert_classification"]
+        spatial_metrics = validation["expert_spatial"]
+        row = {
+            "epoch": int(current_epoch),
+            "global_step": int(step),
+            "spatial_supervised_step": int(spatial_step),
+            **teacher_metrics,
+            **selection_metrics,
+            **{
+                f"expert_val_{key}": value
+                for key, value in classification_metrics.items()
+            },
+            **{
+                f"expert_val_{key}": value
+                for key, value in spatial_metrics.items()
+                if key.startswith("spatial")
+            },
+        }
+        append_csv(output_dir / "selection_metrics.csv", row)
+        selection_loss = float(selection_metrics["selection_loss"])
+        improved_selection = selection_loss < best_selection_loss
+        significant_selection_improvement = bool(
+            not math.isfinite(best_significant_selection_loss)
+            or selection_loss
+            < best_significant_selection_loss
+            * (1.0 - selection_early_stop_relative_delta)
+        )
+        selection_eligible_probes += 1
+        if significant_selection_improvement:
+            best_significant_selection_loss = selection_loss
+            selection_bad_probes = 0
+        else:
+            selection_bad_probes += 1
+        if improved_selection:
+            best_selection_loss = selection_loss
+            best_selection_epoch = int(current_epoch)
+            best_selection_step = int(step)
+            best_metrics = dict(row)
+        last_metrics = dict(row)
+        selection_stop_requested = _selection_early_stop_requested(
+            enabled=selection_early_stop_enabled,
+            eligible=True,
+            eligible_epochs=selection_eligible_probes,
+            minimum_eligible_epochs=selection_minimum_eligible_probes,
+            bad_epochs=selection_bad_probes,
+            patience=selection_early_stop_patience,
+        )
+        selection_probe_summary = {
+            **row,
+            "selection_eligible_probes": selection_eligible_probes,
+            "selection_bad_probes": selection_bad_probes,
+            "selection_stop_triggered": selection_stop_requested,
+        }
+        pending_selection_checkpoint = {
+            "global_step": int(step),
+            "improved": improved_selection,
+            "metrics": dict(row),
+        }
+        _log(
+            "selection_probe "
+            f"epoch={current_epoch} global_step={step} "
+            f"selection_loss={selection_loss:.6f} "
+            f"best_loss={best_selection_loss:.6f} "
+            f"eligible_probes={selection_eligible_probes} "
+            f"bad_probes={selection_bad_probes}"
+        )
+        _release_host_memory()
+        return selection_stop_requested
+
+    def run_step_probes(
+        step: int,
+        spatial_step: int,
+        current_epoch: int,
+    ) -> bool:
+        selection_requested = run_selection_probe(
+            step,
+            spatial_step,
+            current_epoch,
+        )
+        development_requested = run_development_probe(
+            step,
+            spatial_step,
+            current_epoch,
+        )
+        return bool(selection_requested or development_requested)
 
     if expert_selection_enabled:
         if (
@@ -3615,7 +3904,7 @@ def fit(
                 summary_writer=writer,
                 prototype_refresh_state=prototype_refresh_state,
                 step_metrics_writer=step_metrics_writer,
-                development_probe=run_development_probe,
+                development_probe=run_step_probes,
                 step_checkpoint=save_step_checkpoint,
                 resume_epoch_accumulator=epoch_accumulator,
             )
@@ -3624,8 +3913,12 @@ def fit(
             spatial_supervised_step = int(
                 train_metrics["spatial_supervised_step_end"]
             )
-            if development_stop_requested:
-                last_metrics = dict(development_stop_summary)
+            if development_stop_requested or selection_stop_requested:
+                last_metrics = dict(
+                    selection_probe_summary
+                    if selection_stop_requested
+                    else development_stop_summary
+                )
                 _atomic_torch_save(
                     checkpoint_payload(
                         epoch=epoch,
@@ -3767,6 +4060,7 @@ def fit(
             improved_loss = val_metrics["loss"] < best_loss
             selection_eligible = bool(
                 expert_selection_enabled
+                and not step_selection_enabled
                 and global_step >= selection_early_stop_start_step
             )
             improved_selection = bool(
@@ -3803,6 +4097,7 @@ def fit(
             if improved_selection:
                 best_selection_loss = selection_loss
                 best_selection_epoch = epoch
+                best_selection_step = global_step
                 best_metrics = row
             if selection_eligible:
                 selection_eligible_epochs += 1
@@ -3819,7 +4114,10 @@ def fit(
                 )
 
             selection_stop_requested = _selection_early_stop_requested(
-                enabled=selection_early_stop_enabled,
+                enabled=(
+                    selection_early_stop_enabled
+                    and not step_selection_enabled
+                ),
                 eligible=selection_eligible,
                 eligible_epochs=selection_eligible_epochs,
                 minimum_eligible_epochs=(
@@ -3903,8 +4201,13 @@ def fit(
             weights_only=False,
         )
         if (
-            int(best_checkpoint.get("epoch", -1))
-            != best_selection_epoch
+            (
+                int(best_checkpoint.get("global_step", -1))
+                != best_selection_step
+                if step_selection_enabled
+                else int(best_checkpoint.get("epoch", -1))
+                != best_selection_epoch
+            )
             or not math.isclose(
                 float(
                     best_checkpoint.get(

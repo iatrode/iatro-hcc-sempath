@@ -612,6 +612,35 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
     )
     if not isinstance(selection_early_stop, bool):
         raise ValueError("train.selection_early_stop must be boolean")
+    selection_probe_interval = int(
+        cfg.get("train", {}).get("selection_probe_interval_steps", 0)
+        or 0
+    )
+    if selection_probe_interval < 0:
+        raise ValueError(
+            "train.selection_probe_interval_steps must be non-negative"
+        )
+    checkpoint_interval = int(
+        cfg.get("train", {}).get("checkpoint_interval_steps", 1000)
+    )
+    if selection_probe_interval > 0 and (
+        checkpoint_interval <= 0
+        or selection_probe_interval % checkpoint_interval != 0
+    ):
+        raise ValueError(
+            "train.selection_probe_interval_steps must be an integer "
+            "multiple of the positive checkpoint_interval_steps so every "
+            "evaluated model is exactly recoverable"
+        )
+    if (
+        selection_early_stop
+        and selection_probe_interval > 0
+        and development_early_stop
+    ):
+        raise ValueError(
+            "step-level joint selection cannot be combined with "
+            "teacher-only development_early_stop"
+        )
     selection_start_step = cfg.get("train", {}).get(
         "selection_early_stop_start_step"
     )
@@ -682,6 +711,15 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
     ) <= 0:
         raise ValueError(
             "train.selection_minimum_eligible_epochs must be positive"
+        )
+    if int(
+        cfg.get("train", {}).get(
+            "selection_minimum_eligible_probes",
+            1,
+        )
+    ) <= 0:
+        raise ValueError(
+            "train.selection_minimum_eligible_probes must be positive"
         )
     selection_relative_delta = float(
         cfg.get("train", {}).get(
@@ -757,6 +795,17 @@ def validate_training_config(cfg: dict, names: list[str]) -> None:
             )
     if int(cfg.get("train", {}).get("lr_warmup_steps", 0)) < 0:
         raise ValueError("train.lr_warmup_steps must be non-negative")
+    lr_total_steps = cfg.get("train", {}).get("lr_total_steps")
+    if lr_total_steps is not None:
+        lr_total_steps = int(lr_total_steps)
+        if lr_total_steps <= 0:
+            raise ValueError("train.lr_total_steps must be positive")
+        if lr_total_steps <= int(
+            cfg.get("train", {}).get("lr_warmup_steps", 0)
+        ):
+            raise ValueError(
+                "train.lr_total_steps must exceed lr_warmup_steps"
+            )
     if (
         "dynamic_prototype_batch_size" in cfg.get("train", {})
         and int(cfg["train"]["dynamic_prototype_batch_size"]) <= 0

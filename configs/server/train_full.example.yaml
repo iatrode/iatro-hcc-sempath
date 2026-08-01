@@ -104,24 +104,32 @@ train:
   max_grad_norm: 1.0
   amp: true
   topk: 10
-  max_val_batches: 512
+  max_val_batches: 128
   max_eval_batches: 128
   log_interval: 0
   progress: tqdm
   tensorboard: true
   tensorboard_batch_interval: 20
   # Every optimizer step is retained in a buffered append-only CSV. The fixed
-  # development probe supplies intra-epoch loss curves on an unchanged subset.
+  # joint-selection probe supplies intra-epoch teacher/L1/L2 measurements on
+  # unchanged validation assets.
   step_metrics_flush_steps: 50
   # Atomic, exactly resumable mid-epoch checkpoint. Full-corpus epochs are too
   # long to use epoch boundaries as the only recovery point.
   checkpoint_interval_steps: 1000
-  development_probe_interval_steps: 1000
+  # Joint teacher/L1/L2 validation is scheduled by optimizer step so changing
+  # the population fraction cannot silently multiply the stopping budget.
+  development_probe_interval_steps: 0
   development_probe_batches: 64
-  development_early_stop: true
+  development_early_stop: false
   development_early_stop_min_step: 5000
   development_early_stop_relative_delta: 0.005
   development_early_stop_patience: 2
+  selection_probe_interval_steps: 1000
+  selection_early_stop: true
+  selection_minimum_eligible_probes: 8
+  selection_early_stop_patience: 3
+  selection_early_stop_relative_delta: 0.005
   # Re-encode the complete fixed expert banks in the evolving student.
   # Batch sizes are compute chunks only; every refresh uses every bank tile.
   dynamic_prototype_refresh_steps: 500

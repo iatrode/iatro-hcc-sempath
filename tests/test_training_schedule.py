@@ -13,8 +13,10 @@ from hcc_sempath.training.engine import (
     _classification_eval_metrics,
     _complete_bank_spatial_metrics,
     _eligible_selection_epoch_count,
+    _eligible_selection_probe_count,
     _selection_early_stop_requested,
     _selection_eligible_epochs_from_csv,
+    _selection_eligible_probes_from_csv,
     _normalized_selection_metrics,
     _normalize_uint8_images_fp16,
     _selection_start_step,
@@ -24,6 +26,7 @@ from hcc_sempath.training.engine import (
     _objective_gradient_diagnostics,
     _optimizer_step,
     _scalar_epoch_metrics,
+    _scheduler_contract,
     _step_checkpoint_due,
     _should_stop_for_alignment,
     _development_early_stop_state_from_csv,
@@ -227,6 +230,52 @@ def test_selection_reachability_handles_mid_epoch_resume() -> None:
     ) == 2
 
 
+def test_selection_probe_reachability_is_independent_of_epoch_size() -> None:
+    assert _eligible_selection_probe_count(
+        current_global_step=0,
+        maximum_global_step=20_000,
+        interval_steps=1_000,
+        selection_start_step=5_000,
+    ) == 16
+    assert _eligible_selection_probe_count(
+        current_global_step=12_626,
+        maximum_global_step=25_252,
+        interval_steps=1_000,
+        selection_start_step=5_000,
+    ) == 13
+
+
+def test_selection_probe_config_requires_exact_checkpoint_alignment() -> None:
+    cfg = {
+        "data": {"teachers": ["teacher"]},
+        "model": {"teacher_dims": {"teacher": 8}},
+        "loss": {},
+        "train": {
+            "checkpoint_interval_steps": 1_000,
+            "selection_probe_interval_steps": 1_250,
+        },
+    }
+    with pytest.raises(ValueError, match="exactly recoverable"):
+        validate_training_config(cfg, ["teacher"])
+
+
+def test_joint_step_selection_rejects_teacher_only_early_stop() -> None:
+    cfg = {
+        "data": {"teachers": ["teacher"]},
+        "model": {"teacher_dims": {"teacher": 8}},
+        "loss": {},
+        "train": {
+            "checkpoint_interval_steps": 1_000,
+            "selection_probe_interval_steps": 1_000,
+            "selection_early_stop": True,
+            "development_probe_interval_steps": 1_000,
+            "development_early_stop": True,
+        },
+    }
+    with pytest.raises(ValueError, match="teacher-only"):
+        validate_training_config(cfg, ["teacher"])
+
+
 def test_selection_early_stop_waits_for_minimum_eligible_epochs() -> None:
     assert not _selection_early_stop_requested(
         enabled=True,
@@ -281,6 +330,21 @@ def test_selection_eligible_epochs_recover_from_truncated_metrics(
     assert _selection_eligible_epochs_from_csv(
         path,
         maximum_step=350,
+    ) == 2
+
+
+def test_selection_eligible_probes_recover_from_step_metrics(tmp_path) -> None:
+    path = tmp_path / "selection_metrics.csv"
+    path.write_text(
+        "epoch,global_step,selection_loss\n"
+        "1,5000,0.8\n"
+        "1,6000,0.7\n"
+        "1,7000,0.6\n",
+        encoding="utf-8",
+    )
+    assert _selection_eligible_probes_from_csv(
+        path,
+        maximum_step=6_000,
     ) == 2
 
 
@@ -587,6 +651,30 @@ def test_cosine_scheduler_warms_up_and_decays() -> None:
     assert lrs[0] > 0.01
     assert max(lrs[:2]) <= 0.1
     assert lrs[-1] < lrs[2]
+
+
+def test_cosine_scheduler_can_freeze_the_global_step_horizon() -> None:
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.AdamW([parameter], lr=0.1)
+    cfg = {
+        "train": {
+            "scheduler": "cosine",
+            "epochs": 16,
+            "lr_total_steps": 6,
+            "lr_warmup_steps": 1,
+            "min_lr": 0.01,
+            "lr": 0.1,
+        }
+    }
+    scheduler = build_lr_scheduler(optimizer, cfg, steps_per_epoch=100)
+    for _ in range(6):
+        optimizer.step()
+        scheduler.step()
+
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.01)
+    contract = _scheduler_contract(cfg, steps_per_epoch=100)
+    assert contract["planned_total_steps"] == 6
+    assert contract["total_steps_source"] == "explicit_global_step"
 
 
 def test_amp_optimizer_helper_steps_exactly_once() -> None:
@@ -1492,6 +1580,169 @@ def test_fit_selects_checkpoint_from_independent_expert_validation(
     assert checkpoint["run_complete"] is True
     assert checkpoint["selection_finalized"] is True
     assert checkpoint["run_terminal_epoch"] == 3
+
+
+def test_fit_step_selection_stops_and_keeps_exact_best_probe(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    train_loader = [object(), object(), object()]
+    population_val_loader = [object()]
+    classification_val_loader = [object()]
+    spatial_val_loader = [object()]
+    spatial_losses = iter([1.0, 0.8, 0.9])
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    def fake_run_epoch(
+        current_model,
+        loader,
+        prototypes,
+        current_optimizer,
+        device,
+        cfg,
+        train,
+        **kwargs,
+    ):
+        del prototypes, current_optimizer, device, cfg
+        if train:
+            step = int(kwargs["global_step"])
+            stop = False
+            completed = 0
+            for completed in range(1, 4):
+                step += 1
+                stop = bool(
+                    kwargs["development_probe"](
+                        step,
+                        step,
+                        kwargs["epoch"],
+                    )
+                )
+                kwargs["step_checkpoint"](
+                    step,
+                    step,
+                    kwargs["epoch"],
+                    completed,
+                    {
+                        "totals": {"loss": float(completed)},
+                        "gradient_totals": {},
+                        "gradient_count": 0,
+                        "last_gradient_step": None,
+                        "batches": completed,
+                        "tiles": completed,
+                        "seconds": float(completed),
+                    },
+                )
+                if stop:
+                    break
+            return {
+                "loss": 1.0,
+                "global_step_end": float(step),
+                "spatial_supervised_step_end": float(step),
+                "batch_in_epoch_end": float(completed),
+                "epoch_accumulator_end": {
+                    "totals": {"loss": float(completed)},
+                    "gradient_totals": {},
+                    "gradient_count": 0,
+                    "last_gradient_step": None,
+                    "batches": completed,
+                    "tiles": completed,
+                    "seconds": float(completed),
+                },
+            }
+        if loader is population_val_loader:
+            embeddings = (
+                torch.zeros((1, 2)),
+                {"teacher": torch.zeros((1, 2))},
+                {"teacher": torch.zeros((1, 2))},
+                {
+                    "prototype_mask": torch.zeros(1, dtype=torch.bool),
+                    "prototype_classification": torch.full((1,), -1),
+                    "classification_logits": torch.zeros((0, 0)),
+                },
+            )
+            return {"loss": 1.0, "feature": 0.1}, embeddings
+        if loader is classification_val_loader:
+            class_count = len(DEFAULT_CLASSIFICATION_CLASSES)
+            embeddings = (
+                torch.zeros((class_count, 2)),
+                {},
+                {},
+                {
+                    "prototype_mask": torch.ones(
+                        class_count,
+                        dtype=torch.bool,
+                    ),
+                    "prototype_classification": torch.arange(class_count),
+                    "classification_logits": torch.eye(class_count) * 5.0,
+                },
+            )
+            return {}, embeddings
+        if loader is spatial_val_loader:
+            return {
+                "spatial": next(spatial_losses),
+                "spatial_explicit_negative_pairs": 7.0,
+            }
+        raise AssertionError("unexpected loader")
+
+    monkeypatch.setattr(
+        "hcc_sempath.training.engine.run_epoch",
+        fake_run_epoch,
+    )
+    monkeypatch.setattr(
+        "hcc_sempath.training.engine.evaluate_teacher_outputs",
+        lambda *args, **kwargs: {"teacher_feature_cosine": 0.5},
+    )
+    cfg = {
+        "runtime": {"output_dir": str(tmp_path), "seed": 13},
+        "data": {"spatial_manifest_path": "spatial.json"},
+        "model": {},
+        "loss": {
+            "relation_weight": 0.0,
+            "semantic_weight": 0.0,
+            "classification_weight": 1.0,
+            "spatial_weight": 1.0,
+        },
+        "train": {
+            "epochs": 3,
+            "amp": False,
+            "topk": 1,
+            "tensorboard": False,
+            "early_stop_teacher_alignment": False,
+            "checkpoint_interval_steps": 1,
+            "selection_probe_interval_steps": 1,
+            "selection_early_stop": True,
+            "selection_minimum_eligible_probes": 2,
+            "selection_early_stop_patience": 1,
+            "selection_early_stop_relative_delta": 0.005,
+        },
+    }
+
+    summary = fit(
+        model,
+        train_loader,
+        population_val_loader,
+        None,
+        optimizer,
+        torch.device("cpu"),
+        cfg,
+        expert_classification_val_loader=classification_val_loader,
+        expert_spatial_val_loader=spatial_val_loader,
+    )
+
+    assert summary["global_step"] == 1
+    checkpoint = torch.load(
+        tmp_path / "checkpoints" / "best.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert checkpoint["global_step"] == 1
+    assert checkpoint["best_selection_step"] == 1
+    assert checkpoint["selection_eligible_probes"] == 1
+    rows = list(
+        csv.DictReader((tmp_path / "selection_metrics.csv").open())
+    )
+    assert [int(row["global_step"]) for row in rows] == [1, 2]
 
 
 def test_development_metrics_exclude_internal_continuation_state() -> None:

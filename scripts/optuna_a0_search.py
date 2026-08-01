@@ -21,6 +21,7 @@ import time
 from typing import Any
 
 import yaml
+import torch
 
 try:
     import optuna
@@ -2099,6 +2100,18 @@ def export_study_artifacts(
     )
     raw_config_sha256 = best.user_attrs.get("config_sha256")
     if best_config.is_file():
+        checkpoint_payload = torch.load(
+            checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+        scheduler_contract = checkpoint_payload.get(
+            "scheduler_contract"
+        )
+        if not isinstance(scheduler_contract, dict):
+            raise RuntimeError(
+                "selected A0 checkpoint has no scheduler_contract"
+            )
         selected_config = load_yaml(best_config)
         observed_config_sha256 = config_digest(selected_config)
         if (
@@ -2128,6 +2141,7 @@ def export_study_artifacts(
             "trial_config_sha256": raw_config_sha256,
             "best_checkpoint": str(checkpoint),
             "best_checkpoint_sha256": checkpoint_sha256,
+            "scheduler_contract": dict(scheduler_contract),
         }
         atomic_write_yaml(
             output_root / "best_config.yaml",

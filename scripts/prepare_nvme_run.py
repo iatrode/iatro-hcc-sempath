@@ -109,7 +109,21 @@ def _prepare_a12(base: dict, repo: Path, output_root: Path) -> dict:
 
 
 def _prepare_full(base: dict, output_root: Path) -> dict:
-    _selected_a0_provenance(base)
+    selected = _selected_a0_provenance(base)
+    scheduler_contract = selected.get("scheduler_contract")
+    if not isinstance(scheduler_contract, dict):
+        raise ValueError(
+            "selected A0 provenance has no scheduler_contract; re-export "
+            "the study artifact before preparing full-population training"
+        )
+    a0_lr_total_steps = int(
+        scheduler_contract.get("planned_total_steps", 0)
+    )
+    if a0_lr_total_steps <= 0:
+        raise ValueError(
+            "selected A0 scheduler_contract has no positive "
+            "planned_total_steps"
+        )
     resolved = copy.deepcopy(base)
     resolved["data"]["train_tile_fraction"] = 1.0
     resolved["data"]["val_tile_fraction"] = 1.0
@@ -123,7 +137,21 @@ def _prepare_full(base: dict, output_root: Path) -> dict:
             "zhcc_response_ramp_steps": 1000,
         }
     )
+    resolved["train"].update(
+        {
+            "checkpoint_interval_steps": 1000,
+            "lr_total_steps": a0_lr_total_steps,
+            "development_probe_interval_steps": 0,
+            "development_early_stop": False,
+            "selection_probe_interval_steps": 1000,
+            "selection_early_stop": True,
+            "selection_minimum_eligible_probes": 8,
+            "selection_early_stop_patience": 3,
+            "selection_early_stop_relative_delta": 0.005,
+        }
+    )
     resolved["train"].pop("selection_metric_baseline", None)
+    resolved["train"].pop("selection_minimum_eligible_epochs", None)
     study_digest = resolved["data"].pop(
         "formal_study_contract_sha256"
     )

@@ -2,6 +2,16 @@
 
 ## 0.2.0 — Unreleased
 
+- Add fixed-global-step joint teacher/L1/L2 validation and checkpoint
+  selection for full-population training. Patience and minimum evidence count
+  validation probes rather than population epochs, preventing a larger
+  corpus from silently multiplying the optimization budget. Every evaluated
+  model is atomically recoverable, including eligible probes in the first
+  population epoch. Full-population preparation also carries forward the
+  selected A0 cosine schedule's absolute step horizon. The legacy epoch-end
+  mode remains available for exact
+  reproduction of the completed fixed-10% A0 and ablation studies.
+
 - Run fixed-teacher validation matrix diagnostics on the evaluation device,
   vectorize retrieval-overlap scoring, and serialize identical epoch
   checkpoint aliases once. This removes the unreported CPU pause after

@@ -317,7 +317,14 @@ decision boundary when available.
   epoch-0 \(T_0,C_0,S_0\) denominators while retaining the A0 weights, ramp
   boundary, patience, and relative-improvement rule. The A0 ramp boundary is
   explicit, so disabling a late-ramped mechanism cannot create earlier
-  checkpoint opportunities. Conditions that remove classification training
+  checkpoint opportunities. On this fixed 10% study population, every pass is
+  a common approximately 1,284-update checkpoint across A0 and all ablations;
+  those completed results retain that matched grid. Full-population training
+  evaluates the identical joint criterion on a fixed global-step grid so an
+  epoch containing ten times as many updates cannot multiply the stopping
+  budget. Its cosine learning-rate horizon is likewise inherited as the A0
+  study's absolute optimizer-step count rather than recomputed from full-data
+  epochs. Conditions that remove classification training
   still retain the complete L1 validation bank. Each condition receives an
   exact source/asset contract over its active teacher/prototype subset, and a
   checkpoint from an obsolete shorter epoch plan cannot be extended into the
@@ -372,14 +379,18 @@ selection uses three fixed validation terms:
 
 The first trial evaluates the shared initialization before optimization to
 freeze \(T_0,C_0,S_0\). Every later trial recomputes and must reproduce those
-values before using the stored denominators. Epoch \(e\) minimizes
+values before using the stored denominators. Checkpoint \(k\), indexed by
+global optimizer step, minimizes
 \[
-J_e=w_TT_e/T_0+w_CC_e/C_0+w_SS_e/S_0,
+J_k=w_TT_k/T_0+w_CC_k/C_0+w_SS_k/S_0,
 \]
-with default \((w_T,w_C,w_S)=(0.50,0.25,0.25)\). The weights must be positive,
+with the formal A0 weights \((w_T,w_C,w_S)=(0.26,0.28,0.46)\). The weights must be positive,
 sum to one, and are configuration-bound for the prespecified three-cell
 sensitivity analysis. Selection and patience begin only after every active
-expert/PAMT-D supervision ramp has completed. Macro-F1, balanced accuracy,
+expert/PAMT-D supervision ramp has completed. Full-population patience counts
+fixed-step joint-validation probes, never epochs; the reduced A0/ablation
+matrix retains its completed common pass-end grid, which is also a fixed step
+grid because every condition uses the same 10% population. Macro-F1, balanced accuracy,
 ordinary population loss, and individual teacher cosines remain diagnostics.
 No validation expert tile enters replay or any optimizer-visible bank; when
 historical IAC package splits differ from finalized annotation splits, the
@@ -412,8 +423,8 @@ and includes complete-negative tiles when selecting bile minimum-focus size.
 Validation tile IDs must resolve inside the requested manifest `val`/`exval`
 partition, which must be patient/slide-disjoint from the entire
 optimizer-visible population plus the classification/spatial expert replay
-cohort. The finalized joint-selection checkpoint records both its selected
-epoch and the completed run's terminal epoch, and freezes the exact
+cohort. The finalized joint-selection checkpoint records its selected global
+step, containing epoch, completed run terminal step/epoch, and freezes the exact
 optimizer-visible package list, an aggregate
 package/cohort digest, and SHA-256 digests of mutable classification/spatial/prototype
 supervision assets. Resume, independent evaluation, and calibration never
@@ -465,8 +476,9 @@ HCC-SemPath contributes one HCC-specific representation with:
 - `training/pamtd.py`: per-tile four-teacher adjudication and shared semantic
   response target.
 - `training/engine.py`: active objective, exact full-bank dynamic prototype
-  refresh, common classification/spatial intervention schedule, step-level metrics, and fixed
-  intra-epoch development probes.
+  refresh, common classification/spatial intervention schedule, step-level
+  metrics, fixed intra-epoch joint-selection probes, and exact step
+  checkpoints.
 - `training/train.py`: classification/spatial ingestion, fixed expert-tile replay and prototype
   loaders, and frozen
   optimizer/supervision contracts.

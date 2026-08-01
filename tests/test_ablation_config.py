@@ -11,6 +11,7 @@ from experiments.ablation.scripts.resolve_ablation_config import (
     validate_ablation_resume_checkpoint,
 )
 from hcc_sempath.training.engine import _selection_start_step
+from scripts.prepare_nvme_run import _prepare_full
 
 
 CONFIG_ROOT = Path("experiments/ablation/configs")
@@ -186,6 +187,10 @@ def _local_base(tmp_path: Path) -> Path:
         "best_checkpoint_sha256": hashlib.sha256(
             checkpoint.read_bytes()
         ).hexdigest(),
+        "scheduler_contract": {
+            "name": "cosine",
+            "planned_total_steps": 20_576,
+        },
     }
     path = tmp_path / "selected_a0.yaml"
     path.write_text(
@@ -205,6 +210,21 @@ def _resolve(tmp_path: Path, name: str) -> dict:
         condition,
         output_root=tmp_path / "runs",
     )
+
+
+def test_full_run_translates_selection_to_fixed_global_steps(tmp_path) -> None:
+    base = yaml.safe_load(_local_base(tmp_path).read_text())
+    resolved = _prepare_full(base, tmp_path / "runs")
+
+    assert resolved["data"]["train_tile_fraction"] == 1.0
+    assert resolved["data"]["val_tile_fraction"] == 1.0
+    assert resolved["train"]["selection_probe_interval_steps"] == 1000
+    assert resolved["train"]["lr_total_steps"] == 20_576
+    assert resolved["train"]["selection_minimum_eligible_probes"] == 8
+    assert resolved["train"]["selection_early_stop_patience"] == 3
+    assert resolved["train"]["development_probe_interval_steps"] == 0
+    assert resolved["train"]["development_early_stop"] is False
+    assert "selection_minimum_eligible_epochs" not in resolved["train"]
 
 
 def test_condition_files_encode_only_the_prespecified_interventions() -> None:
