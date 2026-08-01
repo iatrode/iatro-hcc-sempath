@@ -78,3 +78,18 @@ Specific conditions can be named:
 HCC_SEMPATH_ABLATION_BASE_CONFIG=/path/to/best_trial/config.yaml \
   bash experiments/ablation/scripts/run_ablations.sh a2 a8 a9 a10 a11 a12
 ```
+
+For a host on which all packages have been copied to local NVMe under
+`/root/data`, place the selected `best_config.yaml` at
+`/root/data/configs/a0_best_config.yaml` and the frozen manifest template at
+`/root/data/configs/manifest.template.yaml`. The dedicated entry points rewrite
+only storage locations, re-freeze path-sensitive contracts, reject any residual
+network-volume path, and launch in tmux without redirecting the training
+console:
+
+```bash
+export HCC_SEMPATH_SOURCE_COMMIT=<40-character-source-commit>
+bash scripts/run_a12_nvme.sh
+# After A12 has completed and the full run is approved:
+bash scripts/run_full_nvme.sh
+```
