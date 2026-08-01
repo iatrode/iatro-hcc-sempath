@@ -260,14 +260,18 @@ def write_prediction_package(
     temporary = output_path.with_suffix(output_path.suffix + ".tmp")
     if temporary.exists():
         temporary.unlink()
-    build_pack_streaming(
-        temporary,
-        header,
-        slide_table,
-        index_table,
-        payloads,
-        overwrite=False,
-    )
+    try:
+        build_pack_streaming(
+            temporary,
+            header,
+            slide_table,
+            index_table,
+            payloads,
+            overwrite=False,
+        )
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     temporary.replace(output_path)
 
 

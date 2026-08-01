@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyarrow as pa
+import pytest
 
 from hcc_sempath.inference.predictions import (
     PredictionPackageReader,
@@ -122,3 +123,39 @@ def test_float16_probability_roundtrip():
         header,
     )
     np.testing.assert_allclose(decoded["spatial_instance_probabilities"], instance, atol=5e-4)
+
+
+def test_failed_prediction_package_removes_temporary_file(tmp_path):
+    source_header, slides, source_index = _source_tables()
+    header = prediction_header(
+        source_path="slide-a.tiles.iac",
+        source_header=source_header,
+        source_index_digest=source_index_sha256(source_header, slides, source_index),
+        checkpoint_path="best.pt",
+        checkpoint_file_digest="a" * 64,
+        checkpoint_model_digest="b" * 64,
+        classification_names=["c0", "c1"],
+        component_names=["s0", "s1"],
+        grid_shape=(32, 32),
+        spatial_stride=7,
+        patch_size=14,
+        patch_padding=4,
+        spatial_dtype="uint8",
+        dataset_split="train",
+    )
+    output = tmp_path / "broken.iac"
+
+    def broken_payloads():
+        raise RuntimeError("synthetic failure")
+        yield b""  # pragma: no cover
+
+    with pytest.raises(RuntimeError, match="synthetic failure"):
+        write_prediction_package(
+            output,
+            header=header,
+            slide_table=slides,
+            index_table=prediction_index_table(source_index, [0]),
+            payloads=broken_payloads(),
+        )
+    assert not output.exists()
+    assert not output.with_suffix(".iac.tmp").exists()
