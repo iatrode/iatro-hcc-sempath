@@ -18,6 +18,9 @@
   supervision bank without falsely declaring overlapping source cohorts to be
   an independent validation cohort; strict independent calibration remains the
   default.
+- Separate metrics on assigned positive/explicit-negative semantic support
+  from descriptive activation in non-assigned regions, and report
+  tile-component precision, recall, F1, and AUC only over known labels.
 - Materialize exact-resume epoch accumulators only when a mid-epoch checkpoint
   is due, eliminating otherwise unused per-step CUDA-to-CPU scalar
   synchronizations without changing checkpoint contents or resume semantics.

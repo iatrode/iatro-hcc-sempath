@@ -119,6 +119,7 @@ def test_weak_spatial_metrics_do_not_treat_unmarked_cells_as_false_positives() -
     bags = torch.zeros(shape, dtype=torch.long)
     area = torch.zeros(shape, dtype=torch.bool)
     explicit = torch.zeros(shape, dtype=torch.bool)
+    implicit = torch.ones(shape, dtype=torch.bool)
 
     points[0, 0, 2, 2] = 1
     instance[0, 0, 2, 2] = 0.9
@@ -128,6 +129,7 @@ def test_weak_spatial_metrics_do_not_treat_unmarked_cells_as_false_positives() -
     area[0, 1, 1:3, 1:3] = True
     abundance[0, 1, 1:3, 1:3] = 0.9
     explicit[1, 1].fill_(True)
+    implicit &= ~(points.bool() | area | explicit)
 
     _, report = evaluate_weak_spatial_supervision(
         instance_probability=instance,
@@ -136,6 +138,7 @@ def test_weak_spatial_metrics_do_not_treat_unmarked_cells_as_false_positives() -
         brush_bag_ids=bags,
         area_positive=area,
         explicit_negative=explicit,
+        implicit_negative=implicit,
         threshold=0.5,
         point_tolerance_cells=1,
         nms_kernel=3,
@@ -146,6 +149,8 @@ def test_weak_spatial_metrics_do_not_treat_unmarked_cells_as_false_positives() -
     assert point["point_hit_rate"] == 1.0
     assert point["instance_explicit_negative_fpr"] == 0.0
     assert point["tile_component_roc_auc"] == 1.0
+    assert point["tile_component_f1"] == 1.0
+    assert point["instance_nonassigned_high_response_rate"] > 0.0
     assert region["positive_area_recall"] == 1.0
     assert region["abundance_explicit_negative_fpr"] == 0.0
 

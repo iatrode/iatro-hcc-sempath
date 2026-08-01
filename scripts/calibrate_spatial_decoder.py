@@ -553,6 +553,9 @@ def main() -> None:
             brush_bag_ids=brush_bag_ids,
             area_positive=area_positive,
             explicit_negative=explicit_negative,
+            implicit_negative=torch.stack(
+                [target.implicit_negative for target in ordered_targets]
+            ),
             component_names=names,
             threshold=0.5,
             point_tolerance_cells=point_tolerance,

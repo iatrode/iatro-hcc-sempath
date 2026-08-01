@@ -127,6 +127,7 @@ def evaluate_weak_spatial_supervision(
     brush_bag_ids: torch.Tensor,
     area_positive: torch.Tensor,
     explicit_negative: torch.Tensor,
+    implicit_negative: torch.Tensor,
     component_names: Sequence[str] = DEFAULT_SPATIAL_COMPONENTS,
     threshold: float = 0.5,
     point_tolerance_cells: int = 1,
@@ -149,6 +150,7 @@ def evaluate_weak_spatial_supervision(
         ("brush_bag_ids", brush_bag_ids),
         ("area_positive", area_positive),
         ("explicit_negative", explicit_negative),
+        ("implicit_negative", implicit_negative),
     ):
         if tensor.shape != expected:
             raise ValueError(
@@ -171,6 +173,7 @@ def evaluate_weak_spatial_supervision(
     bag_bool = brush_bag_ids > 0
     area_bool = area_positive.to(dtype=torch.bool)
     explicit_bool = explicit_negative.to(dtype=torch.bool)
+    implicit_bool = implicit_negative.to(dtype=torch.bool)
     instance_peaks = _peak_mask(
         instance_probability.flatten(0, 1),
         threshold=threshold,
@@ -237,6 +240,15 @@ def evaluate_weak_spatial_supervision(
             ).sum()
         )
 
+        nonassigned = implicit_bool[:, component_idx]
+        nonassigned_total = int(nonassigned.sum())
+        abundance_nonassigned = abundance_probability[:, component_idx][
+            nonassigned
+        ]
+        instance_nonassigned = instance_probability[:, component_idx][
+            nonassigned
+        ]
+
         scores: list[float] = []
         labels: list[int] = []
         for tile_idx in range(expected[0]):
@@ -266,6 +278,29 @@ def evaluate_weak_spatial_supervision(
                 )))
                 labels.append(0)
 
+        predicted_labels = [int(score >= threshold) for score in scores]
+        tile_tp = sum(
+            prediction == 1 and label == 1
+            for prediction, label in zip(predicted_labels, labels)
+        )
+        tile_fp = sum(
+            prediction == 1 and label == 0
+            for prediction, label in zip(predicted_labels, labels)
+        )
+        tile_fn = sum(
+            prediction == 0 and label == 1
+            for prediction, label in zip(predicted_labels, labels)
+        )
+        tile_precision = (
+            tile_tp / (tile_tp + tile_fp)
+            if tile_tp + tile_fp > 0
+            else None
+        )
+        tile_recall = (
+            tile_tp / (tile_tp + tile_fn)
+            if tile_tp + tile_fn > 0
+            else None
+        )
         components[name] = {
             "point_count": point_total,
             "point_hit_rate": point_hits / point_total if point_total else None,
@@ -285,8 +320,36 @@ def evaluate_weak_spatial_supervision(
             "instance_explicit_negative_fpr": (
                 instance_negative_fp / negative_total if negative_total else None
             ),
+            "nonassigned_cells": nonassigned_total,
+            "abundance_nonassigned_mean_response": (
+                float(abundance_nonassigned.mean())
+                if nonassigned_total
+                else None
+            ),
+            "instance_nonassigned_mean_response": (
+                float(instance_nonassigned.mean())
+                if nonassigned_total
+                else None
+            ),
+            "abundance_nonassigned_high_response_rate": (
+                float((abundance_nonassigned >= threshold).float().mean())
+                if nonassigned_total
+                else None
+            ),
+            "instance_nonassigned_high_response_rate": (
+                float((instance_nonassigned >= threshold).float().mean())
+                if nonassigned_total
+                else None
+            ),
             "tile_component_positive_pairs": sum(labels),
             "tile_component_explicit_negative_pairs": len(labels) - sum(labels),
+            "tile_component_precision": tile_precision,
+            "tile_component_recall": tile_recall,
+            "tile_component_f1": (
+                _f1(tile_tp, tile_fp, tile_fn)
+                if tile_tp + tile_fn > 0
+                else None
+            ),
             "tile_component_roc_auc": _binary_roc_auc(scores, labels),
         }
 
@@ -297,6 +360,13 @@ def evaluate_weak_spatial_supervision(
         "positive_area_recall",
         "abundance_explicit_negative_fpr",
         "instance_explicit_negative_fpr",
+        "abundance_nonassigned_mean_response",
+        "instance_nonassigned_mean_response",
+        "abundance_nonassigned_high_response_rate",
+        "instance_nonassigned_high_response_rate",
+        "tile_component_precision",
+        "tile_component_recall",
+        "tile_component_f1",
         "tile_component_roc_auc",
     )
     macro = {}
