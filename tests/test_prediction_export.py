@@ -100,3 +100,22 @@ def test_uint16_probability_roundtrip_is_high_precision():
         header,
     )
     np.testing.assert_allclose(decoded["spatial_instance_probabilities"], instance, atol=1 / 131070)
+
+
+def test_float16_probability_roundtrip():
+    from hcc_sempath.inference.predictions import decode_prediction_payload
+
+    classification = np.array([0.25, 0.75], dtype=np.float32)
+    instance = np.full((2, 2, 2), 0.1234, dtype=np.float32)
+    abundance = np.full((2, 2, 2), 0.9876, dtype=np.float32)
+    header = {
+        "classification_class_names": ["a", "b"],
+        "spatial_component_names": ["x", "y"],
+        "spatial_grid_shape": [2, 2],
+        "spatial_probability_encoding": {"dtype": "float16"},
+    }
+    decoded = decode_prediction_payload(
+        encode_prediction_payload(classification, instance, abundance, spatial_dtype="float16"),
+        header,
+    )
+    np.testing.assert_allclose(decoded["spatial_instance_probabilities"], instance, atol=5e-4)

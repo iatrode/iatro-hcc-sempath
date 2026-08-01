@@ -61,7 +61,7 @@ def source_index_sha256(header: dict, slide_table: pa.Table, index_table: pa.Tab
 def _probability_dtype(name: str) -> np.dtype:
     if name not in {"uint8", "uint16", "float16"}:
         raise ValueError(f"unsupported spatial probability dtype: {name}")
-    return np.dtype(f"<{name}" if name == "float16" else name)
+    return np.dtype("<f2" if name == "float16" else name)
 
 
 def _encode_probability(array: np.ndarray, dtype_name: str) -> np.ndarray:
