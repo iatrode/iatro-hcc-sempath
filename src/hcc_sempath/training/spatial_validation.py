@@ -97,6 +97,241 @@ def _point_locations(
     return points
 
 
+def _binary_roc_auc(scores: list[float], labels: list[int]) -> float | None:
+    """Return tie-aware binary ROC AUC without an optional sklearn dependency."""
+
+    positives = sum(labels)
+    negatives = len(labels) - positives
+    if positives <= 0 or negatives <= 0:
+        return None
+    order = sorted(range(len(scores)), key=scores.__getitem__)
+    rank_sum = 0.0
+    start = 0
+    while start < len(order):
+        end = start + 1
+        while end < len(order) and scores[order[end]] == scores[order[start]]:
+            end += 1
+        average_rank = 0.5 * ((start + 1) + end)
+        rank_sum += average_rank * sum(labels[order[index]] for index in range(start, end))
+        start = end
+    return (
+        rank_sum - positives * (positives + 1) / 2.0
+    ) / (positives * negatives)
+
+
+def evaluate_weak_spatial_supervision(
+    *,
+    instance_probability: torch.Tensor,
+    abundance_probability: torch.Tensor,
+    point_centers: torch.Tensor,
+    brush_bag_ids: torch.Tensor,
+    area_positive: torch.Tensor,
+    explicit_negative: torch.Tensor,
+    component_names: Sequence[str] = DEFAULT_SPATIAL_COMPONENTS,
+    threshold: float = 0.5,
+    point_tolerance_cells: int = 1,
+    nms_kernel: int = 3,
+    brush_top_fraction: float = 1.0,
+) -> tuple[dict, dict]:
+    """Evaluate incomplete checkpoint-selection marks without inventing misses.
+
+    Positive points, bags, and occupied-area marks are not exhaustive masks, so
+    unmarked predictions are never counted as false positives. False-positive
+    rates use annotator-confirmed explicit-negative support only. Tile-component
+    ROC AUC is reported only when both marked-positive and explicit-negative
+    pairs exist for a component.
+    """
+
+    expected = instance_probability.shape
+    for label, tensor in (
+        ("abundance_probability", abundance_probability),
+        ("point_centers", point_centers),
+        ("brush_bag_ids", brush_bag_ids),
+        ("area_positive", area_positive),
+        ("explicit_negative", explicit_negative),
+    ):
+        if tensor.shape != expected:
+            raise ValueError(
+                f"{label} shape mismatch: got={tuple(tensor.shape)} "
+                f"expected={tuple(expected)}"
+            )
+    names = [str(value) for value in component_names]
+    if expected[1] != len(names):
+        raise ValueError("weak spatial evaluation component count/order mismatch")
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("weak spatial evaluation threshold must be in [0, 1]")
+    if point_tolerance_cells < 0:
+        raise ValueError("point tolerance must be non-negative")
+    if nms_kernel <= 0 or nms_kernel % 2 == 0:
+        raise ValueError("NMS kernel must be a positive odd integer")
+    if not 0.0 < brush_top_fraction <= 1.0:
+        raise ValueError("brush_top_fraction must be in (0, 1]")
+
+    point_bool = point_centers > 0
+    bag_bool = brush_bag_ids > 0
+    area_bool = area_positive.to(dtype=torch.bool)
+    explicit_bool = explicit_negative.to(dtype=torch.bool)
+    instance_peaks = _peak_mask(
+        instance_probability.flatten(0, 1),
+        threshold=threshold,
+        kernel=nms_kernel,
+    ).reshape(expected)
+    components: dict[str, dict[str, float | int | None]] = {}
+    for component_idx, name in enumerate(names):
+        point_total = point_hits = 0
+        point_confidence: list[float] = []
+        for tile_idx in range(expected[0]):
+            truth = _point_locations(point_centers[tile_idx, component_idx])
+            if not truth:
+                continue
+            predicted = [
+                (int(row), int(col))
+                for row, col in instance_peaks[tile_idx, component_idx].nonzero().tolist()
+            ]
+            point_total += len(truth)
+            point_hits += _maximum_point_matches(
+                truth,
+                predicted,
+                point_tolerance_cells,
+            )
+            plane = instance_probability[tile_idx, component_idx]
+            for row, col in truth:
+                r0 = max(0, row - point_tolerance_cells)
+                r1 = min(plane.shape[0], row + point_tolerance_cells + 1)
+                c0 = max(0, col - point_tolerance_cells)
+                c1 = min(plane.shape[1], col + point_tolerance_cells + 1)
+                point_confidence.append(float(plane[r0:r1, c0:c1].max()))
+
+        bag_total = bag_hits = 0
+        for tile_idx in range(expected[0]):
+            ids = torch.unique(brush_bag_ids[tile_idx, component_idx])
+            for bag_id in ids[ids > 0].tolist():
+                values = abundance_probability[tile_idx, component_idx][
+                    brush_bag_ids[tile_idx, component_idx] == int(bag_id)
+                ]
+                keep = max(1, int(math.ceil(values.numel() * brush_top_fraction)))
+                score = float(torch.topk(values, keep, sorted=False).values.mean())
+                bag_total += 1
+                bag_hits += int(score >= threshold)
+
+        positive_area = area_bool[:, component_idx]
+        area_total = int(positive_area.sum())
+        area_hits = int(
+            (
+                (abundance_probability[:, component_idx] >= threshold)
+                & positive_area
+            ).sum()
+        )
+        negative = explicit_bool[:, component_idx]
+        negative_total = int(negative.sum())
+        abundance_negative_fp = int(
+            (
+                (abundance_probability[:, component_idx] >= threshold)
+                & negative
+            ).sum()
+        )
+        instance_negative_fp = int(
+            (
+                (instance_probability[:, component_idx] >= threshold)
+                & negative
+            ).sum()
+        )
+
+        scores: list[float] = []
+        labels: list[int] = []
+        for tile_idx in range(expected[0]):
+            has_point = bool(point_bool[tile_idx, component_idx].any())
+            has_measurement = bool(
+                bag_bool[tile_idx, component_idx].any()
+                or area_bool[tile_idx, component_idx].any()
+            )
+            if has_point or has_measurement:
+                score = 0.0
+                if has_point:
+                    score = max(
+                        score,
+                        float(instance_probability[tile_idx, component_idx].max()),
+                    )
+                if has_measurement:
+                    score = max(
+                        score,
+                        float(abundance_probability[tile_idx, component_idx].max()),
+                    )
+                scores.append(score)
+                labels.append(1)
+            elif bool(negative[tile_idx].any()):
+                scores.append(float(torch.maximum(
+                    instance_probability[tile_idx, component_idx][negative[tile_idx]].max(),
+                    abundance_probability[tile_idx, component_idx][negative[tile_idx]].max(),
+                )))
+                labels.append(0)
+
+        components[name] = {
+            "point_count": point_total,
+            "point_hit_rate": point_hits / point_total if point_total else None,
+            "point_mean_local_confidence": (
+                sum(point_confidence) / len(point_confidence)
+                if point_confidence
+                else None
+            ),
+            "brush_bag_count": bag_total,
+            "brush_bag_recall": bag_hits / bag_total if bag_total else None,
+            "positive_area_cells": area_total,
+            "positive_area_recall": area_hits / area_total if area_total else None,
+            "explicit_negative_cells": negative_total,
+            "abundance_explicit_negative_fpr": (
+                abundance_negative_fp / negative_total if negative_total else None
+            ),
+            "instance_explicit_negative_fpr": (
+                instance_negative_fp / negative_total if negative_total else None
+            ),
+            "tile_component_positive_pairs": sum(labels),
+            "tile_component_explicit_negative_pairs": len(labels) - sum(labels),
+            "tile_component_roc_auc": _binary_roc_auc(scores, labels),
+        }
+
+    macro_keys = (
+        "point_hit_rate",
+        "point_mean_local_confidence",
+        "brush_bag_recall",
+        "positive_area_recall",
+        "abundance_explicit_negative_fpr",
+        "instance_explicit_negative_fpr",
+        "tile_component_roc_auc",
+    )
+    macro = {}
+    for key in macro_keys:
+        values = [
+            float(item[key])
+            for item in components.values()
+            if item[key] is not None
+        ]
+        macro[key] = sum(values) / len(values) if values else None
+    readout = {
+        "version": 1,
+        "role": "checkpoint_selection_supervision_metric_readout",
+        "spatial_component_names": names,
+        "instance_threshold": float(threshold),
+        "abundance_threshold": float(threshold),
+        "nms_kernel": int(nms_kernel),
+        "point_tolerance_cells": int(point_tolerance_cells),
+    }
+    report = {
+        "protocol": {
+            "split": "checkpoint_selection_supervision",
+            "tile_count": int(expected[0]),
+            "labels_exhaustive": False,
+            "unmarked_predictions_counted_as_false_positive": False,
+            "threshold": float(threshold),
+            "point_tolerance_cells": int(point_tolerance_cells),
+            "nms_kernel": int(nms_kernel),
+        },
+        "macro": macro,
+        "components": components,
+    }
+    return readout, report
+
+
 def _macro_summary(
     pair_stats: dict[int, dict[str, float]],
     *,

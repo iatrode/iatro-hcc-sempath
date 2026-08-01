@@ -50,6 +50,7 @@ from hcc_sempath.training.roi import (  # noqa: E402
 )
 from hcc_sempath.training.spatial_validation import (  # noqa: E402
     calibrate_spatial_decoder,
+    evaluate_weak_spatial_supervision,
 )
 from hcc_sempath.training.train import (  # noqa: E402
     _assert_disjoint_package_cohorts,
@@ -101,12 +102,18 @@ def _finalized_checkpoint(payload: dict) -> dict:
     return cfg
 
 
-def _split_tile_packages(cfg: dict, split: str) -> list[str]:
-    manifest_path = cfg["data"].get("train_manifest_path")
+def _split_tile_packages(
+    cfg: dict,
+    split: str,
+    *,
+    apply_train_fraction: bool = True,
+    manifest_override: Path | None = None,
+) -> list[str]:
+    manifest_path = manifest_override or cfg["data"].get("train_manifest_path")
     if manifest_path:
         manifest = load_training_manifest(manifest_path)
         paths = manifest_tile_packages(manifest, split)
-        if split == "train":
+        if split == "train" and apply_train_fraction:
             paths = _select_package_fraction(
                 paths,
                 {
@@ -177,12 +184,37 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--annotation", required=True)
     parser.add_argument(
+        "--source-manifest",
+        type=Path,
+        help=(
+            "Relocated manifest used only to resolve immutable source images. "
+            "Required when archived checkpoints contain obsolete host paths."
+        ),
+    )
+    parser.add_argument(
         "--validation-split",
         action="append",
         choices=("val", "exval"),
         default=[],
     )
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--image-cache",
+        type=Path,
+        help=(
+            "Optional temporary decoded-image cache for repeated checkpoint "
+            "evaluation. The annotation and package-pool digests must match."
+        ),
+    )
+    parser.add_argument(
+        "--supervisory-validation",
+        action="store_true",
+        help=(
+            "Evaluate the checkpoint-selection supervision split even when "
+            "its source cohorts overlap the optimizer-visible unlabeled "
+            "population. The report is explicitly marked non-independent."
+        ),
+    )
     parser.add_argument("--output-calibration", required=True)
     parser.add_argument("--output-report", required=True)
     args = parser.parse_args()
@@ -205,10 +237,22 @@ def main() -> None:
         str(value)
         for value in (args.validation_split or ["val"])
     }
+    package_splits = set(validation_splits)
+    if args.supervisory_validation:
+        # The checkpoint-selection bank may intentionally contain labels for
+        # tiles sampled from the optimizer's train population. The annotation
+        # split still controls which labels are evaluated; this wider package
+        # pool only resolves the corresponding immutable source images.
+        package_splits.add("train")
     packages = list(dict.fromkeys(
         path
-        for split in sorted(validation_splits)
-        for path in _split_tile_packages(cfg, split)
+        for split in sorted(package_splits)
+        for path in _split_tile_packages(
+            cfg,
+            split,
+            apply_train_fraction=not args.supervisory_validation,
+            manifest_override=args.source_manifest,
+        )
     ))
     if not packages:
         raise ValueError("checkpoint has no requested validation packages")
@@ -238,13 +282,60 @@ def main() -> None:
     )
     if not validation_targets:
         raise ValueError("independent spatial validation split is empty")
-    tile_ids, images, validation_packages, slide_ids = _load_validation_images(
-        packages,
-        load_spatial_tile_locations(
-            args.annotation,
-            allowed_splits=validation_splits,
-        ),
-    )
+    annotation_sha256 = hashlib.sha256(
+        Path(args.annotation).read_bytes()
+    ).hexdigest()
+    package_pool_sha256 = hashlib.sha256(
+        "\n".join(str(Path(path).resolve()) for path in packages).encode()
+    ).hexdigest()
+    cache_contract = {
+        "version": 1,
+        "annotation_sha256": annotation_sha256,
+        "package_pool_sha256": package_pool_sha256,
+        "validation_splits": sorted(validation_splits),
+        "source_population_splits": sorted(package_splits),
+    }
+    if args.image_cache is not None and args.image_cache.exists():
+        cached = torch.load(
+            args.image_cache,
+            map_location="cpu",
+            weights_only=False,
+        )
+        if not isinstance(cached, dict) or cached.get("contract") != cache_contract:
+            raise ValueError(
+                "decoded spatial image cache contract mismatch: "
+                f"{args.image_cache}"
+            )
+        tile_ids = [str(value) for value in cached["tile_ids"]]
+        images = cached["images"]
+        validation_packages = [
+            str(value) for value in cached["validation_packages"]
+        ]
+        slide_ids = [str(value) for value in cached["slide_ids"]]
+        if not isinstance(images, torch.Tensor) or images.dtype != torch.uint8:
+            raise ValueError("decoded spatial image cache must contain uint8 images")
+    else:
+        tile_ids, images, validation_packages, slide_ids = _load_validation_images(
+            packages,
+            load_spatial_tile_locations(
+                args.annotation,
+                allowed_splits=validation_splits,
+            ),
+        )
+        if args.image_cache is not None:
+            args.image_cache.parent.mkdir(parents=True, exist_ok=True)
+            temporary = args.image_cache.with_suffix(args.image_cache.suffix + ".tmp")
+            torch.save(
+                {
+                    "contract": cache_contract,
+                    "tile_ids": tile_ids,
+                    "images": images,
+                    "validation_packages": validation_packages,
+                    "slide_ids": slide_ids,
+                },
+                temporary,
+            )
+            temporary.replace(args.image_cache)
     validation_metadata = load_spatial_validation_metadata(
         args.annotation,
         component_names=names,
@@ -258,13 +349,27 @@ def main() -> None:
             "validation targets missing completeness metadata: "
             f"count={len(missing_metadata)}"
         )
-    optimizer_packages = _optimizer_visible_packages(
-        cfg,
+    optimizer_packages = (
+        [
+            str(value)
+            for value in cfg["data"].get(
+                "optimizer_visible_tile_packages",
+                [],
+            )
+        ]
+        if args.supervisory_validation
+        else _optimizer_visible_packages(cfg)
     )
-    _assert_disjoint_package_cohorts(
-        optimizer_packages,
-        list(dict.fromkeys(validation_packages)),
-    )
+    if not optimizer_packages:
+        raise ValueError(
+            "checkpoint has no frozen optimizer-visible cohort contract"
+        )
+    patient_slide_disjoint = not args.supervisory_validation
+    if patient_slide_disjoint:
+        _assert_disjoint_package_cohorts(
+            optimizer_packages,
+            list(dict.fromkeys(validation_packages)),
+        )
     teacher_names_value = teacher_names(cfg)
     model = HCCSemPathModel(
         backbone_name=STUDENT_BACKBONE_NAME,
@@ -331,6 +436,12 @@ def main() -> None:
     )
     protocol_contract = {
         "version": 1,
+        "validation_role": (
+            "independent_spatial_validation"
+            if patient_slide_disjoint
+            else "checkpoint_selection_supervision"
+        ),
+        "patient_slide_disjoint_from_training": patient_slide_disjoint,
         "component_names": names,
         "validation_splits": sorted(validation_splits),
         "spatial_output_stride": stride,
@@ -357,9 +468,7 @@ def main() -> None:
         "research_contract_sha256": canonical_payload_sha256(
             research_contract
         ),
-        "validation_annotation_sha256": hashlib.sha256(
-            Path(args.annotation).read_bytes()
-        ).hexdigest(),
+        "validation_annotation_sha256": annotation_sha256,
         "validation_protocol_sha256": canonical_payload_sha256(
             protocol_contract
         ),
@@ -416,84 +525,112 @@ def main() -> None:
             )
         ),
     }
-    calibration, report = calibrate_spatial_decoder(
-        instance_probability=torch.cat(instance_batches),
-        abundance_probability=torch.cat(abundance_batches),
-        point_centers=torch.stack(
-            [target.point_centers for target in ordered_targets]
-        ),
-        brush_bag_ids=torch.stack(
-            [target.brush_bag_ids for target in ordered_targets]
-        ),
-        area_positive=torch.stack(
-            [target.area_positive for target in ordered_targets]
-        ),
-        explicit_negative=torch.stack(
-            [target.explicit_negative for target in ordered_targets]
-        ),
-        implicit_negative=torch.stack(
-            [target.implicit_negative for target in ordered_targets]
-        ),
-        count_complete=torch.stack(
-            [item.count_complete for item in ordered_metadata]
-        ),
-        measurement_complete=torch.stack(
-            [item.measurement_complete for item in ordered_metadata]
-        ),
-        geometry_modes=[
-            item.geometry_modes for item in ordered_metadata
-        ],
-        slide_ids=slide_ids,
-        calibration_provenance=calibration_provenance,
-        component_names=names,
-        output_stride=stride,
-        point_tolerance_cells=int(
-            cfg["loss"].get("spatial_point_tolerance_cells", 1)
-        ),
-        implicit_negative_weight=float(
-            cfg["loss"].get("spatial_implicit_negative_weight", 0.05)
-        ),
-        brush_top_fraction=float(
-            cfg["loss"].get("spatial_brush_top_fraction", 1.0)
-        ),
+    instance_probability = torch.cat(instance_batches)
+    abundance_probability = torch.cat(abundance_batches)
+    point_centers = torch.stack(
+        [target.point_centers for target in ordered_targets]
     )
-    calibration = validate_spatial_decoder_calibration(
-        calibration,
-        names,
-        expected_output_stride=stride,
-        expected_model_state_sha256=calibration_provenance[
-            "checkpoint_model_sha256"
-        ],
-        expected_research_contract_sha256=calibration_provenance[
-            "research_contract_sha256"
-        ],
-        expected_optimizer_visible_contract_sha256=(
-            calibration_provenance[
-                "optimizer_visible_contract_sha256"
-            ]
-        ),
-        expected_supervision_assets_sha256=calibration_provenance[
-            "supervision_assets_sha256"
-        ],
-        expected_formal_asset_contract_sha256=(
-            calibration_provenance[
-                "formal_asset_contract_sha256"
-            ]
-        ),
-        expected_source_tree_sha256=calibration_provenance[
-            "source_tree_sha256"
-        ],
-        expected_study_contract_sha256=calibration_provenance[
-            "study_contract_sha256"
-        ],
+    brush_bag_ids = torch.stack(
+        [target.brush_bag_ids for target in ordered_targets]
     )
+    area_positive = torch.stack(
+        [target.area_positive for target in ordered_targets]
+    )
+    explicit_negative = torch.stack(
+        [target.explicit_negative for target in ordered_targets]
+    )
+    point_tolerance = int(
+        cfg["loss"].get("spatial_point_tolerance_cells", 1)
+    )
+    brush_top_fraction = float(
+        cfg["loss"].get("spatial_brush_top_fraction", 1.0)
+    )
+    if args.supervisory_validation:
+        calibration, report = evaluate_weak_spatial_supervision(
+            instance_probability=instance_probability,
+            abundance_probability=abundance_probability,
+            point_centers=point_centers,
+            brush_bag_ids=brush_bag_ids,
+            area_positive=area_positive,
+            explicit_negative=explicit_negative,
+            component_names=names,
+            threshold=0.5,
+            point_tolerance_cells=point_tolerance,
+            nms_kernel=3,
+            brush_top_fraction=brush_top_fraction,
+        )
+        calibration["provenance"] = calibration_provenance
+    else:
+        calibration, report = calibrate_spatial_decoder(
+            instance_probability=instance_probability,
+            abundance_probability=abundance_probability,
+            point_centers=point_centers,
+            brush_bag_ids=brush_bag_ids,
+            area_positive=area_positive,
+            explicit_negative=explicit_negative,
+            implicit_negative=torch.stack(
+                [target.implicit_negative for target in ordered_targets]
+            ),
+            count_complete=torch.stack(
+                [item.count_complete for item in ordered_metadata]
+            ),
+            measurement_complete=torch.stack(
+                [item.measurement_complete for item in ordered_metadata]
+            ),
+            geometry_modes=[
+                item.geometry_modes for item in ordered_metadata
+            ],
+            slide_ids=slide_ids,
+            calibration_provenance=calibration_provenance,
+            component_names=names,
+            output_stride=stride,
+            point_tolerance_cells=point_tolerance,
+            implicit_negative_weight=float(
+                cfg["loss"].get("spatial_implicit_negative_weight", 0.05)
+            ),
+            brush_top_fraction=brush_top_fraction,
+        )
+        calibration = validate_spatial_decoder_calibration(
+            calibration,
+            names,
+            expected_output_stride=stride,
+            expected_model_state_sha256=calibration_provenance[
+                "checkpoint_model_sha256"
+            ],
+            expected_research_contract_sha256=calibration_provenance[
+                "research_contract_sha256"
+            ],
+            expected_optimizer_visible_contract_sha256=(
+                calibration_provenance[
+                    "optimizer_visible_contract_sha256"
+                ]
+            ),
+            expected_supervision_assets_sha256=calibration_provenance[
+                "supervision_assets_sha256"
+            ],
+            expected_formal_asset_contract_sha256=(
+                calibration_provenance[
+                    "formal_asset_contract_sha256"
+                ]
+            ),
+            expected_source_tree_sha256=calibration_provenance[
+                "source_tree_sha256"
+            ],
+            expected_study_contract_sha256=calibration_provenance[
+                "study_contract_sha256"
+            ],
+        )
     report["protocol"].update(
         {
+            "split": protocol_contract["validation_role"],
             "checkpoint_epoch": int(payload["epoch"]),
             "validation_splits": [
                 str(value) for value in sorted(validation_splits)
             ],
-            "patient_slide_disjoint_from_training": True,
+            "source_population_splits": [
+                str(value) for value in sorted(package_splits)
+            ],
+            "patient_slide_disjoint_from_training": patient_slide_disjoint,
             "validation_patient_count": len(validation_patients),
             "validation_slide_count": len(validation_slides),
             "optimizer_visible_package_count": len(
@@ -516,8 +653,12 @@ def main() -> None:
             encoding="utf-8",
         )
     print(
-        "spatial_calibration_ok "
-        f"tiles={len(tile_ids)} output={args.output_calibration}"
+        (
+            "spatial_supervision_metrics_ok "
+            if args.supervisory_validation
+            else "spatial_calibration_ok "
+        )
+        + f"tiles={len(tile_ids)} output={args.output_calibration}"
     )
 
 

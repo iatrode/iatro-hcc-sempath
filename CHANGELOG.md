@@ -14,6 +14,10 @@
   reject the AutoDL image defaults.
 - Make the clean-archive NVMe preparation entry point resolve its repository
   modules without relying on an ambient working-directory `PYTHONPATH`.
+- Allow spatial decoder metrics to be emitted for the checkpoint-selection
+  supervision bank without falsely declaring overlapping source cohorts to be
+  an independent validation cohort; strict independent calibration remains the
+  default.
 - Materialize exact-resume epoch accumulators only when a mid-epoch checkpoint
   is due, eliminating otherwise unused per-step CUDA-to-CPU scalar
   synchronizations without changing checkpoint contents or resume semantics.

@@ -10,6 +10,7 @@ from hcc_sempath.spatial_schema import (
 )
 from hcc_sempath.training.spatial_validation import (
     calibrate_spatial_decoder,
+    evaluate_weak_spatial_supervision,
 )
 
 
@@ -107,6 +108,46 @@ def _complete_validation_case() -> dict:
         "nms_kernels": [3],
         "focus_minimum_grid": [1, 2],
     }
+
+
+def test_weak_spatial_metrics_do_not_treat_unmarked_cells_as_false_positives() -> None:
+    component_count = len(DEFAULT_SPATIAL_COMPONENTS)
+    shape = (2, component_count, 5, 5)
+    instance = torch.zeros(shape)
+    abundance = torch.zeros(shape)
+    points = torch.zeros(shape)
+    bags = torch.zeros(shape, dtype=torch.long)
+    area = torch.zeros(shape, dtype=torch.bool)
+    explicit = torch.zeros(shape, dtype=torch.bool)
+
+    points[0, 0, 2, 2] = 1
+    instance[0, 0, 2, 2] = 0.9
+    # This unmarked response is unknown, not a false positive.
+    instance[0, 0, 0, 0] = 0.8
+    explicit[1, 0].fill_(True)
+    area[0, 1, 1:3, 1:3] = True
+    abundance[0, 1, 1:3, 1:3] = 0.9
+    explicit[1, 1].fill_(True)
+
+    _, report = evaluate_weak_spatial_supervision(
+        instance_probability=instance,
+        abundance_probability=abundance,
+        point_centers=points,
+        brush_bag_ids=bags,
+        area_positive=area,
+        explicit_negative=explicit,
+        threshold=0.5,
+        point_tolerance_cells=1,
+        nms_kernel=3,
+    )
+
+    point = report["components"][DEFAULT_SPATIAL_COMPONENTS[0]]
+    region = report["components"][DEFAULT_SPATIAL_COMPONENTS[1]]
+    assert point["point_hit_rate"] == 1.0
+    assert point["instance_explicit_negative_fpr"] == 0.0
+    assert point["tile_component_roc_auc"] == 1.0
+    assert region["positive_area_recall"] == 1.0
+    assert region["abundance_explicit_negative_fpr"] == 0.0
 
 
 def test_spatial_calibration_freezes_all_component_readouts() -> None:
