@@ -181,6 +181,7 @@ def prediction_header(
     patch_size: int,
     patch_padding: int,
     spatial_dtype: str,
+    dataset_split: str,
 ) -> dict:
     tiling = dict(source_header.get("tiling") or {})
     source = dict(source_header.get("source") or {})
@@ -206,6 +207,7 @@ def prediction_header(
         "checksum": "crc32",
         "source_package_name": Path(source_path).name,
         "source_dataset": Path(source_path).parent.name,
+        "dataset_split": str(dataset_split),
         "source_iac_index_sha256": source_index_digest,
         "source": source,
         "source_tiling": tiling,

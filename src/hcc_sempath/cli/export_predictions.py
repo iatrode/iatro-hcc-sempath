@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import json
 import time
 from pathlib import Path
@@ -8,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from iatro.iac import read_tables
+from iatro.iac import read_header, read_tables
 from iatro.iac.adapters.tiles import TilePackageReader
 
 from hcc_sempath.inference.predictions import (
@@ -71,6 +73,12 @@ def _packages(args: argparse.Namespace) -> list[Path]:
     return packages
 
 
+def _write_manifest(path: Path, manifest: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export reconstructable FULL-checkpoint tile predictions.")
     parser.add_argument("--checkpoint", required=True, type=Path)
@@ -80,12 +88,14 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--decode-workers", type=int, default=8)
+    parser.add_argument("--encode-workers", type=int, default=8)
     parser.add_argument("--max-tiles", type=int)
     parser.add_argument("--spatial-dtype", choices=("uint8", "uint16", "float16"), default="uint8")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
-    if args.batch_size <= 0 or args.decode_workers <= 0:
-        raise ValueError("batch size and decode workers must be positive")
+    if args.batch_size <= 0 or args.decode_workers <= 0 or args.encode_workers <= 0:
+        raise ValueError("batch size, decode workers, and encode workers must be positive")
     if args.max_tiles is not None and args.max_tiles <= 0:
         raise ValueError("--max-tiles must be positive")
 
@@ -100,6 +110,22 @@ def main() -> None:
     outputs: list[dict] = []
     remaining = args.max_tiles
     started = time.monotonic()
+    manifest_path = args.output_dir / "manifest.json"
+
+    def current_manifest(*, complete: bool) -> dict:
+        return {
+            "schema_version": 1,
+            "complete": complete,
+            "checkpoint": str(args.checkpoint),
+            "checkpoint_sha256": checkpoint_digest,
+            "checkpoint_model_sha256": model_digest,
+            "split": args.split,
+            "spatial_dtype": args.spatial_dtype,
+            "records": sum(int(item["records"]) for item in outputs),
+            "bytes": sum(int(item["bytes"]) for item in outputs),
+            "elapsed_seconds": time.monotonic() - started,
+            "packages": outputs,
+        }
 
     for package_path in _packages(args):
         source_header, slide_table, source_index = read_tables(package_path)
@@ -111,12 +137,38 @@ def main() -> None:
             f"{package_path.parent.name}__"
             f"{package_path.name.removesuffix('.tiles.iac')}.predictions.iac"
         )
+        source_digest = source_index_sha256(source_header, slide_table, source_index)
+        if args.resume and output_path.exists():
+            existing = read_header(output_path)
+            valid_existing = (
+                existing.get("payload_type") == "hcc_sempath_tile_predictions"
+                and existing.get("checkpoint_sha256") == checkpoint_digest
+                and existing.get("source_iac_index_sha256") == source_digest
+                and existing.get("dataset_split") == args.split
+                and existing.get("spatial_probability_encoding", {}).get("dtype") == args.spatial_dtype
+                and int(existing.get("num_records", -1)) == count
+            )
+            if not valid_existing:
+                raise ValueError(f"existing prediction shard has a different contract: {output_path}")
+            outputs.append({
+                "source_package": str(package_path),
+                "prediction_package": str(output_path),
+                "records": count,
+                "bytes": output_path.stat().st_size,
+                "sha256": file_sha256(output_path),
+            })
+            _write_manifest(manifest_path, current_manifest(complete=False))
+            if remaining is not None:
+                remaining -= count
+            continue
         reader = TilePackageReader(package_path)
         first_shape: tuple[int, int] | None = None
 
         def predicted_payloads():
             nonlocal first_shape
-            with torch.inference_mode():
+            with torch.inference_mode(), ThreadPoolExecutor(
+                max_workers=args.encode_workers
+            ) as executor:
                 for start in range(0, count, args.batch_size):
                     batch_rows = rows[start : start + args.batch_size]
                     arrays = reader.read_arrays_at(batch_rows, workers=args.decode_workers)
@@ -136,11 +188,11 @@ def main() -> None:
                         first_shape = shape
                     elif first_shape != shape:
                         raise ValueError("spatial grid shape changed within one source package")
-                    for offset in range(len(batch_rows)):
-                        yield encode_prediction_payload(
-                            classification[offset], instance[offset], abundance[offset],
-                            spatial_dtype=args.spatial_dtype,
-                        )
+                    encode = partial(
+                        encode_prediction_payload,
+                        spatial_dtype=args.spatial_dtype,
+                    )
+                    yield from executor.map(encode, classification, instance, abundance)
 
         expected_grid = tuple(
             (int(source_header[key]) + 2 * SPATIAL_PATCH_PADDING - STUDENT_PATCH_SIZE)
@@ -150,7 +202,7 @@ def main() -> None:
         header = prediction_header(
             source_path=package_path,
             source_header=source_header,
-            source_index_digest=source_index_sha256(source_header, slide_table, source_index),
+            source_index_digest=source_digest,
             checkpoint_path=args.checkpoint,
             checkpoint_file_digest=checkpoint_digest,
             checkpoint_model_digest=model_digest,
@@ -161,6 +213,7 @@ def main() -> None:
             patch_size=STUDENT_PATCH_SIZE,
             patch_padding=SPATIAL_PATCH_PADDING,
             spatial_dtype=args.spatial_dtype,
+            dataset_split=args.split,
         )
         try:
             write_prediction_package(
@@ -181,22 +234,12 @@ def main() -> None:
             "bytes": output_path.stat().st_size,
             "sha256": file_sha256(output_path),
         })
+        _write_manifest(manifest_path, current_manifest(complete=False))
         if remaining is not None:
             remaining -= count
 
-    manifest = {
-        "schema_version": 1,
-        "checkpoint": str(args.checkpoint),
-        "checkpoint_sha256": checkpoint_digest,
-        "checkpoint_model_sha256": model_digest,
-        "split": args.split,
-        "spatial_dtype": args.spatial_dtype,
-        "records": sum(int(item["records"]) for item in outputs),
-        "bytes": sum(int(item["bytes"]) for item in outputs),
-        "elapsed_seconds": time.monotonic() - started,
-        "packages": outputs,
-    }
-    (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    manifest = current_manifest(complete=remaining in (None, 0))
+    _write_manifest(manifest_path, manifest)
     print("prediction_export_ok " + " ".join(f"{key}={manifest[key]}" for key in ("records", "bytes", "elapsed_seconds")))
 
 

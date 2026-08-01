@@ -56,6 +56,7 @@ def test_prediction_package_roundtrip_and_coordinates(tmp_path):
         patch_size=14,
         patch_padding=4,
         spatial_dtype="uint8",
+        dataset_split="exval",
     )
     classification = np.array([0.2, 0.8], dtype=np.float32)
     instance = np.linspace(0, 1, 2 * 32 * 32, dtype=np.float32).reshape(2, 32, 32)
