@@ -9,6 +9,11 @@
 - Hash only Git-tracked source in a checkout and ignore generated editable
   install metadata in a declared source archive, so formal source receipts are
   identical before and after installation and cannot absorb host-local files.
+- Normalize invalid zero-valued host thread variables before any Python/CUDA
+  startup check, preserving the intended CPU quota instead of letting libgomp
+  reject the AutoDL image defaults.
+- Make the clean-archive NVMe preparation entry point resolve its repository
+  modules without relying on an ambient working-directory `PYTHONPATH`.
 - Materialize exact-resume epoch accumulators only when a mid-epoch checkpoint
   is due, eliminating otherwise unused per-step CUDA-to-CPU scalar
   synchronizations without changing checkpoint contents or resume semantics.

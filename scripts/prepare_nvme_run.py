@@ -4,8 +4,13 @@ import argparse
 import copy
 import json
 from pathlib import Path
+import sys
 
 import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from experiments.ablation.scripts.resolve_ablation_config import (
     _ablation_config_sha256,
@@ -226,7 +231,7 @@ def _refresh_population_validation(config: dict) -> None:
 
 
 def prepare(args: argparse.Namespace) -> dict:
-    repo = Path(__file__).resolve().parents[1]
+    repo = REPO_ROOT
     data_root = args.data_root.resolve()
     output_root = args.output_root.resolve()
     base = yaml.safe_load(args.best_config.read_text(encoding="utf-8"))

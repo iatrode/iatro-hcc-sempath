@@ -26,10 +26,19 @@ fi
 
 export PYTHONPATH="${REPO_DIR}/src"
 export PYTHONUNBUFFERED=1
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
-export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
-export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+positive_thread_count() {
+  local value="$1"
+  local fallback="$2"
+  if [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "${value}"
+  else
+    printf '%s' "${fallback}"
+  fi
+}
+export OMP_NUM_THREADS="$(positive_thread_count "${OMP_NUM_THREADS:-}" 2)"
+export MKL_NUM_THREADS="$(positive_thread_count "${MKL_NUM_THREADS:-}" 2)"
+export OPENBLAS_NUM_THREADS="$(positive_thread_count "${OPENBLAS_NUM_THREADS:-}" 1)"
+export NUMEXPR_NUM_THREADS="$(positive_thread_count "${NUMEXPR_NUM_THREADS:-}" 1)"
 
 cd "${REPO_DIR}"
 if [[ $# -eq 1 ]]; then

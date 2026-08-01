@@ -13,6 +13,21 @@ REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="${HCC_SEMPATH_PYTHON:-/root/miniconda3/bin/python}"
 VERIFIED_ASSET_RECEIPT="${HCC_SEMPATH_VERIFIED_ASSET_RECEIPT:-}"
 
+positive_thread_count() {
+  local value="$1"
+  local fallback="$2"
+  if [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "${value}"
+  else
+    printf '%s' "${fallback}"
+  fi
+}
+
+export OMP_NUM_THREADS="$(positive_thread_count "${OMP_NUM_THREADS:-}" 2)"
+export MKL_NUM_THREADS="$(positive_thread_count "${MKL_NUM_THREADS:-}" 2)"
+export OPENBLAS_NUM_THREADS="$(positive_thread_count "${OPENBLAS_NUM_THREADS:-}" 1)"
+export NUMEXPR_NUM_THREADS="$(positive_thread_count "${NUMEXPR_NUM_THREADS:-}" 1)"
+
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Python is not executable: ${PYTHON_BIN}" >&2
   exit 2
@@ -70,10 +85,10 @@ printf -v COMMAND '%q ' env \
   "HCC_SEMPATH_VERIFIED_ASSET_RECEIPT=${VERIFIED_ASSET_RECEIPT}" \
   "HCC_SEMPATH_ASSET_VERIFY_WORKERS=${HCC_SEMPATH_ASSET_VERIFY_WORKERS:-16}" \
   "HCC_SEMPATH_STUDENT_PRETRAINED_PATH=${STUDENT_PRETRAINED_PATH}" \
-  "OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}" \
-  "MKL_NUM_THREADS=${MKL_NUM_THREADS:-2}" \
-  "OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}" \
-  "NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}" \
+  "OMP_NUM_THREADS=${OMP_NUM_THREADS}" \
+  "MKL_NUM_THREADS=${MKL_NUM_THREADS}" \
+  "OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS}" \
+  "NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS}" \
   "${PYTHON_BIN}" "${TRAIN_ARGS[@]}"
 
 tmux new-session -d -s "${SESSION}" -c "${REPO_DIR}" "exec ${COMMAND}"
