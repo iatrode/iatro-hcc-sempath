@@ -20,6 +20,10 @@ COMMANDS: dict[str, tuple[str, str]] = {
     "build-train-manifest": ("hcc_sempath.training.manifest", "Build a training manifest from per-WSI IAC packages."),
     "train": ("hcc_sempath.training.train", "Train the HCC-SemPath student model."),
     "evaluate": ("hcc_sempath.training.evaluate", "Evaluate a trained checkpoint."),
+    "export-predictions": (
+        "hcc_sempath.cli.export_predictions",
+        "Export reconstructable classification and spatial predictions.",
+    ),
     "benchmark": ("hcc_sempath.training.benchmark", "Benchmark student encoder throughput."),
 }
 
