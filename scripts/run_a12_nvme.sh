@@ -7,6 +7,7 @@ DATA_ROOT="${HCC_SEMPATH_DATA_ROOT:-/root/data}"
 CONFIG_ROOT="${HCC_SEMPATH_CONFIG_ROOT:-${DATA_ROOT}/configs}"
 SOURCE_COMMIT="${HCC_SEMPATH_SOURCE_COMMIT:?set HCC_SEMPATH_SOURCE_COMMIT}"
 PYTHON_BIN="${HCC_SEMPATH_PYTHON:-/root/miniconda3/bin/python}"
+VERIFIED_ASSET_RECEIPT="${HCC_SEMPATH_VERIFIED_ASSET_RECEIPT:-${CONFIG_ROOT}/verified_asset_receipt.json}"
 
 cd "${REPO_DIR}"
 PYTHONPATH="${REPO_DIR}/src" "${PYTHON_BIN}" -m scripts.prepare_nvme_run \
@@ -17,7 +18,9 @@ PYTHONPATH="${REPO_DIR}/src" "${PYTHON_BIN}" -m scripts.prepare_nvme_run \
   --data-root "${DATA_ROOT}" \
   --output-root "${DATA_ROOT}/outputs" \
   --output-config "${CONFIG_ROOT}/a12.local_nvme.yaml" \
+  --verified-asset-receipt "${VERIFIED_ASSET_RECEIPT}" \
   --source-commit "${SOURCE_COMMIT}"
 
+export HCC_SEMPATH_VERIFIED_ASSET_RECEIPT="${VERIFIED_ASSET_RECEIPT}"
 exec "${SCRIPT_DIR}/launch_nvme_training.sh" \
   sempath-a12 "${CONFIG_ROOT}/a12.local_nvme.yaml"

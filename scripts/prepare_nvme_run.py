@@ -19,6 +19,7 @@ from scripts.optuna_a0_search import (
     _expert_split_tile_counts,
     _population_validation_contract,
     _resolved_training_iac_paths,
+    write_verified_iac_receipt,
 )
 
 
@@ -264,6 +265,11 @@ def prepare(args: argparse.Namespace) -> dict:
     if "/autodl-fs" in encoded or "/root/autodl-fs" in encoded:
         raise ValueError("resolved config still references the network volume")
     _write_yaml(args.output_config, config)
+    if args.verified_asset_receipt is not None:
+        write_verified_iac_receipt(
+            args.verified_asset_receipt.resolve(),
+            config["data"]["formal_asset_sha256"],
+        )
     return config
 
 
@@ -282,6 +288,15 @@ def parse_args() -> argparse.Namespace:
         default=Path("/root/data/outputs"),
     )
     parser.add_argument("--output-config", type=Path, required=True)
+    parser.add_argument(
+        "--verified-asset-receipt",
+        type=Path,
+        default=None,
+        help=(
+            "Write a stat-bound receipt from the previously verified "
+            "formal SHA-256 contract for fast local-NVMe restarts."
+        ),
+    )
     parser.add_argument("--source-commit", required=True)
     return parser.parse_args()
 

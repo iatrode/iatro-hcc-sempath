@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -1253,6 +1254,33 @@ def _file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _asset_verify_workers(file_count: int) -> int:
+    configured = os.environ.get(
+        "HCC_SEMPATH_ASSET_VERIFY_WORKERS",
+        "16",
+    ).strip()
+    try:
+        workers = int(configured)
+    except ValueError as exc:
+        raise ValueError(
+            "HCC_SEMPATH_ASSET_VERIFY_WORKERS must be an integer"
+        ) from exc
+    if workers <= 0:
+        raise ValueError(
+            "HCC_SEMPATH_ASSET_VERIFY_WORKERS must be positive"
+        )
+    return min(workers, max(1, int(file_count)))
+
+
+def _verify_formal_iac_entry(item: tuple[str, object]) -> None:
+    raw_path, expected_digest = item
+    path = Path(raw_path)
+    if not path.is_file() or _file_sha256(path) != str(expected_digest):
+        raise ValueError(
+            f"formal tile/teacher IAC content changed: {path}"
+        )
+
+
 _VERIFIED_ASSET_RECEIPTS: dict[str, dict[str, dict[str, object]]] = {}
 
 
@@ -1482,20 +1510,24 @@ def _verify_formal_asset_contract(
             "formal tile/teacher IAC package set changed: "
             f"added={added[:10]} removed={removed[:10]}"
         )
+    verification_items: list[tuple[str, object]] = []
     for raw_path in sorted(expected_iac_paths):
-        path = Path(raw_path)
         expected_digest = iac_expected.get(raw_path)
         if expected_digest is None:
             raise ValueError(
                 "formal tile/teacher IAC path is not canonical: "
                 f"{raw_path}"
             )
-        if not path.is_file() or _file_sha256(path) != str(
-            expected_digest
-        ):
-            raise ValueError(
-                f"formal tile/teacher IAC content changed: {path}"
-            )
+        verification_items.append((raw_path, expected_digest))
+    verify_workers = _asset_verify_workers(len(verification_items))
+    print(
+        "formal_iac_verification "
+        f"files={len(verification_items)} workers={verify_workers}",
+        flush=True,
+    )
+    with ThreadPoolExecutor(max_workers=verify_workers) as executor:
+        tuple(executor.map(_verify_formal_iac_entry, verification_items))
+    print("formal_iac_verification complete", flush=True)
     student_path = Path(
         str(student_expected.get("path", ""))
     ).resolve()

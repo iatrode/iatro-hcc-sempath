@@ -11,6 +11,7 @@ CONFIG_PATH="$2"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="${HCC_SEMPATH_PYTHON:-/root/miniconda3/bin/python}"
+VERIFIED_ASSET_RECEIPT="${HCC_SEMPATH_VERIFIED_ASSET_RECEIPT:-}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Python is not executable: ${PYTHON_BIN}" >&2
@@ -18,6 +19,10 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 if [[ ! -f "${CONFIG_PATH}" ]]; then
   echo "training config does not exist: ${CONFIG_PATH}" >&2
+  exit 2
+fi
+if [[ -z "${VERIFIED_ASSET_RECEIPT}" || ! -f "${VERIFIED_ASSET_RECEIPT}" ]]; then
+  echo "verified asset receipt is required: ${VERIFIED_ASSET_RECEIPT:-unset}" >&2
   exit 2
 fi
 if grep -qE '/(root/)?autodl-fs' "${CONFIG_PATH}"; then
@@ -53,6 +58,8 @@ printf -v COMMAND '%q ' env \
   "PYTHONPATH=${REPO_DIR}/src" \
   "PYTHONUNBUFFERED=1" \
   "HCC_SEMPATH_SOURCE_COMMIT=${HCC_SEMPATH_SOURCE_COMMIT:?set HCC_SEMPATH_SOURCE_COMMIT}" \
+  "HCC_SEMPATH_VERIFIED_ASSET_RECEIPT=${VERIFIED_ASSET_RECEIPT}" \
+  "HCC_SEMPATH_ASSET_VERIFY_WORKERS=${HCC_SEMPATH_ASSET_VERIFY_WORKERS:-16}" \
   "OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}" \
   "MKL_NUM_THREADS=${MKL_NUM_THREADS:-2}" \
   "OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}" \
