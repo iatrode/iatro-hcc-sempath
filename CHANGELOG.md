@@ -6,6 +6,9 @@
   vectorize retrieval-overlap scoring, and serialize identical epoch
   checkpoint aliases once. This removes the unreported CPU pause after
   validation without changing checkpoint selection or metric definitions.
+- Hash only Git-tracked source in a checkout and ignore generated editable
+  install metadata in a declared source archive, so formal source receipts are
+  identical before and after installation and cannot absorb host-local files.
 - Materialize exact-resume epoch accumulators only when a mid-epoch checkpoint
   is due, eliminating otherwise unused per-step CUDA-to-CPU scalar
   synchronizations without changing checkpoint contents or resume semantics.

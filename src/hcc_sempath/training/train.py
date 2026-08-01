@@ -1336,29 +1336,47 @@ def _verify_formal_ablation_contract(cfg: dict) -> None:
 
 
 def _source_tree_sha256(repo: Path) -> str:
-    roots = (
-        repo / "pyproject.toml",
-        repo / "README.md",
-        repo / "CHANGELOG.md",
-        repo / "configs",
-        repo / "docs",
-        repo / "experiments" / "ablation",
-        repo / "scripts",
-        repo / "src",
-        repo / "tests",
+    root_names = (
+        "pyproject.toml",
+        "README.md",
+        "CHANGELOG.md",
+        "configs",
+        "docs",
+        "experiments/ablation",
+        "scripts",
+        "src",
+        "tests",
     )
-    files: list[Path] = []
-    for root in roots:
-        if root.is_file():
-            files.append(root)
-        elif root.is_dir():
-            files.extend(
-                path
-                for path in root.rglob("*")
-                if path.is_file()
-                and "__pycache__" not in path.parts
-                and path.suffix not in {".pyc", ".pyo"}
-            )
+    repo = Path(repo).resolve()
+    if (repo / ".git").exists():
+        listed = subprocess.run(
+            ["git", "ls-files", "-z", "--", *root_names],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        ).stdout
+        files = [
+            repo / os.fsdecode(relative)
+            for relative in listed.split(b"\0")
+            if relative
+        ]
+    else:
+        roots = tuple(repo / name for name in root_names)
+        files: list[Path] = []
+        for root in roots:
+            if root.is_file():
+                files.append(root)
+            elif root.is_dir():
+                files.extend(
+                    path
+                    for path in root.rglob("*")
+                    if path.is_file()
+                    and "__pycache__" not in path.parts
+                    and not any(
+                        part.endswith(".egg-info") for part in path.parts
+                    )
+                    and path.suffix not in {".pyc", ".pyo"}
+                )
     digest = hashlib.sha256()
     for path in sorted(set(files)):
         relative = path.relative_to(repo).as_posix().encode("utf-8")

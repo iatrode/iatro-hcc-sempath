@@ -4,6 +4,8 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+import shutil
+import subprocess
 
 import numpy as np
 import pytest
@@ -43,6 +45,7 @@ from hcc_sempath.training.train import (
     _freeze_expert_split_exclusion_contract,
     _freeze_optimizer_visible_contract,
     _file_sha256,
+    _source_tree_sha256,
     _verify_formal_asset_contract,
     _verify_formal_ablation_contract,
     _verify_population_validation_contract,
@@ -53,6 +56,35 @@ from hcc_sempath.training.train import (
 )
 from hcc_sempath.training.prototype_labels import PrototypeLabel
 from hcc_sempath.training.roi import SpatialRoiTarget
+
+
+def test_source_tree_digest_ignores_local_and_install_generated_files(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    (checkout / "src").mkdir(parents=True)
+    (checkout / "pyproject.toml").write_text("[project]\nname='test'\n")
+    (checkout / "src" / "tracked.py").write_text("VALUE = 1\n")
+    subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+    subprocess.run(
+        ["git", "add", "pyproject.toml", "src/tracked.py"],
+        cwd=checkout,
+        check=True,
+    )
+    expected = _source_tree_sha256(checkout)
+
+    (checkout / "configs" / "local").mkdir(parents=True)
+    (checkout / "configs" / "local" / "host.yaml").write_text("host: local\n")
+    assert _source_tree_sha256(checkout) == expected
+
+    archive = tmp_path / "archive"
+    (archive / "src").mkdir(parents=True)
+    shutil.copy2(checkout / "pyproject.toml", archive / "pyproject.toml")
+    shutil.copy2(checkout / "src" / "tracked.py", archive / "src" / "tracked.py")
+    egg_info = archive / "src" / "test.egg-info"
+    egg_info.mkdir()
+    (egg_info / "PKG-INFO").write_text("generated\n")
+    assert _source_tree_sha256(archive) == expected
 
 
 def _write_package(
