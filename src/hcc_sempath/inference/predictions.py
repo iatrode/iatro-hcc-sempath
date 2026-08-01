@@ -139,19 +139,30 @@ def decode_prediction_payload(payload: bytes, header: dict) -> dict[str, np.ndar
     }
 
 
-def prediction_index_table(source_index: pa.Table, rows: list[int]) -> pa.Table:
+def prediction_index_table(
+    source_index: pa.Table,
+    rows: list[int],
+    *,
+    split: str | None = None,
+) -> pa.Table:
     selected = source_index.take(pa.array(rows, type=pa.int64()))
     required = ["slide_idx", "tile_x", "tile_y", "tile_id", "split"]
     missing = [name for name in required if name not in selected.column_names]
     if missing:
         raise ValueError(f"source tile index is missing fields: {missing}")
-    columns = [selected.column(name) for name in required]
+    columns = [selected.column(name) for name in required[:-1]]
+    columns.append(
+        selected.column("split")
+        if split is None
+        else pa.array([str(split)] * len(rows), type=pa.string())
+    )
+    columns.append(selected.column("split"))
     columns.append(pa.array(rows, type=pa.uint32()))
     if "crc32" in selected.column_names:
         columns.append(selected.column("crc32"))
-        names = [*required, "source_row", "source_payload_crc32"]
+        names = [*required, "source_split", "source_row", "source_payload_crc32"]
     else:
-        names = [*required, "source_row"]
+        names = [*required, "source_split", "source_row"]
     return pa.Table.from_arrays(columns, names=names)
 
 
@@ -194,6 +205,7 @@ def prediction_header(
         "codec": "zlib",
         "checksum": "crc32",
         "source_package_name": Path(source_path).name,
+        "source_dataset": Path(source_path).parent.name,
         "source_iac_index_sha256": source_index_digest,
         "source": source,
         "source_tiling": tiling,

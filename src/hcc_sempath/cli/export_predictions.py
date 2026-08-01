@@ -107,7 +107,10 @@ def main() -> None:
         if count <= 0:
             break
         rows = list(range(count))
-        output_path = args.output_dir / f"{package_path.name.removesuffix('.tiles.iac')}.predictions.iac"
+        output_path = args.output_dir / (
+            f"{package_path.parent.name}__"
+            f"{package_path.name.removesuffix('.tiles.iac')}.predictions.iac"
+        )
         reader = TilePackageReader(package_path)
         first_shape: tuple[int, int] | None = None
 
@@ -164,7 +167,7 @@ def main() -> None:
                 output_path,
                 header=header,
                 slide_table=slide_table,
-                index_table=prediction_index_table(source_index, rows),
+                index_table=prediction_index_table(source_index, rows, split=args.split),
                 payloads=predicted_payloads(),
             )
         finally:

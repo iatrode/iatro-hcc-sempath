@@ -65,13 +65,15 @@ def test_prediction_package_roundtrip_and_coordinates(tmp_path):
         output,
         header=header,
         slide_table=slides,
-        index_table=prediction_index_table(source_index, [0]),
+        index_table=prediction_index_table(source_index, [0], split="exval"),
         payloads=[encode_prediction_payload(classification, instance, abundance, spatial_dtype="uint8")],
     )
 
     with PredictionPackageReader(output) as reader:
         assert reader.record_count == 1
         assert reader.index_table.column("source_row")[0].as_py() == 0
+        assert reader.index_table.column("split")[0].as_py() == "exval"
+        assert reader.index_table.column("source_split")[0].as_py() == "val"
         decoded = reader.read_at(0)
         np.testing.assert_allclose(decoded["classification_probabilities"], classification, atol=5e-4)
         np.testing.assert_allclose(decoded["spatial_instance_probabilities"], instance, atol=1 / 510)
