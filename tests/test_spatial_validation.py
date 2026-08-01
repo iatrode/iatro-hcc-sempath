@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 
+import pytest
 import torch
 
 from hcc_sempath.spatial_schema import (
@@ -153,6 +154,45 @@ def test_weak_spatial_metrics_do_not_treat_unmarked_cells_as_false_positives() -
     assert point["instance_nonassigned_high_response_rate"] > 0.0
     assert region["positive_area_recall"] == 1.0
     assert region["abundance_explicit_negative_fpr"] == 0.0
+
+
+def test_weak_spatial_metrics_report_unknown_cells_without_implicit_masks() -> None:
+    component_count = len(DEFAULT_SPATIAL_COMPONENTS)
+    shape = (1, component_count, 3, 3)
+    instance = torch.zeros(shape)
+    abundance = torch.zeros(shape)
+    points = torch.zeros(shape)
+    bags = torch.zeros(shape, dtype=torch.long)
+    area = torch.zeros(shape, dtype=torch.bool)
+    explicit = torch.zeros(shape, dtype=torch.bool)
+    implicit = torch.zeros(shape, dtype=torch.bool)
+
+    points[0, 0, 1, 1] = 1
+    instance[0, 0, 0, 0] = 0.8
+    explicit[0, 0, 2, 2] = True
+
+    _, report = evaluate_weak_spatial_supervision(
+        instance_probability=instance,
+        abundance_probability=abundance,
+        point_centers=points,
+        brush_bag_ids=bags,
+        area_positive=area,
+        explicit_negative=explicit,
+        implicit_negative=implicit,
+        threshold=0.5,
+    )
+
+    component = report["components"][DEFAULT_SPATIAL_COMPONENTS[0]]
+    assert component["nonassigned_cells"] == 7
+    assert component["instance_nonassigned_mean_response"] == pytest.approx(
+        0.8 / 7.0
+    )
+    assert component["instance_nonassigned_high_response_rate"] == pytest.approx(
+        1.0 / 7.0
+    )
+    assert report["protocol"]["nonassigned_region_definition"] == (
+        "complement_of_positive_and_explicit_negative_support"
+    )
 
 
 def test_spatial_calibration_freezes_all_component_readouts() -> None:

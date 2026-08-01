@@ -173,7 +173,13 @@ def evaluate_weak_spatial_supervision(
     bag_bool = brush_bag_ids > 0
     area_bool = area_positive.to(dtype=torch.bool)
     explicit_bool = explicit_negative.to(dtype=torch.bool)
-    implicit_bool = implicit_negative.to(dtype=torch.bool)
+    # Descriptive non-assigned-region statistics must cover genuinely unknown
+    # support, not only cells that training happened to mark as weak implicit
+    # negatives.  The validation annotations intentionally leave most cells
+    # unknown, and those predictions are reported for trend analysis without
+    # treating them as errors.
+    assigned_bool = point_bool | bag_bool | area_bool | explicit_bool
+    nonassigned_bool = ~assigned_bool
     instance_peaks = _peak_mask(
         instance_probability.flatten(0, 1),
         threshold=threshold,
@@ -240,7 +246,7 @@ def evaluate_weak_spatial_supervision(
             ).sum()
         )
 
-        nonassigned = implicit_bool[:, component_idx]
+        nonassigned = nonassigned_bool[:, component_idx]
         nonassigned_total = int(nonassigned.sum())
         abundance_nonassigned = abundance_probability[:, component_idx][
             nonassigned
@@ -378,7 +384,7 @@ def evaluate_weak_spatial_supervision(
         ]
         macro[key] = sum(values) / len(values) if values else None
     readout = {
-        "version": 1,
+        "version": 2,
         "role": "checkpoint_selection_supervision_metric_readout",
         "spatial_component_names": names,
         "instance_threshold": float(threshold),
@@ -392,6 +398,9 @@ def evaluate_weak_spatial_supervision(
             "tile_count": int(expected[0]),
             "labels_exhaustive": False,
             "unmarked_predictions_counted_as_false_positive": False,
+            "nonassigned_region_definition": (
+                "complement_of_positive_and_explicit_negative_support"
+            ),
             "threshold": float(threshold),
             "point_tolerance_cells": int(point_tolerance_cells),
             "nms_kernel": int(nms_kernel),
