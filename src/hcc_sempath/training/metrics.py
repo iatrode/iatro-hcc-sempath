@@ -26,14 +26,14 @@ def _deterministic_subset(
 
 def retrieval_overlap(student: torch.Tensor, teacher: torch.Tensor, topk: int) -> float:
     k = min(topk + 1, student.shape[0])
+    if k <= 1:
+        return 0.0
     student_sim = F.normalize(student, dim=-1) @ F.normalize(student, dim=-1).T
     teacher_sim = F.normalize(teacher, dim=-1) @ F.normalize(teacher, dim=-1).T
     student_idx = student_sim.topk(k=k, dim=1).indices[:, 1:]
     teacher_idx = teacher_sim.topk(k=k, dim=1).indices[:, 1:]
-    overlap = []
-    for s_row, t_row in zip(student_idx, teacher_idx):
-        overlap.append(len(set(s_row.tolist()) & set(t_row.tolist())) / max(1, k - 1))
-    return float(sum(overlap) / max(1, len(overlap)))
+    overlap = student_idx.unsqueeze(-1).eq(teacher_idx.unsqueeze(-2)).any(dim=-1)
+    return float(overlap.float().mean().cpu())
 
 
 def prototype_response_correlation(student: torch.Tensor, teacher: torch.Tensor, prototypes: PrototypeRegistry) -> float:
@@ -68,15 +68,40 @@ def evaluate_teacher_outputs(
     prototypes_by_teacher: dict[str, PrototypeRegistry] | None,
     topk: int,
     max_pairwise_samples: int = 4096,
+    evaluation_device: torch.device | str | None = None,
 ) -> dict[str, float]:
     metrics: dict[str, float] = {}
-    for name in sorted(student_by_teacher):
-        teacher_metrics = evaluate_embeddings(
-            student_by_teacher[name],
-            teacher_by_name[name],
-            prototypes_by_teacher.get(name) if prototypes_by_teacher else None,
-            topk,
-            max_pairwise_samples=max_pairwise_samples,
-        )
-        metrics.update({f"{name}_{key}": value for key, value in teacher_metrics.items()})
+    device = (
+        torch.device(evaluation_device)
+        if evaluation_device is not None
+        else None
+    )
+    with torch.inference_mode():
+        for name in sorted(student_by_teacher):
+            student = student_by_teacher[name]
+            teacher = teacher_by_name[name]
+            prototypes = (
+                prototypes_by_teacher.get(name)
+                if prototypes_by_teacher
+                else None
+            )
+            if device is not None:
+                student = student.to(device, non_blocking=True)
+                teacher = teacher.to(device, non_blocking=True)
+                prototypes = (
+                    prototypes.to(device)
+                    if prototypes is not None
+                    else None
+                )
+            teacher_metrics = evaluate_embeddings(
+                student,
+                teacher,
+                prototypes,
+                topk,
+                max_pairwise_samples=max_pairwise_samples,
+            )
+            metrics.update(
+                {f"{name}_{key}": value for key, value in teacher_metrics.items()}
+            )
+            del student, teacher, prototypes
     return metrics

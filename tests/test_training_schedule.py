@@ -7,6 +7,7 @@ import pytest
 
 from hcc_sempath.training.config import teacher_dims, teacher_names, validate_training_config
 from hcc_sempath.training.engine import (
+    _atomic_torch_save_aliases,
     _amp_enabled,
     _bucket_spatial_sample_mask,
     _classification_eval_metrics,
@@ -48,6 +49,21 @@ from hcc_sempath.training.train import (
 from hcc_sempath.modeling.models import HCCSemPathModel
 from hcc_sempath.modeling.prototypes import PrototypeRegistry
 import torch
+
+
+def test_atomic_checkpoint_aliases_share_one_serialization(tmp_path) -> None:
+    paths = [
+        tmp_path / "last.pt",
+        tmp_path / "best.pt",
+        tmp_path / "best_population_loss.pt",
+    ]
+    _atomic_torch_save_aliases({"value": torch.arange(4)}, paths)
+
+    assert all(path.is_file() for path in paths)
+    assert len({path.stat().st_ino for path in paths}) == 1
+    for path in paths:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        torch.testing.assert_close(payload["value"], torch.arange(4))
 
 
 def test_classification_validation_metrics_are_class_balanced() -> None:

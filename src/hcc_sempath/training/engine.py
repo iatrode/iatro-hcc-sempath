@@ -378,6 +378,24 @@ def _atomic_torch_save(payload: dict, path: Path) -> None:
     temporary.replace(path)
 
 
+def _atomic_torch_save_aliases(payload: dict, paths: list[Path]) -> None:
+    """Serialize once and atomically publish identical checkpoint aliases."""
+
+    unique_paths = list(dict.fromkeys(Path(path) for path in paths))
+    if not unique_paths:
+        return
+    primary = unique_paths[0]
+    _atomic_torch_save(payload, primary)
+    for path in unique_paths[1:]:
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.unlink(missing_ok=True)
+        try:
+            temporary.hardlink_to(primary)
+        except OSError:
+            shutil.copy2(primary, temporary)
+        temporary.replace(path)
+
+
 def _optimizer_step(
     *,
     loss: torch.Tensor,
@@ -2699,9 +2717,9 @@ def _run_validation_streams(
         if callable(close_val_iterator):
             close_val_iterator()
     _, student_by_teacher, teacher_by_name, supervised = val_embeddings
-    cpu_prototypes = (
+    evaluation_prototypes = (
         {
-            name: registry.to("cpu")
+            name: registry.to(device)
             for name, registry in prototypes.items()
         }
         if prototypes
@@ -2710,11 +2728,12 @@ def _run_validation_streams(
     embedding_metrics = evaluate_teacher_outputs(
         student_by_teacher,
         teacher_by_name,
-        cpu_prototypes,
+        evaluation_prototypes,
         int(cfg["train"]["topk"]),
         max_pairwise_samples=int(
             cfg["train"].get("eval_pairwise_max_samples", 4096)
         ),
+        evaluation_device=device,
     )
     population_classification_metrics = _classification_eval_metrics(
         supervised
@@ -2754,7 +2773,6 @@ def _run_validation_streams(
             expert_supervised
         )
         del expert_classification_embeddings, expert_supervised
-        _release_host_memory()
     if expert_spatial_val_loader is not None:
         _set_loader_epoch(expert_spatial_val_loader, 0)
         spatial_eval_cfg = {
@@ -2778,7 +2796,6 @@ def _run_validation_streams(
             global_step=global_step,
             spatial_supervised_step=spatial_supervised_step,
         )
-        _release_host_memory()
     return {
         "population": val_metrics,
         "embedding": embedding_metrics,
@@ -3826,26 +3843,24 @@ def fit(
                     or selection_stop_requested
                 ),
             )
-            _atomic_torch_save(checkpoint, checkpoints / "last.pt")
+            checkpoint_paths = [checkpoints / "last.pt"]
             if improved_selection or (
                 improved_loss and not expert_selection_enabled
             ):
-                _atomic_torch_save(checkpoint, checkpoints / "best.pt")
+                checkpoint_paths.append(checkpoints / "best.pt")
             if improved_loss:
-                _atomic_torch_save(
-                    checkpoint,
-                    checkpoints / "best_population_loss.pt",
+                checkpoint_paths.append(
+                    checkpoints / "best_population_loss.pt"
                 )
             if improved_alignment:
-                _atomic_torch_save(
-                    checkpoint,
-                    checkpoints / "best_teacher_alignment.pt",
+                checkpoint_paths.append(
+                    checkpoints / "best_teacher_alignment.pt"
                 )
             if improved_classification:
-                _atomic_torch_save(
-                    checkpoint,
-                    checkpoints / "best_classification_accuracy.pt",
+                checkpoint_paths.append(
+                    checkpoints / "best_classification_accuracy.pt"
                 )
+            _atomic_torch_save_aliases(checkpoint, checkpoint_paths)
             if selection_stop_requested:
                 _log(
                     "selection_early_stop "
