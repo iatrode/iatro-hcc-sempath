@@ -31,8 +31,12 @@ reliability coordinate during training.
 
 ## 2. Core hypothesis
 
-A 224-pixel tile contains both cell-scale objects and structures that span
-several attention cells. A useful spatial head therefore needs:
+A 224-pixel tile at 20x-equivalent, 0.5 micrometres per pixel contains both
+cell-scale objects and structures that span several attention cells.
+DINOv2-S/14 separates two
+design choices: S is the compact student capacity, while the 14-pixel patch
+projection covers 7 by 7 micrometres, approximately one small lymphocyte. A
+useful spatial head therefore needs:
 
 - a 14-by-14-pixel local observation window for nuclei and other small objects;
 - denser coordinate sampling than the native 16-by-16 DINO token grid;
@@ -149,15 +153,15 @@ teacher prototypes.
 
 ### Dense local branch
 
-The pretrained 14-by-14 DINO patch projection is reused with stride 7 and
-padding 4:
+The pretrained 14-by-14 DINO patch projection, corresponding to a 7-by-7
+micrometre observation window, is reused with stride 7 and padding 4:
 
 ```text
 local = conv2d(image, pretrained_patch_projection, kernel=14, stride=7, padding=4)
 ```
 
-For a 224-pixel input this produces a 32-by-32 local grid without replacing or
-invalidating the teacher caches.
+For a 224-pixel input this produces a 32-by-32 local grid with a 3.5-micrometre
+sampling interval, without replacing or invalidating the teacher caches.
 
 Final 16-by-16 Transformer patch tokens are bilinearly projected onto the
 32-by-32 grid and fused with the local features. Residual context blocks with
@@ -211,8 +215,7 @@ The configured neighbourhood is exclusion support: nearby non-centre cells are
 negative for the instance objective, so one click cannot train multiple decoded
 peaks. A point never supplies inferred object area. Dense-cell brushes and
 circle/brush contours supervise every selected grid cell as positive occupied
-support; top-fraction MIL pooling is retained only as a legacy mechanism
-comparison. A circle additionally supplies instance-exclusion support so one
+support. A circle additionally supplies instance-exclusion support so one
 large object cannot produce multiple centres. Mixed point/brush cell
 annotations supervise resolved instances and unresolved abundance separately.
 Explicit negatives supervise confirmed absence; all other unmarked cells remain
@@ -489,6 +492,8 @@ Implementation conformance requires:
 6. annotation sufficiency is determined by component-wise information
    plateaus, not a preset tile quota;
 7. formal ablations retain the same fixed 10% population subset and complete
-   expert union, and differ only by the named mechanism;
+   expert union, and differ only by the named mechanism; A1 is the package-level
+   global expert-intervention control, whereas A2 and A12 isolate
+   prototype-adjudicated reliability and student-response matching;
 8. only an independently calibrated, finalized joint-selection checkpoint can
    become a release.

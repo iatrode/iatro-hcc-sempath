@@ -29,10 +29,10 @@ cleanup() {
 trap cleanup EXIT
 
 declare -A CONFIGS=(
-  [a1]="experiments/ablation/configs/a1_no_prototype.yaml"
+  [a1]="experiments/ablation/configs/a1_no_global_expert_intervention.yaml"
   [a2]="experiments/ablation/configs/a2_no_adjudication.yaml"
-  [a3]="experiments/ablation/configs/a3_single_teacher.yaml"
-  [a4]="experiments/ablation/configs/a4_single_teacher_prototype.yaml"
+  [a3]="experiments/ablation/configs/a3_single_teacher_no_global_expert_intervention.yaml"
+  [a4]="experiments/ablation/configs/a4_single_teacher_with_global_expert_intervention.yaml"
   [a5]="experiments/ablation/configs/a5_static_global_prototypes.yaml"
   [a6]="experiments/ablation/configs/a6_static_spatial_prototypes.yaml"
   [a7]="experiments/ablation/configs/a7_full_filter_sensitivity.yaml"
@@ -40,7 +40,7 @@ declare -A CONFIGS=(
   [a9]="experiments/ablation/configs/a9_semantic_only_spatial.yaml"
   [a10]="experiments/ablation/configs/a10_local_only_spatial.yaml"
   [a11]="experiments/ablation/configs/a11_no_spatial_context.yaml"
-  [a12]="experiments/ablation/configs/a12_dense_brush_target.yaml"
+  [a12]="experiments/ablation/configs/a12_no_student_response.yaml"
 )
 
 conditions=("$@")

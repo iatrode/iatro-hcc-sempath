@@ -1,0 +1,28 @@
+inherits: matched_tenth.yaml
+
+# Ablation A1 — four-teacher feature/relation distillation plus the matched
+# spatial task, without the global expert intervention.
+#
+# Mechanism removal vs A0: the complete global L1 intervention is disabled:
+# direct classification supervision, teacher-space prototype-semantic
+# supervision, student prototype-response matching, and prototype-adjudicated
+# teacher reliability. This is intentionally a package-level contrast, not an
+# estimate of the effect of prototype coordinates alone.
+#
+# The same classification expert tile images remain in the fixed replay union,
+# but their labels are masked. This preserves image distribution and replay
+# frequency while removing all global expert targets. Four-teacher
+# feature/relation distillation and the complete matched spatial task remain
+# active, including the local spatial prototype readout.
+
+runtime:
+  output_dir: outputs/experiments/ablation/a1_no_global_expert_intervention
+
+data:
+  prototype_paths: null
+
+loss:
+  classification_weight: 0.0
+  semantic_weight: 0.0
+  zhcc_response_weight: 0.0
+  prototype_filter_weight: 0.0

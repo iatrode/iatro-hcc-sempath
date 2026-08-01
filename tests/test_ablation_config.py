@@ -207,6 +207,62 @@ def _resolve(tmp_path: Path, name: str) -> dict:
     )
 
 
+def test_condition_files_encode_only_the_prespecified_interventions() -> None:
+    expected = {
+        "a1": {
+            "data": {"prototype_paths": None},
+            "loss": {
+                "classification_weight": 0.0,
+                "semantic_weight": 0.0,
+                "zhcc_response_weight": 0.0,
+                "prototype_filter_weight": 0.0,
+            },
+        },
+        "a2": {"loss": {"prototype_filter_weight": 0.0}},
+        "a3": {
+            "data": {"teachers": ["virchow2"], "prototype_paths": None},
+            "model": {"teacher_dims": {"virchow2": 2560}},
+            "loss": {
+                "teacher_weights": {"virchow2": 1.0},
+                "classification_weight": 0.0,
+                "semantic_weight": 0.0,
+                "zhcc_response_weight": 0.0,
+                "prototype_filter_weight": 0.0,
+            },
+        },
+        "a4": {
+            "data": {
+                "teachers": ["virchow2"],
+                "prototype_paths": {
+                    "virchow2": (
+                        "artifacts/prototypes/"
+                        "virchow2_hcc_semantic_prototypes.pt"
+                    ),
+                },
+            },
+            "model": {"teacher_dims": {"virchow2": 2560}},
+            "loss": {"teacher_weights": {"virchow2": 1.0}},
+        },
+        "a5": {"train": {"dynamic_prototype_refresh_steps": 0}},
+        "a6": {"train": {"dynamic_spatial_prototype_refresh_steps": 0}},
+        "a7": {"loss": {"prototype_filter_weight": 1.0}},
+        "a8": {"loss": {"spatial_detach_shared_encoder": True}},
+        "a9": {"model": {"spatial_use_local_branch": False}},
+        "a10": {"model": {"spatial_use_semantic_branch": False}},
+        "a11": {"model": {"spatial_use_context": False}},
+        "a12": {"loss": {"zhcc_response_weight": 0.0}},
+    }
+    conditions = sorted(CONFIG_ROOT.glob("a*.yaml"))
+    assert len(conditions) == len(expected)
+    for condition in conditions:
+        condition_id = condition.name.split("_", 1)[0]
+        payload = yaml.safe_load(condition.read_text(encoding="utf-8"))
+        assert payload.pop("inherits") == "matched_tenth.yaml"
+        runtime = payload.pop("runtime")
+        assert set(runtime) == {"output_dir"}
+        assert payload == expected[condition_id]
+
+
 def test_all_conditions_reuse_the_selected_a0_budget_and_schedule(
     tmp_path: Path,
 ) -> None:
@@ -250,7 +306,7 @@ def test_all_conditions_reuse_the_selected_a0_budget_and_schedule(
         assert Path(resolved["runtime"]["output_dir"]).parent == tmp_path / "runs"
 
 
-def test_no_prototype_masks_classification_labels_but_preserves_replay_population(
+def test_no_global_expert_intervention_masks_labels_but_preserves_replay_population(
     tmp_path: Path,
 ) -> None:
     resolved = _resolve(tmp_path, "a1")
@@ -316,20 +372,29 @@ def test_global_and_spatial_prototype_refresh_are_independent(
     assert spatial_static["train"]["dynamic_spatial_prototype_refresh_steps"] == 0
 
 
-def test_spatial_architecture_and_target_conditions_change_one_named_control(
+def test_spatial_architecture_conditions_change_one_named_control(
     tmp_path: Path,
 ) -> None:
     semantic_only = _resolve(tmp_path, "a9")
     local_only = _resolve(tmp_path, "a10")
     no_context = _resolve(tmp_path, "a11")
-    legacy_brush_mil = _resolve(tmp_path, "a12")
 
     assert semantic_only["model"]["spatial_use_local_branch"] is False
     assert semantic_only["model"]["spatial_use_semantic_branch"] is True
     assert local_only["model"]["spatial_use_local_branch"] is True
     assert local_only["model"]["spatial_use_semantic_branch"] is False
     assert no_context["model"]["spatial_use_context"] is False
-    assert legacy_brush_mil["loss"]["spatial_brush_top_fraction"] == 0.25
+
+
+def test_no_student_response_changes_only_the_response_objective(
+    tmp_path: Path,
+) -> None:
+    no_response = _resolve(tmp_path, "a12")
+
+    assert no_response["loss"]["zhcc_response_weight"] == 0.0
+    assert no_response["loss"]["prototype_filter_weight"] == pytest.approx(0.5)
+    assert no_response["loss"]["semantic_weight"] == pytest.approx(0.02)
+    assert no_response["data"]["prototype_paths"] is not None
 
 
 @pytest.mark.parametrize(

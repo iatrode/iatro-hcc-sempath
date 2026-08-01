@@ -1,0 +1,28 @@
+inherits: matched_tenth.yaml
+
+# Ablation A3 — single-teacher distillation without the global expert
+# intervention; matched spatial supervision remains active.
+#
+# A1–A3 isolates teacher multiplicity when neither condition receives direct
+# L1 classification, teacher-space prototype-semantic supervision, student
+# response matching, or prototype-adjudicated reliability. Virchow2 is the
+# frozen single-teacher design constant shared by A3 and A4.
+
+runtime:
+  output_dir: outputs/experiments/ablation/a3_single_teacher_no_global_expert_intervention
+
+data:
+  teachers: [virchow2]
+  prototype_paths: null
+
+model:
+  teacher_dims:
+    virchow2: 2560
+
+loss:
+  teacher_weights:
+    virchow2: 1.0
+  classification_weight: 0.0
+  semantic_weight: 0.0
+  zhcc_response_weight: 0.0
+  prototype_filter_weight: 0.0

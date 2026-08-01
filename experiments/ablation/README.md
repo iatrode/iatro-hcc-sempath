@@ -24,10 +24,10 @@ config is rehashed again inside the training process.
 | ID | Change from A0 | Primary contrast |
 |---|---|---|
 | A0 | Full PAMT-D; supplied by the selected Optuna trial | reference |
-| A1 | remove the global prototype coordinate and classification supervision; retain matched replay images and spatial | A2–A1: global prototype/classification intervention |
+| A1 | remove the complete global expert intervention; retain matched replay images and spatial supervision | A2–A1: global prototype/classification intervention without reliability adjudication |
 | A2 | disable prototype-adjudicated teacher reliability | A0–A2: adjudication |
-| A3 | single Virchow2 teacher, without global prototype/classification supervision | A1–A3: multi-teacher contribution without global prototypes |
-| A4 | single Virchow2 teacher with prototype supervision | A0–A4: multi-teacher contribution with prototypes; A4–A3: prototypes in a single-teacher background |
+| A3 | single Virchow2 teacher without the global expert intervention | A1–A3: multi-teacher contribution without the global intervention |
+| A4 | single Virchow2 teacher with the global expert intervention | A0–A4: multi-teacher contribution with the intervention; A4–A3: intervention gain in a single-teacher background |
 | A5 | compute global student prototypes once and hold them fixed | A0–A5: dynamic global prototypes |
 | A6 | compute local spatial prototypes once and hold them fixed | A0–A6: dynamic spatial prototypes |
 | A7 | apply full rather than half-strength reliability filtering | filter-strength sensitivity |
@@ -35,17 +35,33 @@ config is rehashed again inside the training process.
 | A9 | remove the stride-7 local branch | cell-scale local observation |
 | A10 | remove the final-Transformer semantic branch | teacher-shaped semantic context |
 | A11 | bypass the dilation 1/2/4 spatial context stack | multi-grid structural context |
-| A12 | legacy top-quarter MIL pooling instead of full cell range support | contour-faithful cell brush/circle supervision |
+| A12 | remove student prototype-response matching while retaining adjudicated teacher weighting | shared semantic response target |
 
 A1 and A3 retain the same classification tile images in the replay population
-and the same complete L1 validation bank while zeroing only classification
-training loss. This keeps replay composition and joint checkpoint selection
-matched. A5 and A6
+and the same complete L1 validation bank while removing the complete global
+expert intervention: direct classification, prototype-semantic supervision,
+student-response matching, and prototype-adjudicated reliability. They are
+package-level intervention controls, not prototype-only controls. This keeps
+replay composition and joint checkpoint selection matched. A2 restores the
+global prototype/classification intervention without reliability adjudication;
+A12 retains adjudication but removes only student-response matching. Together,
+A0, A2, and A12 isolate the two PAMT-D mechanisms. A5 and A6
 retain identical module topology and differ only in whether the corresponding
 complete-bank student centroids refresh. A9-A11 also retain identical
 parameters and output geometry; their named computation path is bypassed.
-A12 affects cell range-support bags from brushes and circles; point centres,
-structure/continuous area support, and negative targets are unchanged.
+
+The mechanism matrix has three layers. A1--A4 and A12 test the central
+multi-teacher/global-intervention/PAMT-D hypothesis. A5, A6, and A8 test how
+expert supervision shapes the shared representation. A9--A11 test the spatial
+decoder architecture. A7 is a prespecified filter-strength sensitivity
+analysis and is not interpreted as an independent contribution.
+
+The normalized teacher/classification/spatial selection score is used only to
+choose a checkpoint within each condition. Its condition-specific epoch-0
+denominators make it invalid as a cross-condition efficacy endpoint. Formal
+ablation effects must be computed by applying every selected checkpoint to the
+same frozen external classification and spatial evaluation sets, using one
+fixed evaluator configuration.
 
 Generated configs and outputs remain external. Set the selected A0 trial config
 and optionally an output root, then run all remaining conditions:

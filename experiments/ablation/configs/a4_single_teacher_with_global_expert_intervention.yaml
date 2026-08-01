@@ -1,0 +1,28 @@
+inherits: matched_tenth.yaml
+
+# Ablation A4 — single-teacher distillation with the complete global expert
+# intervention.
+#
+# Direct classification, teacher-space prototype-semantic supervision,
+# student-response matching, and reliability weighting are retained. With one
+# teacher there is no cross-teacher consensus term; reliability is determined
+# by the available expert evidence and evolving student agreement. A4–A3
+# measures the global intervention in a single-teacher background, whereas
+# A0–A4 measures the multi-teacher contribution with that intervention active.
+# Virchow2 is the same frozen design constant used by A3.
+
+runtime:
+  output_dir: outputs/experiments/ablation/a4_single_teacher_with_global_expert_intervention
+
+data:
+  teachers: [virchow2]
+  prototype_paths:
+    virchow2: artifacts/prototypes/virchow2_hcc_semantic_prototypes.pt
+
+model:
+  teacher_dims:
+    virchow2: 2560
+
+loss:
+  teacher_weights:
+    virchow2: 1.0
