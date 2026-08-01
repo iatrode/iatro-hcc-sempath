@@ -356,6 +356,22 @@ def _scalar_epoch_metrics(metrics: dict) -> dict[str, float]:
     }
 
 
+def _step_checkpoint_due(
+    *,
+    step: int,
+    batch_in_epoch: int,
+    batches_in_epoch: int,
+    interval_steps: int,
+) -> bool:
+    """Return whether an exact mid-epoch checkpoint should be materialized."""
+
+    return (
+        interval_steps > 0
+        and step % interval_steps == 0
+        and batch_in_epoch < batches_in_epoch
+    )
+
+
 def _atomic_torch_save(payload: dict, path: Path) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
@@ -1368,6 +1384,10 @@ def run_epoch(
     resume_epoch_accumulator: dict | None = None,
 ) -> dict[str, float] | tuple[dict[str, float], tuple]:
     model.train(train)
+    checkpoint_interval_steps = int(
+        cfg["train"].get("checkpoint_interval_steps", 1000)
+    )
+    batches_in_epoch = len(loader)
     default_totals: dict[str, torch.Tensor | float] = {
         "loss": 0.0,
         "feature": 0.0,
@@ -1979,7 +1999,17 @@ def run_epoch(
                     batch=n_batches,
                     global_step=global_step,
                 )
-            if train and optimizer_stepped and step_checkpoint is not None:
+            if (
+                train
+                and optimizer_stepped
+                and step_checkpoint is not None
+                and _step_checkpoint_due(
+                    step=global_step,
+                    batch_in_epoch=n_batches,
+                    batches_in_epoch=batches_in_epoch,
+                    interval_steps=checkpoint_interval_steps,
+                )
+            ):
                 checkpoint_totals = {
                     key: (
                         float(value.detach().cpu())
@@ -3313,10 +3343,11 @@ def fit(
         epoch_accumulator: dict,
     ) -> None:
         nonlocal global_step, spatial_supervised_step
-        if (
-            checkpoint_interval_steps <= 0
-            or step % checkpoint_interval_steps != 0
-            or batch_in_epoch >= len(train_loader)
+        if not _step_checkpoint_due(
+            step=step,
+            batch_in_epoch=batch_in_epoch,
+            batches_in_epoch=len(train_loader),
+            interval_steps=checkpoint_interval_steps,
         ):
             return
         global_step = int(step)

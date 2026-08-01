@@ -2,6 +2,9 @@
 
 ## 0.2.0 — Unreleased
 
+- Materialize exact-resume epoch accumulators only when a mid-epoch checkpoint
+  is due, eliminating otherwise unused per-step CUDA-to-CPU scalar
+  synchronizations without changing checkpoint contents or resume semantics.
 - Replace the unpublished six-class classification contract with the final
   seven-class contract, splitting hemorrhage/necrosis from
   artifact/contamination and fixing the training bank at 400 tiles per class.

@@ -23,6 +23,7 @@ from hcc_sempath.training.engine import (
     _objective_gradient_diagnostics,
     _optimizer_step,
     _scalar_epoch_metrics,
+    _step_checkpoint_due,
     _should_stop_for_alignment,
     _development_early_stop_state_from_csv,
     _truncate_csv_after_step,
@@ -590,6 +591,33 @@ def test_amp_optimizer_helper_steps_exactly_once() -> None:
     assert parameter.item() == pytest.approx(0.8)
 
 
+@pytest.mark.parametrize(
+    ("step", "batch_in_epoch", "batches_in_epoch", "interval_steps", "due"),
+    [
+        (999, 2, 10, 1000, False),
+        (1000, 2, 10, 1000, True),
+        (1000, 10, 10, 1000, False),
+        (1000, 2, 10, 0, False),
+    ],
+)
+def test_step_checkpoint_due_only_mid_epoch_at_interval(
+    step: int,
+    batch_in_epoch: int,
+    batches_in_epoch: int,
+    interval_steps: int,
+    due: bool,
+) -> None:
+    assert (
+        _step_checkpoint_due(
+            step=step,
+            batch_in_epoch=batch_in_epoch,
+            batches_in_epoch=batches_in_epoch,
+            interval_steps=interval_steps,
+        )
+        is due
+    )
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf")])
 def test_optimizer_helper_rejects_nonfinite_loss_without_step(
     value: float,
@@ -610,7 +638,14 @@ def test_optimizer_helper_rejects_nonfinite_loss_without_step(
     assert parameter.grad is None
 
 
-def test_run_epoch_joint_classification_spatial_route_keeps_full_bank_prototypes_fixed() -> None:
+@pytest.mark.parametrize(
+    ("checkpoint_interval_steps", "expected_checkpoint_count"),
+    [(1, 1), (2, 0)],
+)
+def test_run_epoch_joint_classification_spatial_route_keeps_full_bank_prototypes_fixed(
+    checkpoint_interval_steps: int,
+    expected_checkpoint_count: int,
+) -> None:
     classification_count = len(DEFAULT_CLASSIFICATION_CLASSES)
     spatial_count = len(DEFAULT_SPATIAL_COMPONENTS)
     model = HCCSemPathModel(
@@ -704,6 +739,7 @@ def test_run_epoch_joint_classification_spatial_route_keeps_full_bank_prototypes
             "log_interval": 0,
             "progress": False,
             "max_grad_norm": 0.0,
+            "checkpoint_interval_steps": checkpoint_interval_steps,
         },
     }
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
@@ -733,12 +769,17 @@ def test_run_epoch_joint_classification_spatial_route_keeps_full_bank_prototypes
     assert result["global_step_end"] == 1
     assert result["spatial_supervised_step_end"] == 1
     assert result["batch_in_epoch_end"] == 1
-    assert len(checkpoints) == 1
-    assert callback_order == ["probe", "checkpoint"]
-    assert checkpoints[0][:4] == (1, 1, 1, 1)
-    assert checkpoints[0][4]["batches"] == 1
-    assert checkpoints[0][4]["tiles"] == 1
-    assert checkpoints[0][4]["totals"]["loss"] > 0
+    assert len(checkpoints) == expected_checkpoint_count
+    assert callback_order == (
+        ["probe", "checkpoint"]
+        if expected_checkpoint_count
+        else ["probe"]
+    )
+    if checkpoints:
+        assert checkpoints[0][:4] == (1, 1, 1, 1)
+        assert checkpoints[0][4]["batches"] == 1
+        assert checkpoints[0][4]["tiles"] == 1
+        assert checkpoints[0][4]["totals"]["loss"] > 0
     torch.testing.assert_close(model.classification_prototypes, classification_before)
     torch.testing.assert_close(
         model.spatial_head.instance_prototypes,
