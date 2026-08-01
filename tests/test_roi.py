@@ -16,6 +16,7 @@ from hcc_sempath.training.spatial_losses import (
     _brush_bag_loss,
     _maximum_cardinality_score_matching,
     _point_peak_loss,
+    _routed_negative_loss,
     classification_objective_loss,
     spatial_morphometry_loss,
 )
@@ -638,6 +639,52 @@ def test_circle_is_one_large_instance_and_full_measurement_support(
     assert not target.explicit_negative.any()
 
 
+def test_circle_extent_is_not_reused_as_measurement_point_seed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "spatial.json"
+    _write_records(
+        path,
+        [
+            {
+                "tile_id": "circle",
+                "attribute": "hemorrhage",
+                "split": "train",
+                "state": "positive",
+                "geometry": {
+                    "type": "circle",
+                    "center": [112, 112],
+                    "radius": 28,
+                },
+            }
+        ],
+    )
+    target = build_spatial_roi_targets(
+        path,
+        component_names=["hemorrhage"],
+        image_size=(224, 224),
+        grid_size=(32, 32),
+        allowed_splits={"train"},
+    )["circle"]
+    logits = torch.zeros((1, 1, 32, 32))
+
+    _, parts = spatial_morphometry_loss(
+        instance_logits=logits,
+        abundance_logits=logits,
+        point_centers=target.point_centers[None],
+        instance_exclusion_support=target.instance_exclusion_support[None],
+        brush_bag_ids=target.brush_bag_ids[None],
+        area_positive=target.area_positive[None],
+        explicit_negative=target.explicit_negative[None],
+        implicit_negative=target.implicit_negative[None],
+        component_names=["hemorrhage"],
+        brush_top_fraction=1.0,
+    )
+
+    assert parts["spatial_abundance_point"].item() == 0
+    assert parts["spatial_brush_bag"].item() > 0
+
+
 def test_cell_circle_radius_suppresses_duplicate_instance_peaks() -> None:
     instance = torch.full((1, 1, 7, 7), -5.0)
     instance[0, 0, 3, 3] = 5.0
@@ -1045,6 +1092,29 @@ def test_implicit_background_direct_gradient_is_forty_times_weaker() -> None:
 
     assert explicit_loss == pytest.approx(40.0 * implicit_loss)
     assert explicit_gradient == pytest.approx(40.0 * implicit_gradient)
+
+
+def test_complete_negative_hard_tail_preserves_sparse_peak_gradient() -> None:
+    instance = torch.zeros((1, 1, 32, 32), requires_grad=True)
+    measurement = torch.zeros_like(instance, requires_grad=True)
+    with torch.no_grad():
+        instance[0, 0, 7, 9] = 8
+        measurement[0, 0, 7, 9] = 8
+    mask = torch.ones_like(instance, dtype=torch.bool)
+
+    loss, _, _ = _routed_negative_loss(
+        instance,
+        measurement,
+        mask,
+        torch.ones((1, 1, 1, 1), dtype=torch.bool),
+        hard_tail_topk=4,
+        hard_tail_weight=0.5,
+        sum_heads=True,
+    )
+    loss.backward()
+
+    peak = instance.grad[0, 0, 7, 9].abs()
+    assert peak > 100 * instance.grad.abs().median()
 
 
 def test_area_only_loss_does_not_train_instance_channel() -> None:

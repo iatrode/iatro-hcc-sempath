@@ -574,6 +574,43 @@ def test_structure_point_updates_instance_but_not_unknown_measurement_prototype(
     assert head.measurement_prototype_counts[structure_index].item() == 0
 
 
+def test_circle_center_and_extent_route_to_separate_prototypes() -> None:
+    head = SpatialMorphometryHead(
+        student_dim=2,
+        component_count=1,
+        spatial_dim=2,
+    )
+    features = torch.zeros((1, 2, 2, 2))
+    features[0, :, 0, 0] = torch.tensor([1.0, 0.0])
+    features[0, :, 1, 1] = torch.tensor([0.0, 1.0])
+    point = torch.zeros((1, 1, 2, 2))
+    point[0, 0, 0, 0] = 1
+    exclusion = torch.zeros_like(point, dtype=torch.bool)
+    exclusion[0, 0, 0, 0] = True
+    brush = torch.zeros_like(point, dtype=torch.long)
+    brush[0, 0, 1, 1] = 1
+    empty = torch.zeros_like(point, dtype=torch.bool)
+
+    observations = head.prototype_observation_sums(
+        features,
+        point_centers=point,
+        instance_exclusion_support=exclusion,
+        brush_bag_ids=brush,
+        area_positive=empty,
+        explicit_negative=empty,
+        implicit_negative=empty,
+    )
+
+    torch.testing.assert_close(
+        observations["instance"][0][0],
+        torch.tensor([1.0, 0.0]),
+    )
+    torch.testing.assert_close(
+        observations["measurement"][0][0],
+        torch.tensor([0.0, 1.0]),
+    )
+
+
 def test_hcc_sempath_model_decodes_instances_and_uncalibrated_abundance() -> None:
     model = HCCSemPathModel(
         backbone_name="vit_tiny_patch16_224",
