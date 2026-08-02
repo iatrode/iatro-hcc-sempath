@@ -2,6 +2,9 @@
 
 ## 0.2.0 — Unreleased
 
+- Declare the public source and documentation license as
+  CC-BY-NC-ND-4.0, aligned with the planned gated student-weight release.
+
 - Add fixed-global-step joint teacher/L1/L2 validation and checkpoint
   selection for full-population training. Patience and minimum evidence count
   validation probes rather than population epochs, preventing a larger
@@ -49,7 +52,7 @@
   search over learning rate, weight decay, and global spatial-task weight.
   Search artifacts bind the trial, best epoch, checkpoint, configuration, and
   supervision digests.
-- Make formal A1–A12 runs inherit the selected A0 maximum budget and normalized
+- Make formal A1–A11 runs inherit the selected A0 maximum budget and normalized
   teacher/L1/L2 checkpoint rule, removing the obsolete three-/six-epoch
   population-loss stopping path. Classification-removal conditions retain the
   complete L1 validation bank while zeroing classification training loss.

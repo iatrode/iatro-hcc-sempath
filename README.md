@@ -20,6 +20,16 @@ This repository contains research code and reproducibility protocols. Private
 pathology data, teacher caches, supervision records, and model artifacts are
 managed outside the source distribution.
 
+## License
+
+The source code and documentation are released under
+[CC BY-NC-ND 4.0](LICENSE) for non-commercial use with attribution. Modified
+versions may be created for non-commercial use but may not be redistributed.
+Third-party dependencies and teacher models remain subject to their own
+licenses and access terms. The final SemPath student weights, when released,
+will be distributed separately through a gated model repository under the
+same non-commercial license boundary.
+
 ## Installation
 
 HCC-SemPath supports Python 3.10 and later. Create an isolated environment and
@@ -97,13 +107,13 @@ python scripts/optuna_a0_search.py \
 
 Run the formal study with one coordinator; rerunning the same command resumes
 the contract-bound study with the same trial-seeded TPE trajectory and without
-exceeding its 20-trial global budget:
+exceeding its frozen 10-trial global budget:
 
 ```bash
 python scripts/optuna_a0_search.py \
   --base-config configs/server/train_a0_optuna.example.yaml \
-  --n-trials 20 \
-  --study-trials 20
+  --n-trials 10 \
+  --study-trials 10
 ```
 
 On a multi-GPU host, keep one coordinator and bind one independent trial to
@@ -114,8 +124,8 @@ that remain in flight:
 ```bash
 python scripts/optuna_a0_search.py \
   --base-config configs/server/train_a0_optuna.example.yaml \
-  --n-trials 20 \
-  --study-trials 20 \
+  --n-trials 10 \
+  --study-trials 10 \
   --parallel-trials 4 \
   --devices 0,1,2,3
 ```
