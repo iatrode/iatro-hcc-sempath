@@ -1,7 +1,6 @@
 ---
 license: cc-by-nc-nd-4.0
-library_name: pytorch
-pipeline_tag: image-classification
+library_name: hcc-sempath
 tags:
   - histopathology
   - hepatocellular-carcinoma
@@ -22,7 +21,7 @@ teacher-specific projection heads are not part of the inference release.
 
 ## Inputs and outputs
 
-The released CLI accepts a 224-pixel image, a
+The released CLI accepts a 224x224-pixel RGB image, a
 `<name>.tile.path.iac` tile package, or a supported whole-slide image. Whole
 slides are tissue segmented and tiled at a standardized 20x-equivalent scale
 before inference.
@@ -84,9 +83,9 @@ spatial checkpoint-selection bank, tile-component macro F1 was 0.862 and macro
 one-vs-rest AUROC was 0.948; abundance and instance false-positive rates on
 explicitly negative regions were 0.0079 and 0.0019.
 
-These are internal checkpoint-selection readouts. The manuscript's locked
-external classification and component-specific spatial tests are reported
-separately and supersede this section when released.
+These are internal checkpoint-selection readouts. Independent external
+classification and component-specific spatial results will be reported
+separately; this card will be updated when those results are frozen.
 
 ## Usage
 
@@ -94,7 +93,7 @@ Install HCC-SemPath, obtain access to the gated model repository, and download
 the release:
 
 ```bash
-python -m pip install iatro-hcc-sempath
+python -m pip install hcc-sempath
 hcc-sempath download
 ```
 
@@ -109,6 +108,12 @@ hcc-sempath infer \
 A local release directory can be supplied with `--model`. A complete release
 contains the model contract `config.json` and inference weights
 `model.safetensors`, together with this model card and the licence.
+
+### Release identity
+
+- release contract: version 4;
+- inference state SHA-256: `351fe98950217d47f74d96c00256a84c913cfb00f8685cf6ce803476027c7502`;
+- `model.safetensors` SHA-256: `321e7c7823b09d6cd7a5c20d21dd2d6e84f5a30f5d4425b70144d70e8cd0bb4f`.
 
 ## Intended use
 
