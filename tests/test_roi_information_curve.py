@@ -9,7 +9,12 @@ import numpy as np
 
 
 def _load_module():
-    script = Path(__file__).resolve().parents[1] / "research" / "scripts" / "roi_information_curve.py"
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "experiments"
+        / "scripts"
+        / "roi_information_curve.py"
+    )
     spec = importlib.util.spec_from_file_location("roi_information_curve", script)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

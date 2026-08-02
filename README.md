@@ -134,8 +134,8 @@ Run the A0 search only after the fixed train/validation expert assets pass its
 preflight:
 
 ```bash
-python research/scripts/optuna_a0_search.py \
-  --base-config research/configs/train_a0_optuna.example.yaml \
+python experiments/scripts/optuna_a0_search.py \
+  --base-config experiments/configs/train_a0_optuna.example.yaml \
   --n-trials 0
 ```
 
@@ -144,8 +144,8 @@ the contract-bound study with the same trial-seeded TPE trajectory and without
 exceeding its frozen 10-trial global budget:
 
 ```bash
-python research/scripts/optuna_a0_search.py \
-  --base-config research/configs/train_a0_optuna.example.yaml \
+python experiments/scripts/optuna_a0_search.py \
+  --base-config experiments/configs/train_a0_optuna.example.yaml \
   --n-trials 10 \
   --study-trials 10
 ```
@@ -156,8 +156,8 @@ receives the next trial, while constant-liar TPE accounts for configurations
 that remain in flight:
 
 ```bash
-python research/scripts/optuna_a0_search.py \
-  --base-config research/configs/train_a0_optuna.example.yaml \
+python experiments/scripts/optuna_a0_search.py \
+  --base-config experiments/configs/train_a0_optuna.example.yaml \
   --n-trials 10 \
   --study-trials 10 \
   --parallel-trials 4 \
@@ -192,14 +192,14 @@ whose tile/component records explicitly
 declare `roi_count_complete` and `roi_measurement_complete`:
 
 ```bash
-python research/scripts/calibrate_spatial_decoder.py \
+python experiments/scripts/calibrate_spatial_decoder.py \
   --checkpoint outputs/hcc_sempath_v2/checkpoints/best.pt \
   --annotation /path/to/hcc_spatial_validation.json \
   --validation-split val \
   --output-calibration outputs/hcc_sempath_v2/spatial_calibration.json \
   --output-report outputs/hcc_sempath_v2/spatial_validation_report.json
 
-python research/scripts/export_release_sempath.py \
+python experiments/scripts/export_release_sempath.py \
   --checkpoint outputs/hcc_sempath_v2/checkpoints/best.pt \
   --spatial-calibration outputs/hcc_sempath_v2/spatial_calibration.json \
   --output-dir artifacts/release/hcc_sempath_v2
@@ -307,7 +307,7 @@ calibration.
 Run the reusable spatial stopping audit from the repository root:
 
 ```bash
-python research/scripts/roi_information_curve.py \
+python experiments/scripts/roi_information_curve.py \
   --annotation-json /private/study/spatial_state.json \
   --teacher-feature-packages \
     'gigapath=/features/gigapath/*.iac,h_optimus_1=/features/h1/*.iac,uni2_h=/features/uni2/*.iac,virchow2=/features/virchow2/*.iac' \

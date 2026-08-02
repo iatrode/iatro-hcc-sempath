@@ -14,7 +14,12 @@ optuna = pytest.importorskip("optuna")
 
 
 def _search_module():
-    path = Path(__file__).resolve().parents[1] / "research" / "scripts" / "optuna_a0_search.py"
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "experiments"
+        / "scripts"
+        / "optuna_a0_search.py"
+    )
     spec = importlib.util.spec_from_file_location("optuna_a0_search", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

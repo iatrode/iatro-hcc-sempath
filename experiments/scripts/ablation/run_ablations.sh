@@ -29,17 +29,17 @@ cleanup() {
 trap cleanup EXIT
 
 declare -A CONFIGS=(
-  [a1]="experiments/ablation/configs/a1_no_global_expert_intervention.yaml"
-  [a2]="experiments/ablation/configs/a2_no_adjudication.yaml"
-  [a3]="experiments/ablation/configs/a3_single_teacher_no_global_expert_intervention.yaml"
-  [a4]="experiments/ablation/configs/a4_single_teacher_with_global_expert_intervention.yaml"
-  [a5]="experiments/ablation/configs/a5_static_global_prototypes.yaml"
-  [a6]="experiments/ablation/configs/a6_static_spatial_prototypes.yaml"
-  [a7]="experiments/ablation/configs/a7_full_filter_sensitivity.yaml"
-  [a8]="experiments/ablation/configs/a8_semantic_only_spatial.yaml"
-  [a9]="experiments/ablation/configs/a9_local_only_spatial.yaml"
-  [a10]="experiments/ablation/configs/a10_no_spatial_context.yaml"
-  [a11]="experiments/ablation/configs/a11_no_student_response.yaml"
+  [a1]="experiments/configs/ablation/a1_no_global_expert_intervention.yaml"
+  [a2]="experiments/configs/ablation/a2_no_adjudication.yaml"
+  [a3]="experiments/configs/ablation/a3_single_teacher_no_global_expert_intervention.yaml"
+  [a4]="experiments/configs/ablation/a4_single_teacher_with_global_expert_intervention.yaml"
+  [a5]="experiments/configs/ablation/a5_static_global_prototypes.yaml"
+  [a6]="experiments/configs/ablation/a6_static_spatial_prototypes.yaml"
+  [a7]="experiments/configs/ablation/a7_full_filter_sensitivity.yaml"
+  [a8]="experiments/configs/ablation/a8_semantic_only_spatial.yaml"
+  [a9]="experiments/configs/ablation/a9_local_only_spatial.yaml"
+  [a10]="experiments/configs/ablation/a10_no_spatial_context.yaml"
+  [a11]="experiments/configs/ablation/a11_no_student_response.yaml"
 )
 
 conditions=("$@")
@@ -69,7 +69,7 @@ for condition in "${conditions[@]}"; do
   if [ -n "${HCC_SEMPATH_ABLATION_OUTPUT_ROOT:-}" ]; then
     resolver_args+=(--output-root "$HCC_SEMPATH_ABLATION_OUTPUT_ROOT")
   fi
-  "${PYTHON_CMD[@]}" experiments/ablation/scripts/resolve_ablation_config.py \
+  "${PYTHON_CMD[@]}" experiments/scripts/ablation/resolve_ablation_config.py \
     "${resolver_args[@]}"
 done
 
@@ -84,7 +84,7 @@ for condition in "${conditions[@]}"; do
   train_args=(-m hcc_sempath.cli.main train --config "$run_config")
   if [ -f "$checkpoint" ]; then
     "${PYTHON_CMD[@]}" -c \
-      'import sys; from experiments.ablation.scripts.resolve_ablation_config import validate_ablation_resume_checkpoint; validate_ablation_resume_checkpoint(sys.argv[1], sys.argv[2])' \
+      'import sys; from experiments.scripts.ablation.resolve_ablation_config import validate_ablation_resume_checkpoint; validate_ablation_resume_checkpoint(sys.argv[1], sys.argv[2])' \
       "$run_config" "$checkpoint"
     train_args+=(--resume "$checkpoint")
   fi

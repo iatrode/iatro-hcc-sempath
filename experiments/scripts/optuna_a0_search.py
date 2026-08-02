@@ -264,7 +264,7 @@ def source_tree_sha256(repo: Path) -> str:
         repo / "CHANGELOG.md",
         repo / "configs",
         repo / "docs",
-        repo / "experiments" / "ablation",
+        repo / "experiments",
         repo / "scripts",
         repo / "src",
         repo / "tests",
@@ -2176,7 +2176,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--base-config",
-        default="research/configs/train_a0_optuna.example.yaml",
+        default="experiments/configs/train_a0_optuna.example.yaml",
     )
     parser.add_argument(
         "--study-name",

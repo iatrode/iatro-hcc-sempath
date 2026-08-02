@@ -1342,7 +1342,7 @@ def _source_tree_sha256(repo: Path) -> str:
         "CHANGELOG.md",
         "configs",
         "docs",
-        "experiments/ablation",
+        "experiments",
         "scripts",
         "src",
         "tests",

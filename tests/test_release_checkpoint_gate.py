@@ -10,7 +10,7 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 def _script_module(name: str):
-    path = REPO / "research" / "scripts" / name
+    path = REPO / "experiments" / "scripts" / name
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
