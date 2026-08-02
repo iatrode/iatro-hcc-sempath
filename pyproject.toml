@@ -43,8 +43,8 @@ dependencies = [
   "openslide-python",
   "openslide-bin",
   "pyarrow",
-  "iatro-base-iac>=0.1.2,<0.2",
-  "iatro-iac-adapters>=0.1.2,<0.2",
+  "iatro-base-iac>=0.1.3,<0.2",
+  "iatro-iac-adapters>=0.1.3,<0.2",
 ]
 
 [project.optional-dependencies]

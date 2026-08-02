@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pyarrow as pa
 import pytest
+from iatro.iac import Codec, VariableRecordPack
 
 from hcc_sempath.inference.predictions import (
     PredictionPackageReader,
@@ -72,6 +73,8 @@ def test_prediction_package_roundtrip_and_coordinates(tmp_path):
     )
 
     with PredictionPackageReader(output) as reader:
+        assert reader.header["codec"] == Codec.ZSTD
+        assert reader.header["codec_params"] == {"level": 6}
         assert reader.record_count == 1
         assert reader.index_table.column("source_row")[0].as_py() == 0
         assert reader.index_table.column("split")[0].as_py() == "exval"
@@ -83,6 +86,12 @@ def test_prediction_package_roundtrip_and_coordinates(tmp_path):
         x, y = grid_cell_center_level0(reader.header, tile_x=2, tile_y=3, row=0, column=0)
         assert x == 2 * 444 + 3 * (444 / 224)
         assert y == 3 * 444 + 3 * (444 / 224)
+
+    reader = VariableRecordPack(output)
+    try:
+        assert reader.read(0).startswith(b"HSP1")
+    finally:
+        reader.close()
 
 
 def test_uint16_probability_roundtrip_is_high_precision():
@@ -159,3 +168,39 @@ def test_failed_prediction_package_removes_temporary_file(tmp_path):
         )
     assert not output.exists()
     assert not output.with_suffix(".iac.tmp").exists()
+
+
+def test_prediction_package_rejects_caller_defined_iac_codec(tmp_path):
+    source_header, slides, source_index = _source_tables()
+    header = prediction_header(
+        source_path="slide-a.tiles.iac",
+        source_header=source_header,
+        source_index_digest=source_index_sha256(source_header, slides, source_index),
+        checkpoint_path="best.pt",
+        checkpoint_file_digest="a" * 64,
+        checkpoint_model_digest="b" * 64,
+        classification_names=["c0", "c1"],
+        component_names=["s0", "s1"],
+        grid_shape=(2, 2),
+        spatial_stride=7,
+        patch_size=14,
+        patch_padding=4,
+        spatial_dtype="uint8",
+        dataset_split="train",
+    )
+    header["codec"] = "zlib"
+    with pytest.raises(ValueError, match="must not define IAC-managed fields: codec"):
+        write_prediction_package(
+            tmp_path / "predictions.iac",
+            header=header,
+            slide_table=slides,
+            index_table=prediction_index_table(source_index, [0]),
+            payloads=[
+                encode_prediction_payload(
+                    np.array([0.5, 0.5], dtype=np.float32),
+                    np.zeros((2, 2, 2), dtype=np.float32),
+                    np.zeros((2, 2, 2), dtype=np.float32),
+                    spatial_dtype="uint8",
+                )
+            ],
+        )

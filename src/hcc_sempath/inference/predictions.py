@@ -3,19 +3,37 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
-import zlib
 from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 
-from iatro.iac import PackReader, build_pack_streaming, read_tables
+from iatro.iac import Codec, VariableRecordPack, read_tables
 
 
 SCHEMA_VERSION = 1
 PAYLOAD_TYPE = "hcc_sempath_tile_predictions"
 _PAYLOAD_MAGIC = b"HSP1"
+_IAC_MANAGED_HEADER_FIELDS = frozenset(
+    {
+        "format",
+        "version",
+        "header_bytes",
+        "payload_type",
+        "codec",
+        "codec_params",
+        "checksum",
+        "num_slides",
+        "num_records",
+        "slide_table_offset",
+        "slide_table_length",
+        "index_table_offset",
+        "index_table_length",
+        "data_offset",
+        "data_length",
+    }
+)
 
 
 def file_sha256(path: str | Path, *, chunk_bytes: int = 8 << 20) -> str:
@@ -88,7 +106,6 @@ def encode_prediction_payload(
     abundance: np.ndarray,
     *,
     spatial_dtype: str,
-    compression_level: int = 6,
 ) -> bytes:
     classification = _encode_probability(classification, "float16")
     instance = _encode_probability(instance, spatial_dtype)
@@ -102,11 +119,11 @@ def encode_prediction_payload(
             abundance.tobytes(order="C"),
         )
     )
-    return zlib.compress(raw, level=compression_level)
+    return raw
 
 
 def decode_prediction_payload(payload: bytes, header: dict) -> dict[str, np.ndarray]:
-    raw = zlib.decompress(payload)
+    raw = payload
     if raw[:4] != _PAYLOAD_MAGIC:
         raise ValueError("invalid SemPath prediction payload magic")
     classification_size, instance_size, abundance_size = struct.unpack_from("<III", raw, 4)
@@ -198,13 +215,9 @@ def prediction_header(
         else 0.5 / float(np.iinfo(dtype).max)
     )
     return {
-        "format": "IatroCache",
-        "version": 2,
         "payload_type": PAYLOAD_TYPE,
         "schema_version": SCHEMA_VERSION,
         "created_by": "hcc-sempath",
-        "codec": "zlib",
-        "checksum": "crc32",
         "source_package_name": Path(source_path).name,
         "source_dataset": Path(source_path).parent.name,
         "dataset_split": str(dataset_split),
@@ -261,13 +274,27 @@ def write_prediction_package(
     if temporary.exists():
         temporary.unlink()
     try:
-        build_pack_streaming(
+        extra_header = dict(header)
+        payload_type = str(extra_header.get("payload_type", PAYLOAD_TYPE))
+        if payload_type != PAYLOAD_TYPE:
+            raise ValueError(f"unexpected prediction payload type: {payload_type}")
+        managed = sorted(_IAC_MANAGED_HEADER_FIELDS & extra_header.keys())
+        if managed != ["payload_type"] and managed:
+            raise ValueError(
+                "prediction header must not define IAC-managed fields: "
+                + ", ".join(managed)
+            )
+        extra_header.pop("payload_type", None)
+        VariableRecordPack.build(
             temporary,
-            header,
-            slide_table,
-            index_table,
-            payloads,
+            payload_type=PAYLOAD_TYPE,
+            slide_table=slide_table,
+            index_table=index_table,
+            objects=payloads,
+            codec=Codec.create(Codec.ZSTD, level=6),
+            extra_header=extra_header,
             overwrite=False,
+            streaming=True,
         )
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -278,7 +305,7 @@ def write_prediction_package(
 class PredictionPackageReader:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        self._reader = PackReader(self.path)
+        self._reader = VariableRecordPack(self.path)
         if self._reader.header.get("payload_type") != PAYLOAD_TYPE:
             raise ValueError(f"not a SemPath prediction package: {path}")
         if int(self._reader.header.get("schema_version", -1)) != SCHEMA_VERSION:
@@ -301,7 +328,7 @@ class PredictionPackageReader:
         return len(self._reader.index_table)
 
     def read_at(self, row: int) -> dict[str, np.ndarray]:
-        return decode_prediction_payload(self._reader.read_payload(row), self.header)
+        return decode_prediction_payload(self._reader.read(row), self.header)
 
     def close(self) -> None:
         self._reader.close()

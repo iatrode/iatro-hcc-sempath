@@ -2,6 +2,10 @@
 
 ## 0.2.0 — Unreleased
 
+- Delegate prediction-record compression to the IAC 0.1.3
+  `VariableRecordPack` and native ZSTD codec. SemPath now owns only its
+  prediction payload schema and no longer declares or implements a private
+  zlib codec convention.
 - Replace the unpublished flat CLI with workflow commands. Reusable assets are
   built through the `hcc-sempath build` namespace; annotation uses
   `hcc-sempath annotate`; training, evaluation, and benchmarking remain direct
