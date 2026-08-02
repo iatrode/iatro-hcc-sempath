@@ -67,13 +67,13 @@ HCC-SemPath 验证的核心假设是：当多教师蒸馏与一个覆盖目标�
 
 整体分类读出包含七个互斥类别：
 
-1. 高分化 HCC；
-2. 中分化 HCC；
-3. 低分化 HCC；
-4. 背景肝组织；
-5. 炎性间质；
-6. 出血/坏死；
-7. 人工污染/制片伪影。
+1. `HCC-tumor-well-differentiated`：高分化 HCC；
+2. `HCC-tumor-moderately-differentiated`：中分化 HCC；
+3. `HCC-tumor-poorly-differentiated`：低分化 HCC；
+4. `Background-liver`：背景肝组织；
+5. `Inflammatory-stromal`：炎性间质；
+6. `Hemorrhage-necrosis`：出血/坏死；
+7. `Artifact-contamination`：人工污染/制片伪影。
 
 ### 空间成分
 
