@@ -10,7 +10,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from hcc_sempath.cli.wsi_to_iac import _default_workers, _format_bytes, build_wsi_iac
+from hcc_sempath.build.wsi import _default_workers, _format_bytes, build_wsi_iac
 from iatro.iac.adapters.tiles import read_package_metadata
 
 

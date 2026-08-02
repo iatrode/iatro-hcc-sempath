@@ -18,12 +18,12 @@ from typing import Any, Iterable
 import numpy as np
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from hcc_sempath.annotation_information import (  # noqa: E402
+from hcc_sempath.annotation.information import (  # noqa: E402
     CurveObservation,
     aggregate_fixed_probe_curves,
     fixed_probe_curve,

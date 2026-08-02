@@ -4,7 +4,7 @@ import math
 
 import numpy as np
 
-from hcc_sempath.annotation_information import (
+from hcc_sempath.annotation.information import (
     CurveObservation,
     fixed_probe_curve,
     meaningful_reference_checkpoints,

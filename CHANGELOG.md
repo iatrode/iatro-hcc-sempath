@@ -2,6 +2,18 @@
 
 ## 0.2.0 — Unreleased
 
+- Replace the unpublished flat CLI with workflow commands. Reusable assets are
+  built through the `hcc-sempath build` namespace; annotation uses
+  `hcc-sempath annotate`; training, evaluation, and benchmarking remain direct
+  top-level workflows. Move build and annotation implementations out of the
+  CLI routing package and remove all obsolete command names before the first
+  public release.
+- Add `hcc-sempath infer` for released-model inference over tile IAC packages.
+  Prediction IAC outputs preserve source identities, model digests, probability
+  encoding, spatial grid geometry, and an explicit level-0 coordinate transform.
+  Make `benchmark` consume the same gated release contract instead of internal
+  training configuration and checkpoints.
+
 - Declare the public source and documentation license as
   CC-BY-NC-ND-4.0, aligned with the planned gated student-weight release.
 

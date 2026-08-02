@@ -4,7 +4,7 @@ runtime:
   output_dir: outputs/server_full
 
 data:
-  train_manifest_path: configs/server/manifest.example.yaml
+  train_manifest_path: configs/manifest.example.yaml
   teachers: [gigapath, h_optimus_1, uni2_h, virchow2]
   prototype_paths:
     gigapath: /path/to/prototypes/gigapath_hcc_semantic_prototypes.pt

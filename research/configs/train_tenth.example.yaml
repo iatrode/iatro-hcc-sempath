@@ -1,4 +1,4 @@
-inherits: train_full.example.yaml
+inherits: ../../configs/train.example.yaml
 
 runtime:
   output_dir: outputs/server_tenth

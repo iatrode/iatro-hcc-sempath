@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 from __future__ import annotations
 
 import argparse
@@ -335,6 +334,8 @@ def _select_fixed_training_bank(
     rows: list[dict[str, Any]],
     features: dict[str, np.ndarray],
     classification_names: list[str],
+    *,
+    target_per_class: int,
 ) -> list[int]:
     normalized_features = {
         teacher: _normalize_rows(features[teacher])
@@ -352,10 +353,10 @@ def _select_fixed_training_bank(
             for index, row in enumerate(rows)
             if str(row["classification"]) == label
         ]
-        if len(indices) < TARGET_PER_CLASS:
+        if len(indices) < target_per_class:
             raise ValueError(
                 f"{label} has {len(indices)} accepted tiles; "
-                f"{TARGET_PER_CLASS} are required"
+                f"{target_per_class} are required"
             )
         combined = np.zeros(
             (len(indices), len(indices)),
@@ -370,7 +371,7 @@ def _select_fixed_training_bank(
             ) / len(TEACHERS)
         local_order = _facility_order(
             combined,
-            TARGET_PER_CLASS,
+            target_per_class,
             margin_rank=_rank_margin(indices, global_margin),
         )
         selected_indices.extend(
@@ -386,9 +387,16 @@ def main() -> None:
     parser.add_argument("--training-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--validation-annotation-json", default="")
-    parser.add_argument("--embedding-dim", type=int, default=1536)
     parser.add_argument("--source-split", default="train")
+    parser.add_argument(
+        "--target-per-class",
+        type=int,
+        default=TARGET_PER_CLASS,
+        help="Greedy coverage-bank size per classification class.",
+    )
     args = parser.parse_args()
+    if args.target_per_class <= 0:
+        raise ValueError("--target-per-class must be positive")
 
     annotation_path = Path(args.annotation_json)
     manifest_path = Path(args.training_manifest)
@@ -417,6 +425,7 @@ def main() -> None:
         rows,
         teacher_features,
         classification_names,
+        target_per_class=int(args.target_per_class),
     )
     selected_rows = [rows[index] for index in selected_indices]
     for teacher in TEACHERS:
@@ -439,11 +448,11 @@ def main() -> None:
                 "annotation_json": str(annotation_path),
                 "training_manifest": str(manifest_path),
                 "teacher": teacher,
-                "builder": "build_prototype_assets_from_annotations.py",
+                "builder": "hcc-sempath build supervision",
                 "selection": (
                     "four-teacher fixed greedy facility coverage"
                 ),
-                "target_per_class": TARGET_PER_CLASS,
+                "target_per_class": int(args.target_per_class),
             },
         )
 
@@ -485,7 +494,7 @@ def main() -> None:
         "accepted_training_annotations": len(rows),
         "selected_training_annotations": len(selected_rows),
         "validation_annotations": len(validation_rows),
-        "target_per_class": TARGET_PER_CLASS,
+        "target_per_class": int(args.target_per_class),
         "classification_prototypes": classification_names,
         "teacher_dims": teacher_dims,
         "supervision_manifest": str(supervision_path),

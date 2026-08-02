@@ -2176,7 +2176,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--base-config",
-        default="configs/server/train_a0_optuna.example.yaml",
+        default="research/configs/train_a0_optuna.example.yaml",
     )
     parser.add_argument(
         "--study-name",
@@ -2261,7 +2261,7 @@ def main() -> None:
         parallel_trials=int(args.parallel_trials),
     )
 
-    coordinator_repo = Path(__file__).resolve().parents[1]
+    coordinator_repo = Path(__file__).resolve().parents[2]
     repo = (
         coordinator_repo
         if args.source_root is None

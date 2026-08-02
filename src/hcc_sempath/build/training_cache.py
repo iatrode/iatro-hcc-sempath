@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Prepare the merged, row-shuffled teacher cache consumed by training."""
 
 from __future__ import annotations

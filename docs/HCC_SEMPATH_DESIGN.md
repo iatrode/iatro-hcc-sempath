@@ -411,7 +411,7 @@ slide-separated expert sample:
 - results stratified by component mode and annotation geometry;
 - per-component and macro results with independent-slide counts.
 
-`scripts/calibrate_spatial_decoder.py` implements this gate. Exact point/count
+`research/scripts/calibrate_spatial_decoder.py` implements this gate. Exact point/count
 pairs require explicit per-component `roi_count_complete`; measurement pairs
 likewise require `roi_measurement_complete`. These flags are validation-only
 claims and are never inferred from ordinary weak training marks. Brush and
@@ -485,10 +485,10 @@ HCC-SemPath contributes one HCC-specific representation with:
   and aggregate spatial validation.
 - `training/evaluate.py`: frozen-contract verification and evaluation-cohort
   exclusion.
-- `scripts/roi_information_curve.py`: executable four-teacher,
+- `research/scripts/roi_information_curve.py`: executable four-teacher,
   component-wise annotation sufficiency/QC curve.
-- `scripts/calibrate_spatial_decoder.py`: finalized-selection decoder freeze.
-- `scripts/export_release_sempath.py`: provenance-bound release package.
+- `research/scripts/calibrate_spatial_decoder.py`: finalized-selection decoder freeze.
+- `research/scripts/export_release_sempath.py`: provenance-bound release package.
 
 Implementation conformance requires:
 

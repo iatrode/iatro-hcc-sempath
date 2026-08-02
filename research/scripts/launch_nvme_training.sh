@@ -2,14 +2,14 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: scripts/launch_nvme_training.sh SESSION CONFIG_PATH" >&2
+  echo "usage: research/scripts/launch_nvme_training.sh SESSION CONFIG_PATH" >&2
   exit 2
 fi
 
 SESSION="$1"
 CONFIG_PATH="$2"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+REPO_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON_BIN="${HCC_SEMPATH_PYTHON:-/root/miniconda3/bin/python}"
 VERIFIED_ASSET_RECEIPT="${HCC_SEMPATH_VERIFIED_ASSET_RECEIPT:-}"
 

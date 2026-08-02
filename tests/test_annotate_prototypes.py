@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from hcc_sempath.cli.annotate_prototypes import (
+from hcc_sempath.annotation.server import (
     AnnotationData,
     AnnotationArchive,
     AnnotationState,
@@ -32,8 +32,7 @@ from hcc_sempath.cli.annotate_prototypes import (
     discover_iac_packages,
     make_handler,
 )
-from hcc_sempath.cli.build_priority_list import build_priority_manifest
-from hcc_sempath.cli.build_roi_queue import build_roi_candidate_queue
+from hcc_sempath.annotation.queues import build_priority_manifest, build_roi_candidate_queue
 from iatro.iac.adapters.features import build_teacher_feature_package
 from iatro.iac.adapters.manifests import TileRecord
 from iatro.iac.adapters.tiles import build_tile_package_from_records, encode_jxl_array

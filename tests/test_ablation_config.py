@@ -11,7 +11,7 @@ from experiments.ablation.scripts.resolve_ablation_config import (
     validate_ablation_resume_checkpoint,
 )
 from hcc_sempath.training.engine import _selection_start_step
-from scripts.prepare_nvme_run import _prepare_full
+from research.scripts.prepare_nvme_run import _prepare_full
 
 
 CONFIG_ROOT = Path("experiments/ablation/configs")

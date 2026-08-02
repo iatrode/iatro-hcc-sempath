@@ -58,6 +58,15 @@ Deployment supplies its own WSIs, packages, checkpoints, and manifests.
 
 ## Main commands
 
+Build reusable tile, teacher-feature, and dataset assets through one namespace:
+
+```bash
+hcc-sempath build tiles --help
+hcc-sempath build teacher-features --help
+hcc-sempath build training-cache --help
+hcc-sempath build manifest --help
+```
+
 Run the unit and contract suite:
 
 ```bash
@@ -67,16 +76,16 @@ python -m pytest -q
 Train or resume:
 
 ```bash
-hcc-sempath train --config configs/server/train_full.example.yaml
+hcc-sempath train --config configs/train.example.yaml
 
 hcc-sempath train \
-  --config configs/server/train_full.example.yaml \
+  --config configs/train.example.yaml \
   --resume outputs/hcc_sempath_v2/checkpoints/last.pt
 
 # To extend a completed run, increase train.epochs in a tracked config and
 # resume from its checkpoint.
 hcc-sempath train \
-  --config configs/server/train_full.example.yaml \
+  --config configs/train.example.yaml \
   --resume outputs/hcc_sempath_v2/checkpoints/last.pt
 ```
 
@@ -91,17 +100,42 @@ Evaluate retained teacher alignment and classification:
 
 ```bash
 hcc-sempath evaluate \
-  --config configs/server/train_full.example.yaml \
+  --config configs/train.example.yaml \
   --checkpoint outputs/hcc_sempath_v2/checkpoints/last.pt \
   --split val
+```
+
+Run the gated release model on one tile package or a directory of packages:
+
+```bash
+hcc-sempath infer \
+  --model /path/to/hcc-sempath-release \
+  --input /path/to/tile-iac-root \
+  --output /path/to/predictions
+```
+
+Each output `.predictions.iac` retains source tile and slide identities,
+level-0 coordinates, spatial grid geometry, the model digest, seven
+classification probabilities, and both eleven-component spatial response
+grids. `PredictionPackageReader` decodes records, while
+`grid_cell_center_level0` maps any response cell back to the source WSI.
+Float16 spatial output is the default; `--spatial-dtype uint8` provides a
+compact bounded-error representation.
+
+Benchmark the same released model contract:
+
+```bash
+hcc-sempath benchmark \
+  --model /path/to/hcc-sempath-release \
+  --batch-size 128
 ```
 
 Run the A0 search only after the fixed train/validation expert assets pass its
 preflight:
 
 ```bash
-python scripts/optuna_a0_search.py \
-  --base-config configs/server/train_a0_optuna.example.yaml \
+python research/scripts/optuna_a0_search.py \
+  --base-config research/configs/train_a0_optuna.example.yaml \
   --n-trials 0
 ```
 
@@ -110,8 +144,8 @@ the contract-bound study with the same trial-seeded TPE trajectory and without
 exceeding its frozen 10-trial global budget:
 
 ```bash
-python scripts/optuna_a0_search.py \
-  --base-config configs/server/train_a0_optuna.example.yaml \
+python research/scripts/optuna_a0_search.py \
+  --base-config research/configs/train_a0_optuna.example.yaml \
   --n-trials 10 \
   --study-trials 10
 ```
@@ -122,8 +156,8 @@ receives the next trial, while constant-liar TPE accounts for configurations
 that remain in flight:
 
 ```bash
-python scripts/optuna_a0_search.py \
-  --base-config configs/server/train_a0_optuna.example.yaml \
+python research/scripts/optuna_a0_search.py \
+  --base-config research/configs/train_a0_optuna.example.yaml \
   --n-trials 10 \
   --study-trials 10 \
   --parallel-trials 4 \
@@ -158,14 +192,14 @@ whose tile/component records explicitly
 declare `roi_count_complete` and `roi_measurement_complete`:
 
 ```bash
-python scripts/calibrate_spatial_decoder.py \
+python research/scripts/calibrate_spatial_decoder.py \
   --checkpoint outputs/hcc_sempath_v2/checkpoints/best.pt \
   --annotation /path/to/hcc_spatial_validation.json \
   --validation-split val \
   --output-calibration outputs/hcc_sempath_v2/spatial_calibration.json \
   --output-report outputs/hcc_sempath_v2/spatial_validation_report.json
 
-python scripts/export_release_sempath.py \
+python research/scripts/export_release_sempath.py \
   --checkpoint outputs/hcc_sempath_v2/checkpoints/best.pt \
   --spatial-calibration outputs/hcc_sempath_v2/spatial_calibration.json \
   --output-dir artifacts/release/hcc_sempath_v2
@@ -182,36 +216,24 @@ Annotation states may contain local paths or case identifiers and must remain
 outside the public repository. Use an ignored local workspace or a controlled
 private study repository.
 
-Seed the shared boundary once:
-
-```bash
-hcc-sempath build-priority-list \
-  --annotations /private/study/classification_state.json \
-  --output /private/study/shared_priority_tiles.json
-```
-
 Start the combined annotation service:
 
 ```bash
-hcc-sempath annotate-prototypes \
+hcc-sempath annotate \
   --input /path/to/image_tile_iac_root \
   --classification-state /private/study/classification_state.json \
-  --spatial-state /private/study/spatial_state.json \
-  --priority-manifest /private/study/shared_priority_tiles.json \
-  --roi-candidate-manifest /private/study/spatial_candidates.json \
-  --roi-information-report /private/study/spatial_information_report.json
+  --spatial-state /private/study/spatial_state.json
 ```
 
-The interface exposes separate classification and spatial-annotation workspaces over a
-shared priority boundary. Existing component candidates prioritize the spatial
-queue, and the four-teacher information report increases priority for spatial
-components that still need coverage.
+The interface exposes classification and spatial-annotation workspaces over the
+same tile source. Study-specific priority, review, and ROI manifests can be
+supplied explicitly when a fixed annotation boundary is required.
 
 An explicit re-review pass can give each workspace its own ordered, read-only
 tile boundary:
 
 ```bash
-hcc-sempath annotate-prototypes \
+hcc-sempath annotate \
   --input /path/to/image_tile_iac_root \
   --classification-state /private/study/classification_review.json \
   --spatial-state /private/study/spatial_state.json \
@@ -285,7 +307,7 @@ calibration.
 Run the reusable spatial stopping audit from the repository root:
 
 ```bash
-python scripts/roi_information_curve.py \
+python research/scripts/roi_information_curve.py \
   --annotation-json /private/study/spatial_state.json \
   --teacher-feature-packages \
     'gigapath=/features/gigapath/*.iac,h_optimus_1=/features/h1/*.iac,uni2_h=/features/uni2/*.iac,virchow2=/features/virchow2/*.iac' \

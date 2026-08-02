@@ -27,7 +27,8 @@ from urllib.parse import parse_qs, urlparse
 
 from PIL import Image, ImageDraw
 
-from hcc_sempath.cli._annotation_tiles import AnnotationTilePackageReader, IacRecord
+from hcc_sempath.annotation.tiles import AnnotationTilePackageReader, IacRecord
+from hcc_sempath.spatial_schema import DEFAULT_SPATIAL_COMPONENTS
 from hcc_sempath.training.prototype_labels import (
     DEFAULT_CLASSIFICATION_CLASSES,
 )
@@ -46,19 +47,7 @@ MAX_OPEN_IAC_VIEWERS = 8
 
 CLASSIFICATION_PROTOTYPES = list(DEFAULT_CLASSIFICATION_CLASSES)
 
-SPATIAL_PROTOTYPES = [
-    "hepatocellular-parenchyma",
-    "necrosis",
-    "hemorrhage",
-    "bile-pigment",
-    "inflammatory-cell",
-    "fibroblast",
-    "fibrous-stroma",
-    "steatosis-vacuolation",
-    "small-vessel",
-    "large-vessel",
-    "ductular-portal",
-]
+SPATIAL_PROTOTYPES = list(DEFAULT_SPATIAL_COMPONENTS)
 
 # Spatial ROI taxonomy.
 ROI_SPATIAL_PROTOTYPES = list(SPATIAL_PROTOTYPES)

@@ -2,12 +2,12 @@
 set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "usage: scripts/run_autodl_training.sh CONFIG_PATH [LOG_PATH]" >&2
+  echo "usage: research/scripts/run_autodl_training.sh CONFIG_PATH [LOG_PATH]" >&2
   exit 2
 fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+REPO_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG_PATH="$1"
 if [[ "${CONFIG_PATH}" != /* ]]; then
   CONFIG_PATH="${REPO_DIR}/${CONFIG_PATH}"

@@ -1,17 +1,48 @@
 from __future__ import annotations
 
-import argparse
 import json
 from collections import Counter
 from pathlib import Path
 
-from hcc_sempath.cli.annotate_prototypes import ROI_SPATIAL_PROTOTYPES
+from hcc_sempath.spatial_schema import DEFAULT_SPATIAL_COMPONENTS
 
 
-# This only bounds the size of the component-positive navigation pool. It is not
-# an annotation target or a stopping rule; per-component information curves
-# decide whether additional expert annotation is needed.
+# This bounds only the component-positive navigation pool. Information curves,
+# not this planning cap, determine whether more annotation is required.
 DEFAULT_PLANNING_COVERAGE = 100
+
+
+def build_priority_manifest(annotation_paths: list[str | Path]) -> dict:
+    by_tile_id: dict[str, dict] = {}
+    for source in annotation_paths:
+        path = Path(source)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        annotations = payload.get("annotations")
+        if not isinstance(annotations, dict):
+            raise ValueError(f"priority source requires an annotations object: {path}")
+        for item in annotations.values():
+            tile_id = str(item.get("tile_id") or "").strip()
+            iac = str(item.get("iac") or item.get("iac_path") or "").strip()
+            row = int(item.get("row", -1))
+            if not tile_id or not iac or row < 0:
+                continue
+            candidate = {
+                "tile_id": tile_id,
+                "iac": iac,
+                "row": row,
+                "slide": str(item.get("slide") or item.get("slide_id") or ""),
+            }
+            previous = by_tile_id.get(tile_id)
+            if previous is not None and previous != candidate:
+                raise ValueError(f"conflicting duplicate tile_id: {tile_id}")
+            by_tile_id[tile_id] = candidate
+
+    candidates = sorted(by_tile_id.values(), key=lambda item: (Path(item["iac"]).as_posix(), item["row"], item["tile_id"]))
+    for rank, item in enumerate(candidates):
+        item["rank"] = rank
+    if not candidates:
+        raise ValueError("priority sources did not contain any usable annotations")
+    return {"version": 1, "candidate_count": len(candidates), "candidates": candidates}
 
 
 def _records(path: str | Path) -> list[dict]:
@@ -34,12 +65,15 @@ def build_roi_candidate_queue(
 ) -> dict:
     if planning_coverage <= 0:
         raise ValueError("planning_coverage must be positive")
-    attributes = list(ROI_SPATIAL_PROTOTYPES)
+    attributes = list(DEFAULT_SPATIAL_COMPONENTS)
     by_tile: dict[str, dict] = {}
     for path in annotation_paths:
         for item in _records(path):
             tile_id = str(item.get("tile_id") or "").strip()
-            source_spatial = sorted(set(item.get("source_spatial") or item.get("spatial") or []) & set(attributes))
+            source_spatial = sorted(
+                set(item.get("source_spatial") or item.get("spatial") or [])
+                & set(attributes)
+            )
             if not tile_id or not source_spatial:
                 continue
             candidate = {
@@ -57,22 +91,20 @@ def build_roi_candidate_queue(
     available = Counter()
     for item in by_tile.values():
         available.update(item["source_spatial"])
-    goals = {
-        name: min(planning_coverage, available[name])
-        for name in attributes
-    }
+    goals = {name: min(planning_coverage, available[name]) for name in attributes}
     selected: list[dict] = []
     counts = Counter()
     remaining = dict(by_tile)
     while True:
-        useful = {
-            name: max(0, goals[name] - counts[name])
-            for name in attributes
-        }
+        useful = {name: max(0, goals[name] - counts[name]) for name in attributes}
         best = min(
             remaining.values(),
             key=lambda item: (
-                -sum(1 / max(1, available[name]) for name in item["source_spatial"] if useful[name]),
+                -sum(
+                    1 / max(1, available[name])
+                    for name in item["source_spatial"]
+                    if useful[name]
+                ),
                 -sum(useful[name] for name in item["source_spatial"]),
                 item["slide"],
                 item["tile_id"],
@@ -101,57 +133,3 @@ def build_roi_candidate_queue(
         "candidate_count": len(selected),
         "candidates": selected,
     }
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Build a component-presence navigation pool for ROI annotation."
-    )
-    parser.add_argument(
-        "--annotations",
-        action="append",
-        required=True,
-        help=(
-            "Tile-level annotation JSON or supplemental candidate JSON; "
-            "repeatable. Existing spatial labels are optional and only affect "
-            "priority."
-        ),
-    )
-    parser.add_argument("--output", required=True)
-    parser.add_argument(
-        "--planning-coverage",
-        type=int,
-        default=DEFAULT_PLANNING_COVERAGE,
-        help=(
-            "Maximum positive-tile coverage retained per component "
-            "for navigation planning; this is not an annotation target."
-        ),
-    )
-    parser.add_argument("--overwrite", action="store_true")
-    args = parser.parse_args()
-    output = Path(args.output)
-    if output.exists() and not args.overwrite:
-        raise FileExistsError(f"refusing to replace ROI candidate pool without --overwrite: {output}")
-    payload = build_roi_candidate_queue(
-        args.annotations,
-        planning_coverage=args.planning_coverage,
-    )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    print(
-        json.dumps(
-            {
-                key: payload[key]
-                for key in (
-                    "candidate_count",
-                    "source_positive_inventory",
-                    "unfilled_planning_coverage",
-                )
-            },
-            indent=2,
-        )
-    )
-
-
-if __name__ == "__main__":
-    main()

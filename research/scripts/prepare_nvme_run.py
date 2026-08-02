@@ -8,7 +8,7 @@ import sys
 
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -20,7 +20,7 @@ from experiments.ablation.scripts.resolve_ablation_config import (
 )
 from hcc_sempath.training.config import _deep_merge
 from hcc_sempath.training.train import _file_sha256, _source_tree_sha256
-from scripts.optuna_a0_search import (
+from research.scripts.optuna_a0_search import (
     _expert_split_tile_counts,
     _population_validation_contract,
     _resolved_training_iac_paths,

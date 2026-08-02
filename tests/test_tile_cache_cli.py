@@ -4,8 +4,8 @@ from tempfile import TemporaryDirectory
 
 import pytest
 
-from hcc_sempath.cli import tile_cache
-from hcc_sempath.cli.tile_cache import _discover_wsi, _plan_slide_jobs, _safe_id, _write_batch_progress
+from hcc_sempath.build import tiles as tile_cache
+from hcc_sempath.build.tiles import _discover_wsi, _plan_slide_jobs, _safe_id, _write_batch_progress
 
 
 def test_discover_wsi_scans_only_directory_top_level_for_mrxs_layout() -> None:
