@@ -1,6 +1,6 @@
 inherits: matched_tenth.yaml
 
-# Ablation A12 — remove only student prototype-response matching.
+# Ablation A11 — remove only student prototype-response matching.
 #
 # Prototype coordinates, direct classification supervision, multi-teacher
 # feature/relation distillation, and prototype-adjudicated teacher reliability
@@ -9,7 +9,7 @@ inherits: matched_tenth.yaml
 # the inherited schedule so checkpoint eligibility is unchanged.
 
 runtime:
-  output_dir: outputs/experiments/ablation/a12_no_student_response
+  output_dir: outputs/experiments/ablation/a11_no_student_response
 
 loss:
   zhcc_response_weight: 0.0

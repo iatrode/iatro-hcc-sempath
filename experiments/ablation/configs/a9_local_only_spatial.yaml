@@ -1,10 +1,10 @@
 inherits: matched_tenth.yaml
 
-# A10: A0 without the final-Transformer semantic branch. The spatial head uses
+# A9: A0 without the final-Transformer semantic branch. The spatial head uses
 # only the stride-7 reuse of the pretrained 14x14 patch projection.
 
 runtime:
-  output_dir: outputs/experiments/ablation/a10_local_only_spatial
+  output_dir: outputs/experiments/ablation/a9_local_only_spatial
 
 model:
   spatial_use_semantic_branch: false

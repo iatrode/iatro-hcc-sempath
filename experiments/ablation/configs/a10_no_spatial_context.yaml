@@ -1,0 +1,10 @@
+inherits: matched_tenth.yaml
+
+# A10: A0 with both observation branches retained but without the dilation
+# 1/2/4 residual context stack.
+
+runtime:
+  output_dir: outputs/experiments/ablation/a10_no_spatial_context
+
+model:
+  spatial_use_context: false

@@ -266,11 +266,10 @@ def test_condition_files_encode_only_the_prespecified_interventions() -> None:
         "a5": {"train": {"dynamic_prototype_refresh_steps": 0}},
         "a6": {"train": {"dynamic_spatial_prototype_refresh_steps": 0}},
         "a7": {"loss": {"prototype_filter_weight": 1.0}},
-        "a8": {"loss": {"spatial_detach_shared_encoder": True}},
-        "a9": {"model": {"spatial_use_local_branch": False}},
-        "a10": {"model": {"spatial_use_semantic_branch": False}},
-        "a11": {"model": {"spatial_use_context": False}},
-        "a12": {"loss": {"zhcc_response_weight": 0.0}},
+        "a8": {"model": {"spatial_use_local_branch": False}},
+        "a9": {"model": {"spatial_use_semantic_branch": False}},
+        "a10": {"model": {"spatial_use_context": False}},
+        "a11": {"loss": {"zhcc_response_weight": 0.0}},
     }
     conditions = sorted(CONFIG_ROOT.glob("a*.yaml"))
     assert len(conditions) == len(expected)
@@ -287,9 +286,9 @@ def test_all_conditions_reuse_the_selected_a0_budget_and_schedule(
     tmp_path: Path,
 ) -> None:
     conditions = sorted(CONFIG_ROOT.glob("a[1-9]_*.yaml")) + sorted(
-        CONFIG_ROOT.glob("a1[0-2]_*.yaml")
+        CONFIG_ROOT.glob("a1[0-1]_*.yaml")
     )
-    assert len(conditions) == 12
+    assert len(conditions) == 11
 
     for condition in conditions:
         resolved = resolve_ablation_config(
@@ -395,9 +394,9 @@ def test_global_and_spatial_prototype_refresh_are_independent(
 def test_spatial_architecture_conditions_change_one_named_control(
     tmp_path: Path,
 ) -> None:
-    semantic_only = _resolve(tmp_path, "a9")
-    local_only = _resolve(tmp_path, "a10")
-    no_context = _resolve(tmp_path, "a11")
+    semantic_only = _resolve(tmp_path, "a8")
+    local_only = _resolve(tmp_path, "a9")
+    no_context = _resolve(tmp_path, "a10")
 
     assert semantic_only["model"]["spatial_use_local_branch"] is False
     assert semantic_only["model"]["spatial_use_semantic_branch"] is True
@@ -409,7 +408,7 @@ def test_spatial_architecture_conditions_change_one_named_control(
 def test_no_student_response_changes_only_the_response_objective(
     tmp_path: Path,
 ) -> None:
-    no_response = _resolve(tmp_path, "a12")
+    no_response = _resolve(tmp_path, "a11")
 
     assert no_response["loss"]["zhcc_response_weight"] == 0.0
     assert no_response["loss"]["prototype_filter_weight"] == pytest.approx(0.5)

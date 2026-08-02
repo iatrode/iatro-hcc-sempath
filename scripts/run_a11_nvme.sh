@@ -11,16 +11,16 @@ VERIFIED_ASSET_RECEIPT="${HCC_SEMPATH_VERIFIED_ASSET_RECEIPT:-${CONFIG_ROOT}/ver
 
 cd "${REPO_DIR}"
 PYTHONPATH="${REPO_DIR}/src" "${PYTHON_BIN}" -m scripts.prepare_nvme_run \
-  --mode a12 \
+  --mode a11 \
   --best-config "${CONFIG_ROOT}/a0_best_config.yaml" \
   --manifest-template "${CONFIG_ROOT}/manifest.template.yaml" \
   --manifest-output "${CONFIG_ROOT}/manifest.local_nvme.yaml" \
   --data-root "${DATA_ROOT}" \
   --output-root "${DATA_ROOT}/outputs" \
-  --output-config "${CONFIG_ROOT}/a12.local_nvme.yaml" \
+  --output-config "${CONFIG_ROOT}/a11.local_nvme.yaml" \
   --verified-asset-receipt "${VERIFIED_ASSET_RECEIPT}" \
   --source-commit "${SOURCE_COMMIT}"
 
 export HCC_SEMPATH_VERIFIED_ASSET_RECEIPT="${VERIFIED_ASSET_RECEIPT}"
 exec "${SCRIPT_DIR}/launch_nvme_training.sh" \
-  sempath-a12 "${CONFIG_ROOT}/a12.local_nvme.yaml"
+  sempath-a11 "${CONFIG_ROOT}/a11.local_nvme.yaml"

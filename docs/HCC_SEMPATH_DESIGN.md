@@ -265,8 +265,7 @@ expert_supervision_ramp_steps  1000
 ```
 
 Both expert tasks reach the shared encoder from their first non-zero supervised
-update. Detaching the spatial task from the shared encoder is restricted to the named A8
-mechanism ablation. PAMT-D reliability filtering and student-response matching
+update. PAMT-D reliability filtering and student-response matching
 begin after the common expert ramp and then increase to their configured
 strength. Global and spatial gradient norms, spatial gradient share, and
 gradient cosine are measured on the final shared Transformer block.
@@ -505,7 +504,7 @@ Implementation conformance requires:
    plateaus, not a preset tile quota;
 7. formal ablations retain the same fixed 10% population subset and complete
    expert union, and differ only by the named mechanism; A1 is the package-level
-   global expert-intervention control, whereas A2 and A12 isolate
+   global expert-intervention control, whereas A2 and A11 isolate
    prototype-adjudicated reliability and student-response matching;
 8. only an independently calibrated, finalized joint-selection checkpoint can
    become a release.

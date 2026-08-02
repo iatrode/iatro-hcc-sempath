@@ -616,7 +616,7 @@ def test_spatial_supervision_reaches_shared_encoder_during_common_ramp() -> None
     assert joint["spatial_detach_backbone"] is False
 
 
-def test_detached_spatial_encoder_is_an_explicit_ablation_only() -> None:
+def test_detached_spatial_encoder_requires_explicit_configuration() -> None:
     cfg = {
         "loss": {
             "spatial_weight": 0.2,

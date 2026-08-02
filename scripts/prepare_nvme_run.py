@@ -76,13 +76,13 @@ def _write_yaml(path: Path, payload: dict) -> None:
     temporary.replace(path)
 
 
-def _prepare_a12(base: dict, repo: Path, output_root: Path) -> dict:
+def _prepare_a11(base: dict, repo: Path, output_root: Path) -> dict:
     base = copy.deepcopy(base)
     selected = _selected_a0_provenance(base)
     base_selection = _selection_contract(base)
     condition_path = (
         repo
-        / "experiments/ablation/configs/a12_no_student_response.yaml"
+        / "experiments/ablation/configs/a11_no_student_response.yaml"
     )
     condition = _raw_config(condition_path)
     parent = Path(str(condition.pop("inherits")))
@@ -93,7 +93,7 @@ def _prepare_a12(base: dict, repo: Path, output_root: Path) -> dict:
     resolved = _deep_merge(base, parent_overlay)
     resolved = _deep_merge(resolved, condition)
     if _selection_contract(resolved) != base_selection:
-        raise ValueError("A12 changed the selected A0 checkpoint rule")
+        raise ValueError("A11 changed the selected A0 checkpoint rule")
     resolved["train"].pop("selection_metric_baseline", None)
     study_digest = resolved["data"].pop(
         "formal_study_contract_sha256"
@@ -103,7 +103,7 @@ def _prepare_a12(base: dict, repo: Path, output_root: Path) -> dict:
     )
     resolved["data"]["formal_a0_selection"] = selected
     resolved["runtime"]["output_dir"] = str(
-        (output_root / "a12_no_student_response").resolve()
+        (output_root / "a11_no_student_response").resolve()
     )
     return resolved
 
@@ -266,8 +266,8 @@ def prepare(args: argparse.Namespace) -> dict:
     if not isinstance(base, dict):
         raise ValueError("best_config must be a YAML mapping")
     config = (
-        _prepare_a12(base, repo, output_root)
-        if args.mode == "a12"
+        _prepare_a11(base, repo, output_root)
+        if args.mode == "a11"
         else _prepare_full(base, output_root)
     )
     _relocate_assets(
@@ -289,7 +289,7 @@ def prepare(args: argparse.Namespace) -> dict:
         "source_mode": "declared_archive",
         "source_tree_sha256": _source_tree_sha256(repo),
     }
-    if args.mode == "a12":
+    if args.mode == "a11":
         config["data"].pop("formal_ablation_contract_sha256", None)
         config["data"]["formal_ablation_contract_sha256"] = (
             _ablation_config_sha256(config)
@@ -310,7 +310,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Prepare content-identical SemPath runs on local NVMe."
     )
-    parser.add_argument("--mode", choices=("a12", "full"), required=True)
+    parser.add_argument("--mode", choices=("a11", "full"), required=True)
     parser.add_argument("--best-config", type=Path, required=True)
     parser.add_argument("--manifest-template", type=Path, required=True)
     parser.add_argument("--manifest-output", type=Path, required=True)

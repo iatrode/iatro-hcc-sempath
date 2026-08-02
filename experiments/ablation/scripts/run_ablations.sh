@@ -36,16 +36,15 @@ declare -A CONFIGS=(
   [a5]="experiments/ablation/configs/a5_static_global_prototypes.yaml"
   [a6]="experiments/ablation/configs/a6_static_spatial_prototypes.yaml"
   [a7]="experiments/ablation/configs/a7_full_filter_sensitivity.yaml"
-  [a8]="experiments/ablation/configs/a8_detached_spatial_backbone.yaml"
-  [a9]="experiments/ablation/configs/a9_semantic_only_spatial.yaml"
-  [a10]="experiments/ablation/configs/a10_local_only_spatial.yaml"
-  [a11]="experiments/ablation/configs/a11_no_spatial_context.yaml"
-  [a12]="experiments/ablation/configs/a12_no_student_response.yaml"
+  [a8]="experiments/ablation/configs/a8_semantic_only_spatial.yaml"
+  [a9]="experiments/ablation/configs/a9_local_only_spatial.yaml"
+  [a10]="experiments/ablation/configs/a10_no_spatial_context.yaml"
+  [a11]="experiments/ablation/configs/a11_no_student_response.yaml"
 )
 
 conditions=("$@")
 if [ "${#conditions[@]}" -eq 0 ]; then
-  conditions=(a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12)
+  conditions=(a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11)
 fi
 if [ -z "${HCC_SEMPATH_ABLATION_BASE_CONFIG:-}" ]; then
   echo "HCC_SEMPATH_ABLATION_BASE_CONFIG must point to the completed study's exported best_config.yaml" >&2

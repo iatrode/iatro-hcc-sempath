@@ -1,10 +1,10 @@
 inherits: matched_tenth.yaml
 
-# A9: A0 without the stride-7 local observation branch. The spatial head uses
+# A8: A0 without the stride-7 local observation branch. The spatial head uses
 # only final Transformer tokens resampled onto the unchanged 32x32 output grid.
 
 runtime:
-  output_dir: outputs/experiments/ablation/a9_semantic_only_spatial
+  output_dir: outputs/experiments/ablation/a8_semantic_only_spatial
 
 model:
   spatial_use_local_branch: false
