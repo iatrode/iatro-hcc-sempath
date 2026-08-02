@@ -11,6 +11,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from hcc_sempath.build.wsi import _default_workers, _format_bytes, build_wsi_iac
+from hcc_sempath.iac_naming import PATHOLOGY_TILE_SUFFIX
 from iatro.iac.adapters.tiles import read_package_metadata
 
 
@@ -89,7 +90,7 @@ def _print_package_stats(status: str, slide_id: str, stats: dict) -> None:
 def _package_path_for_slide(output: Path, slide_id: str, total_slides: int) -> Path:
     if total_slides == 1 and output.suffix == ".iac":
         return output
-    return output / f"{slide_id}.tiles.iac"
+    return output / f"{slide_id}{PATHOLOGY_TILE_SUFFIX}"
 
 
 def _qc_path_for_slide(output: Path, slide_id: str, package_path: Path, enabled: bool, total_slides: int) -> Path | None:
@@ -173,7 +174,10 @@ def main() -> None:
     parser.add_argument(
         "--output",
         required=True,
-        help="Output .tiles.iac path for one WSI, or output directory for a WSI directory.",
+        help=(
+            f"Output {PATHOLOGY_TILE_SUFFIX} path for one WSI, or output directory "
+            "for a WSI directory."
+        ),
     )
     parser.add_argument("--patient-id", default=None, help="Patient id for a single WSI; defaults to slide id.")
     parser.add_argument("--slide-id", default=None, help="Slide id for a single WSI; defaults to file stem.")
@@ -212,6 +216,12 @@ def main() -> None:
         slides = slides[: args.limit]
     if len(slides) > 1 and output.suffix == ".iac":
         raise ValueError("--output must be a directory when --input resolves to multiple WSI files")
+    if (
+        len(slides) == 1
+        and output.suffix == ".iac"
+        and not output.name.endswith(PATHOLOGY_TILE_SUFFIX)
+    ):
+        raise ValueError(f"pathology tile output must end with {PATHOLOGY_TILE_SUFFIX}: {output}")
     if len(slides) == 1 and output.suffix == ".iac":
         output.parent.mkdir(parents=True, exist_ok=True)
     else:

@@ -218,7 +218,7 @@ def test_teacher_cache_batch_skips_existing_valid_output_and_writes_progress(tmp
     tile_package = _write_tile_package(tmp_path)
     output_dir = tmp_path / "features"
     output_dir.mkdir()
-    feature_package = output_dir / "slide_a.toy.features.iac"
+    feature_package = output_dir / "slide_a.toy.feat.path.iac"
     build_teacher_feature_package_from_tile_package(
         tile_package,
         [np.arange(4, dtype=np.float32)],
@@ -247,7 +247,7 @@ def test_teacher_cache_batch_records_invalid_existing_output_with_continue(tmp_p
     tile_package = _write_tile_package(tmp_path)
     output_dir = tmp_path / "features"
     output_dir.mkdir()
-    (output_dir / "slide_a.toy.features.iac").write_text("not a package", encoding="utf-8")
+    (output_dir / "slide_a.toy.feat.path.iac").write_text("not a package", encoding="utf-8")
 
     cache_teacher_features_from_packages(
         model=torch.nn.Identity(),
@@ -279,7 +279,7 @@ def test_teacher_cache_package_releases_worker_processes_across_iacs(tmp_path: P
         cache_teacher_features_from_package(
             model=model,
             package_path=tile_package,
-            output_path=tmp_path / f"slide_{idx}.toy.features.iac",
+            output_path=tmp_path / f"slide_{idx}.toy.feat.path.iac",
             tile_size=None,
             batch_size=4,
             device="cpu",
@@ -311,7 +311,7 @@ def test_discover_tile_packages_rejects_invalid_iac_in_input_directory(tmp_path:
 
 def test_discover_tile_packages_rejects_non_tile_file_input(tmp_path: Path) -> None:
     tile_package = _write_tile_package(tmp_path)
-    feature_package = tmp_path / "slide_a.toy.features.iac"
+    feature_package = tmp_path / "slide_a.toy.feat.path.iac"
     build_teacher_feature_package_from_tile_package(
         tile_package,
         [np.arange(4, dtype=np.float32)],

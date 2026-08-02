@@ -165,10 +165,11 @@ the operator.
 
 ## Command surface
 
-The installed CLI exposes seven stable top-level workflows:
+The installed CLI exposes eight stable top-level workflows:
 
 ```text
 hcc-sempath build       Build reusable tiles, features, manifests, and supervision
+hcc-sempath download    Download the gated release into the local model cache
 hcc-sempath annotate    Run the classification/spatial annotation workspace
 hcc-sempath train       Train or resume a SemPath student
 hcc-sempath evaluate    Evaluate a checkpoint against a resolved configuration
@@ -200,35 +201,52 @@ hcc-sempath infer --help
 
 ## Quickstart: released-model inference
 
-Inference needs a separately obtained gated release bundle and one tile IAC
-package or directory of packages:
+After gated access is approved, download the release once. The command selects
+ModelScope for a China public IP and Hugging Face otherwise; `--hub` can make
+that choice explicit.
 
 ```bash
+hcc-sempath download
+
 hcc-sempath infer \
-  --model /path/to/hcc-sempath-release \
-  --input /path/to/tile-iac-root \
+  --input /path/to/case.svs \
   --output /path/to/predictions
 ```
 
-The output is one `.predictions.iac` package per source tile package. It
-contains seven classification probabilities and dense eleven-component spatial
-responses while preserving the information needed to map every grid cell back
-to the source WSI.
+`infer` resolves the downloaded release from the local model cache. A release
+stored elsewhere can be selected with `--model`; `--hub {hf,modelscope}` and
+`--cache-dir` select a particular local cache.
+
+The input may be:
+
+- a `<name>.tile.path.iac` package;
+- one 224x224 or 244x244 PNG, JPEG, WebP, or BMP image;
+- one WSI or a directory containing `.svs`, `.mrxs`, `.ndpi`, `.scn`, `.tif`,
+  or `.tiff` slides.
+
+A 244x244 raster is centre-cropped to the native 224x224 model field at its
+original pixel scale. A WSI is first downsampled to `--target-mpp`, segmented by the
+low-resolution tissue mask and per-tile tissue test, and retained as
+`<name>.tile.path.iac`. Inference then writes `<name>.pred.path.iac`. Both the
+WSI-to-IAC stage and the model stage show progress by default.
 
 Use float16 to retain the model outputs without an additional integer
 quantization step, or a bounded integer encoding for smaller files:
 
 ```bash
 hcc-sempath infer \
-  --model /path/to/hcc-sempath-release \
-  --input /path/to/tile-iac-root \
+  --input /path/to/case.mrxs \
   --output /path/to/predictions \
+  --target-mpp 0.5 \
+  --min-tissue-fraction 0.10 \
   --spatial-dtype float16 \
   --batch-size 128 \
   --workers 8
 ```
 
-Existing outputs are protected unless `--overwrite` is supplied.
+Use `--native-mpp`/`--native-mpp-y` when trustworthy WSI MPP cannot be read.
+Existing tile and prediction outputs are protected unless `--overwrite` is
+supplied. `--no-progress` suppresses progress bars.
 
 ## Complete modelling workflow
 
@@ -245,7 +263,7 @@ hcc-sempath build tiles \
   --input /controlled/wsis \
   --output /assets/tiles \
   --target-mpp 0.5 \
-  --tile-size 512 \
+  --tile-size 224 \
   --min-tissue-fraction 0.30 \
   --workers 8 \
   --lossless
@@ -261,7 +279,7 @@ Important inputs:
 
 Outputs:
 
-- one `.tiles.iac` package per processed slide/source;
+- one `<name>.tile.path.iac` package per processed slide/source;
 - `packages.csv`, `batch_summary.json`, and `batch_progress.json` in directory
   mode;
 - optional per-slide QC images when `--qc` is enabled.
@@ -273,88 +291,61 @@ Acceptance gate:
 - MPP, tile size, and source-level geometry are coherent;
 - tissue filtering and any QC sample are reviewed before feature extraction.
 
-### 2. Cache each frozen teacher once
+### 2. Build the merged four-teacher feature package
 
-Build one aligned feature stream for each teacher. The logical teacher name is
-part of the file and manifest contract.
+The public builder runs the fixed GigaPath, H-optimus-1, UNI2-h, and Virchow2
+teachers, verifies their row alignment, and writes one merged package per tile
+package.
 
 ```bash
 hcc-sempath build teacher-features \
   --input /assets/tiles \
-  --output /assets/features/gigapath \
-  --teacher gigapath \
+  --output /assets/features \
   --device cuda \
-  --precision fp16 \
+  --precision bf16 \
   --batch-size 128 \
   --num-workers 8 \
   --validate-output
-
-hcc-sempath build teacher-features \
-  --input /assets/tiles \
-  --output /assets/features/h_optimus_1 \
-  --teacher h_optimus_1 \
-  --device cuda \
-  --validate-output
-
-hcc-sempath build teacher-features \
-  --input /assets/tiles \
-  --output /assets/features/uni2_h \
-  --teacher uni2_h \
-  --device cuda \
-  --validate-output
-
-hcc-sempath build teacher-features \
-  --input /assets/tiles \
-  --output /assets/features/virchow2 \
-  --teacher virchow2 \
-  --device cuda \
-  --validate-output
 ```
 
-`--teacher-name` can bind a provider-specific model identifier when the preset
-is not sufficient. `--pretrained`, `--compile`, precision, feature dtype, and
-device are explicit operator choices. A progress manifest permits a controlled
-restart; `--continue-on-error` should only be used when the resulting omissions
-will be audited.
+`--pretrained`, `--compile`, precision, feature dtype, and device are explicit
+operator choices. Single-teacher packages are staging files only. They are
+removed after the merged output passes record-count, tile-ID, dimension, byte,
+and sampled exact-value checks; interrupted staging is retained for restart.
 
 Outputs:
 
-- `<tile-package-stem>.<teacher>.features.iac`;
-- a progress CSV and JSON summary for directory runs.
+- one `<name>.feat.path.iac` containing all four teacher vectors per tile;
+- `feature_build_manifest.json` describing the merged packages and dimensions.
 
 Acceptance gate:
 
-- every feature package has the same record count and tile-ID order as its tile
+- the merged package has the same record count and tile-ID order as its tile
   package;
-- the stored feature dimension matches the selected teacher contract;
-- all four teacher streams cover exactly the dataset boundary intended for the
-  subsequent manifest.
+- all four declared teacher dimensions are present;
+- the merged bytes reproduce the verified staging vectors exactly.
 
 Virchow2 uses its class token concatenated with the mean patch-token response;
 this is part of the frozen feature contract, not a runtime switch.
 
-### 3. Optionally merge the four feature streams
+### 3. Optionally prepare the merged cache for training order
 
-The merged training cache reduces repeated small-file access without changing
-feature values:
+`teacher-features` already emits the merged feature contract. `training-cache`
+is only needed when the training run also requires the deterministic row order
+preparation used by the study pipeline:
 
 ```bash
 hcc-sempath build training-cache \
   --tile-root /assets/tiles \
   --feature-root /assets/features \
   --seed 13 \
-  --teacher gigapath=gigapath \
-  --teacher h_optimus_1=h_optimus_1 \
-  --teacher uni2_h=uni2_h \
-  --teacher virchow2=virchow2 \
   --workers 8
 ```
 
-Merged packages are written below
-`<feature-root>/merged/<dataset>/`. The builder verifies record count, tile-ID
-order, dimensions, byte size, and sampled exact feature equality. Use
-`--validate-only` for an existing cache. `--delete-source` is intentionally
-destructive and is not part of the default workflow.
+Packages remain at `<feature-root>/<dataset>/<name>.feat.path.iac`.
+The command validates record count, tile-ID order, dimensions, byte size, and
+sampled exact feature equality before preparing the paired row order. Use
+`--validate-only` for an existing cache.
 
 ### 4. Construct patient/slide-separated manifests
 
@@ -679,7 +670,7 @@ from hcc_sempath.inference.predictions import (
     grid_cell_center_level0,
 )
 
-with PredictionPackageReader("slide.predictions.iac") as reader:
+with PredictionPackageReader("slide.pred.path.iac") as reader:
     prediction = reader.read_at(0)
     index = reader.index_table.slice(0, 1).to_pylist()[0]
     center_x, center_y = grid_cell_center_level0(

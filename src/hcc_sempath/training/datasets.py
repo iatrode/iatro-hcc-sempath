@@ -17,12 +17,12 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 from iatro.iac.adapters.features import FeatureCacheReader
-from iatro.iac import read_header, read_tables
+from iatro.iac import read_header
 from iatro.iac.adapters.manifests import TileRecord
 from iatro.iac.adapters.tiles import TilePackageReader
+from hcc_sempath.iac_naming import pathology_feature_stem, pathology_tile_stem
 from .feature_pack_merge import (
     MERGED_FEATURE_PAYLOAD_TYPE,
-    MERGED_FEATURE_SUFFIX,
     MergedTeacherFeatureCacheReader,
 )
 from .prototype_labels import PrototypeLabel
@@ -288,10 +288,7 @@ def _strip_required_suffix(path: Path, suffix: str) -> str:
 
 
 def _feature_package_matches_tile_stem(feature_path: Path, tile_stem: str) -> bool:
-    if feature_path.name.endswith(MERGED_FEATURE_SUFFIX):
-        feature_stem = _strip_required_suffix(feature_path, MERGED_FEATURE_SUFFIX)
-        return feature_stem == tile_stem or feature_stem.startswith(f"{tile_stem}.")
-    feature_stem = _strip_required_suffix(feature_path, ".features.iac")
+    feature_stem = pathology_feature_stem(feature_path)
     return feature_stem == tile_stem or feature_stem.startswith(f"{tile_stem}.")
 
 
@@ -342,7 +339,7 @@ def validate_teacher_feature_package_pairs(
         tile_header = package_headers[tile_path]
         if tile_header.get("payload_type") != "image_tiles":
             raise ValueError(f"not an image tile package: {tile_path}")
-        tile_stem = _strip_required_suffix(tile_path, ".tiles.iac")
+        tile_stem = pathology_tile_stem(tile_path)
         count = int(tile_header["num_records"])
         if count <= 0:
             raise ValueError(f"empty tile package: {tile_path}")
@@ -413,7 +410,7 @@ class DistillationTileDataset(Dataset):
     ) -> None:
         self.records = records
         if teacher_cache_dir is not None:
-            raise ValueError("loose teacher feature directories are not supported; use a .features.iac package")
+            raise ValueError("loose teacher feature directories are not supported; use a .feat.path.iac package")
         self.package_reader = TilePackageReader(tile_package_path) if tile_package_path else None
         self.active_package_path: Path | None = None
         self.active_package_reader: TilePackageReader | None = None

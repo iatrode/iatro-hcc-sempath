@@ -11,7 +11,7 @@ def test_top_level_help_exposes_workflows_not_legacy_commands(capsys) -> None:
     cli_main.main([])
 
     output = capsys.readouterr().out
-    for command in ("build", "annotate", "train", "evaluate", "export", "infer", "benchmark"):
+    for command in ("build", "download", "annotate", "train", "evaluate", "export", "infer", "benchmark"):
         assert command in output
     for legacy in (
         "build-tile-cache",
@@ -40,10 +40,11 @@ def test_build_help_lists_public_assets(capsys) -> None:
     ("argv", "module_name", "program"),
     [
         (["build", "tiles", "--help"], "hcc_sempath.build.tiles", "hcc-sempath build tiles"),
-        (["build", "teacher-features", "--help"], "hcc_sempath.teacher.cache", "hcc-sempath build teacher-features"),
+        (["build", "teacher-features", "--help"], "hcc_sempath.build.teacher_features", "hcc-sempath build teacher-features"),
         (["build", "training-cache", "--help"], "hcc_sempath.build.training_cache", "hcc-sempath build training-cache"),
         (["build", "manifest", "--help"], "hcc_sempath.training.manifest", "hcc-sempath build manifest"),
         (["build", "supervision", "--help"], "hcc_sempath.build.supervision", "hcc-sempath build supervision"),
+        (["download", "--help"], "hcc_sempath.download", "hcc-sempath download"),
         (["annotate", "--help"], "hcc_sempath.annotation.server", "hcc-sempath annotate"),
         (["train", "--help"], "hcc_sempath.training.train", "hcc-sempath train"),
         (["evaluate", "--help"], "hcc_sempath.training.evaluate", "hcc-sempath evaluate"),

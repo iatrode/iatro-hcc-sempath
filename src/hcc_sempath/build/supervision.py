@@ -16,9 +16,10 @@ from hcc_sempath.training.feature_pack_merge import (
     MergedTeacherFeatureCacheReader,
     is_merged_teacher_feature_package,
 )
+from hcc_sempath.iac_naming import PATHOLOGY_TILE_SUFFIX, pathology_feature_candidates
 
 
-TILE_SUFFIX = ".tiles.iac"
+TILE_SUFFIX = PATHOLOGY_TILE_SUFFIX
 TEACHERS = ("gigapath", "h_optimus_1", "uni2_h", "virchow2")
 TARGET_PER_CLASS = 400
 SEPARATION_WEIGHT = 32.0
@@ -92,10 +93,10 @@ def _feature_path(manifest: dict[str, Any], item: dict[str, Any], teacher: str) 
         raise ValueError(f"annotation row missing iac name: tile_id={item.get('tile_id')}")
     stem = _strip_suffix(iac_name, str(manifest.get("tile_suffix", TILE_SUFFIX)))
     feature_dir = Path(feature_roots[teacher]) / dataset
-    matches = sorted(feature_dir.glob(f"{stem}.*.features.iac"))
+    matches = pathology_feature_candidates(feature_dir, stem)
     if not matches:
         raise FileNotFoundError(
-            f"missing feature package teacher={teacher} tile_id={item.get('tile_id')} expected={feature_dir}/{stem}.*.features.iac"
+            f"missing feature package teacher={teacher} tile_id={item.get('tile_id')} expected={feature_dir}/{stem}.feat.path.iac"
         )
     if len(matches) > 1:
         raise RuntimeError(f"ambiguous feature packages teacher={teacher} tile_id={item.get('tile_id')}: {matches}")

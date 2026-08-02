@@ -57,7 +57,7 @@ def test_batch_progress_is_updated_for_skipped_packages(monkeypatch, tmp_path: P
     output_root.mkdir()
     for stem in ("a", "b"):
         (input_root / f"{stem}.svs").write_text("slide", encoding="utf-8")
-        (output_root / f"{stem}.tiles.iac").write_text("existing", encoding="utf-8")
+        (output_root / f"{stem}.tile.path.iac").write_text("existing", encoding="utf-8")
 
     monkeypatch.setattr(
         "sys.argv",

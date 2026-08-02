@@ -8,11 +8,16 @@ import numpy as np
 import pyarrow as pa
 
 from iatro.iac import PackReader, build_pack_data_segment_from_file, read_header, read_tables
+from hcc_sempath.iac_naming import (
+    PATHOLOGY_FEATURE_SUFFIX,
+    PATHOLOGY_TILE_SUFFIX,
+    pathology_tile_stem,
+)
 
 
 MERGED_FEATURE_PAYLOAD_TYPE = "merged_teacher_features"
-MERGED_FEATURE_SUFFIX = ".merged.features.iac"
-TILE_SUFFIX = ".tiles.iac"
+MERGED_FEATURE_SUFFIX = PATHOLOGY_FEATURE_SUFFIX
+TILE_SUFFIX = PATHOLOGY_TILE_SUFFIX
 
 
 def is_merged_teacher_feature_package(path: str | Path) -> bool:
@@ -340,7 +345,7 @@ def _strip_suffix(path: Path, suffix: str) -> str:
 
 
 def _merged_output_path(tile_path: Path, first_feature_path: Path) -> Path:
-    tile_stem = _strip_suffix(tile_path, TILE_SUFFIX)
+    tile_stem = pathology_tile_stem(tile_path)
     return first_feature_path.with_name(f"{tile_stem}{MERGED_FEATURE_SUFFIX}")
 
 

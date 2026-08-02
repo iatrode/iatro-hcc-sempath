@@ -144,10 +144,11 @@ PyTorch/CUDA 组合；HCC-SemPath 不会替使用方创建或选择 CUDA 环境�
 
 ## 命令结构
 
-安装后 CLI 提供七个稳定的顶层工作流：
+安装后 CLI 提供八个稳定的顶层工作流：
 
 ```text
 hcc-sempath build       构建可复用 tile、特征、manifest 与监督资产
+hcc-sempath download    将 gated 发布模型下载到本地模型缓存
 hcc-sempath annotate    启动分类/空间联合标注工作区
 hcc-sempath train       训练或恢复 SemPath 学生模型
 hcc-sempath evaluate    按解析后的配置评估检查点
@@ -179,32 +180,47 @@ hcc-sempath infer --help
 
 ## 快速开始：使用发布模型推理
 
-推理需要单独取得的 gated 发布模型包，以及一个 tile IAC 包或包含多个包的目录：
+Gated 访问获批后只需下载一次发布模型。命令在中国公网 IP 下选择 ModelScope，其他
+地区选择 Hugging Face；也可通过 `--hub` 显式指定。
 
 ```bash
+hcc-sempath download
+
 hcc-sempath infer \
-  --model /path/to/hcc-sempath-release \
-  --input /path/to/tile-iac-root \
+  --input /path/to/case.svs \
   --output /path/to/predictions
 ```
 
-每个源 tile 包对应一个 `.predictions.iac` 输出。文件保存七分类概率和十一成分的稠密
-空间响应，同时保留将每个输出网格还原到源 WSI 所需的全部信息。
+`infer` 从本地模型缓存解析已下载的发布模型。其他位置的发布模型可用
+`--model` 选择；`--hub {hf,modelscope}` 与 `--cache-dir` 用于选择特定本地缓存。
+
+输入可以是：
+
+- `<name>.tile.path.iac`；
+- 单张 224x224 或 244x244 PNG、JPEG、WebP、BMP 图像；
+- 单个 WSI 或含 `.svs`、`.mrxs`、`.ndpi`、`.scn`、`.tif`、`.tiff` 的目录。
+
+244x244 图像会中心裁剪到模型原生 224x224 视野，保持原像素尺度。WSI 会先按
+`--target-mpp` 降采样，依次经过低分辨率组织 mask 和 tile 级组织过滤，并持久化为
+`<name>.tile.path.iac`；模型结果写为 `<name>.pred.path.iac`。WSI 转换和模型推理两个
+阶段默认都显示进度。
 
 若需要避免额外的整数离散化，使用 float16；若更关注文件体积，可使用带明确范围的
 整数编码：
 
 ```bash
 hcc-sempath infer \
-  --model /path/to/hcc-sempath-release \
-  --input /path/to/tile-iac-root \
+  --input /path/to/case.mrxs \
   --output /path/to/predictions \
+  --target-mpp 0.5 \
+  --min-tissue-fraction 0.10 \
   --spatial-dtype float16 \
   --batch-size 128 \
   --workers 8
 ```
 
-默认不会覆盖已有输出；只有显式提供 `--overwrite` 才会替换。
+WSI 无法读取可信 MPP 时使用 `--native-mpp`/`--native-mpp-y`。默认不会覆盖已有 tile
+或预测输出；只有显式提供 `--overwrite` 才会替换。`--no-progress` 用于关闭进度条。
 
 ## 完整建模流程
 
@@ -219,7 +235,7 @@ hcc-sempath build tiles \
   --input /controlled/wsis \
   --output /assets/tiles \
   --target-mpp 0.5 \
-  --tile-size 512 \
+  --tile-size 224 \
   --min-tissue-fraction 0.30 \
   --workers 8 \
   --lossless
@@ -235,7 +251,7 @@ hcc-sempath build tiles \
 
 输出：
 
-- 每张切片/每个源文件一个 `.tiles.iac`；
+- 每张切片/每个源文件一个 `<name>.tile.path.iac`；
 - 目录模式下生成 `packages.csv`、`batch_summary.json` 和
   `batch_progress.json`；
 - 开启 `--qc` 时生成可选的单切片 QC 图。
@@ -247,81 +263,56 @@ hcc-sempath build tiles \
 - MPP、tile 大小与源切片层级几何关系一致；
 - 在提取教师特征前确认组织过滤效果和 QC 抽样。
 
-### 2. 一次性缓存四个冻结教师
+### 2. 构建四教师合并特征包
 
-为每个教师分别建立与 tile 行严格对齐的特征流。逻辑教师名属于文件和 manifest
-契约的一部分。
+公开构建器固定运行 GigaPath、H-optimus-1、UNI2-h 和 Virchow2，核对四者的逐行
+对应关系，并为每个 tile 包写出一个合并特征包。
 
 ```bash
 hcc-sempath build teacher-features \
   --input /assets/tiles \
-  --output /assets/features/gigapath \
-  --teacher gigapath \
+  --output /assets/features \
   --device cuda \
-  --precision fp16 \
+  --precision bf16 \
   --batch-size 128 \
   --num-workers 8 \
   --validate-output
-
-hcc-sempath build teacher-features \
-  --input /assets/tiles \
-  --output /assets/features/h_optimus_1 \
-  --teacher h_optimus_1 \
-  --device cuda \
-  --validate-output
-
-hcc-sempath build teacher-features \
-  --input /assets/tiles \
-  --output /assets/features/uni2_h \
-  --teacher uni2_h \
-  --device cuda \
-  --validate-output
-
-hcc-sempath build teacher-features \
-  --input /assets/tiles \
-  --output /assets/features/virchow2 \
-  --teacher virchow2 \
-  --device cuda \
-  --validate-output
 ```
 
-当预设不足时，`--teacher-name` 可绑定提供方的具体模型标识。`--pretrained`、
-`--compile`、precision、feature dtype 和 device 都是显式选择。进度 manifest 支持受控
-恢复；只有在后续会审计缺失记录时才应使用 `--continue-on-error`。
+`--pretrained`、`--compile`、precision、feature dtype 和 device 均为显式选项。单教师包
+只作为 staging 中间态；合并输出通过 record 数、tile-ID、维数、字节数和抽样精确值
+校验后会自动清理。任务中断时保留 staging，供下次继续。
 
 输出：
 
-- `<tile-package-stem>.<teacher>.features.iac`；
-- 目录任务的进度 CSV 与 JSON 摘要。
+- 每个 tile 包对应一个含四教师向量的 `<name>.feat.path.iac`；
+- 描述合并包及各教师维数的 `feature_build_manifest.json`。
 
 验收条件：
 
-- 每个特征包与源 tile 包的 record 数和 tile-ID 顺序完全一致；
-- 特征维数符合所选教师契约；
-- 四个教师流覆盖后续 manifest 所声明的同一数据边界。
+- 合并特征包与源 tile 包的 record 数和 tile-ID 顺序完全一致；
+- 四个教师维数全部存在；
+- 合并字节能够精确复现通过校验的 staging 向量。
 
 Virchow2 使用 class token 与 patch token 均值的拼接特征；这是冻结的特征契约，
 不是训练时可切换的选项。
 
-### 3. 可选：合并四个教师特征流
+### 3. 可选：按训练顺序准备合并缓存
 
-合并训练缓存用于减少重复的小文件读取，不改变任何教师特征值：
+`teacher-features` 已经直接写出合并特征。只有研究训练流程还需要确定性配对行顺序时，
+才运行 `training-cache`：
 
 ```bash
 hcc-sempath build training-cache \
   --tile-root /assets/tiles \
   --feature-root /assets/features \
-  --teacher gigapath=gigapath \
-  --teacher h_optimus_1=h_optimus_1 \
-  --teacher uni2_h=uni2_h \
-  --teacher virchow2=virchow2 \
   --seed 13 \
   --workers 8
 ```
 
-合并包写入 `<feature-root>/merged/<dataset>/`。构建器会检查 record 数、tile-ID 顺序、
-特征维数、字节数，并抽样验证特征精确相等。已有缓存可使用 `--validate-only` 检查。
-`--delete-source` 具有破坏性，不属于默认流程。
+特征包保留在 `<feature-root>/<dataset>/<name>.feat.path.iac`。命令会检查 record 数、
+tile-ID 顺序、维数、字节数并抽样验证精确相等，然后准备 tile/feature 配对行顺序。已有
+缓存可使用 `--validate-only` 检查。
 
 ### 4. 构建患者/切片隔离的 manifest
 
@@ -609,7 +600,7 @@ from hcc_sempath.inference.predictions import (
     grid_cell_center_level0,
 )
 
-with PredictionPackageReader("slide.predictions.iac") as reader:
+with PredictionPackageReader("slide.pred.path.iac") as reader:
     prediction = reader.read_at(0)
     index = reader.index_table.slice(0, 1).to_pylist()[0]
     center_x, center_y = grid_cell_center_level0(

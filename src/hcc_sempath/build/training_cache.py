@@ -8,9 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from iatro.iac import read_header
+from hcc_sempath.iac_naming import (
+    is_pathology_tile_name,
+    pathology_feature_candidates,
+    pathology_tile_stem,
+)
 from hcc_sempath.training.feature_pack_merge import (
     MERGED_FEATURE_SUFFIX,
-    TILE_SUFFIX,
     _build_merged_package,
     _delete_source_packages,
     _validate_merged_against_sources,
@@ -34,14 +38,12 @@ class PreparedPackage:
     status: str
 
 
-def _strip_suffix(path: Path, suffix: str) -> str:
-    if not path.name.endswith(suffix):
-        raise ValueError(f"unexpected package suffix: {path}")
-    return path.name[: -len(suffix)]
-
-
 def _discover_tile_packages(tile_root: Path) -> list[Path]:
-    return sorted(path for path in tile_root.glob(f"*/*{TILE_SUFFIX}") if path.is_file())
+    return sorted(
+        path
+        for path in tile_root.glob("*/*.iac")
+        if path.is_file() and is_pathology_tile_name(path)
+    )
 
 
 def _parse_teacher_roots(values: list[str] | None) -> dict[str, str]:
@@ -63,14 +65,14 @@ def _parse_teacher_roots(values: list[str] | None) -> dict[str, str]:
 
 
 def _merged_path(feature_root: Path, dataset: str, stem: str, teacher_roots: dict[str, str]) -> Path:
-    return feature_root / "merged" / dataset / f"{stem}{MERGED_FEATURE_SUFFIX}"
+    return feature_root / dataset / f"{stem}{MERGED_FEATURE_SUFFIX}"
 
 
 def _source_feature_path(feature_root: Path, dataset: str, stem: str, teacher: str, teacher_roots: dict[str, str]) -> Path:
     feature_dir = feature_root / teacher_roots[teacher] / dataset
-    matches = sorted(path for path in feature_dir.glob(f"{stem}.*.features.iac") if not path.name.endswith(MERGED_FEATURE_SUFFIX))
+    matches = pathology_feature_candidates(feature_dir, stem)
     if not matches:
-        raise FileNotFoundError(f"missing_feature teacher={teacher} expected={feature_dir}/{stem}.*.features.iac")
+        raise FileNotFoundError(f"missing_feature teacher={teacher} expected={feature_dir}/{stem}.feat.path.iac")
     if len(matches) > 1:
         raise RuntimeError(f"ambiguous_feature teacher={teacher} matches={matches}")
     return matches[0]
@@ -117,7 +119,7 @@ def _prepare_one(
     validate_only: bool = False,
 ) -> PreparedPackage:
     dataset = tile_path.parent.name
-    stem = _strip_suffix(tile_path, TILE_SUFFIX)
+    stem = pathology_tile_stem(tile_path)
     merged_path = _merged_path(feature_root, dataset, stem, teacher_roots)
     teacher_names = list(teacher_roots)
     if merged_path.exists():
@@ -180,9 +182,19 @@ def _progress(iterable, total: int):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Merge teacher feature IAC packages and shuffle tile/feature rows.")
-    parser.add_argument("--tile-root", required=True, help="Root containing <dataset>/<stem>.tiles.iac packages.")
-    parser.add_argument("--feature-root", required=True, help="Root containing <teacher-subdir>/<dataset>/<stem>.*.features.iac packages.")
+    parser = argparse.ArgumentParser(
+        description="Validate merged teacher features and align tile/feature row order."
+    )
+    parser.add_argument(
+        "--tile-root",
+        required=True,
+        help="Root containing <dataset>/<stem>.tile.path.iac packages.",
+    )
+    parser.add_argument(
+        "--feature-root",
+        required=True,
+        help="Root containing merged <dataset>/<stem>.feat.path.iac packages.",
+    )
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--dtype", default="source", help="Merged feature dtype: source preserves each source package dtype.")

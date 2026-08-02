@@ -18,12 +18,12 @@ BUILD_COMMANDS: dict[str, Command] = {
         "Build image-tile IAC packages from a WSI file or directory.",
     ),
     "teacher-features": Command(
-        "hcc_sempath.teacher.cache",
-        "Build one teacher-feature IAC stream.",
+        "hcc_sempath.build.teacher_features",
+        "Build merged four-teacher pathology features.",
     ),
     "training-cache": Command(
         "hcc_sempath.build.training_cache",
-        "Merge teacher features and align shuffled training rows.",
+        "Validate merged features and align shuffled training rows.",
     ),
     "manifest": Command(
         "hcc_sempath.training.manifest",
@@ -36,6 +36,10 @@ BUILD_COMMANDS: dict[str, Command] = {
 }
 
 COMMANDS: dict[str, Command] = {
+    "download": Command(
+        "hcc_sempath.download",
+        "Download the gated SemPath release for local inference.",
+    ),
     "annotate": Command(
         "hcc_sempath.annotation.server",
         "Open the classification and spatial annotation UI.",

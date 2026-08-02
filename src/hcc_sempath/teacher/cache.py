@@ -24,6 +24,7 @@ from iatro.iac import read_tables
 from iatro.iac.adapters.manifests import TileRecord
 from iatro.iac.adapters.tiles import TilePackageReader, read_package_manifest, read_package_metadata
 from iatro.iac.adapters.validate import validate_package
+from hcc_sempath.iac_naming import PATHOLOGY_FEATURE_SUFFIX, pathology_tile_stem
 
 
 _THREAD_LOCAL = threading.local()
@@ -620,10 +621,8 @@ def _validate_common_tile_size(package_paths: list[Path]) -> tuple[int, int]:
 
 
 def _default_output_path(package_path: Path, output_dir: Path, teacher_name: str) -> Path:
-    stem = package_path.stem
-    if stem.endswith(".tiles"):
-        stem = stem[:-len(".tiles")]
-    return output_dir / f"{stem}.{teacher_name}.features.iac"
+    stem = pathology_tile_stem(package_path)
+    return output_dir / f"{stem}.{teacher_name}{PATHOLOGY_FEATURE_SUFFIX}"
 
 
 def _validate_feature_output(package_path: str | Path, expected_teacher: str = "", full: bool = False) -> dict:
@@ -1030,7 +1029,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--input", help="Input image-tile .iac file or directory recursively scanned for image-tile .iac packages.")
-    parser.add_argument("--output", required=True, help="Output .features.iac file, or output directory for multiple input packages.")
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="Internal single-teacher .feat.path.iac file or staging directory.",
+    )
     parser.add_argument(
         "--teacher",
         help="Teacher preset, timm model name, hf_hub:* model name, or local model directory.",

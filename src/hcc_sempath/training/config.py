@@ -216,7 +216,7 @@ def _existing_merged_feature_package_for_tile(
 ) -> Path | None:
     if not bool(cfg.get("data", {}).get("prefer_merged_teacher_features", True)):
         return None
-    stem = package_stem(tile_path, str(manifest.get("tile_suffix", ".tiles.iac")))
+    stem = package_stem(tile_path, str(manifest.get("tile_suffix", ".tile.path.iac")))
     candidates: list[Path] = []
     feature_roots = manifest.get("feature_roots")
     if isinstance(feature_roots, dict):
@@ -866,7 +866,7 @@ def manifest_data_paths(cfg: dict, manifest: dict, split: str) -> tuple[list[str
             tile_paths=[tile_path],
             teachers=teachers,
             feature_root=feature_root,
-            feature_suffix_template=data.get("feature_suffix_template", ".{teacher}.features.iac"),
+            feature_suffix_template=data.get("feature_suffix_template", ".{teacher}.feat.path.iac"),
         )
         return {
             name: str(paths[0])

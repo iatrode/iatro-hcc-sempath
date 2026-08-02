@@ -8,15 +8,24 @@ from pathlib import Path
 import yaml
 
 from iatro.iac import read_header, read_tables
+from hcc_sempath.iac_naming import (
+    LEGACY_PATHOLOGY_TILE_SUFFIX,
+    PATHOLOGY_FEATURE_SUFFIX,
+    PATHOLOGY_TILE_SUFFIX,
+    pathology_feature_candidates,
+    pathology_tile_stem,
+)
 
 
-TILE_SUFFIX = ".tiles.iac"
-FEATURE_SUFFIX_TEMPLATE = ".{teacher}.features.iac"
+TILE_SUFFIX = PATHOLOGY_TILE_SUFFIX
+FEATURE_SUFFIX_TEMPLATE = ".{teacher}.feat.path.iac"
 
 
 def package_stem(path: str | Path, tile_suffix: str = TILE_SUFFIX) -> str:
     name = Path(path).name
     if not name.endswith(tile_suffix):
+        if tile_suffix == PATHOLOGY_TILE_SUFFIX:
+            return pathology_tile_stem(path)
         raise ValueError(f"tile package does not end with {tile_suffix}: {path}")
     return name[: -len(tile_suffix)]
 
@@ -48,17 +57,34 @@ def _feature_package_path_for_tile(
         if teacher_root is None:
             raise ValueError(f"training manifest feature_roots missing teacher={teacher}")
         feature_dir = Path(teacher_root) / tile_path.parent.name
-        matches = sorted(feature_dir.glob(f"{stem}.*.features.iac"))
+        matches = pathology_feature_candidates(feature_dir, stem)
         if not matches:
             raise FileNotFoundError(
-                f"missing feature package teacher={teacher} tile={tile_path} expected={feature_dir}/{stem}.*.features.iac"
+                f"missing feature package teacher={teacher} tile={tile_path} expected={feature_dir}/{stem}.feat.path.iac"
             )
         if len(matches) > 1:
             raise RuntimeError(f"ambiguous feature packages teacher={teacher} tile={tile_path} matches={matches}")
         return matches[0]
     if feature_root is None:
         raise ValueError("feature_root is required when manifest.feature_roots is not configured")
-    return feature_package_path(feature_root, teacher, stem, feature_suffix_template)
+    merged_matches = pathology_feature_candidates(
+        Path(feature_root) / tile_path.parent.name,
+        stem,
+    )
+    exact_merged = [path for path in merged_matches if path.name == f"{stem}{PATHOLOGY_FEATURE_SUFFIX}"]
+    if len(exact_merged) == 1:
+        return exact_merged[0]
+    expected = feature_package_path(feature_root, teacher, stem, feature_suffix_template)
+    if expected.exists():
+        return expected
+    matches = pathology_feature_candidates(Path(feature_root) / teacher, stem)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"ambiguous feature packages teacher={teacher} tile={tile_path} matches={matches}"
+        )
+    return expected
 
 
 def _discover_tile_packages(root: str | Path, tile_suffix: str = TILE_SUFFIX) -> list[Path]:
@@ -179,6 +205,22 @@ def build_training_manifest(
 ) -> dict:
     if not 0 <= val_frac < 1:
         raise ValueError("val_frac must be in [0, 1)")
+    if tile_suffix == PATHOLOGY_TILE_SUFFIX:
+        roots = [Path(root) for root in dev_sources.values()]
+        if public_source is not None:
+            roots.append(Path(public_source[1]))
+        observed_suffixes = {
+            suffix
+            for root in roots
+            for suffix in (PATHOLOGY_TILE_SUFFIX, LEGACY_PATHOLOGY_TILE_SUFFIX)
+            if any(path.is_file() for path in root.glob(f"*{suffix}"))
+        }
+        if len(observed_suffixes) > 1:
+            raise ValueError(
+                "mixed canonical and legacy pathology tile names are not supported in one manifest"
+            )
+        if observed_suffixes == {LEGACY_PATHOLOGY_TILE_SUFFIX}:
+            tile_suffix = LEGACY_PATHOLOGY_TILE_SUFFIX
     datasets = {}
     splits = {"train": {}, "val": {}, "exval": {}}
     summary = {"datasets": {}, "splits": {"train": {}, "val": {}, "exval": {}}}
@@ -404,7 +446,11 @@ def main() -> None:
     parser.add_argument("--split-key", default="patient_id", choices=["patient_id", "slide_id", "stem"])
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--teacher", action="append", default=[], help="Teacher name to verify under --feature-root.")
-    parser.add_argument("--feature-root", default="", help="Root containing <teacher>/<stem>.<teacher>.features.iac.")
+    parser.add_argument(
+        "--feature-root",
+        default="",
+        help="Root containing merged <dataset>/<stem>.feat.path.iac packages.",
+    )
     parser.add_argument("--feature-suffix-template", default=FEATURE_SUFFIX_TEMPLATE)
     parser.add_argument("--check-artifacts", action="store_true", help="Fail if tile or teacher feature packages are missing.")
     parser.add_argument("--output", required=True)
