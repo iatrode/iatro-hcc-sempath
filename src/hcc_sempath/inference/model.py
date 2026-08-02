@@ -5,14 +5,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from safetensors.torch import load_file as load_safetensors_file
 
 from hcc_sempath.modeling.models import HCCSemPathModel, model_state_sha256
 
 
 RELEASE_CONFIG_NAME = "config.json"
-RELEASE_WEIGHTS_NAME = "hcc_sempath_release.pt"
+RELEASE_WEIGHTS_NAME = "model.safetensors"
 RELEASE_FORMAT = "hcc-sempath-classification-spatial-state-dict"
-RELEASE_VERSION = 3
+RELEASE_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -57,7 +58,7 @@ def load_release_model(
         raise ValueError("release classification-name count does not match model contract")
     if len(spatial_names) != int(model_config.get("spatial_num_components", -1)):
         raise ValueError("release spatial-name count does not match model contract")
-    state = torch.load(weights_path, map_location="cpu", weights_only=True)
+    state = load_safetensors_file(weights_path, device="cpu")
     if not isinstance(state, dict) or not state:
         raise ValueError("release weights must contain a non-empty state dict")
     model_digest = model_state_sha256(state)

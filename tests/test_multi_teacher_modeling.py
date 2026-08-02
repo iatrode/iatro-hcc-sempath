@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import save_file as save_safetensors_file
 
 from hcc_sempath.modeling.models import (
     HCCSemPathModel,
@@ -875,14 +876,17 @@ def test_release_loader_uses_checkpoint_backbone_configuration(tmp_path: Path) -
         spatial_num_components=3,
         spatial_dim=12,
     )
-    checkpoint = tmp_path / "release.pt"
+    checkpoint = tmp_path / "model.safetensors"
     config = tmp_path / "config.json"
     release_state = model.state_dict()
-    torch.save(release_state, checkpoint)
+    save_safetensors_file(
+        {key: value.detach().contiguous() for key, value in release_state.items()},
+        checkpoint,
+    )
     config.write_text(
         json.dumps({
             "format": "hcc-sempath-classification-spatial-state-dict",
-            "version": 3,
+            "version": 4,
             "model": {
                 "backbone_name": "vit_tiny_patch16_224",
                 "embedding_dim": 11,
@@ -935,7 +939,7 @@ def test_release_loader_rejects_invalid_release_format(
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="version 3"):
+    with pytest.raises(ValueError, match="version 4"):
         load_hcc_sempath_release(config, checkpoint)
 
 

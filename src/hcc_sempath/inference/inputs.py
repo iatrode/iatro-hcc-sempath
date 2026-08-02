@@ -25,7 +25,7 @@ from hcc_sempath.modeling.models import STUDENT_IMAGE_SIZE
 
 
 RASTER_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
-SUPPORTED_RASTER_SIZES = {STUDENT_IMAGE_SIZE, 244}
+SUPPORTED_RASTER_SIZES = {STUDENT_IMAGE_SIZE}
 
 
 @dataclass(frozen=True)

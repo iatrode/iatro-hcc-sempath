@@ -220,13 +220,12 @@ stored elsewhere can be selected with `--model`; `--hub {hf,modelscope}` and
 The input may be:
 
 - a `<name>.tile.path.iac` package;
-- one 224x224 or 244x244 PNG, JPEG, WebP, or BMP image;
+- one 224x224 PNG, JPEG, WebP, or BMP image;
 - one WSI or a directory containing `.svs`, `.mrxs`, `.ndpi`, `.scn`, `.tif`,
   or `.tiff` slides.
 
-A 244x244 raster is centre-cropped to the native 224x224 model field at its
-original pixel scale. A WSI is first downsampled to `--target-mpp`, segmented by the
-low-resolution tissue mask and per-tile tissue test, and retained as
+A WSI is first downsampled to `--target-mpp`, segmented by the low-resolution
+tissue mask and per-tile tissue test, and retained as
 `<name>.tile.path.iac`. Inference then writes `<name>.pred.path.iac`. Both the
 WSI-to-IAC stage and the model stage show progress by default.
 
@@ -554,7 +553,7 @@ hcc-sempath export \
 
 The release directory contains:
 
-- `hcc_sempath_release.pt`;
+- `model.safetensors`;
 - `config.json`.
 
 Teacher heads and optimizer state are removed. The shared encoder,
@@ -755,4 +754,5 @@ Third-party dependencies and teacher models remain governed by their original
 licenses and access agreements. A SemPath checkpoint does not grant access to,
 or redistribute, any gated teacher model. Final student weights, when released,
 will be distributed separately through a gated model repository under the
-declared release terms.
+declared release terms. The release contract, intended use, output semantics,
+and internal checkpoint readout are documented in [MODEL_CARD.md](MODEL_CARD.md).

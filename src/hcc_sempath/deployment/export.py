@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import torch
+from safetensors.torch import save_file as save_safetensors_file
 
 from hcc_sempath.modeling.models import (
     HCCSemPathModel,
@@ -128,7 +129,7 @@ def export_release(
         )
     release_config = {
         "format": "hcc-sempath-classification-spatial-state-dict",
-        "version": 3,
+        "version": 4,
         "model": {
             "backbone_name": STUDENT_BACKBONE_NAME,
             "embedding_dim": embedding_dim(config),
@@ -167,11 +168,23 @@ def export_release(
         },
     }
     output_dir.mkdir(parents=True, exist_ok=True)
-    weights_path = output_dir / "hcc_sempath_release.pt"
+    weights_path = output_dir / "model.safetensors"
     config_path = output_dir / "config.json"
-    temporary_weights = weights_path.with_suffix(".pt.tmp")
+    temporary_weights = weights_path.with_suffix(".safetensors.tmp")
     temporary_config = config_path.with_suffix(".json.tmp")
-    torch.save(release_state, temporary_weights)
+    serializable_state = {
+        key: value.detach().cpu().contiguous()
+        for key, value in release_state.items()
+    }
+    save_safetensors_file(
+        serializable_state,
+        str(temporary_weights),
+        metadata={
+            "format": "pt",
+            "hcc_sempath_release_version": "4",
+            "release_model_sha256": release_digest,
+        },
+    )
     temporary_config.write_text(
         json.dumps(release_config, indent=2) + "\n",
         encoding="utf-8",

@@ -197,11 +197,10 @@ hcc-sempath infer \
 输入可以是：
 
 - `<name>.tile.path.iac`；
-- 单张 224x224 或 244x244 PNG、JPEG、WebP、BMP 图像；
+- 单张 224x224 PNG、JPEG、WebP、BMP 图像；
 - 单个 WSI 或含 `.svs`、`.mrxs`、`.ndpi`、`.scn`、`.tif`、`.tiff` 的目录。
 
-244x244 图像会中心裁剪到模型原生 224x224 视野，保持原像素尺度。WSI 会先按
-`--target-mpp` 降采样，依次经过低分辨率组织 mask 和 tile 级组织过滤，并持久化为
+WSI 会先按 `--target-mpp` 降采样，依次经过低分辨率组织 mask 和 tile 级组织过滤，并持久化为
 `<name>.tile.path.iac`；模型结果写为 `<name>.pred.path.iac`。WSI 转换和模型推理两个
 阶段默认都显示进度。
 
@@ -502,7 +501,7 @@ hcc-sempath export \
 
 发布目录包含：
 
-- `hcc_sempath_release.pt`；
+- `model.safetensors`；
 - `config.json`。
 
 导出会移除教师 heads 和优化器状态，保留共享 encoder、分类 head、空间 head、类别/

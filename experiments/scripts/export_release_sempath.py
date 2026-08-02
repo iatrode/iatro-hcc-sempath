@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import torch
+from safetensors.torch import save_file as save_safetensors_file
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -319,7 +320,7 @@ def main() -> None:
 
     release_config = {
         "format": "hcc-sempath-classification-spatial-state-dict",
-        "version": 3,
+        "version": 4,
         "model": {
             "backbone_name": STUDENT_BACKBONE_NAME,
             "embedding_dim": embedding_dim(cfg),
@@ -401,7 +402,18 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(release_state, output_dir / "hcc_sempath_release.pt")
+    save_safetensors_file(
+        {
+            key: value.detach().cpu().contiguous()
+            for key, value in release_state.items()
+        },
+        str(output_dir / "model.safetensors"),
+        metadata={
+            "format": "pt",
+            "hcc_sempath_release_version": "4",
+            "release_model_sha256": release_model_digest,
+        },
+    )
     (output_dir / "config.json").write_text(
         json.dumps(release_config, indent=2) + "\n",
         encoding="utf-8",

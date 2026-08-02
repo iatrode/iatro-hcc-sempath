@@ -12,7 +12,7 @@ from hcc_sempath.release_hub import (
 def _release(path: Path) -> Path:
     path.mkdir(parents=True)
     (path / "config.json").write_text(json.dumps({"format": "test"}), encoding="utf-8")
-    (path / "hcc_sempath_release.pt").write_bytes(b"weights")
+    (path / "model.safetensors").write_bytes(b"weights")
     return path
 
 

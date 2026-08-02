@@ -13,11 +13,14 @@
   encoding, spatial grid geometry, and an explicit level-0 coordinate transform.
   Make `benchmark` consume the same gated release contract instead of internal
   training configuration and checkpoints.
-- Extend released-model inference to 224/244-pixel raster images and WSI files,
+- Extend released-model inference to 224-pixel raster images and WSI files,
   including tissue-aware WSI tiling, progress reporting, and canonical
   `.tile.path.iac`, `.feat.path.iac`, and `.pred.path.iac` names. Add
   `hcc-sempath download` for the local gated-model cache and make the public
   feature builder emit one verified four-teacher package per tile package.
+- Store the inference-only release state in `model.safetensors`; training
+  checkpoints remain private PyTorch recovery artifacts and are never part of
+  the gated model release.
 
 - Declare the public source and documentation license as
   CC-BY-NC-ND-4.0, aligned with the planned gated student-weight release.

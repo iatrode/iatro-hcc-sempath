@@ -1824,11 +1824,11 @@ def load_hcc_sempath_release(
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     if (
         config.get("format") != "hcc-sempath-classification-spatial-state-dict"
-        or int(config.get("version", -1)) != 3
+        or int(config.get("version", -1)) != 4
     ):
         raise ValueError(
             "unsupported HCC-SemPath release; expected "
-            "hcc-sempath-classification-spatial-state-dict version 3"
+            "hcc-sempath-classification-spatial-state-dict version 4"
         )
     model_config = config["model"]
     config["spatial_decoder_calibration"] = (
@@ -1843,11 +1843,7 @@ def load_hcc_sempath_release(
             ),
         )
     )
-    state = torch.load(
-        checkpoint_path,
-        map_location=device,
-        weights_only=True,
-    )
+    state = load_safetensors_file(str(checkpoint_path), device="cpu")
     provenance = config.get("training_provenance")
     if not isinstance(provenance, dict):
         raise ValueError("release has no training provenance")

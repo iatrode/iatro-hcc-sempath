@@ -26,10 +26,10 @@ def test_infer_raster_pipeline_writes_canonical_iac_and_progress(
     model_dir = tmp_path / "model"
     model_dir.mkdir()
     (model_dir / "config.json").write_text("{}", encoding="utf-8")
-    weights = model_dir / "hcc_sempath_release.pt"
+    weights = model_dir / "model.safetensors"
     weights.write_bytes(b"fake release")
     source = tmp_path / "case.png"
-    Image.new("RGB", (244, 244), (100, 40, 150)).save(source)
+    Image.new("RGB", (224, 224), (100, 40, 150)).save(source)
     release = SimpleNamespace(
         weights_path=weights,
         model_digest="d" * 64,

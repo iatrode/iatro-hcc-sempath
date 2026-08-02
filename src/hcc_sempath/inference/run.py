@@ -58,7 +58,7 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run SemPath on a pathology tile IAC, one 224/244px raster image, "
+            "Run SemPath on a pathology tile IAC, one 224px raster image, "
             "or a WSI. Raster and WSI inputs are first materialized as canonical "
             ".tile.path.iac packages; predictions are written as .pred.path.iac."
         )
@@ -67,7 +67,7 @@ def _parser() -> argparse.ArgumentParser:
         "--model",
         type=Path,
         help=(
-            "Local release directory containing config.json and hcc_sempath_release.pt. "
+            "Local release directory containing config.json and model.safetensors. "
             "Omit to use the release installed by `hcc-sempath download`."
         ),
     )
@@ -83,7 +83,7 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
         help=(
-            "Pathology .tile.path.iac, legacy .tiles.iac, 224/244px PNG/JPEG/WebP/BMP, "
+            "Pathology .tile.path.iac, legacy .tiles.iac, 224px PNG/JPEG/WebP/BMP, "
             "WSI (.svs/.mrxs/.ndpi/.scn/.tif/.tiff), or directory; repeatable."
         ),
     )

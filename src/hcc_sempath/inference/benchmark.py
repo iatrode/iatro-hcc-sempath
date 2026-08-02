@@ -16,7 +16,7 @@ def main() -> None:
     parser.add_argument(
         "--model",
         required=True,
-        help="Release directory containing config.json and hcc_sempath_release.pt.",
+        help="Release directory containing config.json and model.safetensors.",
     )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--steps", type=int, default=20)
