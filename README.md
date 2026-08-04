@@ -1,6 +1,6 @@
 # HCC-SemPath
 
-[![Source](https://img.shields.io/badge/source-GitHub-181717?logo=github)](https://github.com/iatrode/iatro-hcc-sempath) [![Hugging Face](<https://img.shields.io/badge/Hugging%20Face-gated%20model-ffcc4d?logo=huggingface&logoColor=black>)](https://huggingface.co/iatrode/iatro-hcc-sempath) [![ModelScope](<https://img.shields.io/badge/ModelScope-gated%20model-624aff>)](https://modelscope.cn/models/iatrode/iatro-hcc-sempath) [![PyPI](https://img.shields.io/pypi/v/hcc-sempath?include_prereleases)](https://pypi.org/project/hcc-sempath/) [![Python](https://img.shields.io/pypi/pyversions/hcc-sempath)](https://pypi.org/project/hcc-sempath/) [![CI](https://github.com/iatrode/iatro-hcc-sempath/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/iatrode/iatro-hcc-sempath/actions/workflows/ci.yml)
+[![Source](https://img.shields.io/badge/source-GitHub-181717?logo=github)](https://github.com/iatrode/iatro-hcc-sempath) [![Hugging Face](<https://img.shields.io/badge/Hugging%20Face-gated%20model-ffcc4d?logo=huggingface&logoColor=black>)](https://huggingface.co/iatrode/iatro-hcc-sempath) [![ModelScope](<https://img.shields.io/badge/ModelScope-gated%20model-624aff>)](https://modelscope.cn/models/iatrode/iatro-hcc-sempath) [![PyPI](https://img.shields.io/pypi/v/hcc-sempath?include_prereleases)](https://pypi.org/project/hcc-sempath/) [![Python](https://img.shields.io/pypi/pyversions/hcc-sempath)](https://pypi.org/project/hcc-sempath/) [![CI](https://github.com/iatrode/iatro-hcc-sempath/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/iatrode/iatro-hcc-sempath/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-CC%20BY--NC--ND%204.0-2b5797)](LICENSE)
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -152,7 +152,7 @@ from PyPI:
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install --pre hcc-sempath
+python -m pip install hcc-sempath
 hcc-sempath --help
 ```
 

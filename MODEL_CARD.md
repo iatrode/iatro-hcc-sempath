@@ -11,6 +11,8 @@ tags:
 
 # HCC-SemPath
 
+[![Source](https://img.shields.io/badge/source-GitHub-181717?logo=github)](https://github.com/iatrode/iatro-hcc-sempath) [![Hugging Face](<https://img.shields.io/badge/Hugging%20Face-gated%20model-ffcc4d?logo=huggingface&logoColor=black>)](https://huggingface.co/iatrode/iatro-hcc-sempath) [![ModelScope](<https://img.shields.io/badge/ModelScope-gated%20model-624aff>)](https://modelscope.cn/models/iatrode/iatro-hcc-sempath) [![PyPI](https://img.shields.io/pypi/v/hcc-sempath?include_prereleases)](https://pypi.org/project/hcc-sempath/) [![License](https://img.shields.io/badge/license-CC%20BY--NC--ND%204.0-2b5797)](LICENSE)
+
 HCC-SemPath is a compact pathology model for hepatocellular carcinoma (HCC)
 histomorphologic classification and spatial component measurement. It uses a
 DINOv2-S/14 student trained by prototype-adjudicated distillation from four
@@ -93,7 +95,7 @@ Install HCC-SemPath, obtain access to the gated model repository, and download
 the release:
 
 ```bash
-python -m pip install --pre hcc-sempath
+python -m pip install hcc-sempath
 hcc-sempath download
 ```
 

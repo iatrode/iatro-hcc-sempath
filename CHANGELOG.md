@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0.dev3 — Unreleased
+
+- Add the licence and cross-platform release badges to the repository and
+  model-card entrypoints. Align the unpinned PyPI installation command across
+  GitHub, Hugging Face, and ModelScope after validating prerelease discovery.
+
 ## 0.2.0.dev2 — 2026-08-04
 
 - Add pinned GitHub Actions workflows for routine push/PR validation and
