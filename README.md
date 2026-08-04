@@ -5,9 +5,10 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 **Gated model weights:** [Hugging Face](https://huggingface.co/iatrode/iatro-hcc-sempath) | [ModelScope](https://modelscope.cn/models/iatrode/iatro-hcc-sempath).
-Both hubs distribute the same SemPath model artifact. The PyPI package contains
-the modelling code and CLI; clinical assets, teacher weights, and patient-level
-outputs are not distributed.
+Both hubs host the same SemPath model artifact. Access requires manual author
+approval; no external request has been approved and no model weights have yet
+been distributed. The PyPI package contains the modelling code and CLI;
+clinical assets, teacher weights, and patient-level outputs are not distributed.
 
 HCC-SemPath is an HCC-specific pathology representation model. It distils four
 frozen pathology foundation models into one DINOv2-S/14 student, then anchors
@@ -47,6 +48,7 @@ experiments and their public/private boundary are documented in
 - [Configuration](#configuration)
 - [Testing](#testing)
 - [Repository layout](#repository-layout)
+- [Acknowledgements](#acknowledgements)
 - [License](#license)
 
 ## Scientific contract
@@ -752,6 +754,16 @@ tests/               unit, schema, resume, CLI, and integration contracts
 study. It is not the default installed command surface and must not contain
 host-specific launch scripts, checkpoints, private annotations, teacher caches,
 or transient reports.
+
+## Acknowledgements
+
+HCC-SemPath was trained with frozen representations from
+[Prov-GigaPath](https://huggingface.co/prov-gigapath/prov-gigapath),
+[H-optimus-1](https://huggingface.co/bioptimus/H-optimus-1),
+[UNI2-h](https://huggingface.co/MahmoodLab/UNI2-h), and
+[Virchow2](https://huggingface.co/paige-ai/Virchow2). We thank the teams behind
+these models for making their pathology representations available to the
+research community.
 
 ## License
 

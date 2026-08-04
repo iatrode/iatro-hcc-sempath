@@ -5,8 +5,9 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 **Gated 模型权重：** [Hugging Face](https://huggingface.co/iatrode/iatro-hcc-sempath) | [ModelScope](https://modelscope.cn/models/iatrode/iatro-hcc-sempath)。
-两个模型仓库分发同一份 SemPath 模型资产。PyPI 包仅包含建模代码和 CLI；临床资产、
-教师权重及患者级输出均不公开分发。
+两个模型仓库托管同一份 SemPath 模型资产，访问均需作者人工审核；目前尚未批准任何
+外部访问请求，也未实际分发模型权重。PyPI 包仅包含建模代码和 CLI；临床资产、教师
+权重及患者级输出均不公开分发。
 
 HCC-SemPath 是一个 HCC 专用病理表征模型。它将四个冻结的病理基础模型蒸馏到一个
 DINOv2-S/14 学生模型中，并使用一个规模小、固定且由病理医师标注的原型库约束所得
@@ -41,6 +42,7 @@ tile 级预测结果。
 - [配置文件](#配置文件)
 - [测试](#测试)
 - [仓库结构](#仓库结构)
+- [致谢](#致谢)
 - [许可证](#许可证)
 
 ## 科学契约
@@ -671,6 +673,15 @@ tests/               unit、schema、resume、CLI 与 integration 契约测试
 
 `experiments/` 保留理解论文结果所需的协议，但不属于默认安装命令面。该目录不得包含
 机器特定启动脚本、检查点、私有标注、教师缓存或临时报告。
+
+## 致谢
+
+HCC-SemPath 使用了
+[Prov-GigaPath](https://huggingface.co/prov-gigapath/prov-gigapath)、
+[H-optimus-1](https://huggingface.co/bioptimus/H-optimus-1)、
+[UNI2-h](https://huggingface.co/MahmoodLab/UNI2-h) 和
+[Virchow2](https://huggingface.co/paige-ai/Virchow2) 的冻结表征进行训练。感谢这些模型
+的开发团队向研究社区提供其计算病理表征。
 
 ## 许可证
 
