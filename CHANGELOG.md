@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — Unreleased
+## 0.2.0.dev1 — 2026-08-04
 
 - Normalize the first-release supervision terminology to
   `T_cls`/classification and `T_spatial`/spatial throughout the public
