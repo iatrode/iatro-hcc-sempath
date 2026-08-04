@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0.dev2 — Unreleased
+## 0.2.0.dev2 — 2026-08-04
 
 - Add pinned GitHub Actions workflows for routine push/PR validation and
   manually dispatched, tag-bound PyPI and GitHub releases. Release preflight
