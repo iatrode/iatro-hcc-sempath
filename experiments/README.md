@@ -23,8 +23,8 @@ prototype bank, final spatial tile/slide/geometry counts, and the prespecified
 information-saturation decision in all four teacher spaces. Model performance
 is not used to decide whether annotation is sufficient.
 
-The A0 model is selected only by the frozen teacher-retention plus complete L1
-and L2 validation score. Classification and spatial comparisons use paired
+The A0 model is selected only by the frozen teacher-retention plus complete
+classification and spatial validation score. Classification and spatial comparisons use paired
 slide-level bootstrap intervals. The selected Optuna trial is the A0 reference
 for one fixed-seed 10% mechanism matrix; every other condition inherits its
 subset and hyperparameters without retuning. Decoder calibration and locked

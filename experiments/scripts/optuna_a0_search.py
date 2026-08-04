@@ -537,7 +537,7 @@ def _population_schedule_contract(
         int(read_header(path)["num_records"])
         for path in selected_train_tiles
     )
-    # L1/L2 may overlap. Subtracting both totals is conservative and therefore
+    # Classification/spatial banks may overlap. Subtracting both totals is conservative and therefore
     # cannot overstate the number of optimizer-visible rows.
     lower_bound = max(
         0,
@@ -614,7 +614,7 @@ def _population_validation_contract(
     max_records = int(cfg.get("data", {}).get("max_val_records", 0))
     if max_records > 0:
         records = min(records, max_records)
-    # The teacher-retention probe excludes the complete L1/L2 train+validation
+    # The teacher-retention probe excludes the complete classification/spatial train+validation
     # expert union. Subtracting that full union is conservative because many of
     # its rows may live outside the selected validation packages.
     lower_bound = max(0, records - int(expert_tiles))
@@ -930,7 +930,7 @@ def _expert_split_tile_counts(
     overlap = train & val
     if overlap:
         raise ValueError(
-            "train/validation expert tile overlap across L1/L2: "
+            "train/validation expert tile overlap across classification/spatial supervision: "
             f"count={len(overlap)} sample={next(iter(sorted(overlap)))}"
         )
     return {
@@ -1447,14 +1447,14 @@ def score_row(
     )
     if evaluated_classes != total_classes or total_classes != 7:
         raise ValueError(
-            "selection row did not evaluate all seven L1 classes"
+            "selection row did not evaluate all seven classification classes"
         )
     if _metric_value(
         row,
         "expert_val_spatial_explicit_negative_pairs",
     ) <= 0:
         raise ValueError(
-            "selection row has no explicit-negative L2 supervision"
+            "selection row has no explicit-negative spatial supervision"
         )
     return reported
 
@@ -2171,7 +2171,7 @@ def export_study_artifacts(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "A0 Optuna search using independent L1/L2 expert validation"
+            "A0 Optuna search using independent classification/spatial expert validation"
         )
     )
     parser.add_argument(

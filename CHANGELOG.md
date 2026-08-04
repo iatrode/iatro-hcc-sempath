@@ -2,6 +2,12 @@
 
 ## 0.2.0 — Unreleased
 
+- Normalize the first-release supervision terminology to
+  `T_cls`/classification and `T_spatial`/spatial throughout the public
+  documentation, experiment contracts, diagnostics, and examples. This is a
+  terminology-only change; configuration fields and serialized assets are
+  unchanged.
+
 - Delegate prediction-record compression to the IAC 0.1.3
   `VariableRecordPack` and native ZSTD codec. SemPath now owns only its
   prediction payload schema and no longer declares or implements a private
@@ -29,7 +35,7 @@
 - Declare the public source and documentation license as
   CC-BY-NC-ND-4.0, aligned with the planned gated student-weight release.
 
-- Add fixed-global-step joint teacher/L1/L2 validation and checkpoint
+- Add fixed-global-step joint teacher/classification/spatial validation and checkpoint
   selection for full-population training. Patience and minimum evidence count
   validation probes rather than population epochs, preventing a larger
   corpus from silently multiplying the optimization budget. Every evaluated
@@ -64,7 +70,7 @@
 - Replace the unpublished six-class classification contract with the final
   seven-class contract, splitting hemorrhage/necrosis from
   artifact/contamination and fixing the training bank at 400 tiles per class.
-- Add independent full-bank L1 and L2 validation streams for A0 search and
+- Add independent full-bank classification and spatial validation streams for A0 search and
   checkpoint selection. The frozen A0 selection loss combines epoch-0-
   normalized component-balanced spatial loss, class-balanced classification
   cross entropy, and direct fixed-teacher feature/relation retention with
@@ -77,9 +83,9 @@
   Search artifacts bind the trial, best epoch, checkpoint, configuration, and
   supervision digests.
 - Make formal A1–A11 runs inherit the selected A0 maximum budget and normalized
-  teacher/L1/L2 checkpoint rule, removing the obsolete three-/six-epoch
+  teacher/classification/spatial checkpoint rule, removing the obsolete three-/six-epoch
   population-loss stopping path. Classification-removal conditions retain the
-  complete L1 validation bank while zeroing classification training loss.
+  complete classification validation bank while zeroing classification training loss.
   Freeze the A0 ramp boundary, bind each condition's active source/asset
   subset, and reject continuation from a checkpoint created under a shorter
   epoch plan. Bind `best_config.yaml` to the completed study's winning trial

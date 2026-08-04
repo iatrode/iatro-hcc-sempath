@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 
-from iatro.iac import Codec, VariableRecordPack, read_tables
+from iatro.iac import Codec, VariableRecordPack
 
 
 SCHEMA_VERSION = 1

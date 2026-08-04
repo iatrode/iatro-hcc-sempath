@@ -301,7 +301,7 @@ decision boundary when available.
 - The union of their training tiles is replayed throughout population
   distillation; newly annotated tiles enter the same union automatically.
 - A0 Optuna search uses one deterministic 10% population subset, the complete
-  training expert union, and independent complete L1/L2 validation banks. It
+  training expert union, and independent complete classification/spatial validation banks. It
   searches learning rate, weight decay, and the global spatial-task weight for
   at most 16 epochs. Multi-GPU execution assigns one independent trial to each
   GPU under one coordinator. Asynchronous device reuse prevents paid GPU
@@ -324,7 +324,7 @@ decision boundary when available.
   budget. Its cosine learning-rate horizon is likewise inherited as the A0
   study's absolute optimizer-step count rather than recomputed from full-data
   epochs. Conditions that remove classification training
-  still retain the complete L1 validation bank. Each condition receives an
+  still retain the complete classification validation bank. Each condition receives an
   exact source/asset contract over its active teacher/prototype subset, and a
   checkpoint from an obsolete shorter epoch plan cannot be extended into the
   formal run. The ablation base is accepted only when the completed Optuna
@@ -368,7 +368,7 @@ selection uses three fixed validation terms:
   population-validation packages. It is computed from mean cosine distance
   on the full probe plus relation MSE on its deterministic evenly spaced
   4,096-tile subset, using the configured relation weight. Dynamic PAMT-D
-  targets and student prototypes do not enter this term. Every L1/L2 expert
+  targets and student prototypes do not enter this term. Every classification/spatial expert
   train and validation tile is excluded from this label-blind probe; ordinary
   population-validation diagnostics are accumulated on the same 128 batches.
 - \(C_e\): class-balanced cross entropy over the complete seven-class expert

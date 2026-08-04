@@ -1117,14 +1117,14 @@ def _package_cohort_ids(
     slide_ids: set[str] = set()
     for package_path in package_paths:
         _, slide_table, _ = read_tables(package_path)
-        for field, destination in (
+        for field_name, destination in (
             ("patient_id", patient_ids),
             ("slide_id", slide_ids),
         ):
-            if field in slide_table.column_names:
+            if field_name in slide_table.column_names:
                 destination.update(
                     str(value)
-                    for value in slide_table.column(field).to_pylist()
+                    for value in slide_table.column(field_name).to_pylist()
                     if value not in (None, "")
                 )
     return patient_ids, slide_ids

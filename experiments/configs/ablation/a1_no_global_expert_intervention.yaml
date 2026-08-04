@@ -3,7 +3,7 @@ inherits: matched_tenth.yaml
 # Ablation A1 — four-teacher feature/relation distillation plus the matched
 # spatial task, without the global expert intervention.
 #
-# Mechanism removal vs A0: the complete global L1 intervention is disabled:
+# Mechanism removal vs A0: the complete classification intervention is disabled:
 # direct classification supervision, teacher-space prototype-semantic
 # supervision, student prototype-response matching, and prototype-adjudicated
 # teacher reliability. This is intentionally a package-level contrast, not an

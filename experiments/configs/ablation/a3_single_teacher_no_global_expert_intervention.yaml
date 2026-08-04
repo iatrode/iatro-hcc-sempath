@@ -4,7 +4,7 @@ inherits: matched_tenth.yaml
 # intervention; matched spatial supervision remains active.
 #
 # A1–A3 isolates teacher multiplicity when neither condition receives direct
-# L1 classification, teacher-space prototype-semantic supervision, student
+# classification supervision, teacher-space prototype-semantic supervision, student
 # response matching, or prototype-adjudicated reliability. Virchow2 is the
 # frozen single-teacher design constant shared by A3 and A4.
 

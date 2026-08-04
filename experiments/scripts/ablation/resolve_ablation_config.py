@@ -431,7 +431,7 @@ def resolve_ablation_config(
         base["data"].get("require_complete_expert_validation", False)
     ):
         raise ValueError(
-            "formal ablations require complete L1/L2 expert validation"
+            "formal ablations require complete classification/spatial expert validation"
         )
     condition_path = Path(condition_path)
     condition = _raw_config(condition_path)

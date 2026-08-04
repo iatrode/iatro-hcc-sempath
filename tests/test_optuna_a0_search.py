@@ -255,7 +255,7 @@ def test_preflight_rejects_cross_modality_train_val_overlap(
 
     with pytest.raises(
         ValueError,
-        match="expert tile overlap across L1/L2",
+        match="expert tile overlap across classification/spatial supervision",
     ):
         module._expert_split_tile_counts(classification, spatial)
 

@@ -111,13 +111,13 @@ train:
   tensorboard: true
   tensorboard_batch_interval: 20
   # Every optimizer step is retained in a buffered append-only CSV. The fixed
-  # joint-selection probe supplies intra-epoch teacher/L1/L2 measurements on
+  # joint-selection probe supplies intra-epoch teacher/classification/spatial measurements on
   # unchanged validation assets.
   step_metrics_flush_steps: 50
   # Atomic, exactly resumable mid-epoch checkpoint. Full-corpus epochs are too
   # long to use epoch boundaries as the only recovery point.
   checkpoint_interval_steps: 1000
-  # Joint teacher/L1/L2 validation is scheduled by optimizer step so changing
+  # Joint teacher/classification/spatial validation is scheduled by optimizer step so changing
   # the population fraction cannot silently multiply the stopping budget.
   development_probe_interval_steps: 0
   development_probe_batches: 64
