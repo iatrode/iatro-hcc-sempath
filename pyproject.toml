@@ -51,7 +51,7 @@ dev = [
   "matplotlib>=3.8",
   "optuna>=4.9,<5",
   "pytest>=8,<10",
-  "ruff>=0.9,<1",
+  "ruff>=0.15,<0.16",
   "tensorboard>=2.16",
 ]
 [project.scripts]
