@@ -27,7 +27,7 @@ try:
     import optuna
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
-        "optuna is required. Install with: pip install -e '.[search]'"
+        "optuna is required. Install with: pip install -e '.[dev]'"
     ) from exc
 
 

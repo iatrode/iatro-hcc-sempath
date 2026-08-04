@@ -1,6 +1,13 @@
 # HCC-SemPath
 
+[![Source](https://img.shields.io/badge/source-GitHub-181717?logo=github)](https://github.com/iatrode/iatro-hcc-sempath) [![Hugging Face](<https://img.shields.io/badge/Hugging%20Face-gated%20model-ffcc4d?logo=huggingface&logoColor=black>)](https://huggingface.co/iatrode/iatro-hcc-sempath) [![ModelScope](<https://img.shields.io/badge/ModelScope-gated%20model-624aff>)](https://modelscope.cn/models/iatrode/iatro-hcc-sempath) [![PyPI](https://img.shields.io/pypi/v/hcc-sempath?include_prereleases)](https://pypi.org/project/hcc-sempath/) [![Python](https://img.shields.io/pypi/pyversions/hcc-sempath)](https://pypi.org/project/hcc-sempath/) [![CI](https://github.com/iatrode/iatro-hcc-sempath/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/iatrode/iatro-hcc-sempath/actions/workflows/ci.yml)
+
 [English](README.md) | [简体中文](README.zh-CN.md)
+
+**Gated model weights:** [Hugging Face](https://huggingface.co/iatrode/iatro-hcc-sempath) | [ModelScope](https://modelscope.cn/models/iatrode/iatro-hcc-sempath).
+Both hubs distribute the same SemPath model artifact. The PyPI package contains
+the modelling code and CLI; clinical assets, teacher weights, and patient-level
+outputs are not distributed.
 
 HCC-SemPath is an HCC-specific pathology representation model. It distils four
 frozen pathology foundation models into one DINOv2-S/14 student, then anchors
@@ -140,23 +147,25 @@ must be obtained from each original provider under its own terms.
 
 ## Installation
 
-HCC-SemPath supports Python 3.10 and later. From a source checkout:
+HCC-SemPath supports Python 3.10 and later. Install the latest public preview
+from PyPI:
 
 ```bash
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -e .
+python -m pip install --upgrade pip
+python -m pip install --pre hcc-sempath
 hcc-sempath --help
 ```
 
-Install development and hyperparameter-search dependencies when needed:
+For development from a source checkout, install the editable package and its
+complete developer toolchain:
 
 ```bash
-python -m pip install -e ".[dev,search]"
+python -m pip install -e ".[dev]"
 ```
 
-The two IatroCache packages are version-locked in `pyproject.toml`. Install the
-resolved project dependencies together rather than independently overriding one
-of those versions.
+The two IatroCache dependencies are constrained to their compatible public
+release series in `pyproject.toml`. Install the resolved project dependencies
+together rather than independently overriding either package.
 
 For WSI ingestion, OpenSlide must be usable in the selected Python environment.
 GPU training additionally requires a PyTorch/CUDA combination appropriate for

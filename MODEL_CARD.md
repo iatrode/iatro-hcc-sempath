@@ -93,7 +93,7 @@ Install HCC-SemPath, obtain access to the gated model repository, and download
 the release:
 
 ```bash
-python -m pip install hcc-sempath
+python -m pip install --pre hcc-sempath
 hcc-sempath download
 ```
 

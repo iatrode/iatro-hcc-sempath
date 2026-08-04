@@ -1,6 +1,12 @@
 # HCC-SemPath
 
+[![Source](https://img.shields.io/badge/source-GitHub-181717?logo=github)](https://github.com/iatrode/iatro-hcc-sempath) [![Hugging Face](<https://img.shields.io/badge/Hugging%20Face-gated%20model-ffcc4d?logo=huggingface&logoColor=black>)](https://huggingface.co/iatrode/iatro-hcc-sempath) [![ModelScope](<https://img.shields.io/badge/ModelScope-gated%20model-624aff>)](https://modelscope.cn/models/iatrode/iatro-hcc-sempath) [![PyPI](https://img.shields.io/pypi/v/hcc-sempath?include_prereleases)](https://pypi.org/project/hcc-sempath/) [![Python](https://img.shields.io/pypi/pyversions/hcc-sempath)](https://pypi.org/project/hcc-sempath/) [![CI](https://github.com/iatrode/iatro-hcc-sempath/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/iatrode/iatro-hcc-sempath/actions/workflows/ci.yml)
+
 [English](README.md) | [简体中文](README.zh-CN.md)
+
+**Gated 模型权重：** [Hugging Face](https://huggingface.co/iatrode/iatro-hcc-sempath) | [ModelScope](https://modelscope.cn/models/iatrode/iatro-hcc-sempath)。
+两个模型仓库分发同一份 SemPath 模型资产。PyPI 包仅包含建模代码和 CLI；临床资产、
+教师权重及患者级输出均不公开分发。
 
 HCC-SemPath 是一个 HCC 专用病理表征模型。它将四个冻结的病理基础模型蒸馏到一个
 DINOv2-S/14 学生模型中，并使用一个规模小、固定且由病理医师标注的原型库约束所得
@@ -122,22 +128,22 @@ HCC-SemPath 验证的核心假设是：当多教师蒸馏与一个覆盖目标�
 
 ## 安装
 
-HCC-SemPath 支持 Python 3.10 及以上版本。在源码检出目录中执行：
+HCC-SemPath 支持 Python 3.10 及以上版本。通过 PyPI 安装最新公开预览版：
 
 ```bash
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -e .
+python -m pip install --upgrade pip
+python -m pip install --pre hcc-sempath
 hcc-sempath --help
 ```
 
-开发与超参数搜索需要额外依赖：
+从源码进行开发时，在源码检出目录安装 editable 包及完整开发工具链：
 
 ```bash
-python -m pip install -e ".[dev,search]"
+python -m pip install -e ".[dev]"
 ```
 
-`pyproject.toml` 中的两个 IatroCache 包采用互锁版本。应整体安装项目解析出的依赖，
-不应单独覆盖其中一个包的版本。
+`pyproject.toml` 将两个 IatroCache 依赖约束在兼容的公开版本系列内。应整体安装项目
+解析出的依赖，不应单独覆盖其中任一包的版本。
 
 WSI 读取要求 OpenSlide 在当前 Python 环境中可用。GPU 训练还需要与宿主机匹配的
 PyTorch/CUDA 组合；HCC-SemPath 不会替使用方创建或选择 CUDA 环境。

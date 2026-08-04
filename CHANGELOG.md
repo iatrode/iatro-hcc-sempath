@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0.dev2 — Unreleased
+
+- Add pinned GitHub Actions workflows for routine push/PR validation and
+  manually dispatched, tag-bound PyPI and GitHub releases. Release preflight
+  verifies source metadata, PyPI version availability, distribution identity,
+  console entrypoints, and the public/private asset boundary.
+- Consolidate the English and Chinese open-source entrypoints around PyPI,
+  Hugging Face, and ModelScope. The developer extra now contains the complete
+  test, lint, and repository-local Optuna toolchain; build and publication
+  dependencies remain isolated inside the manual release workflow. The
+  redundant search extra is removed before its first public release.
+- Align declared dependencies with the source contract: add SciPy and the
+  ModelScope client at runtime, move experiment plotting and optional
+  TensorBoard logging into the developer extra, add supported minimum
+  versions, and remove the obsolete direct image-codec dependency.
+
 ## 0.2.0.dev1 — 2026-08-04
 
 - Normalize the first-release supervision terminology to
